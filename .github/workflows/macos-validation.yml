@@ -5,20 +5,8 @@ name: macOS validation
 on:
   workflow_dispatch:
   pull_request:
-    paths:
-      - 'Sources/**'
-      - 'Tests/**'
-      - 'LaunchIcon.xcodeproj/**'
-      - 'script/**'
-      - '.github/workflows/macos-validation.yml'
   push:
     branches: [main]
-    paths:
-      - 'Sources/**'
-      - 'Tests/**'
-      - 'LaunchIcon.xcodeproj/**'
-      - 'script/**'
-      - '.github/workflows/macos-validation.yml'
 
 permissions:
   contents: read
