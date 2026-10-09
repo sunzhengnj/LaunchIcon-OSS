@@ -2925,7 +2925,6 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertEqual(LauncherLayout.pageColumns * LauncherLayout.pageRows, 35)
         XCTAssertEqual(LauncherLayout.pageCapacity, 35)
         XCTAssertEqual(LauncherLayout.folderColumns * LauncherLayout.folderRows, 25)
-        XCTAssertEqual(LauncherLayout.folderCapacity, 25)
 
         let entries = (0..<36).map { _ in LauncherEntry.app(UUID()) }
         XCTAssertEqual(LauncherLayout.pageCount(forEntryCount: entries.count), 2)
@@ -2947,7 +2946,6 @@ final class LaunchIconCoreTests: XCTestCase {
             LauncherLayout.pageIndicatorSlots(pageCount: 9, selectedPage: 8),
             [.ellipsis, .page(2), .page(3), .page(4), .page(5), .page(6), .page(7), .page(8)]
         )
-        XCTAssertEqual(LauncherLayout.folderCapacity, LauncherLayout.folderColumns * LauncherLayout.folderRows)
     }
 
     func testFocusSlotAfterPageTurnKeepsRelativeGridPosition() {
@@ -3496,6 +3494,25 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertEqual(state.folders[folderID]?.name, "工具")
     }
 
+    func testDropUsesLocalizedFolderNameProvidedByUI() throws {
+        let first = UUID()
+        let second = UUID()
+        let state = LayoutState(
+            orderedEntries: [.app(first), .app(second)],
+            appKeys: [first: "bundle:first", second: "bundle:second"],
+            updatedAt: Date(timeIntervalSince1970: 0)
+        )
+        let result = try LauncherLayout.applyDrop(
+            LayoutDrop(source: .topLevel(first), destination: .merge(.topLevel(second))),
+            to: state,
+            newFolderName: "New Folder"
+        ).get()
+        guard case .folder(let folderID) = result.orderedEntries.first else {
+            return XCTFail("Expected merged folder")
+        }
+        XCTAssertEqual(result.folders[folderID]?.name, "New Folder")
+    }
+
     func testDragOutReturnsAppToTopLevelAndDissolvesSingleMemberFolder() throws {
         let folderID = UUID()
         let kept = UUID()
@@ -3575,7 +3592,7 @@ final class LaunchIconCoreTests: XCTestCase {
                     }),
                     "\(source) → \(destination)"
                 )
-                XCTAssertTrue(moved.folders.values.allSatisfy { (2...LauncherLayout.folderCapacity).contains($0.itemIDs.count) })
+                XCTAssertTrue(moved.folders.values.allSatisfy { $0.itemIDs.count >= 2 })
             }
         }
         XCTAssertGreaterThan(accepted, 20)
@@ -3656,7 +3673,7 @@ final class LaunchIconCoreTests: XCTestCase {
             XCTAssertEqual(Set(folderMemberIDs).count, folderMemberIDs.count, "step \(step)")
             XCTAssertTrue(Set(folderMemberIDs).isDisjoint(with: folderEntryIDs), "step \(step)")
             XCTAssertTrue(state.folders.values.allSatisfy {
-                (2...LauncherLayout.folderCapacity).contains($0.itemIDs.count)
+                $0.itemIDs.count >= 2
             }, "step \(step)")
             XCTAssertEqual(state.appKeys, originalAppKeys, "step \(step)")
         }
@@ -3665,12 +3682,12 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertGreaterThan(rejectedDrops, 0)
     }
 
-    func testNestedFolderDropsAreRejectedAndFolderCapacityIsEnforced() {
+    func testNestedFolderDropsAreRejectedAndFoldersCanExceedTwentyFiveMembers() {
         let folderA = UUID()
         let folderB = UUID()
         let memberA = UUID()
         let appID = UUID()
-        let members = (0..<LauncherLayout.folderCapacity).map { _ in UUID() }
+        let members = (0..<25).map { _ in UUID() }
         let extra = UUID()
         let fullFolder = UUID()
         let state = LayoutState(
@@ -3678,7 +3695,7 @@ final class LaunchIconCoreTests: XCTestCase {
             folders: [
                 folderA: LauncherFolder(id: folderA, name: "A", itemIDs: [memberA], createdAt: Date(timeIntervalSince1970: 0)),
                 folderB: LauncherFolder(id: folderB, name: "B", itemIDs: [UUID()], createdAt: Date(timeIntervalSince1970: 0)),
-                fullFolder: LauncherFolder(id: fullFolder, name: "Full", itemIDs: Array(members.prefix(LauncherLayout.folderCapacity)), createdAt: Date(timeIntervalSince1970: 0))
+                fullFolder: LauncherFolder(id: fullFolder, name: "Full", itemIDs: members, createdAt: Date(timeIntervalSince1970: 0))
             ],
             appKeys: [appID: "bundle:app", extra: "bundle:extra"],
             updatedAt: Date(timeIntervalSince1970: 0)
@@ -3699,10 +3716,10 @@ final class LaunchIconCoreTests: XCTestCase {
             ),
             .failure(.nestedFolder)
         )
-        XCTAssertEqual(
-            LauncherLayout.applyDrop(LayoutDrop(source: .topLevel(extra), destination: .merge(.topLevel(fullFolder))), to: state),
-            .failure(.folderFull)
-        )
+        guard case .success(let expanded) = LauncherLayout.applyDrop(
+            LayoutDrop(source: .topLevel(extra), destination: .merge(.topLevel(fullFolder))), to: state
+        ) else { return XCTFail("A 25-member folder should accept another app") }
+        XCTAssertEqual(expanded.folders[fullFolder]?.itemIDs, members + [extra])
     }
 
     func testSearchMatchesAppsInsideFolders() {
@@ -4314,9 +4331,9 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertNil(restoredFolderFirst.appKeys[firstID])
     }
 
-    func testReconcileMovesFolderMembersBeyondCapacityToTopLevel() {
+    func testReconcilePreservesFolderMembersBeyondTwentyFive() {
         let folderID = UUID()
-        let memberIDs = (0..<(LauncherLayout.folderCapacity + 3)).map { _ in UUID() }
+        let memberIDs = (0..<28).map { _ in UUID() }
         let candidatesInFolderOrder = memberIDs.enumerated().map { index, _ in
             AppCandidate(
                 canonicalURL: URL(fileURLWithPath: "/Applications/Member\(index).app"),
@@ -4336,20 +4353,17 @@ final class LaunchIconCoreTests: XCTestCase {
 
         let restored = LauncherLayout.reconcile(candidates: candidates, into: stored)
 
-        XCTAssertEqual(restored.folders[folderID]?.itemIDs, Array(memberIDs.prefix(LauncherLayout.folderCapacity)))
-        XCTAssertEqual(
-            restored.orderedEntries,
-            [.folder(folderID)] + memberIDs.dropFirst(LauncherLayout.folderCapacity).map(LauncherEntry.app)
-        )
+        XCTAssertEqual(restored.folders[folderID]?.itemIDs, memberIDs)
+        XCTAssertEqual(restored.orderedEntries, [.folder(folderID)])
         XCTAssertEqual(
             LauncherLayout.searchableApps(in: restored, catalog: candidates).map(\.deduplicationKey),
             candidatesInFolderOrder.map(\.deduplicationKey)
         )
     }
 
-    func testReconcileDoesNotCountDuplicateFolderMemberAgainstCapacity() {
+    func testReconcileRemovesDuplicateFolderMember() {
         let folderID = UUID()
-        let memberIDs = (0..<LauncherLayout.folderCapacity).map { _ in UUID() }
+        let memberIDs = (0..<25).map { _ in UUID() }
         let candidates = memberIDs.enumerated().map { index, _ in
             AppCandidate(
                 canonicalURL: URL(fileURLWithPath: "/Applications/Member\(index).app"),
@@ -4376,9 +4390,9 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertEqual(restored.orderedEntries, [.folder(folderID)])
     }
 
-    func testReconcileDoesNotCountDuplicateFolderIdentityAgainstCapacity() {
+    func testReconcileRemovesDuplicateFolderIdentity() {
         let folderID = UUID()
-        let memberIDs = (0..<LauncherLayout.folderCapacity).map { _ in UUID() }
+        let memberIDs = (0..<25).map { _ in UUID() }
         let duplicateID = UUID()
         let candidates = memberIDs.enumerated().map { index, _ in
             AppCandidate(
@@ -4469,7 +4483,7 @@ final class LaunchIconCoreTests: XCTestCase {
                 appKeys[id] = keyIndex < candidateKeys.count ? candidateKeys[keyIndex] : "bundle:removed"
             }
             let folders = Dictionary(uniqueKeysWithValues: folderIDs.map { id in
-                let memberCount = next(LauncherLayout.folderCapacity + 7)
+                let memberCount = next(32)
                 let members = (0..<memberCount).map { _ in
                     let allIDs = appIDs + missingIDs
                     return allIDs[next(allIDs.count)]
@@ -4511,7 +4525,7 @@ final class LaunchIconCoreTests: XCTestCase {
             }, "seed \(initialSeed)")
             XCTAssertTrue(restored.folders.allSatisfy { id, folder in
                 id == folder.id
-                    && (2...LauncherLayout.folderCapacity).contains(folder.itemIDs.count)
+                    && folder.itemIDs.count >= 2
                     && Set(folder.itemIDs).count == folder.itemIDs.count
                     && folder.itemIDs.allSatisfy { restored.appKeys[$0] != nil }
             }, "seed \(initialSeed)")

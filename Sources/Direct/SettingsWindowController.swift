@@ -11,13 +11,13 @@ final class SettingsWindowController: NSWindowController {
     private var preferences: LauncherPreferences
     private var hiddenApplications: [HiddenApplication]
     private let shortcutPopup = NSPopUpButton(frame: .zero, pullsDown: false)
-    private let loginCheckbox = NSButton(checkboxWithTitle: "开机登录", target: nil, action: nil)
-    private let statusCheckbox = NSButton(checkboxWithTitle: "显示菜单栏图标", target: nil, action: nil)
-    private let hideCheckbox = NSButton(checkboxWithTitle: "启动应用后自动收起", target: nil, action: nil)
-    private let motionCheckbox = NSButton(checkboxWithTitle: "减少动态效果（合并只保留短淡入）", target: nil, action: nil)
+    private let loginCheckbox = NSButton(checkboxWithTitle: L("开机登录"), target: nil, action: nil)
+    private let statusCheckbox = NSButton(checkboxWithTitle: L("显示菜单栏图标"), target: nil, action: nil)
+    private let hideCheckbox = NSButton(checkboxWithTitle: L("启动应用后自动收起"), target: nil, action: nil)
+    private let motionCheckbox = NSButton(checkboxWithTitle: L("减少动态效果（合并只保留短淡入）"), target: nil, action: nil)
     private let hiddenApplicationsPopup = NSPopUpButton(frame: .zero, pullsDown: false)
-    private let restoreHiddenApplicationButton = NSButton(title: "恢复", target: nil, action: nil)
-    private let rescanButton = NSButton(title: "重新扫描", target: nil, action: nil)
+    private let restoreHiddenApplicationButton = NSButton(title: L("恢复"), target: nil, action: nil)
+    private let rescanButton = NSButton(title: L("重新扫描"), target: nil, action: nil)
     private let messageLabel = NSTextField(labelWithString: "")
     private var shortcutRegistrationError: String?
     private var isRescanning = false
@@ -31,7 +31,7 @@ final class SettingsWindowController: NSWindowController {
             backing: .buffered,
             defer: false
         )
-        window.title = "LaunchIcon 设置"
+        window.title = L("LaunchIcon 设置")
         window.center()
         super.init(window: window)
         buildContent(in: window)
@@ -65,8 +65,8 @@ final class SettingsWindowController: NSWindowController {
         rescanButton.isEnabled = true
         guard shortcutRegistrationError == nil else { return }
         messageLabel.stringValue = canEditLayout
-            ? "重新扫描完成"
-            : "扫描仍不完整，暂时无法整理"
+            ? L("重新扫描完成")
+            : L("扫描仍不完整，暂时无法整理")
     }
 
     private func buildContent(in window: NSWindow) {
@@ -88,22 +88,22 @@ final class SettingsWindowController: NSWindowController {
 
         let titleRow = NSStackView()
         titleRow.orientation = .horizontal
-        let title = NSTextField(labelWithString: "通用")
+        let title = NSTextField(labelWithString: L("通用"))
         title.font = .systemFont(ofSize: 18, weight: .semibold)
         titleRow.addArrangedSubview(title)
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         titleRow.addArrangedSubview(spacer)
-        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "未知"
-        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "未知"
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? L("未知")
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? L("未知")
         let sourceCommit = Bundle.main.infoDictionary?["LaunchIconSourceCommit"] as? String
-        let source = sourceCommit.map { "源码 \($0.prefix(7))" } ?? "开发构建"
-        let versionLabel = NSTextField(labelWithString: "版本 \(version) (\(build)) · \(source)")
+        let source = sourceCommit.map { String(format: L("源码 %@"), String($0.prefix(7))) } ?? L("开发构建")
+        let versionLabel = NSTextField(labelWithString: String(format: L("版本 %@ (%@) · %@"), version, build, source))
         versionLabel.font = .systemFont(ofSize: 11)
         versionLabel.textColor = .secondaryLabelColor
         versionLabel.toolTip = sourceCommit
         if let sourceCommit {
-            versionLabel.setAccessibilityHelp("完整源码提交：\(sourceCommit)")
+            versionLabel.setAccessibilityHelp(String(format: L("完整源码提交：%@"), sourceCommit))
         }
         titleRow.addArrangedSubview(versionLabel)
         stack.addArrangedSubview(titleRow)
@@ -112,10 +112,10 @@ final class SettingsWindowController: NSWindowController {
         let shortcutRow = NSStackView()
         shortcutRow.orientation = .horizontal
         shortcutRow.spacing = 16
-        let shortcutLabel = NSTextField(labelWithString: "呼出快捷键")
+        let shortcutLabel = NSTextField(labelWithString: L("呼出快捷键"))
         shortcutLabel.widthAnchor.constraint(equalToConstant: 112).isActive = true
         shortcutPopup.addItems(withTitles: LauncherShortcut.allCases.map(\.title))
-        shortcutPopup.setAccessibilityLabel("呼出快捷键")
+        shortcutPopup.setAccessibilityLabel(L("呼出快捷键"))
         shortcutPopup.target = self
         shortcutPopup.action = #selector(preferencesChanged)
         shortcutRow.addArrangedSubview(shortcutLabel)
@@ -127,10 +127,10 @@ final class SettingsWindowController: NSWindowController {
             checkbox.action = #selector(preferencesChanged)
             stack.addArrangedSubview(checkbox)
         }
-        statusCheckbox.setAccessibilityHelp("关闭后仍可用快捷键呼出；从启动器顶部设置按钮或按 Command-逗号可再次打开设置")
-        motionCheckbox.setAccessibilityLabel("减少动态效果")
-        motionCheckbox.setAccessibilityHelp("开启后不播放合并图标飞入与文件夹弹跳，只保留短淡入；关闭可恢复完整过渡。macOS 系统的减少动态效果设置仍会优先生效")
-        motionCheckbox.toolTip = "关闭此项可显示完整合并过渡动画；系统减少动态效果开启时仍会简化动画"
+        statusCheckbox.setAccessibilityHelp(L("关闭后仍可用快捷键呼出；从启动器顶部设置按钮或按 Command-逗号可再次打开设置"))
+        motionCheckbox.setAccessibilityLabel(L("减少动态效果"))
+        motionCheckbox.setAccessibilityHelp(L("开启后不播放合并图标飞入与文件夹弹跳，只保留短淡入；关闭可恢复完整过渡。macOS 系统的减少动态效果设置仍会优先生效"))
+        motionCheckbox.toolTip = L("关闭此项可显示完整合并过渡动画；系统减少动态效果开启时仍会简化动画")
 
         let separator = NSBox()
         separator.boxType = .separator
@@ -140,7 +140,7 @@ final class SettingsWindowController: NSWindowController {
         loginCheckbox.target = self
         loginCheckbox.action = #selector(loginChanged)
         stack.addArrangedSubview(loginCheckbox)
-        let systemButton = NSButton(title: "打开系统登录项设置…", target: self, action: #selector(openLoginSettings))
+        let systemButton = NSButton(title: L("打开系统登录项设置…"), target: self, action: #selector(openLoginSettings))
         systemButton.bezelStyle = .inline
         stack.addArrangedSubview(systemButton)
 
@@ -149,13 +149,13 @@ final class SettingsWindowController: NSWindowController {
         stack.addArrangedSubview(hiddenSeparator)
         hiddenSeparator.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
 
-        let hiddenTitle = NSTextField(labelWithString: "隐藏的应用")
+        let hiddenTitle = NSTextField(labelWithString: L("隐藏的应用"))
         hiddenTitle.font = .systemFont(ofSize: 13, weight: .semibold)
         stack.addArrangedSubview(hiddenTitle)
         let hiddenRow = NSStackView()
         hiddenRow.orientation = .horizontal
         hiddenRow.spacing = 10
-        hiddenApplicationsPopup.setAccessibilityLabel("隐藏的应用")
+        hiddenApplicationsPopup.setAccessibilityLabel(L("隐藏的应用"))
         hiddenApplicationsPopup.setContentHuggingPriority(.defaultLow, for: .horizontal)
         restoreHiddenApplicationButton.target = self
         restoreHiddenApplicationButton.action = #selector(restoreHiddenApplication)
@@ -166,8 +166,8 @@ final class SettingsWindowController: NSWindowController {
         rescanButton.bezelStyle = .rounded
         rescanButton.target = self
         rescanButton.action = #selector(rescan)
-        rescanButton.setAccessibilityLabel("重新扫描")
-        rescanButton.setAccessibilityHelp("重新扫描 Applications 文件夹")
+        rescanButton.setAccessibilityLabel(L("重新扫描"))
+        rescanButton.setAccessibilityHelp(L("重新扫描 Applications 文件夹"))
         stack.addArrangedSubview(rescanButton)
 
         messageLabel.textColor = .secondaryLabelColor
@@ -189,7 +189,7 @@ final class SettingsWindowController: NSWindowController {
     private func updateHiddenApplications() {
         hiddenApplicationsPopup.removeAllItems()
         guard !hiddenApplications.isEmpty else {
-            hiddenApplicationsPopup.addItem(withTitle: "没有隐藏的应用")
+            hiddenApplicationsPopup.addItem(withTitle: L("没有隐藏的应用"))
             hiddenApplicationsPopup.isEnabled = false
             restoreHiddenApplicationButton.isEnabled = false
             return
@@ -208,7 +208,7 @@ final class SettingsWindowController: NSWindowController {
         rescanButton.isEnabled = false
         onRescan?()
         guard shortcutRegistrationError == nil else { return }
-        messageLabel.stringValue = "正在重新扫描"
+        messageLabel.stringValue = L("正在重新扫描")
     }
 
     @objc private func preferencesChanged() {
@@ -224,7 +224,7 @@ final class SettingsWindowController: NSWindowController {
         } else {
             preferences = proposed
             shortcutRegistrationError = nil
-            messageLabel.stringValue = "设置已应用"
+            messageLabel.stringValue = L("设置已应用")
         }
     }
 
@@ -240,7 +240,7 @@ final class SettingsWindowController: NSWindowController {
                 || status == SMAppService.Status.requiresApproval.rawValue ? .on : .off
             if status == SMAppService.Status.requiresApproval.rawValue,
                self.shortcutRegistrationError == nil {
-                self.messageLabel.stringValue = "请在系统设置的登录项中允许 LaunchIcon。"
+                self.messageLabel.stringValue = L("请在系统设置的登录项中允许 LaunchIcon。")
             }
         }
     }
@@ -264,19 +264,19 @@ final class SettingsWindowController: NSWindowController {
             self.loginCheckbox.state = result.0 == SMAppService.Status.enabled.rawValue
                 || result.0 == SMAppService.Status.requiresApproval.rawValue ? .on : .off
             self.messageLabel.stringValue = result.1 ?? (result.0 == SMAppService.Status.requiresApproval.rawValue
-                ? "请在系统设置的登录项中允许 LaunchIcon。" : "开机登录设置已更新")
+                ? L("请在系统设置的登录项中允许 LaunchIcon。") : L("开机登录设置已更新"))
         }
     }
 
     @objc private func restoreHiddenApplication() {
         guard let key = hiddenApplicationsPopup.selectedItem?.representedObject as? String else { return }
         guard onRestoreHiddenApplication?(key) == true else {
-            messageLabel.stringValue = "当前无法恢复该应用，请等待扫描完成后重试。"
+            messageLabel.stringValue = L("当前无法恢复该应用，请等待扫描完成后重试。")
             return
         }
         hiddenApplications.removeAll { $0.key == key }
         updateHiddenApplications()
-        messageLabel.stringValue = "已恢复应用"
+        messageLabel.stringValue = L("已恢复应用")
     }
 
     @objc private func openLoginSettings() {

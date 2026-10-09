@@ -25,7 +25,6 @@ public enum LayoutMutationError: Error, Equatable, Sendable {
     case missingSource
     case missingTarget
     case nestedFolder
-    case folderFull
     case cannotDropOnSelf
 }
 
@@ -40,7 +39,6 @@ public enum LauncherLayout {
     public static let pageCapacity = pageColumns * pageRows
     public static let folderColumns = 5
     public static let folderRows = 5
-    public static let folderCapacity = folderColumns * folderRows
     public static let pageIndicatorLimit = 7
     public static let pageAnimationDuration: TimeInterval = 0.28
     public static let pageTurnDistanceFraction: CGFloat = 0.18
@@ -1320,18 +1318,12 @@ public enum LauncherLayout {
             : visibleCandidates
         let liveKeys = Set(visibleCandidates.map(\.deduplicationKey))
         let deadIDs = Set(state.appKeys.compactMap { liveKeys.contains($0.value) ? nil : $0.key })
-        var overflowMemberIDsByFolder: [UUID: [UUID]] = [:]
-
         for folderID in Array(state.folders.keys) {
             guard var folder = state.folders[folderID] else { continue }
             var seenMemberKeys = Set<String>()
             folder.itemIDs.removeAll { itemID in
                 guard !deadIDs.contains(itemID), let key = state.appKeys[itemID] else { return true }
                 return !seenMemberKeys.insert(key).inserted
-            }
-            if folder.itemIDs.count > folderCapacity {
-                overflowMemberIDsByFolder[folderID] = Array(folder.itemIDs.dropFirst(folderCapacity))
-                folder.itemIDs = Array(folder.itemIDs.prefix(folderCapacity))
             }
             if folder.id != folderID {
                 folder = LauncherFolder(
@@ -1351,9 +1343,6 @@ public enum LauncherLayout {
                 itemIDs: folder.itemIDs,
                 createdAt: folder.createdAt
             )
-            if let overflowMemberIDs = overflowMemberIDsByFolder.removeValue(forKey: folderID) {
-                overflowMemberIDsByFolder[repairedID] = overflowMemberIDs
-            }
             state.orderedEntries = state.orderedEntries.map { entry in
                 guard case .folder(folderID) = entry else { return entry }
                 return .folder(repairedID)
@@ -1383,15 +1372,6 @@ public enum LauncherLayout {
         where !state.orderedEntries.contains(.folder(folderID)) {
             state.orderedEntries.append(.folder(folderID))
         }
-        var entriesWithOverflowMembers: [LauncherEntry] = []
-        for entry in state.orderedEntries {
-            entriesWithOverflowMembers.append(entry)
-            guard case .folder(let folderID) = entry,
-                  let overflowMemberIDs = overflowMemberIDsByFolder[folderID] else { continue }
-            entriesWithOverflowMembers.append(contentsOf: overflowMemberIDs.map(LauncherEntry.app))
-        }
-        state.orderedEntries = entriesWithOverflowMembers
-
         var placedKeys = Set<String>()
         var duplicateAppIDs = Set<UUID>()
         var uniqueEntries: [LauncherEntry] = []
@@ -1571,12 +1551,16 @@ public enum LauncherLayout {
         return state
     }
 
-    public static func applyDrop(_ drop: LayoutDrop, to state: LayoutState) -> Result<LayoutState, LayoutMutationError> {
+    public static func applyDrop(
+        _ drop: LayoutDrop,
+        to state: LayoutState,
+        newFolderName: String = "新建文件夹"
+    ) -> Result<LayoutState, LayoutMutationError> {
         switch drop.destination {
         case .topLevelIndex(let index):
             return moveToTopLevel(source: drop.source, index: index, in: state)
         case .merge(let target):
-            return merge(source: drop.source, onto: target, in: state)
+            return merge(source: drop.source, onto: target, in: state, newFolderName: newFolderName)
         case .folderIndex(let folderID, let index):
             return moveIntoFolder(source: drop.source, folderID: folderID, index: index, in: state)
         }
@@ -1650,7 +1634,6 @@ public enum LauncherLayout {
         }
 
         guard let folder = state.folders[folderID] else { return .failure(.missingTarget) }
-        if folder.itemIDs.count >= folderCapacity { return .failure(.folderFull) }
 
         let insertAt = insertionIndexAfterRemovingSource(
             sourceIndex: nil,
@@ -1663,7 +1646,6 @@ public enum LauncherLayout {
         case .success(let entry):
             guard case .app(let appID) = entry else { return .failure(.nestedFolder) }
             guard var liveFolder = state.folders[folderID] else { return .failure(.missingTarget) }
-            if liveFolder.itemIDs.count >= folderCapacity { return .failure(.folderFull) }
             liveFolder.itemIDs.insert(appID, at: min(insertAt, liveFolder.itemIDs.count))
             state.folders[folderID] = liveFolder
             state.updatedAt = .now
@@ -1671,7 +1653,7 @@ public enum LauncherLayout {
         }
     }
 
-    private static func merge(source: LayoutItemRef, onto target: LayoutItemRef, in state: LayoutState) -> Result<LayoutState, LayoutMutationError> {
+    private static func merge(source: LayoutItemRef, onto target: LayoutItemRef, in state: LayoutState, newFolderName: String) -> Result<LayoutState, LayoutMutationError> {
         guard source != target else { return .failure(.cannotDropOnSelf) }
         if isFolder(source, in: state) {
             return .failure(.nestedFolder)
@@ -1684,14 +1666,13 @@ public enum LauncherLayout {
             if state.folders[targetID] != nil {
                 return add(source: source, toFolder: targetID, in: state)
             }
-            return createFolder(from: source, ontoApp: targetID, in: state)
+            return createFolder(from: source, ontoApp: targetID, in: state, name: newFolderName)
         }
     }
 
     private static func add(source: LayoutItemRef, toFolder folderID: UUID, in state: LayoutState) -> Result<LayoutState, LayoutMutationError> {
         var state = state
-        guard let folder = state.folders[folderID] else { return .failure(.missingTarget) }
-        if folder.itemIDs.count >= folderCapacity { return .failure(.folderFull) }
+        guard state.folders[folderID] != nil else { return .failure(.missingTarget) }
         switch extract(source, from: &state) {
         case .failure(let error):
             return .failure(error)
@@ -1699,7 +1680,6 @@ public enum LauncherLayout {
             guard case .app(let appID) = entry else { return .failure(.nestedFolder) }
             guard var liveFolder = state.folders[folderID] else { return .failure(.missingTarget) }
             if liveFolder.itemIDs.contains(appID) { return .failure(.cannotDropOnSelf) }
-            if liveFolder.itemIDs.count >= folderCapacity { return .failure(.folderFull) }
             liveFolder.itemIDs.append(appID)
             state.folders[folderID] = liveFolder
             state.updatedAt = .now
@@ -1707,7 +1687,7 @@ public enum LauncherLayout {
         }
     }
 
-    private static func createFolder(from source: LayoutItemRef, ontoApp targetID: UUID, in state: LayoutState) -> Result<LayoutState, LayoutMutationError> {
+    private static func createFolder(from source: LayoutItemRef, ontoApp targetID: UUID, in state: LayoutState, name: String) -> Result<LayoutState, LayoutMutationError> {
         guard state.orderedEntries.contains(.app(targetID)) || folderContains(targetID, in: state) else {
             return .failure(.missingTarget)
         }
@@ -1735,7 +1715,7 @@ public enum LauncherLayout {
                 return .failure(.missingTarget)
             }
 
-            let folder = LauncherFolder(id: folderID, name: "新建文件夹", itemIDs: [targetID, sourceID])
+            let folder = LauncherFolder(id: folderID, name: name, itemIDs: [targetID, sourceID])
             state.folders[folderID] = folder
             state.orderedEntries.insert(.folder(folderID), at: min(insertionIndex, state.orderedEntries.count))
             state.updatedAt = .now

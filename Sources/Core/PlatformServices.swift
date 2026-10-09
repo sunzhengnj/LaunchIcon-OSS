@@ -413,12 +413,32 @@ public protocol AppLaunching: Sendable {
 
 public enum WorkspaceLaunchError: LocalizedError, Equatable, Sendable {
     case requestRejected(URL)
+    case timedOut(URL)
 
     public var errorDescription: String? {
         switch self {
         case .requestRejected:
             return "系统未接受打开应用的请求。"
+        case .timedOut:
+            return "系统未在 10 秒内回应启动请求；应用可能仍在启动。"
         }
+    }
+}
+
+private final class WorkspaceLaunchFlight: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, any Error>?
+
+    init(_ continuation: CheckedContinuation<Void, any Error>) {
+        self.continuation = continuation
+    }
+
+    func finish(_ result: Result<Void, any Error>) {
+        lock.lock()
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(with: result)
     }
 }
 
@@ -426,23 +446,22 @@ public struct WorkspaceAppLauncher: AppLaunching {
     public init() {}
 
     public func launch(_ applicationURL: URL) async throws {
-        let path = applicationURL.path
-        let applicationIsLaunchable = await Task.detached(priority: .userInitiated) {
-            let fileManager = FileManager.default
-            guard fileManager.fileExists(atPath: path),
-                  let executableURL = Bundle(url: applicationURL)?.executableURL else {
-                return false
+        try await withCheckedThrowingContinuation { continuation in
+            let flight = WorkspaceLaunchFlight(continuation)
+            DispatchQueue.global().asyncAfter(deadline: .now() + 10) {
+                flight.finish(.failure(WorkspaceLaunchError.timedOut(applicationURL)))
             }
-            return fileManager.isExecutableFile(atPath: executableURL.path)
-        }.value
-        guard applicationIsLaunchable else {
-            throw WorkspaceLaunchError.requestRejected(applicationURL)
-        }
-        let accepted = await MainActor.run {
-            NSWorkspace.shared.open(applicationURL)
-        }
-        guard accepted else {
-            throw WorkspaceLaunchError.requestRejected(applicationURL)
+            DispatchQueue.global(qos: .userInitiated).async {
+                let fileManager = FileManager.default
+                guard fileManager.fileExists(atPath: applicationURL.path),
+                      let executableURL = Bundle(url: applicationURL)?.executableURL,
+                      fileManager.isExecutableFile(atPath: executableURL.path),
+                      NSWorkspace.shared.open(applicationURL) else {
+                    flight.finish(.failure(WorkspaceLaunchError.requestRejected(applicationURL)))
+                    return
+                }
+                flight.finish(.success(()))
+            }
         }
     }
 }
