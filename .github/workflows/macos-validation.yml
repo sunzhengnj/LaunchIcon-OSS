@@ -38,6 +38,9 @@ jobs:
       - name: Record toolchain
         run: xcodebuild -version
 
+      - name: Ensure ripgrep is available
+        run: command -v rg >/dev/null || brew install ripgrep
+
       - name: Guard against explicit network APIs
         run: ./script/check_no_network_apis.sh
 
