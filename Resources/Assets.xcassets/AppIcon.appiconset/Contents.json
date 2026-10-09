@@ -1,0 +1,18 @@
+{
+  "images" : [
+    { "filename" : "Light-16.png", "idiom" : "mac", "size" : "16x16", "scale" : "1x" },
+    { "filename" : "Light-32.png", "idiom" : "mac", "size" : "16x16", "scale" : "2x" },
+    { "filename" : "Light-32@1x.png", "idiom" : "mac", "size" : "32x32", "scale" : "1x" },
+    { "filename" : "Light-64.png", "idiom" : "mac", "size" : "32x32", "scale" : "2x" },
+    { "filename" : "Light-128.png", "idiom" : "mac", "size" : "128x128", "scale" : "1x" },
+    { "filename" : "Light-256.png", "idiom" : "mac", "size" : "128x128", "scale" : "2x" },
+    { "filename" : "Light-256@1x.png", "idiom" : "mac", "size" : "256x256", "scale" : "1x" },
+    { "filename" : "Light-512.png", "idiom" : "mac", "size" : "256x256", "scale" : "2x" },
+    { "filename" : "Light-512@1x.png", "idiom" : "mac", "size" : "512x512", "scale" : "1x" },
+    { "filename" : "Light-1024.png", "idiom" : "mac", "size" : "512x512", "scale" : "2x" }
+  ],
+  "info" : {
+    "author" : "xcode",
+    "version" : 1
+  }
+}

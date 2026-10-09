@@ -1,0 +1,75 @@
+name: 问题反馈 / Bug report
+description: 报告 LaunchIcon 的崩溃或行为问题
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。请先确认你运行的是哪个安装包；Xcode 开发副本和“应用程序”中的版本可能不同。
+        请勿上传完整布局文件、偏好文件或含个人路径的原始崩溃报告。分享日志前请先脱敏。
+  - type: input
+    id: version
+    attributes:
+      label: 安装包版本与构建号
+      description: 按 README 的命令读取已安装 App 的实际版本与构建号；不要填写下载页面以外的开发副本版本。
+      placeholder: 例如 1.0.0 (65)
+    validations:
+      required: true
+  - type: input
+    id: source-commit
+    attributes:
+      label: 包内源码提交号（如有）
+      description: 可按 README 的命令读取 LaunchIconSourceCommit；本地开发副本可留空。
+      placeholder: 完整 Git 提交号
+  - type: input
+    id: macos-version
+    attributes:
+      label: macOS 版本
+      placeholder: macOS 27.0
+    validations:
+      required: true
+  - type: input
+    id: occurrence-time
+    attributes:
+      label: 问题发生时间（可选）
+      description: 如果是闪退、卡死或文件夹开合异常，请尽量填写本地时间和时区（精确到分钟），以便与崩溃报告和 FolderLifecycle 阶段日志对应。
+      placeholder: 2026-10-01 00:12 Asia/Shanghai
+  - type: dropdown
+    id: chip
+    attributes:
+      label: Mac 芯片
+      options:
+        - Apple Silicon
+        - Intel
+        - 不确定
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 从启动应用开始，逐步写出点击、拖拽、快捷键等操作；若是偶发问题，请说明大约发生几次。
+      placeholder: |
+        1. 启动 LaunchIcon 并按 ⌥ Space
+        2. 点击某个文件夹
+        3. …
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际结果
+      description: 请写明是窗口消失、应用退出、无响应，还是出现了错误提示。
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期结果
+    validations:
+      required: true
+  - type: textarea
+    id: crash
+    attributes:
+      label: 崩溃信息或文件夹阶段诊断（可选，先脱敏）
+      description: 如有 .ips，请只摘录 Exception Type、Termination Reason 和 Crashed Thread 的相关栈；删除用户名、路径和其他私人数据。包含文件夹阶段诊断的版本可在 ~/Library/Application Support/LaunchIcon/Diagnostics/com.sunzheng.LaunchIcon.log 找到本地日志；只复制对应发生时间前后的 Folder open/close 行并检查隐私信息，不要上传完整 .ips 或日志、布局文件或偏好文件。

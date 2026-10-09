@@ -1,0 +1,15 @@
+.DS_Store
+DerivedData/
+build/
+xcuserdata/
+*.xcuserstate
+*.moved-aside
+*.p12
+*.mobileprovision
+*.pem
+*.p8
+.env
+.env.*
+!.env.example
+*.xcresult
+.notary*
