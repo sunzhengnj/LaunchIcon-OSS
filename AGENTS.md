@@ -58,7 +58,7 @@
 
 ## 公开仓与私有开发
 
-维护者在私有仓持续开发；本公开仓在里程碑时接收清理后的导出。详见 [Docs/SYNC_FROM_PRIVATE.md](Docs/SYNC_FROM_PRIVATE.md)。
+维护者在私有仓持续开发；本公开仓接收清理后的里程碑源码，维护者明确要求时也可接收标明 WIP 的开发源码快照。详见 [Docs/SYNC_FROM_PRIVATE.md](Docs/SYNC_FROM_PRIVATE.md)。
 
 - 社区 PR 请对本仓库开
 - 不要期望每一个私有 WIP 提交都出现在这里

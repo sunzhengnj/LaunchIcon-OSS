@@ -2,6 +2,10 @@ import AppKit
 import LaunchIconCore
 import OSLog
 
+func L(_ key: String) -> String {
+    Bundle.main.localizedString(forKey: key, value: key, table: "Localizable")
+}
+
 @main
 final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
     nonisolated(unsafe) private static var retained: DirectAppDelegate?
@@ -130,7 +134,7 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
         if let shortcutError {
             showSettings()
             settingsController?.presentShortcutRegistrationError(
-                "无法使用呼出快捷键 \(preferences.shortcut.title)。可能与系统或其他应用冲突，请选择其他组合；菜单栏图标仍可使用。"
+                String(format: L("无法使用呼出快捷键 %@。可能与系统或其他应用冲突，请选择其他组合；菜单栏图标仍可使用。"), preferences.shortcut.title)
             )
             record("Shortcut recovery shown: \(shortcutError)")
         }
@@ -142,7 +146,7 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
             precondition(launcherController?.reloadCatalogIfIdle() == true, "Cancelled catalog scan remained busy")
         }
         #endif
-        if ProcessInfo.processInfo.environment["LAUNCHICON_SHOW_ON_LAUNCH"] == "1" {
+        if shortcutError == nil {
             launcherController?.show()
         }
         #if DEBUG
@@ -196,11 +200,11 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
         let mainMenu = NSMenu()
         let appItem = NSMenuItem()
         let appMenu = NSMenu(title: "LaunchIcon")
-        let settingsItem = appMenu.addItem(withTitle: "设置…", action: #selector(openSettings), keyEquivalent: ",")
+        let settingsItem = appMenu.addItem(withTitle: L("设置…"), action: #selector(openSettings), keyEquivalent: ",")
         settingsItem.target = self
         appMenu.addItem(.separator())
         let quitItem = appMenu.addItem(
-            withTitle: "退出 LaunchIcon",
+            withTitle: L("退出 LaunchIcon"),
             action: #selector(NSApplication.terminate(_:)),
             keyEquivalent: "q"
         )
@@ -209,8 +213,8 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
         mainMenu.addItem(appItem)
 
         let editItem = NSMenuItem()
-        let editMenu = NSMenu(title: "编辑")
-        editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        let editMenu = NSMenu(title: L("编辑"))
+        editMenu.addItem(withTitle: L("全选"), action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         editItem.submenu = editMenu
         mainMenu.addItem(editItem)
         NSApplication.shared.mainMenu = mainMenu
@@ -236,18 +240,18 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
         let menu = NSMenu()
         menu.delegate = self
         let toggleItem = menu.addItem(
-            withTitle: "显示 LaunchIcon",
+            withTitle: L("显示 LaunchIcon"),
             action: #selector(toggleLauncher),
             keyEquivalent: " "
         )
         toggleItem.target = self
         toggleItem.keyEquivalentModifierMask = menuModifiers(for: preferences.shortcut)
-        let reloadItem = menu.addItem(withTitle: "重新扫描", action: #selector(reloadCatalog), keyEquivalent: "r")
+        let reloadItem = menu.addItem(withTitle: L("重新扫描"), action: #selector(reloadCatalog), keyEquivalent: "r")
         reloadItem.target = self
-        let settingsItem = menu.addItem(withTitle: "设置…", action: #selector(openSettings), keyEquivalent: ",")
+        let settingsItem = menu.addItem(withTitle: L("设置…"), action: #selector(openSettings), keyEquivalent: ",")
         settingsItem.target = self
         menu.addItem(.separator())
-        let quitItem = menu.addItem(withTitle: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        let quitItem = menu.addItem(withTitle: L("退出"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         quitItem.target = NSApplication.shared
         item.menu = menu
         toggleMenuItem = toggleItem
@@ -284,11 +288,11 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
                 hotKeyRegistered = true
             case let .failure(error):
                 record("Hot key \(proposed.shortcut.title): failed: \(error)")
-                return "无法使用快捷键 \(proposed.shortcut.title)，可能与系统或其他应用冲突。原组合保持不变。"
+                return String(format: L("无法使用快捷键 %@，可能与系统或其他应用冲突。原组合保持不变。"), proposed.shortcut.title)
             }
         }
         guard proposed.showsStatusItem || hotKeyRegistered else {
-            return "快捷键不可用时不能隐藏菜单栏图标。"
+            return L("快捷键不可用时不能隐藏菜单栏图标。")
         }
         preferences = proposed
         launcherController?.hidesAfterLaunch = proposed.hidesAfterLaunch
@@ -377,9 +381,9 @@ extension DirectAppDelegate: NSMenuDelegate {
     /// on an item that would now show the launcher.
     @MainActor
     private func refreshStatusItemToggleTitle() {
-        toggleMenuItem?.title = LauncherLayout.statusItemToggleTitle(
+        toggleMenuItem?.title = L(LauncherLayout.statusItemToggleTitle(
             isVisible: launcherController?.window?.isVisible == true,
             isDismissing: launcherController?.isDismissing == true
-        )
+        ))
     }
 }

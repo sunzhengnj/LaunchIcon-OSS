@@ -465,7 +465,7 @@ final class LauncherWindowController: NSWindowController {
         cachedCandidates = []
         rootView.setCachedCatalogAvailable(false)
         rootView.setRescanVisible(false)
-        rootView.setLayoutEditingEnabled(false, explanation: "正在扫描应用，暂时无法整理")
+        rootView.setLayoutEditingEnabled(false, explanation: L("正在扫描应用，暂时无法整理"))
         rootView.setLoading(true)
         catalogLoadingTask = Task { [weak self] in
             guard let self else { return }
@@ -484,7 +484,7 @@ final class LauncherWindowController: NSWindowController {
                             rootView.noteScanCancelledWhileEmpty()
                         }
                         rootView.setLoading(false)
-                        rootView.setLayoutEditingEnabled(false, explanation: "应用扫描已取消，请重新扫描")
+                        rootView.setLayoutEditingEnabled(false, explanation: L("应用扫描已取消，请重新扫描"))
                         rootView.setRescanVisible(true)
                     }
                 }
@@ -523,9 +523,9 @@ final class LauncherWindowController: NSWindowController {
             rootView.setCatalog(report.candidates, layout: layout)
             rootView.setLoading(false)
             let editingExplanation: String? = if !persistable {
-                "布局文件无法读取，暂时无法整理；原文件已保留"
+                L("布局文件无法读取，暂时无法整理；原文件已保留")
             } else if !report.canPersistReconciledLayout {
-                "应用扫描不完整，暂时无法整理；请重新扫描"
+                L("应用扫描不完整，暂时无法整理；请重新扫描")
             } else {
                 nil
             }
@@ -570,7 +570,7 @@ final class LauncherWindowController: NSWindowController {
         rootView.setCachedCatalogAvailable(false)
         rootView.setCatalog(cachedCandidates, layout: LauncherLayout.reconcile(candidates: cachedCandidates, into: cachedLayout))
         rootView.setLoading(false)
-        rootView.setLayoutEditingEnabled(false, explanation: "正在显示上次应用列表；重新扫描后可整理")
+        rootView.setLayoutEditingEnabled(false, explanation: L("正在显示上次应用列表；重新扫描后可整理"))
         rootView.setRescanVisible(true)
         onCatalogReloadFinished?(false)
     }
@@ -856,17 +856,17 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     private let countLabel = NSTextField(labelWithString: "")
     private let readOnlyStatusLabel = NSTextField(labelWithString: "")
     private let readOnlyStatusRow = NSStackView()
-    private let rescanButton = LauncherChromeButton(title: "重新扫描", target: nil, action: nil)
-    private let readOnlyCachedButton = LauncherChromeButton(title: "使用上次应用列表", target: nil, action: nil)
-    private let messageLabel = NSTextField(wrappingLabelWithString: "正在准备应用…")
+    private let rescanButton = LauncherChromeButton(title: L("重新扫描"), target: nil, action: nil)
+    private let readOnlyCachedButton = LauncherChromeButton(title: L("使用上次应用列表"), target: nil, action: nil)
+    private let messageLabel = NSTextField(wrappingLabelWithString: L("正在准备应用…"))
     private let scanSkeleton = ScanSkeletonView()
-    private let cachedCatalogButton = LauncherChromeButton(title: "使用上次应用列表", target: nil, action: nil)
+    private let cachedCatalogButton = LauncherChromeButton(title: L("使用上次应用列表"), target: nil, action: nil)
     private let emptyStateView = NSStackView()
     private let emptyStateIcon = NSImageView()
-    private let emptyStateTitle = NSTextField(labelWithString: "未找到可用的应用")
-    private let emptyStateDetail = NSTextField(wrappingLabelWithString: "请确认应用位于 Applications 文件夹，然后重新扫描。")
-    private let emptyStateReloadButton = LauncherChromeButton(title: "重新扫描", target: nil, action: nil)
-    private let emptyStateCachedButton = LauncherChromeButton(title: "使用上次应用列表", target: nil, action: nil)
+    private let emptyStateTitle = NSTextField(labelWithString: L("未找到可用的应用"))
+    private let emptyStateDetail = NSTextField(wrappingLabelWithString: L("请确认应用位于 Applications 文件夹，然后重新扫描。"))
+    private let emptyStateReloadButton = LauncherChromeButton(title: L("重新扫描"), target: nil, action: nil)
+    private let emptyStateCachedButton = LauncherChromeButton(title: L("使用上次应用列表"), target: nil, action: nil)
     private let toastView = NSVisualEffectView()
     private let toastLabel = NSTextField(labelWithString: "")
     private let toastCloseButton = NSButton(title: "", target: nil, action: nil)
@@ -892,10 +892,10 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     private let searchCollectionView = PagingCollectionView()
     private let pageIndicator = PageIndicatorView()
     private let footerControls = NSStackView()
-    private let dragHintLabel = NSTextField(labelWithString: "拖拽整理")
+    private let dragHintLabel = NSTextField(labelWithString: L("拖拽整理"))
     private let navigationHintLabel = NSTextField(labelWithString: "")
-    private let previousPageButton = PagingArrowButton(symbolName: "chevron.left", accessibilityLabel: "上一页")
-    private let nextPageButton = PagingArrowButton(symbolName: "chevron.right", accessibilityLabel: "下一页")
+    private let previousPageButton = PagingArrowButton(symbolName: "chevron.left", accessibilityLabel: L("上一页"))
+    private let nextPageButton = PagingArrowButton(symbolName: "chevron.right", accessibilityLabel: L("下一页"))
     private let folderOverlay = FolderOverlayView()
     private let desktopBackgroundView = NSView()
     private var backgroundLoadTask: Task<Void, Never>?
@@ -979,7 +979,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     /// if the drag is still in hand and motion is still reduced.
     private var pageDragRestWaitsForLauncher = false
     private(set) var didConsumeClick = false
-    private var dragPreview: (ref: LayoutItemRef, frame: CGRect, image: NSImage)?
+    private var dragPreview: (ref: LayoutItemRef, frame: CGRect, image: NSImage, pointerOffset: CGPoint)?
     /// The drag image is a still picture. `showsLift` is the scale and shadow
     /// drawn when the drag started. Reduced motion drops that picture without
     /// moving the drag frame. Turning motion back on does not add a lift.
@@ -1124,15 +1124,15 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         card.translatesAutoresizingMaskIntoConstraints = false
         addSubview(card)
 
-        searchField.placeholderString = "搜索应用"
+        searchField.placeholderString = L("搜索应用")
         searchField.delegate = self
         searchField.sendsSearchStringImmediately = true
         searchField.focusRingType = .none
         searchField.controlSize = .large
         searchField.font = .systemFont(ofSize: 14, weight: .regular)
         searchField.alignment = .center
-        searchField.setAccessibilityLabel("搜索应用")
-        searchField.setAccessibilityHelp("按应用名称或 Bundle ID 搜索")
+        searchField.setAccessibilityLabel(L("搜索应用"))
+        searchField.setAccessibilityHelp(L("按应用名称或 Bundle ID 搜索"))
         searchField.isBordered = false
         searchField.isBezeled = false
         searchField.drawsBackground = false
@@ -1153,12 +1153,12 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         card.addSubview(searchChrome)
         searchChrome.addSubview(searchField)
 
-        settingsButton.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "设置")
+        settingsButton.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: L("设置"))
         settingsButton.imagePosition = .imageOnly
         settingsButton.bezelStyle = .circular
-        settingsButton.toolTip = "设置"
-        settingsButton.setAccessibilityLabel("设置")
-        settingsButton.setAccessibilityHelp("打开 LaunchIcon 设置")
+        settingsButton.toolTip = L("设置")
+        settingsButton.setAccessibilityLabel(L("设置"))
+        settingsButton.setAccessibilityHelp(L("打开 LaunchIcon 设置"))
         settingsButton.target = self
         settingsButton.action = #selector(openSettings)
         settingsButton.onInsertTab = { [weak self] in
@@ -1180,14 +1180,14 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         rescanButton.isHidden = true
         rescanButton.target = self
         rescanButton.action = #selector(reloadCatalog)
-        rescanButton.setAccessibilityHelp("重新扫描应用并恢复可整理的列表")
+        rescanButton.setAccessibilityHelp(L("重新扫描应用并恢复可整理的列表"))
         rescanButton.translatesAutoresizingMaskIntoConstraints = false
         readOnlyCachedButton.bezelStyle = .rounded
         readOnlyCachedButton.controlSize = .small
         readOnlyCachedButton.isHidden = true
         readOnlyCachedButton.target = self
         readOnlyCachedButton.action = #selector(useCachedCatalog)
-        readOnlyCachedButton.setAccessibilityHelp("使用本机上次完整扫描的应用列表；整理功能暂不可用")
+        readOnlyCachedButton.setAccessibilityHelp(L("使用本机上次完整扫描的应用列表；整理功能暂不可用"))
         readOnlyCachedButton.translatesAutoresizingMaskIntoConstraints = false
         readOnlyStatusRow.orientation = .horizontal
         readOnlyStatusRow.alignment = .centerY
@@ -1423,7 +1423,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         cachedCatalogButton.isHidden = true
         cachedCatalogButton.target = self
         cachedCatalogButton.action = #selector(useCachedCatalog)
-        cachedCatalogButton.setAccessibilityHelp("取消当前扫描，使用本机上次完整扫描的应用列表；整理功能暂不可用")
+        cachedCatalogButton.setAccessibilityHelp(L("取消当前扫描，使用本机上次完整扫描的应用列表；整理功能暂不可用"))
         cachedCatalogButton.translatesAutoresizingMaskIntoConstraints = false
         card.addSubview(cachedCatalogButton)
         scanSkeleton.actionView = cachedCatalogButton
@@ -1454,14 +1454,14 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         emptyStateReloadButton.controlSize = .large
         emptyStateReloadButton.target = self
         emptyStateReloadButton.action = #selector(reloadCatalog)
-        emptyStateReloadButton.setAccessibilityHelp("重新扫描标准 Applications 文件夹")
+        emptyStateReloadButton.setAccessibilityHelp(L("重新扫描标准 Applications 文件夹"))
 
         emptyStateCachedButton.bezelStyle = .rounded
         emptyStateCachedButton.controlSize = .large
         emptyStateCachedButton.isHidden = true
         emptyStateCachedButton.target = self
         emptyStateCachedButton.action = #selector(useCachedCatalog)
-        emptyStateCachedButton.setAccessibilityHelp("使用本机上次完整扫描的应用列表；整理功能暂不可用")
+        emptyStateCachedButton.setAccessibilityHelp(L("使用本机上次完整扫描的应用列表；整理功能暂不可用"))
 
         for view in [emptyStateIcon, emptyStateTitle, emptyStateDetail, emptyStateReloadButton, emptyStateCachedButton] {
             emptyStateView.addArrangedSubview(view)
@@ -1489,12 +1489,12 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
 
         toastCloseButton.image = NSImage(
             systemSymbolName: "xmark.circle.fill",
-            accessibilityDescription: "关闭提示"
+            accessibilityDescription: L("关闭提示")
         )
         toastCloseButton.imagePosition = .imageOnly
         toastCloseButton.isBordered = false
         toastCloseButton.contentTintColor = .secondaryLabelColor
-        toastCloseButton.setAccessibilityLabel("关闭提示")
+        toastCloseButton.setAccessibilityLabel(L("关闭提示"))
         toastCloseButton.target = self
         toastCloseButton.action = #selector(closeToast)
         toastCloseButton.translatesAutoresizingMaskIntoConstraints = false
@@ -1553,14 +1553,14 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             footerControls.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -56),
             footerControls.heightAnchor.constraint(equalToConstant: 24),
             pageIndicator.heightAnchor.constraint(equalToConstant: 24),
-            previousPageButton.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 12),
+            previousPageButton.leadingAnchor.constraint(equalTo: card.leadingAnchor),
             previousPageButton.centerYAnchor.constraint(equalTo: gridViewport.centerYAnchor),
-            previousPageButton.widthAnchor.constraint(equalToConstant: 44),
-            previousPageButton.heightAnchor.constraint(equalToConstant: 72),
-            nextPageButton.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -12),
+            previousPageButton.widthAnchor.constraint(equalToConstant: 96),
+            previousPageButton.heightAnchor.constraint(equalTo: gridViewport.heightAnchor),
+            nextPageButton.trailingAnchor.constraint(equalTo: card.trailingAnchor),
             nextPageButton.centerYAnchor.constraint(equalTo: gridViewport.centerYAnchor),
-            nextPageButton.widthAnchor.constraint(equalToConstant: 44),
-            nextPageButton.heightAnchor.constraint(equalToConstant: 72),
+            nextPageButton.widthAnchor.constraint(equalToConstant: 96),
+            nextPageButton.heightAnchor.constraint(equalTo: gridViewport.heightAnchor),
             messageLabel.centerXAnchor.constraint(equalTo: gridViewport.centerXAnchor),
             messageLabel.centerYAnchor.constraint(equalTo: gridViewport.centerYAnchor),
             messageLabel.leadingAnchor.constraint(greaterThanOrEqualTo: card.leadingAnchor, constant: 40),
@@ -1802,7 +1802,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         let changed = isLayoutEditingEnabled != enabled
         isLayoutEditingEnabled = enabled
         if !enabled { dragPreview = nil }
-        layoutEditingExplanation = enabled ? nil : explanation ?? "应用列表正在加载或不完整，暂时无法整理"
+        layoutEditingExplanation = enabled ? nil : explanation ?? L("应用列表正在加载或不完整，暂时无法整理")
         // The label, drag hint, and title field follow the grid. Touching the
         // field while the launcher is fading can end a rename that should stay
         // a draft until the window is back.
@@ -1828,7 +1828,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     private func applyLayoutEditingChrome() {
         let reason = isLayoutEditingEnabled ? nil : layoutEditingExplanation
         activeCollectionView.toolTip = reason
-        activeCollectionView.setAccessibilityHelp(reason ?? "拖动应用以整理布局")
+        activeCollectionView.setAccessibilityHelp(reason ?? L("拖动应用以整理布局"))
         stagingCollectionView.toolTip = reason
         folderOverlay.setEditingEnabled(isLayoutEditingEnabled, explanation: reason)
         updateReadOnlyStatus()
@@ -1837,7 +1837,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
 
     private func updateReadOnlyStatus() {
         if layoutSaveFailed {
-            readOnlyStatusLabel.stringValue = "布局未保存，请检查磁盘空间或文件权限"
+            readOnlyStatusLabel.stringValue = L("布局未保存，请检查磁盘空间或文件权限")
             readOnlyStatusLabel.isHidden = false
         } else {
             readOnlyStatusLabel.stringValue = layoutEditingExplanation ?? ""
@@ -2399,7 +2399,10 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     }
 
     func showLaunchError(for candidate: AppCandidate, error: Error) {
-        showToast("无法打开“\(displayName(for: candidate))”", help: error.localizedDescription)
+        let title = error as? WorkspaceLaunchError == .timedOut(candidate.canonicalURL)
+            ? String(format: L("打开“%@”超时"), displayName(for: candidate))
+            : String(format: L("无法打开“%@”"), displayName(for: candidate))
+        showToast(title, help: L(error.localizedDescription))
     }
 
     func showLayoutSaveError(_ error: Error) {
@@ -2409,7 +2412,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         } else {
             catalogPresentationWaitsForLauncher = true
         }
-        showToast("布局未保存，请检查磁盘空间或文件权限", help: error.localizedDescription, autoDismiss: false)
+        showToast(L("布局未保存，请检查磁盘空间或文件权限"), help: error.localizedDescription, autoDismiss: false)
     }
 
     func clearLayoutSaveError() {
@@ -2422,11 +2425,11 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         // The save failure may still be waiting out the fade. Drop that
         // request so the next appearance does not show a cleared error.
         // A different toast that replaced it stays.
-        if deferredToast?.message == "布局未保存，请检查磁盘空间或文件权限" {
+        if deferredToast?.message == L("布局未保存，请检查磁盘空间或文件权限") {
             deferredToast = nil
             toastWaitsForLauncher = false
         }
-        guard toastLabel.stringValue == "布局未保存，请检查磁盘空间或文件权限" else { return }
+        guard toastLabel.stringValue == L("布局未保存，请检查磁盘空间或文件权限") else { return }
         hideToast(animated: true)
     }
 
@@ -3007,8 +3010,8 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         if collectionView === folderOverlay.collectionView {
             // On macOS 27 AppKit can raise an Objective-C exception while dequeuing
             // the first item after this collection view changes from hidden to visible.
-            // Folder grids contain at most 25 items, so creating their lightweight item
-            // controllers directly avoids that unstable reuse path at negligible cost.
+            // The collection view creates controllers for visible folder items;
+            // creating them directly avoids that unstable reuse path.
             item = AppGridItem()
         } else {
             guard let reusedItem = collectionView.makeItem(
@@ -3223,7 +3226,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         if let folderID = pending.folderID {
             playFolderLandingAnimation(
                 folderID,
-                after: startsFlight && pending.createdFolder && !prefersReducedMotion ? mergeFlightDuration : 0
+                after: startsFlight && pending.createdFolder && !prefersReducedMotion ? mergeFlightDuration * 0.6 : 0
             )
         }
     }
@@ -3864,7 +3867,10 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
                 )
             )
         }
-        return applyDrop(LayoutDrop(source: source, destination: destination))
+        return applyDrop(
+            LayoutDrop(source: source, destination: destination),
+            releasePoint: convert(draggingInfo.draggingLocation, from: nil)
+        )
     }
 
     private func applySearch(
@@ -3935,7 +3941,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
                     return searchableAppIDsByKey[candidate.deduplicationKey].map { .app($0, candidate) }
                 case .folder(let id, _):
                     guard let folder = layoutState.folders[id] else { return nil }
-                    let preview = folder.itemIDs.prefix(4).compactMap { itemID in
+                    let preview = folder.itemIDs.prefix(9).compactMap { itemID in
                         layoutState.appKeys[itemID].flatMap { catalogByKey[$0] }
                     }
                     return .folder(folder, Array(preview))
@@ -3947,7 +3953,9 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         if resetPage { currentPage = 0 }
         clearButton.isHidden = true
         let presented = currentPresentedItems()
-        countLabel.stringValue = isSearching ? "\(presented.count) 个结果" : "\(layoutState.orderedEntries.count) 个项目"
+        countLabel.stringValue = isSearching
+            ? String(format: L("%d 个结果"), presented.count)
+            : String(format: L("%d 个项目"), layoutState.orderedEntries.count)
         updateSearchChrome(searching: isSearching)
         updatePagination(resetToFirstPage: resetPage)
         reloadVisibleCollections(
@@ -3962,22 +3970,22 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         let showScanSkeleton = isCatalogLoading && allCandidates.isEmpty && !isSearching
         scanSkeleton.isHidden = !showScanSkeleton
         if isCatalogLoading, allCandidates.isEmpty {
-            messageLabel.stringValue = "正在准备应用…"
+            messageLabel.stringValue = L("正在准备应用…")
             messageLabel.isHidden = false
         } else if allCandidates.isEmpty {
             messageLabel.isHidden = true
             emptyStateView.isHidden = false
             if presentsCancelledEmptyCatalog {
-                emptyStateTitle.stringValue = "扫描已取消"
-                emptyStateDetail.stringValue = "应用扫描已取消，请重新扫描。"
-                emptyStateReloadButton.setAccessibilityHelp("重新扫描应用")
+                emptyStateTitle.stringValue = L("扫描已取消")
+                emptyStateDetail.stringValue = L("应用扫描已取消，请重新扫描。")
+                emptyStateReloadButton.setAccessibilityHelp(L("重新扫描应用"))
             } else {
-                emptyStateTitle.stringValue = "未找到可用的应用"
-                emptyStateDetail.stringValue = "请确认应用位于 Applications 文件夹，然后重新扫描。"
-                emptyStateReloadButton.setAccessibilityHelp("重新扫描标准 Applications 文件夹")
+                emptyStateTitle.stringValue = L("未找到可用的应用")
+                emptyStateDetail.stringValue = L("请确认应用位于 Applications 文件夹，然后重新扫描。")
+                emptyStateReloadButton.setAccessibilityHelp(L("重新扫描标准 Applications 文件夹"))
             }
         } else if presented.isEmpty {
-            messageLabel.stringValue = isSearching ? "未找到匹配的应用，按 Esc 清除搜索" : "正在准备应用…"
+            messageLabel.stringValue = isSearching ? L("未找到匹配的应用，按 Esc 清除搜索") : L("正在准备应用…")
             messageLabel.isHidden = false
         } else {
             messageLabel.isHidden = true
@@ -4158,7 +4166,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
                 return .app(id, candidate)
             case .folder(let id):
                 guard let folder = layoutState.folders[id] else { return nil }
-                let preview = folder.itemIDs.prefix(4).compactMap { itemID in
+                let preview = folder.itemIDs.prefix(9).compactMap { itemID in
                     layoutState.appKeys[itemID].flatMap { catalogByKey[$0] }
                 }
                 return .folder(folder, Array(preview))
@@ -4422,14 +4430,24 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     }
 
     @discardableResult
-    private func applyDrop(_ drop: LayoutDrop) -> Bool {
+    private func applyDrop(_ drop: LayoutDrop, releasePoint: CGPoint? = nil) -> Bool {
         guard isLayoutEditingEnabled,
               LauncherLayout.shouldAcceptLayoutDrop(isDismissing: launcherIsDismissing()) else { return false }
         let preview = dragPreview
         dragPreview = nil
         pendingMergeAnimation = nil
         let existingFolderIDs = Set(layoutState.folders.keys)
-        let sourceFrame = preview?.frame ?? frameInRoot(for: drop.source)
+        let sourceFrame: CGRect?
+        if let preview, let releasePoint {
+            sourceFrame = CGRect(
+                x: releasePoint.x - preview.pointerOffset.x - preview.frame.width / 2,
+                y: releasePoint.y - preview.pointerOffset.y - preview.frame.height / 2,
+                width: preview.frame.width,
+                height: preview.frame.height
+            )
+        } else {
+            sourceFrame = preview?.frame ?? frameInRoot(for: drop.source)
+        }
         let targetFrame: CGRect?
         if case .merge(let target) = drop.destination {
             targetFrame = frameInRoot(for: target)
@@ -4438,7 +4456,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         }
         let flyingIcon = preview?.image ?? iconImage(for: drop.source)
 
-        switch LauncherLayout.applyDrop(drop, to: layoutState) {
+        switch LauncherLayout.applyDrop(drop, to: layoutState, newFolderName: L("新建文件夹")) {
         case .success(let next):
             guard next != layoutState else { return true }
             // NSCollectionView expects its data source to reflect an accepted drop
@@ -4469,11 +4487,8 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             }
             return true
         case .failure(let error):
-            if error == .folderFull {
-                showToast("文件夹已满，最多容纳 25 个应用")
-                NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .now)
-            } else if error == .nestedFolder {
-                showToast("不能将文件夹放入另一个文件夹")
+            if error == .nestedFolder {
+                showToast(L("不能将文件夹放入另一个文件夹"))
             }
             return false
         }
@@ -4484,14 +4499,14 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         let field = AliasNameField(string: layoutState.appAliases[candidate.deduplicationKey] ?? "")
         field.frame = NSRect(x: 0, y: 0, width: 220, height: 24)
         field.placeholderString = candidate.displayName
-        field.setAccessibilityLabel("\(candidate.displayName) 的别名")
+        field.setAccessibilityLabel(String(format: L("%@ 的别名"), candidate.displayName))
 
         let alert = NSAlert()
-        alert.messageText = "设置应用别名"
-        alert.informativeText = "别名会用于显示和搜索；留空可恢复原名称。"
+        alert.messageText = L("设置应用别名")
+        alert.informativeText = L("别名会用于显示和搜索；留空可恢复原名称。")
         alert.accessoryView = field
-        alert.addButton(withTitle: "保存")
-        alert.addButton(withTitle: "取消")
+        alert.addButton(withTitle: L("保存"))
+        alert.addButton(withTitle: L("取消"))
         field.adoptAlertButtons(alert.buttons)
         // The accessory field is not in the window until the alert lays out.
         // Setting the first responder before that is ignored, so typing never
@@ -4903,7 +4918,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         let dest = target.insetBy(dx: target.width * 0.28, dy: target.height * 0.28)
         NSAnimationContext.runAnimationGroup({ context in
             context.duration = mergeFlightDuration
-            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
             flyer.animator().frame = dest
             flyer.animator().alphaValue = 0.15
         }, completionHandler: { [weak self, weak flyer] in
@@ -4985,7 +5000,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
 
         var immediateSpringGeneration: Int?
         if delay > 0 {
-            // Model opacity stays 0 until the flight ends. fillMode alone does not
+            // Model opacity stays 0 until the reveal starts. fillMode alone does not
             // hide a tile whose layer was just created for this drop.
             folderLandingGeneration &+= 1
             let generation = folderLandingGeneration
@@ -5214,7 +5229,10 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
                 )
             )
         }
-        return applyDrop(LayoutDrop(source: source, destination: destination))
+        return applyDrop(
+            LayoutDrop(source: source, destination: destination),
+            releasePoint: convert(info.draggingLocation, from: nil)
+        )
     }
 
     private func draggedItem(from info: NSDraggingInfo) -> LayoutItemRef? {
@@ -5294,7 +5312,11 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         if let itemView = collectionView.item(at: indexPath)?.view {
             let frame = itemView.convert(itemView.bounds, to: self)
             let sourceImage = itemView.draggingImage()
-            dragPreview = (sourceRef, frame, sourceImage)
+            let pointer = convert(event.locationInWindow, from: nil)
+            dragPreview = (
+                sourceRef, frame, sourceImage,
+                CGPoint(x: pointer.x - frame.midX, y: pointer.y - frame.midY)
+            )
             let sourceInCollection = itemView.convert(itemView.bounds, to: collectionView)
             let presentation = LauncherLayout.dragLiftPresentation(
                 for: sourceInCollection.size,
@@ -5707,13 +5729,13 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         footerControls.isHidden = openedFolderID != nil
         if isSearching {
             dragHintLabel.isHidden = true
-            navigationHintLabel.stringValue = "Esc 清除搜索"
+            navigationHintLabel.stringValue = L("Esc 清除搜索")
             return
         }
 
         dragHintLabel.isHidden = !isLayoutEditingEnabled || layoutState.orderedEntries.isEmpty
-        dragHintLabel.stringValue = pageCount > 1 ? "拖拽整理 · 悬停箭头跨页" : "拖拽整理"
-        navigationHintLabel.stringValue = pageCount > 1 ? "← → 翻页 · Esc 返回" : "Esc 返回"
+        dragHintLabel.stringValue = pageCount > 1 ? L("拖拽整理 · 悬停左右边缘跨页") : L("拖拽整理")
+        navigationHintLabel.stringValue = pageCount > 1 ? L("← → 翻页 · Esc 返回") : L("Esc 返回")
     }
 
     private var isPaging: Bool { isPagingGesture || isPageTransitioning }
@@ -6827,7 +6849,7 @@ private final class PageIndicatorView: NSStackView {
                 dot.onDelete = { [weak self] deletion in self?.onDelete?(deletion) ?? false }
                 dot.target = self
                 dot.action = #selector(selectPage)
-                dot.setAccessibilityLabel("第 \(page + 1) 页")
+                dot.setAccessibilityLabel(String(format: L("第 %d 页"), page + 1))
                 dot.translatesAutoresizingMaskIntoConstraints = false
                 NSLayoutConstraint.activate([
                     dot.widthAnchor.constraint(equalToConstant: 24),
@@ -7139,10 +7161,10 @@ private final class AppGridTileView: NSView {
         deferredIconImage = nil
         deferredPreviewImages = nil
         loadedIconWaitsForLauncher = false
-        titleLabel.stringValue = isLaunching ? "正在启动…" : displayName
+        titleLabel.stringValue = isLaunching ? L("正在启动…") : displayName
         toolTip = displayName
-        setAccessibilityLabel(isFolder ? "文件夹 \(displayName)" : displayName)
-        baseAccessibilityHelp = isFolder ? "按下以打开文件夹" : "按下以打开应用"
+        setAccessibilityLabel(isFolder ? String(format: L("文件夹 %@"), displayName) : displayName)
+        baseAccessibilityHelp = isFolder ? L("按下以打开文件夹") : L("按下以打开应用")
         setAccessibilityHelp(baseAccessibilityHelp)
         updateDropTargetAppearance()
         configureContextMenu()
@@ -7508,13 +7530,13 @@ private final class AppGridTileView: NSView {
         }
         let contextMenu = NSMenu()
         let aliasItem = contextMenu.addItem(
-            withTitle: "设置别名…",
+            withTitle: L("设置别名…"),
             action: #selector(renameAlias),
             keyEquivalent: ""
         )
         aliasItem.target = self
         let hideItem = contextMenu.addItem(
-            withTitle: "隐藏应用",
+            withTitle: L("隐藏应用"),
             action: #selector(hideApplication),
             keyEquivalent: ""
         )
@@ -7605,17 +7627,17 @@ private final class AppGridTileView: NSView {
         NSColor.controlBackgroundColor.withAlphaComponent(0.7).setFill()
         let cornerRadius = iconSize * 0.24
         NSBezierPath(roundedRect: well, xRadius: cornerRadius, yRadius: cornerRadius).fill()
-        let inset: CGFloat = 6
-        let gap: CGFloat = 4
-        let tile = floor((iconSize - inset * 2 - gap) / 2)
-        let positions: [NSPoint] = [
-            NSPoint(x: well.minX + inset, y: well.maxY - inset - tile),
-            NSPoint(x: well.minX + inset + tile + gap, y: well.maxY - inset - tile),
-            NSPoint(x: well.minX + inset, y: well.minY + inset),
-            NSPoint(x: well.minX + inset + tile + gap, y: well.minY + inset)
-        ]
-        for (index, icon) in previewImages.prefix(4).enumerated() {
-            icon.draw(in: NSRect(origin: positions[index], size: NSSize(width: tile, height: tile)))
+        let inset: CGFloat = 5
+        let gap: CGFloat = 2
+        let tile = floor((iconSize - inset * 2 - gap * 2) / 3)
+        for (index, icon) in previewImages.prefix(9).enumerated() {
+            let column = index % 3
+            let row = index / 3
+            let origin = NSPoint(
+                x: well.minX + inset + CGFloat(column) * (tile + gap),
+                y: well.maxY - inset - tile - CGFloat(row) * (tile + gap)
+            )
+            icon.draw(in: NSRect(origin: origin, size: NSSize(width: tile, height: tile)))
         }
     }
 
@@ -7664,7 +7686,7 @@ private final class AppGridTileView: NSView {
             layer?.borderWidth = 2
             layer?.borderColor = NSColor.controlAccentColor.cgColor
             setAccessibilitySelected(true)
-            setAccessibilityHelp(isFolder ? "拖放到此文件夹" : "拖放到此以合并")
+            setAccessibilityHelp(isFolder ? L("拖放到此文件夹") : L("拖放到此以合并"))
         } else {
             layer?.borderWidth = 0
             layer?.borderColor = nil
@@ -8145,7 +8167,7 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
     /// rename is in progress ends that editor and would save or drop the draft.
     private var titleEditingEnabled = true
     private var isStrippingMarkedTitle = false
-    private let closeButton = LauncherChromeButton(title: "关闭", target: nil, action: nil)
+    private let closeButton = LauncherChromeButton(title: L("关闭"), target: nil, action: nil)
     private let folderScrollView = LauncherScrollView()
     private var preferredPanelWidth: NSLayoutConstraint!
     private var preferredPanelHeight: NSLayoutConstraint!
@@ -8157,7 +8179,7 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
         setAccessibilityElement(true)
         setAccessibilityRole(.group)
         setAccessibilityEnabled(true)
-        setAccessibilityLabel("打开的文件夹")
+        setAccessibilityLabel(L("打开的文件夹"))
         dimmer.wantsLayer = true
         dimmer.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.28).cgColor
         dimmer.translatesAutoresizingMaskIntoConstraints = false
@@ -8173,7 +8195,7 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
         panel.setAccessibilityElement(true)
         panel.setAccessibilityRole(.group)
         panel.setAccessibilityEnabled(true)
-        panel.setAccessibilityLabel("文件夹")
+        panel.setAccessibilityLabel(L("文件夹"))
         panel.translatesAutoresizingMaskIntoConstraints = false
         addSubview(panel)
 
@@ -8184,19 +8206,19 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
         titleField.isBezeled = false
         titleField.drawsBackground = false
         titleField.focusRingType = .none
-        titleField.placeholderString = "文件夹名称"
-        titleField.setAccessibilityLabel("文件夹名称")
+        titleField.placeholderString = L("文件夹名称")
+        titleField.setAccessibilityLabel(L("文件夹名称"))
         titleField.delegate = self
         titleField.onBacktab = { [weak self] in self?.onBacktabFromTitle?() ?? false }
         titleField.translatesAutoresizingMaskIntoConstraints = false
         panel.addSubview(titleField)
 
         closeButton.title = ""
-        closeButton.image = NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: "关闭文件夹")
+        closeButton.image = NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: L("关闭文件夹"))
         closeButton.imagePosition = .imageOnly
         closeButton.isBordered = false
         closeButton.contentTintColor = .secondaryLabelColor
-        closeButton.setAccessibilityLabel("关闭文件夹")
+        closeButton.setAccessibilityLabel(L("关闭文件夹"))
         closeButton.target = self
         closeButton.action = #selector(close)
         closeButton.onInsertTab = { [weak self] in self?.onTabToMembers?() ?? false }
@@ -8215,7 +8237,7 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
         collectionView.backgroundColors = [.clear]
         collectionView.setAccessibilityElement(true)
         collectionView.setAccessibilityRole(.list)
-        collectionView.setAccessibilityLabel("文件夹中的应用")
+        collectionView.setAccessibilityLabel(L("文件夹中的应用"))
 
         preferredPanelWidth = panel.widthAnchor.constraint(equalToConstant: 820)
         preferredPanelWidth.priority = .defaultHigh
@@ -8290,9 +8312,9 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
     func setEditingEnabled(_ enabled: Bool, explanation: String?) {
         titleEditingEnabled = enabled
         titleField.toolTip = explanation
-        titleField.setAccessibilityHelp(explanation ?? "编辑文件夹名称")
+        titleField.setAccessibilityHelp(explanation ?? L("编辑文件夹名称"))
         collectionView.toolTip = explanation
-        collectionView.setAccessibilityHelp(explanation ?? "拖动应用以整理文件夹")
+        collectionView.setAccessibilityHelp(explanation ?? L("拖动应用以整理文件夹"))
         guard titleField.currentEditor() == nil else { return }
         titleField.isEditable = enabled
     }
@@ -8332,8 +8354,8 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
             titleBeforeEdit = folder.name
             titleField.stringValue = folder.name
         }
-        setAccessibilityLabel("打开的文件夹 \(folder.name)")
-        panel.setAccessibilityLabel("文件夹 \(folder.name)")
+        setAccessibilityLabel(String(format: L("打开的文件夹 %@"), folder.name))
+        panel.setAccessibilityLabel(String(format: L("文件夹 %@"), folder.name))
         if !isHidden { NSAccessibility.post(element: panel, notification: .layoutChanged) }
     }
 

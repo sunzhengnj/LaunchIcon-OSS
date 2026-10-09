@@ -124,11 +124,10 @@ final class LauncherDragUITests: XCTestCase {
     }
 
     @MainActor
-    func testFullFolderRejectsAnotherAppWithVisibleExplanation() throws {
+    func testFolderAcceptsAnotherAppBeyondTwentyFiveMembers() throws {
         try withFixture(additionalApps: 24) { app, layout in
             app.terminate()
-            try seedFullFolder(in: layout)
-            let original = try LayoutSnapshot.load(from: layout)
+            try seedTwentyFiveMemberFolder(in: layout)
             app.launch()
 
             let folder = app.buttons["文件夹 满员测试"]
@@ -137,12 +136,16 @@ final class LauncherDragUITests: XCTestCase {
             XCTAssertTrue(extra.exists)
             extra.click(forDuration: 0.3, thenDragTo: folder)
 
-            XCTAssertTrue(app.groups["文件夹已满，最多容纳 25 个应用"].waitForExistence(timeout: 3))
+            let added = expectation(
+                for: NSPredicate(format: "isTrue == YES"),
+                evaluatedWith: LayoutHasFolder(layout, expectedItemCount: 26),
+                handler: nil
+            )
+            wait(for: [added], timeout: 5)
             app.terminate()
             let saved = try LayoutSnapshot.load(from: layout)
-            XCTAssertEqual(saved.folders.values.first?.itemIDs, original.folders.values.first?.itemIDs)
-            XCTAssertEqual(saved.orderedEntries.map(\.id), original.orderedEntries.map(\.id))
-            XCTAssertEqual(saved.appKeys, original.appKeys)
+            XCTAssertEqual(saved.folders.values.first?.itemIDs.count, 26)
+            XCTAssertEqual(saved.orderedEntries.count, 1)
         }
     }
 
@@ -150,7 +153,7 @@ final class LauncherDragUITests: XCTestCase {
     func testKeyboardFocusRevealsLastMemberOfFullFolder() throws {
         try withFixture(additionalApps: 24) { app, layout in
             app.terminate()
-            try seedFullFolder(in: layout)
+            try seedTwentyFiveMemberFolder(in: layout)
             app.launch()
 
             let folder = app.buttons["文件夹 满员测试"]
@@ -366,7 +369,7 @@ final class LauncherDragUITests: XCTestCase {
 
             calculator.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
                 .press(forDuration: 0.3,
-                       thenDragTo: nextPage.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)),
+                       thenDragTo: nextPage.coordinate(withNormalizedOffset: CGVector(dx: 0.95, dy: 0.2)),
                        withVelocity: .slow,
                        thenHoldForDuration: 1.7)
             let thirdPageApp = app.buttons["Fixture 68"]
@@ -376,7 +379,7 @@ final class LauncherDragUITests: XCTestCase {
             XCTAssertTrue(previousPage.exists)
             thirdPageApp.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
                 .press(forDuration: 0.3,
-                       thenDragTo: previousPage.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)),
+                       thenDragTo: previousPage.coordinate(withNormalizedOffset: CGVector(dx: 0.05, dy: 0.8)),
                        withVelocity: .slow,
                        thenHoldForDuration: 1.7)
             XCTAssertTrue(calculator.waitForExistence(timeout: 5))
@@ -1629,7 +1632,7 @@ final class LauncherDragUITests: XCTestCase {
         }
     }
 
-    private func seedFullFolder(in layout: URL) throws {
+    private func seedTwentyFiveMemberFolder(in layout: URL) throws {
         let data = try Data(contentsOf: layout)
         var document = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         let entries = try XCTUnwrap(document["orderedEntries"] as? [[String: Any]])
