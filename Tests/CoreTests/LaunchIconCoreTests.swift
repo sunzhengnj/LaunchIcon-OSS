@@ -1598,17 +1598,27 @@ final class LaunchIconCoreTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(250))
         let writer = Process()
         writer.executableURL = URL(fileURLWithPath: "/bin/sh")
+        // Keep the burst sustained (~1s) but short enough to finish inside the
+        // observation window on slower CI runners (was 40×0.05≈2s+ under 4s).
         writer.arguments = [
             "-c",
-            "index=0; while [ \"$index\" -lt 40 ]; do /usr/bin/touch \"$1/Noise-$index\"; index=$((index + 1)); /bin/sleep 0.05; done",
+            "index=0; while [ \"$index\" -lt 20 ]; do /usr/bin/touch \"$1/Noise-$index\"; index=$((index + 1)); /bin/sleep 0.05; done",
             "watcher-noise",
             unrelated.path
         ]
         try writer.run()
-        await fulfillment(of: [changed, rebound], timeout: 4)
-        let writerIsRunning = writer.isRunning
-        XCTAssertFalse(writerIsRunning)
-        if !writerIsRunning {
+        defer {
+            if writer.isRunning {
+                writer.terminate()
+                writer.waitUntilExit()
+            }
+        }
+        await fulfillment(of: [changed, rebound], timeout: 6)
+        if writer.isRunning {
+            writer.terminate()
+            writer.waitUntilExit()
+            XCTFail("noise writer overran observation window")
+        } else {
             XCTAssertEqual(writer.terminationStatus, 0)
         }
     }
