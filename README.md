@@ -26,9 +26,27 @@ Native AppKit · no account · no network · your layout stays on your Mac.</p>
   <a href="CONTRIBUTING.md">Contribute</a>
 </p>
 
-<!-- Demo slot: uncomment once Docs/Media/demo.gif is committed.
-<p align="center"><img src="Docs/Media/demo.gif" width="760" alt="LaunchIcon demo: open with Option-Space, search by pinyin, drag an app into a folder"></p>
--->
+<p align="center"><img src="Docs/Media/demo.gif" width="760" alt="LaunchIcon demo: app grid, open a folder, search 微信 by typing the pinyin initials wx, then 计算器 by jsq"></p>
+<p align="center"><sub>Recorded with the v1.0.0 release on macOS (Chinese system language). <a href="Docs/Media/demo.mp4">MP4 version</a></sub></p>
+
+<table>
+  <tr>
+    <td><img src="Docs/Media/grid.png" alt="7×5 app grid with folders"></td>
+    <td><img src="Docs/Media/folder.png" alt="An open folder"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>App grid with folders</sub></td>
+    <td align="center"><sub>Open folder</sub></td>
+  </tr>
+  <tr>
+    <td><img src="Docs/Media/search-pinyin.png" alt="Typing wx finds 微信 (WeChat) by pinyin initials"></td>
+    <td align="center"><img src="Docs/Media/settings.png" width="300" alt="Settings: hotkey, menu bar icon, hidden apps"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>Pinyin search: <code>wx</code> → 微信</sub></td>
+    <td align="center"><sub>Settings (⌥ Space hotkey, hidden apps)</sub></td>
+  </tr>
+</table>
 
 > [!NOTE]
 > **Early release, feedback welcome.** The installer is ad-hoc signed and **not notarized** (see [Install](#install)). The full UI test suite is not all green yet, and drag and drop across pages is still being fixed. See [Known limitations](#known-limitations).

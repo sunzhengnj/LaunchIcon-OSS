@@ -26,9 +26,27 @@
   <a href="CONTRIBUTING.md">参与贡献</a>
 </p>
 
-<!-- 演示位：提交 Docs/Media/demo.gif 后取消注释。
-<p align="center"><img src="Docs/Media/demo.gif" width="760" alt="LaunchIcon 演示：⌥ Space 呼出、拼音搜索、把 App 拖进文件夹"></p>
--->
+<p align="center"><img src="Docs/Media/demo.gif" width="760" alt="LaunchIcon 演示：应用网格、打开文件夹、输入拼音首字母 wx 找到微信、jsq 找到计算器"></p>
+<p align="center"><sub>使用 v1.0.0 安装包在 macOS（中文系统）上录制。<a href="Docs/Media/demo.mp4">MP4 版本</a></sub></p>
+
+<table>
+  <tr>
+    <td><img src="Docs/Media/grid.png" alt="7×5 应用网格与文件夹"></td>
+    <td><img src="Docs/Media/folder.png" alt="打开的文件夹"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>应用网格与文件夹</sub></td>
+    <td align="center"><sub>打开文件夹</sub></td>
+  </tr>
+  <tr>
+    <td><img src="Docs/Media/search-pinyin.png" alt="输入 wx 按拼音首字母找到微信"></td>
+    <td align="center"><img src="Docs/Media/settings.png" width="300" alt="设置：呼出快捷键、菜单栏图标、隐藏的应用"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>拼音搜索：<code>wx</code> → 微信</sub></td>
+    <td align="center"><sub>设置（⌥ Space 快捷键、隐藏应用）</sub></td>
+  </tr>
+</table>
 
 > [!NOTE]
 > **早期版本，欢迎反馈**。安装包采用 ad-hoc 签名，**尚未完成 Apple 公证**（见[安装](#安装)）。完整 UI 测试还没有全部通过，跨页拖拽仍在修复中。详见[已知限制](#已知限制)。
