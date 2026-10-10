@@ -6,9 +6,12 @@
 
 <h1 align="center">LaunchIcon</h1>
 
-<p align="center">把常用 App 放回熟悉的位置。为 macOS 制作的轻量、本地优先启动器。</p>
+<p align="center"><strong>为 macOS 26+ 做的轻量、本地优先的应用网格启动器。</strong><br>
+按 <kbd>⌥ Space</kbd> 呼出 7 × 5 应用网格，用文件夹分类、拖拽整理，支持汉字、拼音全拼和首字母搜索。<br>
+原生 AppKit · 无需账号 · 不联网 · 布局只存在你的 Mac 上。</p>
 
 <p align="center">
+  <a href="https://github.com/sunzhengnj/LaunchIcon-OSS/releases/latest"><img src="https://img.shields.io/github/v/release/sunzhengnj/LaunchIcon-OSS?label=release" alt="最新版本"></a>
   <a href="https://github.com/sunzhengnj/LaunchIcon-OSS/actions/workflows/macos-validation.yml"><img src="https://github.com/sunzhengnj/LaunchIcon-OSS/actions/workflows/macos-validation.yml/badge.svg" alt="macOS 后台验证"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache-2.0 许可证"></a>
   <img src="https://img.shields.io/badge/macOS-26%2B-black" alt="macOS 26 或更高版本">
@@ -16,14 +19,31 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/sunzhengnj/LaunchIcon-OSS/releases/tag/v1.0.0"><strong>下载安装包</strong></a> ·
-  <a href="#功能">功能</a> ·
+  <a href="https://github.com/sunzhengnj/LaunchIcon-OSS/releases/latest"><strong>⬇ 下载（未公证预览版）</strong></a> ·
+  <a href="#安装">安装</a> ·
+  <a href="#已知限制">已知限制</a> ·
   <a href="#从源码构建">从源码构建</a> ·
   <a href="CONTRIBUTING.md">参与贡献</a>
 </p>
 
+<!-- 演示位：提交 Docs/Media/demo.gif 后取消注释。
+<p align="center"><img src="Docs/Media/demo.gif" width="760" alt="LaunchIcon 演示：⌥ Space 呼出、拼音搜索、把 App 拖进文件夹"></p>
+-->
+
+> [!NOTE]
+> **早期版本，欢迎反馈**。安装包采用 ad-hoc 签名，**尚未完成 Apple 公证**（见[安装](#安装)）。完整 UI 测试还没有全部通过，跨页拖拽仍在修复中。详见[已知限制](#已知限制)。
+
 > [!IMPORTANT]
 > **源码与安装包不是同一版本。** `main` 现包含更新的 **WIP 开发源码快照**。[v1.0.0 安装包](https://github.com/sunzhengnj/LaunchIcon-OSS/releases/tag/v1.0.0) 由较早的源码构建，不包含下述新改动。目前没有对应 `main` 的新安装包。详见[源码快照说明](Docs/SOURCE_SNAPSHOT_2026-10-09.md)。
+
+## 亮点
+
+- **7 × 5 应用网格，支持分页**。用鼠标或键盘都能浏览。
+- **文件夹与拖拽整理**。自由排序，创建和重命名文件夹，把用不到的 App 隐藏起来。
+- **搜索快，中文友好**。可搜应用名称和别名；中文名称支持拼音全拼或首字母（例如 `wx` → 微信）。
+- **`⌥ Space` 一键呼出**，也可以从菜单栏打开；快捷键可在设置中更换。
+- **本地优先，保护隐私**。无需账号，没有云同步，不发起网络请求；布局与偏好只保存在本机。
+- **原生、轻量**。基于 Swift 和 AppKit，用 macOS 公开 API 查找已安装应用，遵循“减少动态效果”设置。
 
 ## 功能
 
@@ -43,13 +63,26 @@ LaunchIcon 使用自己的视觉设计，不读取系统 Launchpad 数据库、�
 
 这些改动仍需完整 UI 和实体输入验收。**Dock / 访达随深色模式切换的 App 图标尚未实现**；已有的深色品牌图片不是 AppIcon 外观变体。
 
-## 下载与安装
+## 安装
 
-1. 从 [v1.0.0 Release](https://github.com/sunzhengnj/LaunchIcon-OSS/releases/tag/v1.0.0) 下载 `LaunchIcon-v1.0.0-macOS-unnotarized.dmg` 和同页的 `.sha256` 文件，并核对下载完整性。
-2. 打开 DMG，把 `LaunchIcon.app` 拖进“应用程序”。替换旧版前先退出旧 App；布局与偏好保存在 App 包之外。
-3. **这个已发布安装包**启动后默认在后台就绪。按 `⌥ Space` 或点击菜单栏图标呼出。上文所述的新源码已改变启动行为。
+1. 从 [v1.0.0 Release](https://github.com/sunzhengnj/LaunchIcon-OSS/releases/tag/v1.0.0) 下载 `LaunchIcon-v1.0.0-macOS-unnotarized.dmg` 和同页的 `.sha256` 文件，在两个文件所在的文件夹里核对完整性：
+   ```bash
+   shasum -a 256 -c LaunchIcon-v1.0.0-macOS-unnotarized.dmg.sha256
+   ```
+2. 打开 DMG，把 `LaunchIcon.app` 拖进“应用程序”。替换旧版前先退出旧 App；布局与偏好保存在 App 包之外，不会丢失。
+3. 先打开一次 LaunchIcon。macOS 会提示无法验证开发者，这是正常现象：App 采用 **ad-hoc 签名，尚未完成公证**。
+4. 仅在确认下载来自本仓库且信任它时，打开 **系统设置 → 隐私与安全性**，滚动到“安全性”，点击 LaunchIcon 旁边的 **仍要打开**，再用密码或触控 ID 确认。从 macOS 15 起，**右键（Control-点按）→ 打开已无法绕过这个提示**。参见 [Apple 安全说明](https://support.apple.com/102445)。
+5. **v1.0.0 安装包启动后在后台就绪，不会弹出窗口**。按 `⌥ Space` 或点击菜单栏图标呼出网格。（新版源码快照打开时会直接显示主界面。）
 
-安装包采用 **ad-hoc 签名，尚未完成 Apple 公证**。macOS 可能阻止首次打开。仅在确认下载来自本仓库且信任它时，到“系统设置 → 隐私与安全性”选择“仍要打开”。不要关闭 Gatekeeper，也不要运行来源不明的解除隔离命令。参见 [Apple 安全说明](https://support.apple.com/102445)。
+请不要关闭 Gatekeeper，也不要运行来源不明的解除隔离命令。如果不想运行未公证的安装包，可以用 Xcode [从源码构建](#从源码构建)。
+
+## 已知限制
+
+- 安装包是 ad-hoc 签名，没有 Developer ID 签名，也没有经过 Apple 公证。
+- 最近一次完整 UI 测试为 **47 通过 / 5 失败 / 2 跳过**，尚未在当前快照上重跑。
+- 跨页拖拽仍在修复中；实体输入、VoiceOver、大文件夹和 Dock / 访达深色图标的验证尚未完成。
+- v1.0.0 安装包启动后在后台运行（用 `⌥ Space` 或菜单栏图标呼出）。
+- 需要 macOS 26 或更高版本。
 
 ## 从源码构建
 
