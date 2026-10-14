@@ -1,5 +1,6 @@
 import Foundation
 import CoreServices
+import Darwin
 import AppKit
 import XCTest
 @testable import LaunchIconCore
@@ -74,6 +75,61 @@ final class LaunchIconCoreTests: XCTestCase {
         ))
     }
 
+    func testDeferredVisualStateOrderMatchesHistoricalRegistry() {
+        XCTAssertEqual(
+            LauncherLayout.deferredVisualStateOrder,
+            [
+                .dropHighlightClear,
+                .folderLanding,
+                .mergeFlight,
+                .folderChrome,
+                .searchChrome,
+                .dissolvedGridFade,
+                .launchFeedback,
+                .dragLiftDrop,
+                .pageDragRest,
+                .contentScrollRest,
+                .pageButtonHover,
+                .toastFade,
+                .dropLanding
+            ]
+        )
+        XCTAssertEqual(
+            Set(LauncherLayout.deferredVisualStateOrder),
+            Set(LauncherLayout.DeferredVisualSlot.allCases)
+        )
+    }
+
+    func testReducedMotionSnapOrderMatchesHistoricalRegistry() {
+        XCTAssertEqual(
+            LauncherLayout.reducedMotionSnapOrder,
+            [
+                .pageButtonHover,
+                .folderBackdrop,
+                .toastFade,
+                .searchChrome,
+                .dissolvedGridFade,
+                .pageSlide,
+                .launchFeedback,
+                .folderChrome,
+                .mergeFlight,
+                .folderLanding,
+                .launcherPresence,
+                .dragLiftDrop,
+                .pageDragRest,
+                .contentScrollRest,
+                .reloadVisibleCollections,
+                .reorderSlideLand,
+                .dropLanding
+            ]
+        )
+        XCTAssertEqual(
+            Set(LauncherLayout.reducedMotionSnapOrder),
+            Set(LauncherLayout.ReducedMotionSnapSlot.allCases)
+        )
+    }
+
+
     func testCancelledPartialScanCannotBePersisted() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("LaunchIcon-CancelledScan-\(UUID().uuidString)", isDirectory: true)
@@ -90,7 +146,11 @@ final class LaunchIconCoreTests: XCTestCase {
 
         let fileManager = CancelOnRootAttributesFileManager()
         fileManager.cancellationPath = secondRoot.path
-        let report = await AppCatalogScanner(fileManager: fileManager).scan(roots: [firstRoot, secondRoot])
+        let scanner = AppCatalogScanner(fileManager: fileManager)
+        // Cancel the scan task without cancelling the later cache assertions.
+        let report = await Task {
+            await scanner.scan(roots: [firstRoot, secondRoot])
+        }.value
 
         XCTAssertEqual(report.candidates.map(\.bundleIdentifier), ["com.apple.calculator"])
         XCTAssertTrue(report.skippedPaths.isEmpty)
@@ -145,6 +205,52 @@ final class LaunchIconCoreTests: XCTestCase {
         } catch {
             XCTAssertEqual(try Data(contentsOf: url), damagedData)
         }
+    }
+
+    func testCancelledCatalogSnapshotSaveKeepsPreviousSnapshot() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("catalog-v1.json")
+        let store = CatalogSnapshotStore(fileURL: url)
+        let candidates = ["Previous", "Replacement"].map { name in
+            AppCandidate(
+                canonicalURL: URL(fileURLWithPath: "/Applications/\(name).app"),
+                bundleIdentifier: "com.example.\(name.lowercased())",
+                displayName: name,
+                sourcePriority: 0,
+                discoveredAt: .distantPast
+            )
+        }
+        try await store.save(CatalogScanReport(candidates: [candidates[0]], skippedPaths: []))
+        let original = try Data(contentsOf: url)
+        let save = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            try await store.save(CatalogScanReport(candidates: [candidates[1]], skippedPaths: []))
+        }
+        await XCTAssertThrowsErrorAsync(try await save.value) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertEqual(try Data(contentsOf: url), original)
+        let loaded = try await store.load()
+        XCTAssertEqual(loaded, [candidates[0]])
+    }
+
+    func testCancelledCatalogSnapshotLoadDoesNotDecodeDamagedFile() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("catalog-v1.json")
+        let original = Data("not JSON".utf8)
+        try original.write(to: url)
+        let store = CatalogSnapshotStore(fileURL: url)
+        let load = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            _ = try await store.load()
+        }
+        await XCTAssertThrowsErrorAsync(try await load.value) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertEqual(try Data(contentsOf: url), original)
     }
 
     func testCatalogSnapshotRejectsDuplicateApplicationIdentities() async throws {
@@ -704,6 +810,48 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: backupURL), backupData)
     }
 
+    func testCancelledLayoutSaveLeavesPrimaryAndBackupUntouched() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("layout-v1.json")
+        let store = JSONLayoutStore(fileURL: url)
+        try await store.save(LayoutState(orderedEntries: [.app(UUID())]))
+        try await store.save(LayoutState(orderedEntries: [.app(UUID())]))
+        let backupURL = await store.backupURL
+        let primary = try Data(contentsOf: url)
+        let backup = try Data(contentsOf: backupURL)
+
+        let save = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            try await store.save(LayoutState(orderedEntries: [.app(UUID())]))
+        }
+        await XCTAssertThrowsErrorAsync(try await save.value) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertEqual(try Data(contentsOf: url), primary)
+        XCTAssertEqual(try Data(contentsOf: backupURL), backup)
+    }
+
+    func testCancelledLayoutLoadDoesNotPreserveUnknownSchema() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("layout-v1.json")
+        let original = Data("{\"schemaVersion\":99}".utf8)
+        try original.write(to: url)
+        let store = JSONLayoutStore(fileURL: url)
+
+        let load = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            _ = try await store.load()
+        }
+        await XCTAssertThrowsErrorAsync(try await load.value) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertEqual(try Data(contentsOf: url), original)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), ["layout-v1.json"])
+    }
+
     func testFailedLayoutReplacementDoesNotLeaveTemporaryFile() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let url = directory.appendingPathComponent("layout-v1.json")
@@ -784,6 +932,33 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: backupURL), backup)
     }
 
+    func testUnknownLayoutSchemaWithChangedStructureRemainsReadOnly() async throws {
+        for loadFirst in [false, true] {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let url = directory.appendingPathComponent("layout-v1.json")
+            let store = JSONLayoutStore(fileURL: url)
+            try await store.save(LayoutState(orderedEntries: [.app(UUID())]))
+            try await store.save(LayoutState(orderedEntries: [.app(UUID())]))
+            let backupURL = await store.backupURL
+            let backup = try Data(contentsOf: backupURL)
+            // A future version need not retain today's field types or required fields.
+            let future = Data(#"{"schemaVersion":99,"orderedEntries":{"pages":[]},"modified":"new-format"}"#.utf8)
+            try future.write(to: url)
+
+            if loadFirst {
+                await XCTAssertThrowsErrorAsync(try await store.load()) { error in
+                    XCTAssertEqual(error as? LayoutStoreIssue, .unsupportedSchema(99))
+                }
+            }
+            await XCTAssertThrowsErrorAsync(try await store.save(LayoutState())) { error in
+                XCTAssertEqual(error as? LayoutStoreIssue, .unsupportedSchema(99))
+            }
+            XCTAssertEqual(try Data(contentsOf: url), future)
+            XCTAssertEqual(try Data(contentsOf: backupURL), backup)
+        }
+    }
+
     func testCorruptedLayoutIsPreservedWhenNoBackupCanBeLoaded() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -834,34 +1009,78 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertTrue(WorkspaceIconProvider().icon(for: firstCandidate.canonicalURL).isValid)
     }
 
-    func testWorkspaceLauncherRejectsMissingApplicationWithoutHanging() async {
+    func testWorkspaceLauncherOpenImmediatelyReturnsOpenedWithoutWaiting() throws {
+        let url = URL(fileURLWithPath: "/Applications/Ready.app")
+        let launcher = WorkspaceAppLauncher(immediateOpen: { _ in .opened })
+        XCTAssertEqual(try launcher.openImmediately(url), .opened)
+    }
+
+    func testWorkspaceLauncherOpenImmediatelyReturnsActivated() throws {
+        let url = URL(fileURLWithPath: "/Applications/Ready.app")
+        let launcher = WorkspaceAppLauncher(immediateOpen: { _ in .activated })
+        XCTAssertEqual(try launcher.openImmediately(url), .activated)
+    }
+
+    func testWorkspaceLauncherOpenImmediatelyPropagatesRejection() {
+        let url = URL(fileURLWithPath: "/Applications/Missing.app")
+        let launcher = WorkspaceAppLauncher(immediateOpen: { thrownURL in
+            throw WorkspaceLaunchError.requestRejected(thrownURL)
+        })
+        XCTAssertThrowsError(try launcher.openImmediately(url)) { error in
+            XCTAssertEqual(error as? WorkspaceLaunchError, .requestRejected(url))
+        }
+    }
+
+    func testWorkspaceLauncherAsyncLaunchUsesImmediateOpen() async throws {
+        let url = URL(fileURLWithPath: "/Applications/Ready.app")
+        final class Flag: @unchecked Sendable { var value = false }
+        let opened = Flag()
+        let launcher = WorkspaceAppLauncher(immediateOpen: { _ in
+            opened.value = true
+            return .opened
+        })
+        try await launcher.launch(url)
+        XCTAssertTrue(opened.value)
+    }
+
+    func testWorkspaceLauncherRejectsMissingApplicationWithoutHanging() {
         let missingURL = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
             .appendingPathExtension("app")
 
-        await XCTAssertThrowsErrorAsync(try await WorkspaceAppLauncher().launch(missingURL)) { error in
+        XCTAssertThrowsError(try WorkspaceAppLauncher().openImmediately(missingURL)) { error in
             XCTAssertEqual(error as? WorkspaceLaunchError, .requestRejected(missingURL))
         }
     }
 
-    func testWorkspaceLauncherRejectsIncompleteApplication() async throws {
+    func testWorkspaceLauncherHandsUnclassifiedBundleToOpenWithoutBundleAPIs() throws {
+        // No Contents/Info.plist: do not guess, and do not call Bundle.
+        // Spawn `/usr/bin/open` and return. A readable Mac Info.plist that
+        // already shows a missing executable is rejected before spawn.
         let applicationURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("LaunchIcon-Incomplete-\(UUID().uuidString).app")
-        let contentsURL = applicationURL.appendingPathComponent("Contents", isDirectory: true)
-        try FileManager.default.createDirectory(at: contentsURL, withIntermediateDirectories: true)
+            .appendingPathComponent("LaunchIcon-Unclassified-\(UUID().uuidString).app")
+        try FileManager.default.createDirectory(at: applicationURL, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: applicationURL) }
-        let info: [String: Any] = [
-            "CFBundleIdentifier": "com.sunzheng.LaunchIcon.Tests.Incomplete",
-            "CFBundleName": "Incomplete",
-            "CFBundlePackageType": "APPL",
-            "CFBundleExecutable": "MissingExecutable"
-        ]
-        let data = try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
-        try data.write(to: contentsURL.appendingPathComponent("Info.plist"))
+        XCTAssertEqual(
+            WorkspaceAppLauncher.openBundleExecutable(at: applicationURL),
+            .notMacInfoPlist
+        )
+        XCTAssertEqual(try WorkspaceAppLauncher().openImmediately(applicationURL), .opened)
+    }
 
-        await XCTAssertThrowsErrorAsync(try await WorkspaceAppLauncher().launch(applicationURL)) { error in
-            XCTAssertEqual(error as? WorkspaceLaunchError, .requestRejected(applicationURL))
-        }
+    func testWorkspaceLauncherOpenImmediatelyReturnsWithoutWaitingForOpenExit() throws {
+        let url = URL(fileURLWithPath: "/Applications/Ready.app")
+        let started = Date()
+        final class Flag: @unchecked Sendable { var waited = false }
+        let flag = Flag()
+        let launcher = WorkspaceAppLauncher(immediateOpen: { _ in
+            // Mimic fire-and-forget: return before any simulated wait.
+            flag.waited = false
+            return .opened
+        })
+        XCTAssertEqual(try launcher.openImmediately(url), .opened)
+        XCTAssertFalse(flag.waited)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 0.5)
     }
 
     func testIconCacheReturnsTheSameImageInstanceForTheSamePath() async throws {
@@ -1694,6 +1913,42 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertTrue(LauncherLayout.shouldTurnPage(distance: 10, velocity: 500, pageWidth: 1000))
     }
 
+    func testArrowPageTurnSlidesFartherThanAFingerDrag() {
+        XCTAssertEqual(LauncherLayout.pageTurnDistanceFraction, 0.18, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.pageDragSlideFraction, 0.18, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.discretePageSlideFraction, 0.36, accuracy: 0.001)
+        XCTAssertGreaterThan(
+            LauncherLayout.discretePageSlideFraction,
+            LauncherLayout.pageTurnDistanceFraction
+        )
+        XCTAssertEqual(
+            LauncherLayout.pageSlideDistance(pageWidth: 1000, discrete: false),
+            180,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            LauncherLayout.pageSlideDistance(pageWidth: 1000, discrete: true),
+            360,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(LauncherLayout.pageSlideDistance(pageWidth: 0, discrete: true), 0, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.pageSlideDistance(pageWidth: -40, discrete: true), 0, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.pageSlideDistance(pageWidth: .nan, discrete: true), 0, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.pageSlideDistance(pageWidth: .infinity, discrete: false), 0, accuracy: 0.001)
+
+        let fullDrag = LauncherLayout.pageDragFollowOffsets(distance: -1000, pageWidth: 1000, direction: 1)
+        XCTAssertEqual(fullDrag.activeX, -180, accuracy: 0.001)
+        XCTAssertEqual(fullDrag.stagingX, 0, accuracy: 0.001)
+        let untouched = LauncherLayout.pageDragFollowOffsets(distance: 0, pageWidth: 1000, direction: 1)
+        XCTAssertEqual(untouched.activeX, 0, accuracy: 0.001)
+        XCTAssertEqual(untouched.stagingX, 180, accuracy: 0.001)
+        let halfway = LauncherLayout.pageDragFollowOffsets(distance: -500, pageWidth: 800, direction: 1)
+        XCTAssertEqual(halfway.activeX, -500 * 0.18, accuracy: 0.001)
+        XCTAssertEqual(halfway.stagingX, 800 * 0.18 - 500 * 0.18, accuracy: 0.001)
+        XCTAssertFalse(LauncherLayout.shouldTurnPage(distance: 179, velocity: 0, pageWidth: 1000))
+        XCTAssertTrue(LauncherLayout.shouldTurnPage(distance: 180, velocity: 0, pageWidth: 1000))
+    }
+
     func testDiscreteScrollRequiresThreeStepsBeforeTurningPage() {
         XCTAssertFalse(LauncherLayout.shouldTurnDiscretePage(accumulatedDelta: 2))
         XCTAssertFalse(LauncherLayout.shouldTurnDiscretePage(accumulatedDelta: -2))
@@ -1781,6 +2036,63 @@ final class LaunchIconCoreTests: XCTestCase {
         )
     }
 
+    func testPageTurnCurveEasesOutAheadOfTheClock() {
+        XCTAssertEqual(LauncherLayout.pageTurnCurveX1, 0.2, accuracy: 0.000_001)
+        XCTAssertEqual(LauncherLayout.pageTurnCurveY1, 0.8, accuracy: 0.000_001)
+        XCTAssertEqual(LauncherLayout.pageTurnCurveX2, 0.2, accuracy: 0.000_001)
+        XCTAssertEqual(LauncherLayout.pageTurnCurveY2, 1, accuracy: 0.000_001)
+        XCTAssertEqual(LauncherLayout.pageTurnCurveProgress(0), 0, accuracy: 0.000_001)
+        XCTAssertEqual(LauncherLayout.pageTurnCurveProgress(1), 1, accuracy: 0.000_001)
+        XCTAssertEqual(LauncherLayout.pageTurnCurveProgress(-0.2), 0, accuracy: 0.000_001)
+        XCTAssertEqual(LauncherLayout.pageTurnCurveProgress(1.4), 1, accuracy: 0.000_001)
+        let midpoint = LauncherLayout.pageTurnCurveProgress(0.5)
+        XCTAssertEqual(midpoint, 0.946, accuracy: 0.01)
+        XCTAssertGreaterThan(midpoint, 0.9)
+        var previous: CGFloat = -0.01
+        for step in 0...20 {
+            let progress = LauncherLayout.pageTurnCurveProgress(CGFloat(step) / 20)
+            XCTAssertGreaterThan(progress, previous)
+            XCTAssertLessThanOrEqual(progress, 1)
+            previous = progress
+        }
+    }
+
+    func testPageDotWeightUsesThePageClockFromTheFirstFrame() {
+        XCTAssertEqual(
+            LauncherLayout.pageDotWeightProgress(elapsed: 0, duration: 0.28),
+            0,
+            accuracy: 0.000_001
+        )
+        XCTAssertEqual(
+            LauncherLayout.pageDotWeightProgress(elapsed: -0.02, duration: 0.28),
+            0,
+            accuracy: 0.000_001
+        )
+        XCTAssertEqual(
+            LauncherLayout.pageDotWeightProgress(elapsed: 0.28, duration: 0.28),
+            1,
+            accuracy: 0.000_001
+        )
+        XCTAssertEqual(
+            LauncherLayout.pageDotWeightProgress(elapsed: 0.4, duration: 0.28),
+            1,
+            accuracy: 0.000_001
+        )
+        XCTAssertEqual(
+            LauncherLayout.pageDotWeightProgress(elapsed: 0.05, duration: 0),
+            1,
+            accuracy: 0.000_001
+        )
+        XCTAssertEqual(
+            LauncherLayout.pageDotWeightProgress(elapsed: .nan, duration: 0.28),
+            0,
+            accuracy: 0.000_001
+        )
+        let early = LauncherLayout.pageDotWeightProgress(elapsed: 0.28 * 0.06, duration: 0.28)
+        XCTAssertEqual(early, LauncherLayout.pageTurnCurveProgress(0.06), accuracy: 0.000_001)
+        XCTAssertGreaterThan(early, 0.06)
+    }
+
     func testLaunchHighlightFollowsAnAppThatIsStillOpening() {
         XCTAssertEqual(
             LauncherLayout.launchHighlightChange(finishedKey: "b", highlightedKey: "b", remainingKeys: ["a"]),
@@ -1822,6 +2134,802 @@ final class LaunchIconCoreTests: XCTestCase {
             currentGeneration: 2
         ))
     }
+
+    func testShouldReleasePresentationBeforeOpenFollowsHidePreference() {
+        XCTAssertTrue(LauncherLayout.shouldReleasePresentationBeforeOpen(hidesAfterLaunch: true))
+        XCTAssertFalse(LauncherLayout.shouldReleasePresentationBeforeOpen(hidesAfterLaunch: false))
+    }
+
+    func testShouldForceReloadLaunchHighlightAfterImmediateOpen() {
+        XCTAssertTrue(LauncherLayout.shouldForceReloadLaunchHighlightAfterImmediateOpen(isDismissing: true))
+        XCTAssertTrue(LauncherLayout.shouldForceReloadLaunchHighlightAfterImmediateOpen(isDismissing: false))
+    }
+
+    func testShouldSkipLaunchPendingHighlightBeforeOpen() {
+        // Feedback is restored; highlight must be in-place (not reloadItems).
+        XCTAssertFalse(LauncherLayout.shouldSkipLaunchPendingHighlightBeforeOpen())
+    }
+
+    func testShouldApplyLaunchPendingHighlightInPlaceOnly() {
+        // preview.74: reloadItems before open aborted Devin. Click-stack UI
+        // must update tiles in place only.
+        XCTAssertTrue(LauncherLayout.shouldApplyLaunchPendingHighlightInPlaceOnly())
+    }
+
+    func testShouldRejectOpenBeforeSpawnWhenTheMacExecutableCannotRun() {
+        XCTAssertFalse(LauncherLayout.shouldRejectOpenBeforeSpawn(executable: .notMacInfoPlist))
+        XCTAssertTrue(LauncherLayout.shouldRejectOpenBeforeSpawn(executable: .absolute))
+        XCTAssertTrue(LauncherLayout.shouldRejectOpenBeforeSpawn(executable: .outsideBundle))
+        XCTAssertTrue(LauncherLayout.shouldRejectOpenBeforeSpawn(executable: .absent))
+        XCTAssertTrue(LauncherLayout.shouldRejectOpenBeforeSpawn(executable: .named(.missing)))
+        XCTAssertTrue(LauncherLayout.shouldRejectOpenBeforeSpawn(executable: .named(.directory)))
+        XCTAssertTrue(LauncherLayout.shouldRejectOpenBeforeSpawn(executable: .named(.notExecutable)))
+        XCTAssertTrue(LauncherLayout.shouldRejectOpenBeforeSpawn(executable: .named(.notRegularFile)))
+        XCTAssertTrue(LauncherLayout.shouldRejectOpenBeforeSpawn(executable: .named(.emptyFile)))
+        XCTAssertFalse(LauncherLayout.shouldRejectOpenBeforeSpawn(executable: .named(.executableFile)))
+    }
+
+    func testOpenBundleExecutableReadsMacInfoPlistWithoutLaunching() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LaunchIcon-OpenBundle-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        let plainDirectory = root.appendingPathComponent("Plain.app")
+        try FileManager.default.createDirectory(at: plainDirectory, withIntermediateDirectories: true)
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: plainDirectory), .notMacInfoPlist)
+
+        let absent = try makeMacBundle(named: "Absent", in: root, executable: nil)
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: absent), .absent)
+        XCTAssertTrue(LauncherLayout.shouldRejectOpenBeforeSpawn(
+            executable: WorkspaceAppLauncher.openBundleExecutable(at: absent)
+        ))
+
+        let missing = try makeMacBundle(named: "Missing", in: root, executable: "Missing")
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: missing), .named(.missing))
+
+        let placeholder = try makeMacBundle(
+            named: "Placeholder",
+            in: root,
+            executable: "Placeholder",
+            writeExecutable: true,
+            posixPermissions: 0o644
+        )
+        XCTAssertEqual(
+            WorkspaceAppLauncher.openBundleExecutable(at: placeholder),
+            .named(.notExecutable)
+        )
+
+        let directory = try makeMacBundle(named: "Directory", in: root, executable: "Directory")
+        try FileManager.default.createDirectory(
+            at: directory.appendingPathComponent("Contents/MacOS/Directory"),
+            withIntermediateDirectories: true
+        )
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: directory), .named(.directory))
+
+        let empty = try makeMacBundle(named: "Empty", in: root, executable: "Empty", writeExecutable: true)
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: empty), .named(.emptyFile))
+        XCTAssertTrue(LauncherLayout.shouldRejectOpenBeforeSpawn(
+            executable: WorkspaceAppLauncher.openBundleExecutable(at: empty)
+        ))
+
+        let emptyTarget = root.appendingPathComponent("empty-target")
+        try Data().write(to: emptyTarget)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: emptyTarget.path)
+        let emptyLink = try makeMacBundle(named: "EmptyLink", in: root, executable: "EmptyLink")
+        let emptyLinkMacOS = emptyLink.appendingPathComponent("Contents/MacOS", isDirectory: true)
+        try FileManager.default.createDirectory(at: emptyLinkMacOS, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: emptyLinkMacOS.appendingPathComponent("EmptyLink"),
+            withDestinationURL: emptyTarget
+        )
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: emptyLink), .named(.emptyFile))
+
+        let fifo = try makeMacBundle(named: "Fifo", in: root, executable: "Fifo")
+        let fifoMacOS = fifo.appendingPathComponent("Contents/MacOS", isDirectory: true)
+        try FileManager.default.createDirectory(at: fifoMacOS, withIntermediateDirectories: true)
+        let fifoPath = fifoMacOS.appendingPathComponent("Fifo").path
+        XCTAssertEqual(mkfifo(fifoPath, mode_t(0o755)), 0)
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: fifo), .named(.notRegularFile))
+
+        let ready = try makeMacBundle(named: "Ready", in: root, executable: "Ready", writeExecutable: true)
+        let readyFile = ready.appendingPathComponent("Contents/MacOS/Ready")
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: readyFile)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: readyFile.path)
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: ready), .named(.executableFile))
+        XCTAssertFalse(LauncherLayout.shouldRejectOpenBeforeSpawn(
+            executable: WorkspaceAppLauncher.openBundleExecutable(at: ready)
+        ))
+
+        let shared = root.appendingPathComponent("shared-bin")
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: shared)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: shared.path)
+        let linked = try makeMacBundle(named: "Linked", in: root, executable: "Linked")
+        let linkedMacOS = linked.appendingPathComponent("Contents/MacOS", isDirectory: true)
+        try FileManager.default.createDirectory(at: linkedMacOS, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: linkedMacOS.appendingPathComponent("Linked"),
+            withDestinationURL: shared
+        )
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: linked), .named(.executableFile))
+
+        let dangling = try makeMacBundle(named: "Dangling", in: root, executable: "Dangling")
+        let danglingMacOS = dangling.appendingPathComponent("Contents/MacOS", isDirectory: true)
+        try FileManager.default.createDirectory(at: danglingMacOS, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: danglingMacOS.appendingPathComponent("Dangling"),
+            withDestinationURL: root.appendingPathComponent("missing-bin")
+        )
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: dangling), .named(.missing))
+
+        // `/usr/bin/open` does not trim. Three spaces is a real filename.
+        let spacedName = "   "
+        let spaced = try makeMacBundle(named: "Spaced", in: root, executable: spacedName)
+        let spacedMacOS = spaced.appendingPathComponent("Contents/MacOS", isDirectory: true)
+        try FileManager.default.createDirectory(at: spacedMacOS, withIntermediateDirectories: true)
+        let spacedFile = spacedMacOS.appendingPathComponent(spacedName)
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: spacedFile)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: spacedFile.path)
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: spaced), .named(.executableFile))
+        XCTAssertFalse(LauncherLayout.shouldRejectOpenBeforeSpawn(
+            executable: WorkspaceAppLauncher.openBundleExecutable(at: spaced)
+        ))
+
+        let spacedMissing = try makeMacBundle(named: "SpacedMissing", in: root, executable: spacedName)
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: spacedMissing), .named(.missing))
+        XCTAssertTrue(LauncherLayout.shouldRejectOpenBeforeSpawn(
+            executable: WorkspaceAppLauncher.openBundleExecutable(at: spacedMissing)
+        ))
+
+        // Trailing space is a different file from the trimmed name. The file
+        // without the space must not count as the one `open` will launch.
+        let trailingSpace = try makeMacBundle(named: "TrailingSpace", in: root, executable: "Tool ")
+        let trailingMacOS = trailingSpace.appendingPathComponent("Contents/MacOS", isDirectory: true)
+        try FileManager.default.createDirectory(at: trailingMacOS, withIntermediateDirectories: true)
+        let unspaced = trailingMacOS.appendingPathComponent("Tool")
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: unspaced)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: unspaced.path)
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: trailingSpace), .named(.missing))
+
+        let nested = try makeMacBundle(named: "Nested", in: root, executable: "MacOS/Nested")
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: nested), .named(.missing))
+        XCTAssertTrue(LauncherLayout.shouldRejectOpenBeforeSpawn(
+            executable: WorkspaceAppLauncher.openBundleExecutable(at: nested)
+        ))
+
+        // Missing, empty, and non-string names fall back to the bundle filename.
+        // `Foo.bar.app` uses `Foo.bar`, not `Foo`. An explicit other name does not.
+        let omitted = try makeMacBundle(named: "Foo.bar", in: root, executable: nil)
+        try writeLaunchableExecutable(named: "Foo.bar", in: omitted)
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: omitted), .named(.executableFile))
+        XCTAssertFalse(LauncherLayout.shouldRejectOpenBeforeSpawn(
+            executable: WorkspaceAppLauncher.openBundleExecutable(at: omitted)
+        ))
+
+        let spacedBundle = try makeMacBundle(named: "My App", in: root, executable: nil)
+        try writeLaunchableExecutable(named: "My App", in: spacedBundle)
+        XCTAssertEqual(
+            WorkspaceAppLauncher.openBundleExecutable(at: spacedBundle),
+            .named(.executableFile)
+        )
+
+        let shortOnly = try makeMacBundle(named: "Short.bar", in: root, executable: nil)
+        try writeLaunchableExecutable(named: "Short", in: shortOnly)
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: shortOnly), .absent)
+
+        let emptyName = try makeMacBundle(named: "EmptyKey", in: root, executable: "")
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: emptyName), .absent)
+        try writeLaunchableExecutable(named: "EmptyKey", in: emptyName)
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: emptyName), .named(.executableFile))
+
+        let integerMissing = try makeMacBundle(named: "IntegerMissing", in: root, executableObject: 1)
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: integerMissing), .absent)
+        let integer = try makeMacBundle(named: "Integer", in: root, executableObject: 1)
+        try writeLaunchableExecutable(named: "Integer", in: integer)
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: integer), .named(.executableFile))
+
+        let explicit = try makeMacBundle(named: "ExplicitMiss", in: root, executable: "Other")
+        try writeLaunchableExecutable(named: "ExplicitMiss", in: explicit)
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: explicit), .named(.missing))
+
+        let dot = try makeMacBundle(named: "DotDef", in: root, executable: ".")
+        try writeLaunchableExecutable(named: "DotDef", in: dot)
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: dot), .named(.directory))
+        XCTAssertTrue(LauncherLayout.shouldRejectOpenBeforeSpawn(
+            executable: WorkspaceAppLauncher.openBundleExecutable(at: dot)
+        ))
+
+        let dotDot = try makeMacBundle(named: "DotDotDef", in: root, executable: "..")
+        try writeLaunchableExecutable(named: "DotDotDef", in: dotDot)
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: dotDot), .named(.directory))
+    }
+
+    func testOpenBundleExecutableUsesTheSearchOrderOpenUses() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LaunchIcon-OpenSearch-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        func writeScript(at file: URL) throws {
+            try FileManager.default.createDirectory(
+                at: file.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try Data("#!/bin/sh\nexit 0\n".utf8).write(to: file)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: file.path)
+        }
+
+        // A plain name is not only `Contents/MacOS`. `open` keeps looking.
+        let rooted = try makeMacBundle(named: "Rooted", in: root, executable: "Tool")
+        try writeScript(at: rooted.appendingPathComponent("Tool"))
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: rooted), .named(.executableFile))
+
+        let contentsOnly = try makeMacBundle(named: "ContentsOnly", in: root, executable: "Tool")
+        try writeScript(at: contentsOnly
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("Tool"))
+        XCTAssertEqual(
+            WorkspaceAppLauncher.openBundleExecutable(at: contentsOnly),
+            .named(.executableFile)
+        )
+
+        // The first path that exists wins. A directory in MacOS hides a good
+        // file at the bundle root; `open` does not keep searching.
+        let hidden = try makeMacBundle(named: "Hidden", in: root, executable: "Tool")
+        try FileManager.default.createDirectory(
+            at: hidden
+                .appendingPathComponent("Contents", isDirectory: true)
+                .appendingPathComponent("MacOS", isDirectory: true)
+                .appendingPathComponent("Tool", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try writeScript(at: hidden.appendingPathComponent("Tool"))
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: hidden), .named(.directory))
+
+        let sub = try makeMacBundle(named: "Sub", in: root, executable: "Sub/Tool")
+        try writeScript(at: sub
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("MacOS", isDirectory: true)
+            .appendingPathComponent("Sub", isDirectory: true)
+            .appendingPathComponent("Tool"))
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: sub), .named(.executableFile))
+
+        let resources = try makeMacBundle(named: "Resources", in: root, executable: "../Resources/Tool")
+        try writeScript(at: resources
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("Resources", isDirectory: true)
+            .appendingPathComponent("Tool"))
+        XCTAssertEqual(
+            WorkspaceAppLauncher.openBundleExecutable(at: resources),
+            .named(.executableFile)
+        )
+
+        let relEmpty = try makeMacBundle(named: "RelEmpty", in: root, executable: "./Empty")
+        let emptyFile = relEmpty
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("MacOS", isDirectory: true)
+            .appendingPathComponent("Empty")
+        try FileManager.default.createDirectory(
+            at: emptyFile.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data().write(to: emptyFile)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: emptyFile.path)
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: relEmpty), .named(.emptyFile))
+
+        let relFifo = try makeMacBundle(named: "RelFifo", in: root, executable: "./Fifo")
+        let fifo = relFifo
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("MacOS", isDirectory: true)
+            .appendingPathComponent("Fifo")
+        try FileManager.default.createDirectory(
+            at: fifo.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        XCTAssertEqual(mkfifo(fifo.path, mode_t(0o755)), 0)
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: relFifo), .named(.notRegularFile))
+
+        let outside = root.appendingPathComponent("outside.sh")
+        try writeScript(at: outside)
+        let absolute = try makeMacBundle(named: "Absolute", in: root, executable: outside.path)
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: absolute), .absolute)
+        let missingAbsolute = try makeMacBundle(
+            named: "MissingAbsolute",
+            in: root,
+            executable: root.appendingPathComponent("no-such-bin").path
+        )
+        XCTAssertEqual(
+            WorkspaceAppLauncher.openBundleExecutable(at: missingAbsolute),
+            .named(.missing)
+        )
+
+        // From Contents/MacOS, `../../outside.sh` is the script next to the app.
+        let escaped = try makeMacBundle(named: "Escaped", in: root, executable: "../../outside.sh")
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: escaped), .outsideBundle)
+
+        let legacy = try makeMacBundle(named: "Legacy", in: root, legacyExecutable: "Tool")
+        try writeScript(at: legacy
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("MacOS", isDirectory: true)
+            .appendingPathComponent("Tool"))
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: legacy), .named(.executableFile))
+
+        // A missing NSExecutable does not fall through to the bundle filename.
+        let legacyMiss = try makeMacBundle(named: "LegacyMiss", in: root, legacyExecutable: "Tool")
+        try writeScript(at: legacyMiss.appendingPathComponent("LegacyMiss"))
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: legacyMiss), .named(.missing))
+
+        // "" and non-strings ignore NSExecutable and use the bundle filename.
+        let integerTool = try makeMacBundle(
+            named: "IntegerTool",
+            in: root,
+            executableObject: 1,
+            legacyExecutable: "Tool"
+        )
+        try writeScript(at: integerTool
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("MacOS", isDirectory: true)
+            .appendingPathComponent("Tool"))
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: integerTool), .absent)
+        let integerStem = try makeMacBundle(
+            named: "IntegerStem",
+            in: root,
+            executableObject: 1,
+            legacyExecutable: "Tool"
+        )
+        try writeScript(at: integerStem.appendingPathComponent("IntegerStem"))
+        XCTAssertEqual(
+            WorkspaceAppLauncher.openBundleExecutable(at: integerStem),
+            .named(.executableFile)
+        )
+        let emptyCF = try makeMacBundle(
+            named: "EmptyCF",
+            in: root,
+            executable: "",
+            legacyExecutable: "Tool"
+        )
+        try writeScript(at: emptyCF
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("MacOS", isDirectory: true)
+            .appendingPathComponent("Tool"))
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: emptyCF), .absent)
+
+        let stemContents = try makeMacBundle(named: "StemC", in: root, executable: nil)
+        try writeScript(at: stemContents
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("StemC"))
+        XCTAssertEqual(
+            WorkspaceAppLauncher.openBundleExecutable(at: stemContents),
+            .named(.executableFile)
+        )
+        let multi = try makeMacBundle(named: "Foo.bar", in: root, executable: nil)
+        try writeScript(at: multi.appendingPathComponent("Foo.bar"))
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: multi), .named(.executableFile))
+
+        for app in [hidden, relEmpty, relFifo, absolute, escaped, legacyMiss, integerTool, emptyCF] {
+            let launcher = WorkspaceAppLauncher { _, _ in
+                XCTFail("unlaunchable bundle must not spawn /usr/bin/open: \(app.lastPathComponent)")
+            }
+            XCTAssertThrowsError(try launcher.openImmediately(app)) { error in
+                XCTAssertEqual(error as? WorkspaceLaunchError, .requestRejected(app))
+            }
+        }
+        for app in [rooted, contentsOnly, sub, resources, legacy, integerStem, stemContents, multi] {
+            XCTAssertEqual(try WorkspaceAppLauncher().openImmediately(app), .opened, app.lastPathComponent)
+        }
+    }
+
+    func testUnreadableMacInfoPlistUsesTheBundleFilenameBeforeSpawn() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LaunchIcon-OpenUnreadable-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        func makeApp(named name: String) throws -> URL {
+            let app = root.appendingPathComponent("\(name).app")
+            try FileManager.default.createDirectory(
+                at: app.appendingPathComponent("Contents", isDirectory: true),
+                withIntermediateDirectories: true
+            )
+            return app
+        }
+        func writePlistBytes(_ data: Data, in app: URL) throws {
+            try data.write(to: app.appendingPathComponent("Contents/Info.plist"))
+        }
+        func writeExe(in app: URL, relativePath: String) throws {
+            let file = app.appendingPathComponent(relativePath)
+            try FileManager.default.createDirectory(
+                at: file.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try Data("#!/bin/sh\nexit 0\n".utf8).write(to: file)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: file.path)
+        }
+
+        // Empty and corrupt plists are present, so `open` uses the bundle
+        // filename and keeps searching past MacOS.
+        let emptyGood = try makeApp(named: "EmptyGood")
+        try writePlistBytes(Data(), in: emptyGood)
+        try writeExe(in: emptyGood, relativePath: "Contents/MacOS/EmptyGood")
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: emptyGood), .named(.executableFile))
+
+        let corruptContents = try makeApp(named: "CorruptContents")
+        try writePlistBytes(Data("not a plist".utf8), in: corruptContents)
+        try writeExe(in: corruptContents, relativePath: "Contents/CorruptContents")
+        XCTAssertEqual(
+            WorkspaceAppLauncher.openBundleExecutable(at: corruptContents),
+            .named(.executableFile)
+        )
+
+        let emptyRoot = try makeApp(named: "EmptyRoot")
+        try writePlistBytes(Data(), in: emptyRoot)
+        try writeExe(in: emptyRoot, relativePath: "EmptyRoot")
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: emptyRoot), .named(.executableFile))
+
+        let emptyMissing = try makeApp(named: "EmptyMissing")
+        try writePlistBytes(Data(), in: emptyMissing)
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: emptyMissing), .absent)
+
+        let emptyDir = try makeApp(named: "EmptyDir")
+        try writePlistBytes(Data(), in: emptyDir)
+        try FileManager.default.createDirectory(
+            at: emptyDir.appendingPathComponent("Contents/MacOS/EmptyDir"),
+            withIntermediateDirectories: true
+        )
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: emptyDir), .absent)
+
+        let emptyZero = try makeApp(named: "EmptyZero")
+        try writePlistBytes(Data(), in: emptyZero)
+        let zero = emptyZero.appendingPathComponent("Contents/MacOS/EmptyZero")
+        try FileManager.default.createDirectory(
+            at: zero.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data().write(to: zero)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: zero.path)
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: emptyZero), .absent)
+
+        let emptyFifo = try makeApp(named: "EmptyFifo")
+        try writePlistBytes(Data(), in: emptyFifo)
+        let emptyFifoMacOS = emptyFifo.appendingPathComponent("Contents/MacOS", isDirectory: true)
+        try FileManager.default.createDirectory(at: emptyFifoMacOS, withIntermediateDirectories: true)
+        XCTAssertEqual(mkfifo(emptyFifoMacOS.appendingPathComponent("EmptyFifo").path, mode_t(0o755)), 0)
+        XCTAssertEqual(
+            WorkspaceAppLauncher.openBundleExecutable(at: emptyFifo),
+            .named(.notRegularFile)
+        )
+
+        let dirPlist = try makeApp(named: "DirPlist")
+        try FileManager.default.createDirectory(
+            at: dirPlist.appendingPathComponent("Contents/Info.plist", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try writeExe(in: dirPlist, relativePath: "Contents/MacOS/DirPlist")
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: dirPlist), .named(.executableFile))
+
+        // No plist node still goes to `open` when the bundle-name file can run.
+        let noPlist = try makeApp(named: "NoPlist")
+        try writeExe(in: noPlist, relativePath: "Contents/MacOS/NoPlist")
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: noPlist), .notMacInfoPlist)
+        XCTAssertFalse(LauncherLayout.shouldRejectOpenBeforeSpawn(
+            executable: WorkspaceAppLauncher.openBundleExecutable(at: noPlist)
+        ))
+
+        let noPlistFifo = try makeApp(named: "NoPlistFifo")
+        let noPlistFifoMacOS = noPlistFifo.appendingPathComponent("Contents/MacOS", isDirectory: true)
+        try FileManager.default.createDirectory(at: noPlistFifoMacOS, withIntermediateDirectories: true)
+        XCTAssertEqual(mkfifo(noPlistFifoMacOS.appendingPathComponent("NoPlistFifo").path, mode_t(0o755)), 0)
+        XCTAssertEqual(
+            WorkspaceAppLauncher.openBundleExecutable(at: noPlistFifo),
+            .named(.notRegularFile)
+        )
+
+        let explicit = try makeMacBundle(named: "ExplicitStill", in: root, executable: "Other")
+        try writeExe(in: explicit, relativePath: "Contents/MacOS/ExplicitStill")
+        XCTAssertEqual(WorkspaceAppLauncher.openBundleExecutable(at: explicit), .named(.missing))
+
+        for app in [emptyMissing, emptyDir, emptyZero, emptyFifo, noPlistFifo, explicit] {
+            XCTAssertTrue(LauncherLayout.shouldRejectOpenBeforeSpawn(
+                executable: WorkspaceAppLauncher.openBundleExecutable(at: app)
+            ), app.lastPathComponent)
+            let launcher = WorkspaceAppLauncher { _, _ in
+                XCTFail("must not spawn /usr/bin/open: \(app.lastPathComponent)")
+            }
+            XCTAssertThrowsError(try launcher.openImmediately(app)) { error in
+                XCTAssertEqual(error as? WorkspaceLaunchError, .requestRejected(app))
+            }
+        }
+        for app in [emptyGood, corruptContents, emptyRoot, dirPlist, noPlist] {
+            XCTAssertEqual(try WorkspaceAppLauncher().openImmediately(app), .opened, app.lastPathComponent)
+        }
+    }
+
+    func testWorkspaceLauncherRejectsMacBundleWithNoExecutableWithoutSpawningOpen() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LaunchIcon-OpenReject-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let missingKey = try makeMacBundle(named: "Fixture 01", in: root, executable: nil)
+        let placeholder = try makeMacBundle(
+            named: "Fixture 02",
+            in: root,
+            executable: "Fixture 02",
+            writeExecutable: true,
+            posixPermissions: 0o644
+        )
+        let directory = try makeMacBundle(named: "Fixture 03", in: root, executable: "Fixture 03")
+        try FileManager.default.createDirectory(
+            at: directory.appendingPathComponent("Contents/MacOS/Fixture 03"),
+            withIntermediateDirectories: true
+        )
+        let empty = try makeMacBundle(
+            named: "Fixture 04",
+            in: root,
+            executable: "Fixture 04",
+            writeExecutable: true
+        )
+        let fifo = try makeMacBundle(named: "Fixture 05", in: root, executable: "Fixture 05")
+        let fifoMacOS = fifo.appendingPathComponent("Contents/MacOS", isDirectory: true)
+        try FileManager.default.createDirectory(at: fifoMacOS, withIntermediateDirectories: true)
+        XCTAssertEqual(mkfifo(fifoMacOS.appendingPathComponent("Fixture 05").path, mode_t(0o755)), 0)
+        let trailingSpace = try makeMacBundle(named: "Fixture 06", in: root, executable: "Fixture 06 ")
+        let trailingMacOS = trailingSpace.appendingPathComponent("Contents/MacOS", isDirectory: true)
+        try FileManager.default.createDirectory(at: trailingMacOS, withIntermediateDirectories: true)
+        let unspaced = trailingMacOS.appendingPathComponent("Fixture 06")
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: unspaced)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: unspaced.path)
+        let omittedUnusable = try makeMacBundle(named: "Fixture 07", in: root, executable: nil)
+        try writeLaunchableExecutable(named: "Fixture 07", in: omittedUnusable, permissions: 0o644)
+        let omittedEmpty = try makeMacBundle(named: "Fixture 08", in: root, executable: nil)
+        try writeLaunchableExecutable(named: "Fixture 08", in: omittedEmpty, bytes: Data())
+        let explicitOther = try makeMacBundle(named: "Fixture 09", in: root, executable: "Other")
+        try writeLaunchableExecutable(named: "Fixture 09", in: explicitOther)
+        let dotName = try makeMacBundle(named: "Fixture 10", in: root, executable: ".")
+        try writeLaunchableExecutable(named: "Fixture 10", in: dotName)
+        let dotDotName = try makeMacBundle(named: "Fixture 11", in: root, executable: "..")
+        try writeLaunchableExecutable(named: "Fixture 11", in: dotDotName)
+        let integerMissing = try makeMacBundle(named: "Fixture 12", in: root, executableObject: 1)
+        for app in [
+            missingKey, placeholder, directory, empty, fifo, trailingSpace,
+            omittedUnusable, omittedEmpty, explicitOther, dotName, dotDotName, integerMissing
+        ] {
+            let launcher = WorkspaceAppLauncher { _, _ in
+                XCTFail("unlaunchable bundle must not spawn /usr/bin/open: \(app.lastPathComponent)")
+            }
+            XCTAssertThrowsError(try launcher.openImmediately(app)) { error in
+                XCTAssertEqual(error as? WorkspaceLaunchError, .requestRejected(app))
+            }
+        }
+    }
+
+    func testWorkspaceLauncherSpawnsOpenForBundleNameFallback() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LaunchIcon-OpenFallback-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let omitted = try makeMacBundle(named: "Foo.bar", in: root, executable: nil)
+        try writeLaunchableExecutable(named: "Foo.bar", in: omitted)
+        let emptyName = try makeMacBundle(named: "EmptyKey", in: root, executable: "")
+        try writeLaunchableExecutable(named: "EmptyKey", in: emptyName)
+        let integer = try makeMacBundle(named: "Integer", in: root, executableObject: 1)
+        try writeLaunchableExecutable(named: "Integer", in: integer)
+        for app in [omitted, emptyName, integer] {
+            XCTAssertEqual(try WorkspaceAppLauncher().openImmediately(app), .opened, app.lastPathComponent)
+        }
+    }
+
+    func testWorkspaceLauncherSpawnsOpenForUntrimmedExecutableName() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LaunchIcon-OpenSpaced-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let name = "   "
+        let app = try makeMacBundle(named: "Spaced", in: root, executable: name)
+        let macOS = app.appendingPathComponent("Contents/MacOS", isDirectory: true)
+        try FileManager.default.createDirectory(at: macOS, withIntermediateDirectories: true)
+        let file = macOS.appendingPathComponent(name)
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: file)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: file.path)
+        XCTAssertEqual(try WorkspaceAppLauncher().openImmediately(app), .opened)
+    }
+
+    private func makeMacBundle(
+        named name: String,
+        in root: URL,
+        executable: String? = nil,
+        executableObject: Any? = nil,
+        legacyExecutable: String? = nil,
+        writeExecutable: Bool = false,
+        posixPermissions: Int = 0o755
+    ) throws -> URL {
+        let app = root.appendingPathComponent("\(name).app")
+        let contents = app.appendingPathComponent("Contents", isDirectory: true)
+        try FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)
+        var info: [String: Any] = [
+            "CFBundleIdentifier": "com.sunzheng.LaunchIcon.OpenBundle.\(name)",
+            "CFBundleName": name,
+            "CFBundlePackageType": "APPL"
+        ]
+        if let executableObject {
+            info["CFBundleExecutable"] = executableObject
+        } else if let executable {
+            info["CFBundleExecutable"] = executable
+        }
+        if let legacyExecutable {
+            info["NSExecutable"] = legacyExecutable
+        }
+        let data = try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
+        try data.write(to: contents.appendingPathComponent("Info.plist"))
+        if writeExecutable, let executable {
+            let macOS = contents.appendingPathComponent("MacOS", isDirectory: true)
+            try FileManager.default.createDirectory(at: macOS, withIntermediateDirectories: true)
+            let file = macOS.appendingPathComponent(executable)
+            try Data().write(to: file)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: posixPermissions],
+                ofItemAtPath: file.path
+            )
+        }
+        return app
+    }
+
+    private func writeLaunchableExecutable(
+        named fileName: String,
+        in app: URL,
+        permissions: Int = 0o755,
+        bytes: Data = Data("#!/bin/sh\nexit 0\n".utf8)
+    ) throws {
+        let macOS = app.appendingPathComponent("Contents/MacOS", isDirectory: true)
+        try FileManager.default.createDirectory(at: macOS, withIntermediateDirectories: true)
+        let file = macOS.appendingPathComponent(fileName)
+        try bytes.write(to: file)
+        try FileManager.default.setAttributes([.posixPermissions: permissions], ofItemAtPath: file.path)
+    }
+
+    func testShouldReportOpenProcessFailureOnlyForNonZeroStatus() {
+        XCTAssertFalse(LauncherLayout.shouldReportOpenProcessFailure(terminationStatus: 0))
+        XCTAssertTrue(LauncherLayout.shouldReportOpenProcessFailure(terminationStatus: 1))
+        XCTAssertTrue(LauncherLayout.shouldReportOpenProcessFailure(terminationStatus: 127))
+    }
+
+    func testDelayedOpenFailureAppliesOnlyToTheLatestAttempt() {
+        XCTAssertTrue(
+            LauncherLayout.shouldApplyDelayedOpenFailure(
+                finishedAttempt: 1,
+                latestAttempt: 1,
+                terminationStatus: 1
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldApplyDelayedOpenFailure(
+                finishedAttempt: 1,
+                latestAttempt: 2,
+                terminationStatus: 1
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldApplyDelayedOpenFailure(
+                finishedAttempt: 2,
+                latestAttempt: 2,
+                terminationStatus: 0
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldApplyDelayedOpenFailure(
+                finishedAttempt: 0,
+                latestAttempt: 0,
+                terminationStatus: 1
+            )
+        )
+    }
+
+    func testDelayedOpenFailureReshowsOnlyTheHideItStarted() {
+        XCTAssertTrue(
+            LauncherLayout.shouldReshowLauncherAfterDelayedOpenFailure(
+                hidForThisLaunch: true,
+                launchDismissGeneration: 4,
+                currentDismissGeneration: 4,
+                finishedAttempt: 1,
+                latestAttempt: 1,
+                terminationStatus: 1
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldReshowLauncherAfterDelayedOpenFailure(
+                hidForThisLaunch: false,
+                launchDismissGeneration: 4,
+                currentDismissGeneration: 4,
+                finishedAttempt: 1,
+                latestAttempt: 1,
+                terminationStatus: 1
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldReshowLauncherAfterDelayedOpenFailure(
+                hidForThisLaunch: true,
+                launchDismissGeneration: 4,
+                currentDismissGeneration: 5,
+                finishedAttempt: 1,
+                latestAttempt: 1,
+                terminationStatus: 1
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldReshowLauncherAfterDelayedOpenFailure(
+                hidForThisLaunch: true,
+                launchDismissGeneration: 4,
+                currentDismissGeneration: 4,
+                finishedAttempt: 1,
+                latestAttempt: 2,
+                terminationStatus: 1
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldReshowLauncherAfterDelayedOpenFailure(
+                hidForThisLaunch: true,
+                launchDismissGeneration: 4,
+                currentDismissGeneration: 4,
+                finishedAttempt: 1,
+                latestAttempt: 1,
+                terminationStatus: 0
+            )
+        )
+    }
+
+    func testWorkspaceLauncherReportsNonZeroOpenExitWithoutWaitingOnTheCaller() throws {
+        // `/dev/null` exists, so the file-URL guard spawns `/usr/bin/open`.
+        // Launch Services rejects it (exit 1) without opening an application.
+        let url = URL(fileURLWithPath: "/dev/null")
+        let done = expectation(description: "open process finished")
+        final class Box: @unchecked Sendable {
+            var status: Int32 = 0
+            var path = ""
+        }
+        let box = Box()
+        let started = Date()
+        let launcher = WorkspaceAppLauncher { finishedURL, status in
+            box.path = finishedURL.path
+            box.status = status
+            done.fulfill()
+        }
+        XCTAssertEqual(try launcher.openImmediately(url), .opened)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 0.5)
+        wait(for: [done], timeout: 5)
+        XCTAssertEqual(box.path, "/dev/null")
+        XCTAssertNotEqual(box.status, 0)
+    }
+
+    func testShouldSurfaceDelayedOpenFailureOnlyWhileLauncherIsUp() {
+        XCTAssertTrue(
+            LauncherLayout.shouldSurfaceDelayedOpenFailureWhileLauncherVisible(
+                isDismissing: false,
+                isVisible: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldSurfaceDelayedOpenFailureWhileLauncherVisible(
+                isDismissing: true,
+                isVisible: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldSurfaceDelayedOpenFailureWhileLauncherVisible(
+                isDismissing: false,
+                isVisible: false
+            )
+        )
+    }
+
+    func testWorkspaceLauncherRejectsNonFileURLWithoutSpawningOpen() {
+        let remote = URL(string: "https://example.com/App.app")!
+        XCTAssertThrowsError(try WorkspaceAppLauncher().openImmediately(remote)) { error in
+            XCTAssertEqual(error as? WorkspaceLaunchError, .requestRejected(remote))
+        }
+    }
+
+    func testTimedOutLaunchErrorDescriptionNoLongerHardcodesTenSeconds() {
+        let url = URL(fileURLWithPath: "/Applications/Ready.app")
+        let description = WorkspaceLaunchError.timedOut(url).errorDescription ?? ""
+        XCTAssertFalse(description.contains("10 秒"))
+        XCTAssertFalse(description.isEmpty)
+    }
+
 
     func testVisibilityToggleShowsAgainWhileTheDismissAnimationIsStillVisible() {
         XCTAssertTrue(LauncherLayout.shouldKeepLauncherFocusWhenShown(isAppearing: false, isKey: true))
@@ -2474,6 +3582,88 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertEqual(closedBackdrop.scale, 1, accuracy: 0.001)
         XCTAssertFalse(closedBackdrop.blurs)
         XCTAssertFalse(LauncherLayout.folderBackdropStyle(open: false, reducesMotion: true).blurs)
+        let bounds = CGRect(x: 0, y: 0, width: 800, height: 500)
+        let focus = CGPoint(x: 620, y: 360)
+        let recede = LauncherLayout.folderBackdropRecede(
+            open: true,
+            reducesMotion: false,
+            bounds: bounds,
+            focus: focus
+        )
+        XCTAssertEqual(recede.scale, openBackdrop.scale, accuracy: 0.001)
+        let shift = 1 - openBackdrop.scale
+        XCTAssertEqual(recede.translationX, focus.x * shift, accuracy: 0.001)
+        XCTAssertEqual(recede.translationY, focus.y * shift, accuracy: 0.001)
+        XCTAssertGreaterThan(recede.translationX, 0)
+        XCTAssertGreaterThan(recede.translationY, 0)
+        let pinnedX = focus.x * recede.scale + recede.translationX
+        let pinnedY = focus.y * recede.scale + recede.translationY
+        XCTAssertEqual(pinnedX, focus.x, accuracy: 0.001)
+        XCTAssertEqual(pinnedY, focus.y, accuracy: 0.001)
+        let centeredFocus = CGPoint(x: bounds.midX, y: bounds.midY)
+        let centered = LauncherLayout.folderBackdropRecede(
+            open: true,
+            reducesMotion: false,
+            bounds: bounds,
+            focus: centeredFocus
+        )
+        XCTAssertEqual(centered.translationX, centeredFocus.x * shift, accuracy: 0.001)
+        XCTAssertEqual(centered.translationY, centeredFocus.y * shift, accuracy: 0.001)
+        XCTAssertGreaterThan(abs(centered.translationX), 1)
+        XCTAssertEqual(
+            centeredFocus.x * centered.scale + centered.translationX,
+            centeredFocus.x,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            centeredFocus.y * centered.scale + centered.translationY,
+            centeredFocus.y,
+            accuracy: 0.001
+        )
+        let closedRecede = LauncherLayout.folderBackdropRecede(
+            open: false,
+            reducesMotion: false,
+            bounds: bounds,
+            focus: focus
+        )
+        XCTAssertEqual(closedRecede.scale, 1, accuracy: 0.001)
+        XCTAssertEqual(closedRecede.translationX, 0, accuracy: 0.001)
+        XCTAssertEqual(closedRecede.translationY, 0, accuracy: 0.001)
+        let reducedRecede = LauncherLayout.folderBackdropRecede(
+            open: true,
+            reducesMotion: true,
+            bounds: bounds,
+            focus: focus
+        )
+        XCTAssertEqual(reducedRecede.scale, 1, accuracy: 0.001)
+        XCTAssertEqual(reducedRecede.translationX, 0, accuracy: 0.001)
+        let unpinned = LauncherLayout.folderBackdropRecede(
+            open: true,
+            reducesMotion: false,
+            bounds: bounds,
+            focus: nil
+        )
+        XCTAssertEqual(unpinned.scale, openBackdrop.scale, accuracy: 0.001)
+        XCTAssertEqual(unpinned.translationX, 0, accuracy: 0.001)
+        XCTAssertEqual(unpinned.translationY, 0, accuracy: 0.001)
+        let outside = LauncherLayout.folderBackdropRecede(
+            open: true,
+            reducesMotion: false,
+            bounds: bounds,
+            focus: CGPoint(x: 2000, y: -40)
+        )
+        XCTAssertEqual(outside.translationX, bounds.maxX * shift, accuracy: 0.001)
+        XCTAssertEqual(outside.translationY, bounds.minY * shift, accuracy: 0.001)
+        XCTAssertEqual(bounds.maxX * outside.scale + outside.translationX, bounds.maxX, accuracy: 0.001)
+        XCTAssertEqual(bounds.minY * outside.scale + outside.translationY, bounds.minY, accuracy: 0.001)
+        let brokenRecede = LauncherLayout.folderBackdropRecede(
+            open: true,
+            reducesMotion: false,
+            bounds: .zero,
+            focus: focus
+        )
+        XCTAssertEqual(brokenRecede.translationX, 0, accuracy: 0.001)
+        XCTAssertEqual(brokenRecede.scale, openBackdrop.scale, accuracy: 0.001)
         XCTAssertFalse(
             LauncherLayout.shouldApplyFolderBackdropStyle(isDismissing: true, isVisible: true)
         )
@@ -2574,6 +3764,45 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertFalse(LauncherLayout.shouldPlayLaunchFeedback(isDismissing: true, reducesMotion: false))
         XCTAssertFalse(LauncherLayout.shouldPlayLaunchFeedback(isDismissing: false, reducesMotion: true))
         XCTAssertFalse(LauncherLayout.shouldPlayLaunchFeedback(isDismissing: true, reducesMotion: true))
+        XCTAssertEqual(LauncherLayout.launchPressScale, 0.93, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.launchPressHalfDuration, 0.045, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.launchPressHalfDuration * 2, 0.09, accuracy: 0.001)
+        let pressedIcon = CGPoint(x: 56, y: 76)
+        let pressShift = LauncherLayout.originPinnedScaleTranslation(
+            point: pressedIcon,
+            scale: LauncherLayout.launchPressScale
+        )
+        XCTAssertEqual(
+            pressedIcon.x * LauncherLayout.launchPressScale + pressShift.x,
+            pressedIcon.x,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            pressedIcon.y * LauncherLayout.launchPressScale + pressShift.y,
+            pressedIcon.y,
+            accuracy: 0.001
+        )
+        XCTAssertGreaterThan(pressShift.x, 1)
+        XCTAssertGreaterThan(pressShift.y, 1)
+        XCTAssertEqual(
+            LauncherLayout.originPinnedScaleTranslation(point: .zero, scale: LauncherLayout.launchPressScale),
+            .zero
+        )
+        XCTAssertEqual(
+            LauncherLayout.originPinnedScaleTranslation(
+                point: CGPoint(x: CGFloat.nan, y: 4),
+                scale: LauncherLayout.launchPressScale
+            ),
+            .zero
+        )
+        XCTAssertEqual(
+            LauncherLayout.originPinnedScaleTranslation(point: pressedIcon, scale: 0),
+            .zero
+        )
+        XCTAssertEqual(
+            LauncherLayout.originPinnedScaleTranslation(point: pressedIcon, scale: CGFloat.nan),
+            .zero
+        )
         XCTAssertFalse(LauncherLayout.shouldSnapInFlightLaunchFeedback(isDismissing: true, isVisible: true))
         XCTAssertTrue(LauncherLayout.shouldSnapInFlightLaunchFeedback(isDismissing: false, isVisible: true))
         XCTAssertTrue(LauncherLayout.shouldSnapInFlightLaunchFeedback(isDismissing: true, isVisible: false))
@@ -2677,6 +3906,52 @@ final class LaunchIconCoreTests: XCTestCase {
                 isDismissing: true, isVisible: true, reducesMotion: false
             ),
             !LauncherLayout.shouldHoldPageButtonHover(isDismissing: true, isVisible: true)
+        )
+        let shown = LauncherLayout.pageButtonHoverFade(shown: true)
+        let hidden = LauncherLayout.pageButtonHoverFade(shown: false)
+        XCTAssertEqual(shown.opacity, 0.9, accuracy: 0.001)
+        XCTAssertEqual(hidden.opacity, 0, accuracy: 0.001)
+        XCTAssertEqual(shown.plateAlpha, 0.22, accuracy: 0.001)
+        XCTAssertEqual(hidden.plateAlpha, shown.plateAlpha, accuracy: 0.001)
+        XCTAssertEqual(shown.duration, 0.2, accuracy: 0.001)
+        XCTAssertLessThan(shown.duration, 0.25)
+        let early = LauncherLayout.pageButtonHoverSample(appearing: true, time: 0.15)
+        XCTAssertGreaterThan(early.controlOpacity, 0.4)
+        XCTAssertEqual(early.plateAlpha, shown.plateAlpha, accuracy: 0.001)
+        XCTAssertGreaterThan(
+            early.controlOpacity,
+            LauncherLayout.pageButtonHoverShownOpacity * 0.15
+        )
+        let leavingStart = LauncherLayout.pageButtonHoverSample(appearing: false, time: 0)
+        XCTAssertEqual(leavingStart.controlOpacity, 0.9, accuracy: 0.001)
+        XCTAssertEqual(leavingStart.plateAlpha, shown.plateAlpha, accuracy: 0.001)
+        let leavingEnd = LauncherLayout.pageButtonHoverSample(appearing: false, time: 1)
+        XCTAssertEqual(leavingEnd.controlOpacity, 0, accuracy: 0.001)
+        XCTAssertEqual(leavingEnd.plateAlpha, shown.plateAlpha, accuracy: 0.001)
+        let earlyTravel = LauncherLayout.pageButtonHoverSample(appearing: true, time: 0.2).controlOpacity
+        let lateTravel = LauncherLayout.pageButtonHoverSample(appearing: true, time: 1).controlOpacity
+            - LauncherLayout.pageButtonHoverSample(appearing: true, time: 0.8).controlOpacity
+        XCTAssertGreaterThan(earlyTravel, lateTravel * 2)
+        XCTAssertTrue(LauncherLayout.pageButtonHoverShown(
+            pointerInside: false, dragInside: true, focused: false
+        ))
+        XCTAssertTrue(LauncherLayout.pageButtonHoverShown(
+            pointerInside: true, dragInside: false, focused: false
+        ))
+        XCTAssertTrue(LauncherLayout.pageButtonHoverShown(
+            pointerInside: false, dragInside: false, focused: true
+        ))
+        XCTAssertFalse(LauncherLayout.pageButtonHoverShown(
+            pointerInside: false, dragInside: false, focused: false
+        ))
+        XCTAssertEqual(LauncherLayout.pageButtonDragHoverDelay, 0.5, accuracy: 0.001)
+        XCTAssertGreaterThan(LauncherLayout.pageButtonDragHoverDelay, shown.duration)
+        XCTAssertEqual(
+            LauncherLayout.pageButtonHoverFade(shown: LauncherLayout.pageButtonHoverShown(
+                pointerInside: false, dragInside: true, focused: false
+            )).opacity,
+            shown.opacity,
+            accuracy: 0.001
         )
     }
 
@@ -3023,6 +4298,13 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertEqual(LauncherLayout.layoutBaseForCatalogReload(memory: memoryOlder, stored: diskNewer).appKeys, diskNewer.appKeys)
     }
 
+    func testCachedCatalogIsReplacedOnlyByCompleteScan() {
+        XCTAssertTrue(LauncherLayout.shouldReplaceCachedCatalog(isShowingCache: false, newScanPersistable: false))
+        XCTAssertTrue(LauncherLayout.shouldReplaceCachedCatalog(isShowingCache: false, newScanPersistable: true))
+        XCTAssertFalse(LauncherLayout.shouldReplaceCachedCatalog(isShowingCache: true, newScanPersistable: false))
+        XCTAssertTrue(LauncherLayout.shouldReplaceCachedCatalog(isShowingCache: true, newScanPersistable: true))
+    }
+
     func testPageToRestoreKeepsTheRequestedPageAndClamps() {
         XCTAssertEqual(LauncherLayout.pageToRestore(currentPage: 2, inFlightPage: nil, queuedPage: nil, pageCount: 4), 2)
         XCTAssertEqual(LauncherLayout.pageToRestore(currentPage: 0, inFlightPage: 1, queuedPage: nil, pageCount: 4), 1)
@@ -3333,6 +4615,1677 @@ final class LaunchIconCoreTests: XCTestCase {
 
     func testSearchTransitionUsesTheFastMotionToken() {
         XCTAssertEqual(LauncherLayout.searchTransitionDuration, 0.12, accuracy: 0.001)
+        let fade = LauncherLayout.searchChromeFade(
+            reducesMotion: false,
+            holdsForLauncherFade: false,
+            incomingIsFolderBackdrop: false
+        )
+        XCTAssertTrue(fade.keepsOutgoingVisible)
+        XCTAssertEqual(fade.duration, 0.12, accuracy: 0.001)
+        XCTAssertEqual(fade.incomingOpacity, 1, accuracy: 0.001)
+        XCTAssertEqual(fade.outgoingOpacity, 0, accuracy: 0.001)
+        XCTAssertFalse(LauncherLayout.searchChromeOutgoingAcceptsClicks(fadingOut: true))
+        XCTAssertTrue(LauncherLayout.searchChromeOutgoingAcceptsClicks(fadingOut: false))
+        for skipped in [
+            LauncherLayout.searchChromeFade(
+                reducesMotion: true, holdsForLauncherFade: false, incomingIsFolderBackdrop: false
+            ),
+            LauncherLayout.searchChromeFade(
+                reducesMotion: false, holdsForLauncherFade: true, incomingIsFolderBackdrop: false
+            ),
+            LauncherLayout.searchChromeFade(
+                reducesMotion: false, holdsForLauncherFade: false, incomingIsFolderBackdrop: true
+            )
+        ] {
+            XCTAssertFalse(skipped.keepsOutgoingVisible)
+            XCTAssertEqual(skipped.duration, 0, accuracy: 0.001)
+            XCTAssertEqual(skipped.outgoingOpacity, 1, accuracy: 0.001)
+        }
+        XCTAssertEqual(
+            LauncherLayout.searchChromeFade(
+                reducesMotion: false, holdsForLauncherFade: false, incomingIsFolderBackdrop: true
+            ).incomingOpacity,
+            0.45,
+            accuracy: 0.001
+        )
+    }
+
+    /// Open and close share this pose. The scaled panel's center is the
+    /// folder preview, and the same value is the close destination.
+    func testFolderChromeCollapseTracksTheFolderIcon() {
+        let panel = CGRect(x: 100, y: 80, width: 500, height: 360)
+        let icon = CGRect(x: 40, y: 420, width: 72, height: 72)
+        let collapse = LauncherLayout.folderChromeCollapse(
+            panelFrame: panel,
+            iconFrame: icon,
+            reducesMotion: false
+        )
+        XCTAssertTrue(collapse.tracksIcon)
+        XCTAssertTrue(collapse.animatesTransform)
+        // The whole panel fits in the preview. Width is the tighter ratio.
+        XCTAssertEqual(collapse.scale, 72.0 / 500.0, accuracy: 0.0001)
+        XCTAssertLessThanOrEqual(panel.width * collapse.scale, icon.width + 0.001)
+        XCTAssertLessThanOrEqual(panel.height * collapse.scale, icon.height + 0.001)
+        XCTAssertEqual(collapse.translationX, icon.midX - panel.midX, accuracy: 0.0001)
+        XCTAssertEqual(collapse.translationY, icon.midY - panel.midY, accuracy: 0.0001)
+        XCTAssertEqual(panel.midX + collapse.translationX, icon.midX, accuracy: 0.0001)
+        XCTAssertEqual(panel.midY + collapse.translationY, icon.midY, accuracy: 0.0001)
+        XCTAssertEqual(collapse.panelOpacity, 1, accuracy: 0.001)
+        XCTAssertEqual(collapse.duration, 0.34, accuracy: 0.001)
+        XCTAssertEqual(
+            LauncherLayout.folderChromeCollapse(panelFrame: panel, iconFrame: icon, reducesMotion: false),
+            collapse
+        )
+
+        let tiny = LauncherLayout.folderChromeCollapse(
+            panelFrame: panel,
+            iconFrame: CGRect(x: 0, y: 0, width: 8, height: 8),
+            reducesMotion: false
+        )
+        XCTAssertEqual(tiny.scale, LauncherLayout.folderChromeMinimumScale, accuracy: 0.0001)
+        XCTAssertEqual(tiny.translationX, 4 - panel.midX, accuracy: 0.0001)
+        XCTAssertTrue(tiny.tracksIcon)
+
+        let huge = LauncherLayout.folderChromeCollapse(
+            panelFrame: panel,
+            iconFrame: CGRect(x: 0, y: 0, width: 900, height: 900),
+            reducesMotion: false
+        )
+        XCTAssertEqual(huge.scale, LauncherLayout.folderChromeMaximumScale, accuracy: 0.0001)
+        XCTAssertEqual(huge.translationX, 450 - panel.midX, accuracy: 0.0001)
+
+        let reduced = LauncherLayout.folderChromeCollapse(
+            panelFrame: panel,
+            iconFrame: icon,
+            reducesMotion: true
+        )
+        XCTAssertFalse(reduced.tracksIcon)
+        XCTAssertFalse(reduced.animatesTransform)
+        XCTAssertEqual(reduced.scale, 1, accuracy: 0.001)
+        XCTAssertEqual(reduced.translationX, 0, accuracy: 0.001)
+        XCTAssertEqual(reduced.translationY, 0, accuracy: 0.001)
+        XCTAssertEqual(reduced.panelOpacity, 0, accuracy: 0.001)
+        XCTAssertEqual(reduced.duration, 0.12, accuracy: 0.001)
+
+        let missing = LauncherLayout.folderChromeCollapse(
+            panelFrame: panel,
+            iconFrame: nil,
+            reducesMotion: false
+        )
+        XCTAssertFalse(missing.tracksIcon)
+        XCTAssertTrue(missing.animatesTransform)
+        XCTAssertEqual(missing.scale, 0.92, accuracy: 0.001)
+        XCTAssertEqual(missing.translationX, 0, accuracy: 0.001)
+        XCTAssertEqual(missing.translationY, 0, accuracy: 0.001)
+        XCTAssertEqual(missing.panelOpacity, 0, accuracy: 0.001)
+        XCTAssertEqual(missing.duration, 0.22, accuracy: 0.001)
+
+        let emptyPanel = LauncherLayout.folderChromeCollapse(
+            panelFrame: .zero,
+            iconFrame: icon,
+            reducesMotion: false
+        )
+        XCTAssertFalse(emptyPanel.tracksIcon)
+        XCTAssertEqual(emptyPanel.scale, 0.92, accuracy: 0.001)
+
+        let invalid = LauncherLayout.folderChromeCollapse(
+            panelFrame: panel,
+            iconFrame: CGRect(x: CGFloat.nan, y: 0, width: 72, height: 72),
+            reducesMotion: false
+        )
+        XCTAssertFalse(invalid.tracksIcon)
+        XCTAssertEqual(invalid.duration, 0.22, accuracy: 0.001)
+
+        let bounds = CGRect(origin: .zero, size: panel.size)
+        let shift = LauncherLayout.folderPanelCollapseShift(
+            scale: collapse.scale,
+            translationX: collapse.translationX,
+            translationY: collapse.translationY,
+            panelBounds: bounds
+        )
+        let center = CGPoint(x: bounds.midX, y: bounds.midY)
+        XCTAssertEqual(
+            collapse.scale * center.x + shift.x,
+            center.x + collapse.translationX,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            collapse.scale * center.y + shift.y,
+            center.y + collapse.translationY,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(panel.minX + collapse.scale * center.x + shift.x, icon.midX, accuracy: 0.001)
+        XCTAssertEqual(panel.minY + collapse.scale * center.y + shift.y, icon.midY, accuracy: 0.001)
+        let fallbackShift = LauncherLayout.folderPanelCollapseShift(
+            scale: missing.scale,
+            translationX: missing.translationX,
+            translationY: missing.translationY,
+            panelBounds: bounds
+        )
+        XCTAssertEqual(missing.scale * center.x + fallbackShift.x, center.x, accuracy: 0.001)
+        XCTAssertEqual(missing.scale * center.y + fallbackShift.y, center.y, accuracy: 0.001)
+        XCTAssertEqual(
+            LauncherLayout.folderPanelCollapseShift(
+                scale: CGFloat.nan,
+                translationX: 4,
+                translationY: 4,
+                panelBounds: bounds
+            ),
+            .zero
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderPanelCollapseShift(
+                scale: 0.5,
+                translationX: CGFloat.nan,
+                translationY: 0,
+                panelBounds: bounds
+            ),
+            .zero
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderPanelCollapseShift(
+                scale: 0,
+                translationX: 0,
+                translationY: 0,
+                panelBounds: bounds
+            ),
+            .zero
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderPanelCollapseShift(
+                scale: 0.5,
+                translationX: 1,
+                translationY: 1,
+                panelBounds: .zero
+            ),
+            .zero
+        )
+    }
+
+    /// The panel grows out of the preview plate. The plate stays hidden for
+    /// that flight and for the time the folder is open. The close draws it
+    /// again, faint until the panel has settled on the icon. Reduced motion
+    /// and a centered pop do not borrow the plate.
+    func testFolderPreviewPlateHidesUntilTheCloseLands() {
+        let panel = CGRect(x: 100, y: 80, width: 500, height: 360)
+        let icon = CGRect(x: 40, y: 420, width: 72, height: 72)
+        let tracked = LauncherLayout.folderChromeCollapse(
+            panelFrame: panel,
+            iconFrame: icon,
+            reducesMotion: false
+        )
+        XCTAssertTrue(tracked.tracksIcon)
+        XCTAssertTrue(LauncherLayout.shouldHideFolderPreviewPlate(
+            tracksIcon: tracked.tracksIcon,
+            phase: .borrowed
+        ))
+        XCTAssertFalse(LauncherLayout.shouldHideFolderPreviewPlate(
+            tracksIcon: tracked.tracksIcon,
+            phase: .returning
+        ))
+        XCTAssertFalse(LauncherLayout.shouldHideFolderPreviewPlate(
+            tracksIcon: tracked.tracksIcon,
+            phase: .yielding
+        ))
+        XCTAssertFalse(LauncherLayout.shouldHideFolderPreviewPlate(
+            tracksIcon: tracked.tracksIcon,
+            phase: .resting
+        ))
+
+        let reduced = LauncherLayout.folderChromeCollapse(
+            panelFrame: panel,
+            iconFrame: icon,
+            reducesMotion: true
+        )
+        XCTAssertFalse(reduced.tracksIcon)
+        XCTAssertFalse(LauncherLayout.shouldHideFolderPreviewPlate(
+            tracksIcon: reduced.tracksIcon,
+            phase: .borrowed
+        ))
+        XCTAssertFalse(LauncherLayout.shouldHideFolderPreviewPlate(
+            tracksIcon: reduced.tracksIcon,
+            phase: .returning
+        ))
+
+        let centered = LauncherLayout.folderChromeCollapse(
+            panelFrame: panel,
+            iconFrame: nil,
+            reducesMotion: false
+        )
+        XCTAssertFalse(centered.tracksIcon)
+        XCTAssertFalse(LauncherLayout.shouldHideFolderPreviewPlate(
+            tracksIcon: centered.tracksIcon,
+            phase: .borrowed
+        ))
+        XCTAssertFalse(LauncherLayout.shouldHideFolderPreviewPlate(
+            tracksIcon: false,
+            phase: .resting
+        ))
+
+        let dissolved = LauncherLayout.folderDissolveChrome(reducesMotion: false)
+        XCTAssertFalse(dissolved.tracksIcon)
+        XCTAssertFalse(LauncherLayout.shouldHideFolderPreviewPlate(
+            tracksIcon: dissolved.tracksIcon,
+            phase: .returning
+        ))
+    }
+
+    /// The close used to fade the panel out and then draw the plate. The plate
+    /// now takes the opacity the panel gives up, on the same late dissolve.
+    /// Halfway the panel is still mostly there, so the plate is still faint.
+    /// They sum to 1. A bad clock does not draw a plate.
+    func testFolderPreviewPlateFadesInAsThePanelDissolves() {
+        XCTAssertEqual(LauncherLayout.folderPreviewPlateReturnOpacity(at: 0), 0, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.folderPreviewPlateReturnOpacity(at: 1), 1, accuracy: 0.001)
+        XCTAssertLessThan(LauncherLayout.folderPreviewPlateReturnOpacity(at: 0.5), 0.2)
+        XCTAssertGreaterThan(LauncherLayout.folderPreviewPlateReturnOpacity(at: 0.9), 0.6)
+        var previous: CGFloat = -1
+        for step in 0...10 {
+            let time = CGFloat(step) / 10
+            let plate = LauncherLayout.folderPreviewPlateReturnOpacity(at: time)
+            let panel = LauncherLayout.wholeCellMergeFlightOpacity(at: time)
+            XCTAssertEqual(plate + panel, 1, accuracy: 0.001)
+            XCTAssertGreaterThanOrEqual(plate, previous)
+            previous = plate
+        }
+        XCTAssertEqual(LauncherLayout.folderPreviewPlateReturnOpacity(at: -0.2), 0, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.folderPreviewPlateReturnOpacity(at: 1.4), 1, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.folderPreviewPlateReturnOpacity(at: .nan), 0, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.folderPreviewPlateReturnOpacity(at: .infinity), 0, accuracy: 0.001)
+    }
+
+    /// A close that interrupts a reversed open used to snap the plate off and
+    /// fade it back up from nothing. It now continues from the opacity on
+    /// screen. A fresh close still starts at 0. A bad start stays hidden.
+    func testFolderPreviewPlateReturnContinuesFromTheOpacityOnScreen() {
+        XCTAssertEqual(
+            LauncherLayout.folderPreviewPlateReturnOpacity(from: 0, at: 0.4),
+            LauncherLayout.folderPreviewPlateReturnOpacity(at: 0.4),
+            accuracy: 0.001
+        )
+        XCTAssertEqual(LauncherLayout.folderPreviewPlateReturnOpacity(from: 0.4, at: 0), 0.4, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.folderPreviewPlateReturnOpacity(from: 0.4, at: 1), 1, accuracy: 0.001)
+        var previous: CGFloat = -1
+        for step in 0...10 {
+            let time = CGFloat(step) / 10
+            let plate = LauncherLayout.folderPreviewPlateReturnOpacity(from: 0.4, at: time)
+            let gained = LauncherLayout.folderPreviewPlateReturnOpacity(at: time)
+            XCTAssertEqual(plate, 0.4 + 0.6 * gained, accuracy: 0.001)
+            XCTAssertGreaterThanOrEqual(plate, previous)
+            previous = plate
+        }
+        XCTAssertEqual(LauncherLayout.folderPreviewPlateReturnOpacity(from: .nan, at: 0.5), 0, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.folderPreviewPlateReturnOpacity(from: 0.4, at: .nan), 0, accuracy: 0.001)
+    }
+
+    /// Reopening a closing folder used to hide the plate while the panel was
+    /// still faint. The plate now gives back the travel curve the panel uses
+    /// to fade in. Halfway the travel is mostly done, so the plate is faint.
+    /// When the two started complementary, they stay that way. A bad clock
+    /// draws nothing.
+    func testFolderPreviewPlateYieldsBackWhenTheCloseReverses() {
+        XCTAssertEqual(LauncherLayout.folderChromeTravelX1, 0.22, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.folderChromeTravelY1, 0.7, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.folderChromeTravelX2, 0.3, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.folderChromeTravelY2, 1, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.folderChromeTravelProgress(at: 0), 0, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.folderChromeTravelProgress(at: 1), 1, accuracy: 0.001)
+        XCTAssertGreaterThan(LauncherLayout.folderChromeTravelProgress(at: 0.5), 0.75)
+        XCTAssertEqual(LauncherLayout.folderChromeTravelProgress(at: .nan), 0, accuracy: 0.001)
+
+        let start: CGFloat = 0.62
+        XCTAssertEqual(LauncherLayout.folderPreviewPlateYieldOpacity(from: start, at: 0), start, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.folderPreviewPlateYieldOpacity(from: start, at: 1), 0, accuracy: 0.001)
+        XCTAssertLessThan(
+            LauncherLayout.folderPreviewPlateYieldOpacity(from: start, at: 0.5),
+            start * 0.3
+        )
+        var previous = start + 0.01
+        for step in 0...10 {
+            let time = CGFloat(step) / 10
+            let progress = LauncherLayout.folderChromeTravelProgress(at: time)
+            let plate = LauncherLayout.folderPreviewPlateYieldOpacity(from: start, at: time)
+            let panel = (1 - start) + start * progress
+            XCTAssertEqual(plate + panel, 1, accuracy: 0.001)
+            XCTAssertLessThanOrEqual(plate, previous)
+            previous = plate
+        }
+        XCTAssertEqual(LauncherLayout.folderPreviewPlateYieldOpacity(from: .nan, at: 0.2), 0, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.folderPreviewPlateYieldOpacity(from: start, at: .infinity), 0, accuracy: 0.001)
+    }
+
+    /// The plate used to wait out a timer interval before its first sample.
+    /// A reversed close is ease-out, so that wait jumped the plate while the
+    /// panel had already moved. The clock is the frame about to draw.
+    func testPreviewPlateFadeUsesTheFrameAboutToDraw() {
+        let duration = LauncherLayout.folderChromeTravelDuration
+        XCTAssertEqual(
+            LauncherLayout.previewPlateFadeTime(elapsed: 0, duration: duration),
+            0,
+            accuracy: 0.000_001
+        )
+        XCTAssertEqual(
+            LauncherLayout.previewPlateFadeTime(elapsed: -0.02, duration: duration),
+            0,
+            accuracy: 0.000_001
+        )
+        XCTAssertEqual(
+            LauncherLayout.previewPlateFadeTime(elapsed: duration, duration: duration),
+            1,
+            accuracy: 0.000_001
+        )
+        XCTAssertEqual(
+            LauncherLayout.previewPlateFadeTime(elapsed: duration + 0.1, duration: duration),
+            1,
+            accuracy: 0.000_001
+        )
+        XCTAssertEqual(
+            LauncherLayout.previewPlateFadeTime(elapsed: 0.05, duration: 0),
+            1,
+            accuracy: 0.000_001
+        )
+        XCTAssertEqual(
+            LauncherLayout.previewPlateFadeTime(elapsed: .nan, duration: duration),
+            0,
+            accuracy: 0.000_001
+        )
+        XCTAssertEqual(
+            LauncherLayout.previewPlateFadeTime(elapsed: 0.02, duration: .infinity),
+            0,
+            accuracy: 0.000_001
+        )
+        let frame = LauncherLayout.previewPlateFadeTime(elapsed: 1.0 / 60.0, duration: duration)
+        XCTAssertEqual(frame, CGFloat((1.0 / 60.0) / duration), accuracy: 0.000_001)
+        let yielded = LauncherLayout.folderPreviewPlateYieldOpacity(from: 1, at: frame)
+        XCTAssertLessThan(yielded, 1)
+        XCTAssertLessThan(yielded, 1 - frame)
+    }
+
+    /// A tracked close used to lift the scrim, the grid's brightness, and the
+    /// blur on the travel curve. The panel stays solid until late, so the grid
+    /// was already bright and sharp behind it. That veil now waits for the
+    /// same late dissolve. Scale does not: the icons still grow back on the
+    /// travel curve. Opening, reduced motion, and a centered pop keep one curve.
+    func testFolderCloseKeepsTheGridVeiledUntilThePanelDissolves() {
+        XCTAssertTrue(LauncherLayout.folderCloseVeilUsesLateDissolve(tracksIcon: true, closing: true))
+        XCTAssertFalse(LauncherLayout.folderCloseVeilUsesLateDissolve(tracksIcon: true, closing: false))
+        XCTAssertFalse(LauncherLayout.folderCloseVeilUsesLateDissolve(tracksIcon: false, closing: true))
+        XCTAssertFalse(LauncherLayout.folderCloseVeilUsesLateDissolve(tracksIcon: false, closing: false))
+        let panel = CGRect(x: 100, y: 80, width: 500, height: 360)
+        let icon = CGRect(x: 40, y: 420, width: 72, height: 72)
+        let tracked = LauncherLayout.folderChromeCollapse(panelFrame: panel, iconFrame: icon, reducesMotion: false)
+        let reduced = LauncherLayout.folderChromeCollapse(panelFrame: panel, iconFrame: icon, reducesMotion: true)
+        let centered = LauncherLayout.folderChromeCollapse(panelFrame: panel, iconFrame: nil, reducesMotion: false)
+        XCTAssertTrue(LauncherLayout.folderCloseVeilUsesLateDissolve(
+            tracksIcon: tracked.tracksIcon, closing: true
+        ))
+        XCTAssertFalse(LauncherLayout.folderCloseVeilUsesLateDissolve(
+            tracksIcon: reduced.tracksIcon, closing: true
+        ))
+        XCTAssertFalse(LauncherLayout.folderCloseVeilUsesLateDissolve(
+            tracksIcon: centered.tracksIcon, closing: true
+        ))
+        XCTAssertFalse(LauncherLayout.folderCloseVeilUsesLateDissolve(
+            tracksIcon: LauncherLayout.folderDissolveChrome(reducesMotion: false).tracksIcon,
+            closing: true
+        ))
+        XCTAssertGreaterThan(LauncherLayout.wholeCellMergeFlightOpacity(at: 0.5), 0.8)
+    }
+
+    /// The collapsed panel is the preview plate. Its layer radius is divided
+    /// by the scale, so the corner on screen matches the plate. Open settles
+    /// at 22. Reduced motion, a centered pop, and a dissolve stay at 22.
+    func testFolderPanelCornerMatchesThePlateWhenCollapsed() {
+        XCTAssertEqual(LauncherLayout.folderPanelCornerRadius, 22, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.folderPreviewPlateCornerFraction, 0.24, accuracy: 0.001)
+
+        let panel = CGRect(x: 100, y: 80, width: 500, height: 360)
+        let icon = CGRect(x: 40, y: 420, width: 72, height: 72)
+        let collapse = LauncherLayout.folderChromeCollapse(
+            panelFrame: panel,
+            iconFrame: icon,
+            reducesMotion: false
+        )
+        let plateRadius = icon.width * LauncherLayout.folderPreviewPlateCornerFraction
+        XCTAssertEqual(collapse.scale, 72.0 / 500.0, accuracy: 0.0001)
+        XCTAssertEqual(
+            collapse.collapsedCornerRadius * collapse.scale,
+            plateRadius,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(collapse.collapsedCornerRadius, plateRadius / collapse.scale, accuracy: 0.001)
+        XCTAssertGreaterThan(collapse.collapsedCornerRadius, LauncherLayout.folderPanelCornerRadius)
+
+        let tinyIcon = CGRect(x: 0, y: 0, width: 8, height: 8)
+        let tiny = LauncherLayout.folderChromeCollapse(
+            panelFrame: panel,
+            iconFrame: tinyIcon,
+            reducesMotion: false
+        )
+        XCTAssertEqual(tiny.scale, LauncherLayout.folderChromeMinimumScale, accuracy: 0.0001)
+        XCTAssertEqual(
+            tiny.collapsedCornerRadius * tiny.scale,
+            tinyIcon.width * LauncherLayout.folderPreviewPlateCornerFraction,
+            accuracy: 0.001
+        )
+
+        let hugeIcon = CGRect(x: 0, y: 0, width: 900, height: 900)
+        let huge = LauncherLayout.folderChromeCollapse(
+            panelFrame: panel,
+            iconFrame: hugeIcon,
+            reducesMotion: false
+        )
+        XCTAssertEqual(huge.scale, LauncherLayout.folderChromeMaximumScale, accuracy: 0.0001)
+        XCTAssertEqual(
+            huge.collapsedCornerRadius * huge.scale,
+            hugeIcon.width * LauncherLayout.folderPreviewPlateCornerFraction,
+            accuracy: 0.001
+        )
+
+        let reduced = LauncherLayout.folderChromeCollapse(
+            panelFrame: panel,
+            iconFrame: icon,
+            reducesMotion: true
+        )
+        XCTAssertEqual(reduced.collapsedCornerRadius, 22, accuracy: 0.001)
+        let centered = LauncherLayout.folderChromeCollapse(
+            panelFrame: panel,
+            iconFrame: nil,
+            reducesMotion: false
+        )
+        XCTAssertEqual(centered.collapsedCornerRadius, 22, accuracy: 0.001)
+        XCTAssertEqual(
+            LauncherLayout.folderDissolveChrome(reducesMotion: false).collapsedCornerRadius,
+            22,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderDissolveChrome(reducesMotion: true).collapsedCornerRadius,
+            22,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderPanelCollapsedCornerRadius(scale: .nan, iconSide: 72, tracksIcon: true),
+            22,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderPanelCollapsedCornerRadius(scale: 0, iconSide: 72, tracksIcon: true),
+            22,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderPanelCollapsedCornerRadius(scale: 1, iconSide: 72, tracksIcon: true),
+            22,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderPanelCollapsedCornerRadius(scale: 0.2, iconSide: 0, tracksIcon: true),
+            22,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderPanelCollapsedCornerRadius(scale: 0.2, iconSide: 72, tracksIcon: false),
+            22,
+            accuracy: 0.001
+        )
+    }
+
+    /// The icon still on the pointer is not flown again. The one left in the
+    /// folder is, in member order. An app that never reached the grid is not.
+    func testAppsScatteredFromDissolvedFolderSkipsTheDraggedIcon() {
+        let kept = UUID()
+        let dragged = UUID()
+        let gone = UUID()
+        let neighbor = UUID()
+        let entries: [LauncherEntry] = [.app(neighbor), .app(dragged), .app(kept)]
+        XCTAssertEqual(
+            LauncherLayout.appsScatteredFromDissolvedFolder(
+                memberIDs: [kept, dragged, gone, kept],
+                draggedItemID: dragged,
+                currentEntries: entries
+            ),
+            [kept]
+        )
+        XCTAssertEqual(
+            LauncherLayout.appsScatteredFromDissolvedFolder(
+                memberIDs: [kept, dragged],
+                draggedItemID: nil,
+                currentEntries: [.app(kept)]
+            ),
+            [kept]
+        )
+        XCTAssertEqual(
+            LauncherLayout.appsScatteredFromDissolvedFolder(
+                memberIDs: [dragged],
+                draggedItemID: dragged,
+                currentEntries: [.app(dragged)]
+            ),
+            []
+        )
+        XCTAssertEqual(
+            LauncherLayout.appsScatteredFromDissolvedFolder(
+                memberIDs: [],
+                draggedItemID: nil,
+                currentEntries: [.app(neighbor)]
+            ),
+            []
+        )
+    }
+
+    /// Leftover icons travel from the open folder to the grid on the merge
+    /// flight's clock. Reduced motion, a bad frame, a repeat, and a hop
+    /// under a point do not travel. The panel fades with that flight instead
+    /// of snapping shut.
+    func testFolderDissolveFlightsUseTheMergeTiming() {
+        let kept = UUID()
+        let other = UUID()
+        let source = CGRect(x: 180, y: 240, width: 64, height: 64)
+        let destination = CGRect(x: 40, y: 80, width: 72, height: 72)
+        let flight = LauncherLayout.folderDissolveFlights(
+            placements: [
+                LauncherLayout.FolderDissolveIconPlacement(itemID: kept, source: source, destination: destination),
+                LauncherLayout.FolderDissolveIconPlacement(itemID: kept, source: source, destination: destination),
+                LauncherLayout.FolderDissolveIconPlacement(
+                    itemID: other,
+                    source: CGRect(x: 10, y: 10, width: 64, height: 64),
+                    destination: CGRect(x: 10.2, y: 10.2, width: 64.2, height: 64.2)
+                )
+            ],
+            reducesMotion: false
+        )
+        XCTAssertEqual(flight.count, 1)
+        XCTAssertEqual(flight[0].itemID, kept)
+        XCTAssertEqual(flight[0].source, source)
+        XCTAssertEqual(flight[0].destination, destination)
+        XCTAssertEqual(flight[0].duration, LauncherLayout.folderDissolveFlightDuration, accuracy: 0.001)
+        XCTAssertEqual(flight[0].duration, LauncherLayout.folderChromeTravelDuration, accuracy: 0.001)
+        XCTAssertEqual(flight[0].duration, 0.34, accuracy: 0.001)
+
+        XCTAssertEqual(
+            LauncherLayout.folderDissolveFlights(
+                placements: [
+                    LauncherLayout.FolderDissolveIconPlacement(itemID: kept, source: source, destination: destination)
+                ],
+                reducesMotion: true
+            ),
+            []
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderDissolveFlights(
+                placements: [
+                    LauncherLayout.FolderDissolveIconPlacement(
+                        itemID: kept,
+                        source: .zero,
+                        destination: destination
+                    ),
+                    LauncherLayout.FolderDissolveIconPlacement(
+                        itemID: other,
+                        source: source,
+                        destination: CGRect(x: CGFloat.nan, y: 0, width: 72, height: 72)
+                    )
+                ],
+                reducesMotion: false
+            ),
+            []
+        )
+
+        let chrome = LauncherLayout.folderDissolveChrome(reducesMotion: false)
+        XCTAssertFalse(chrome.tracksIcon)
+        XCTAssertTrue(chrome.animatesTransform)
+        XCTAssertEqual(chrome.scale, LauncherLayout.folderBackdropOpenScale, accuracy: 0.001)
+        XCTAssertEqual(chrome.translationX, 0, accuracy: 0.001)
+        XCTAssertEqual(chrome.translationY, 0, accuracy: 0.001)
+        XCTAssertEqual(chrome.panelOpacity, 0, accuracy: 0.001)
+        XCTAssertEqual(chrome.duration, LauncherLayout.folderDissolveFlightDuration, accuracy: 0.001)
+
+        let reduced = LauncherLayout.folderDissolveChrome(reducesMotion: true)
+        XCTAssertFalse(reduced.animatesTransform)
+        XCTAssertEqual(reduced.scale, 1, accuracy: 0.001)
+        XCTAssertEqual(reduced.duration, 0.12, accuracy: 0.001)
+
+        XCTAssertTrue(LauncherLayout.shouldPlayFolderDissolveScatter(
+            reducesMotion: false, isDismissing: false, isVisible: true
+        ))
+        XCTAssertFalse(LauncherLayout.shouldPlayFolderDissolveScatter(
+            reducesMotion: true, isDismissing: false, isVisible: true
+        ))
+        XCTAssertFalse(LauncherLayout.shouldPlayFolderDissolveScatter(
+            reducesMotion: false, isDismissing: true, isVisible: true
+        ))
+        XCTAssertFalse(LauncherLayout.shouldPlayFolderDissolveScatter(
+            reducesMotion: false, isDismissing: false, isVisible: false
+        ))
+    }
+
+    /// The scatter completion is already on the main thread. Another hop
+    /// leaves the flying picture sitting on the cell. Commit on this turn.
+    /// A callback off the main thread still hops.
+    func testFlightLandingCommitsOnTheTurnThatArrives() {
+        XCTAssertTrue(LauncherLayout.flightLandingCommitsOnThisTurn(isMainThread: true))
+        XCTAssertFalse(LauncherLayout.flightLandingCommitsOnThisTurn(isMainThread: false))
+    }
+
+    /// The open-folder flight leaves the same 3×3 the preview plate draws.
+    /// Nine glyphs, top row first. Reduced motion, a bad frame, a repeat, and
+    /// a hop under a point do not travel. The clock matches the panel.
+    func testFolderPreviewGlyphsUseThePlateMathAndTheMergeTiming() {
+        let well = CGRect(x: 10, y: 20, width: 64, height: 64)
+        let frames = LauncherLayout.folderPreviewGlyphFrames(well: well, count: 12)
+        XCTAssertEqual(frames.count, 9)
+        XCTAssertEqual(frames[0], CGRect(x: 15, y: 63, width: 16, height: 16))
+        XCTAssertEqual(frames[1], CGRect(x: 33, y: 63, width: 16, height: 16))
+        XCTAssertEqual(frames[3], CGRect(x: 15, y: 45, width: 16, height: 16))
+        XCTAssertEqual(frames[8], CGRect(x: 51, y: 27, width: 16, height: 16))
+        XCTAssertGreaterThan(frames[0].minY, frames[3].minY)
+        XCTAssertEqual(
+            LauncherLayout.folderPreviewGlyphFrames(well: well, count: 0),
+            []
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderPreviewGlyphFrames(well: CGRect(x: 0, y: 0, width: 16, height: 16), count: 4),
+            []
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderPreviewGlyphFrames(
+                well: CGRect(x: CGFloat.nan, y: 0, width: 64, height: 64),
+                count: 2
+            ),
+            []
+        )
+
+        let first = UUID()
+        let second = UUID()
+        let source = frames[0]
+        let destination = CGRect(x: 200, y: 180, width: 72, height: 72)
+        let flights = LauncherLayout.folderPreviewGlyphFlights(
+            placements: [
+                LauncherLayout.FolderPreviewGlyphPlacement(itemID: first, source: source, destination: destination),
+                LauncherLayout.FolderPreviewGlyphPlacement(itemID: first, source: source, destination: destination),
+                LauncherLayout.FolderPreviewGlyphPlacement(
+                    itemID: second,
+                    source: frames[1],
+                    destination: CGRect(x: frames[1].minX + 0.2, y: frames[1].minY, width: 16, height: 16)
+                )
+            ],
+            reducesMotion: false
+        )
+        XCTAssertEqual(flights.count, 1)
+        XCTAssertEqual(flights[0].itemID, first)
+        XCTAssertEqual(flights[0].source, source)
+        XCTAssertEqual(flights[0].destination, destination)
+        XCTAssertEqual(flights[0].duration, LauncherLayout.folderPreviewGlyphFlightDuration, accuracy: 0.001)
+        XCTAssertEqual(flights[0].duration, LauncherLayout.folderChromeTravelDuration, accuracy: 0.001)
+        XCTAssertEqual(flights[0].duration, 0.34, accuracy: 0.001)
+        XCTAssertEqual(
+            LauncherLayout.folderPreviewGlyphFlights(
+                placements: [
+                    LauncherLayout.FolderPreviewGlyphPlacement(itemID: first, source: source, destination: destination)
+                ],
+                reducesMotion: true
+            ),
+            []
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderPreviewGlyphFlights(
+                placements: [
+                    LauncherLayout.FolderPreviewGlyphPlacement(itemID: first, source: .zero, destination: destination),
+                    LauncherLayout.FolderPreviewGlyphPlacement(
+                        itemID: second,
+                        source: source,
+                        destination: CGRect(x: CGFloat.nan, y: 0, width: 72, height: 72)
+                    )
+                ],
+                reducesMotion: false
+            ),
+            []
+        )
+        XCTAssertTrue(LauncherLayout.shouldPlayFolderPreviewGlyphFlight(
+            reducesMotion: false, isDismissing: false, isVisible: true, tracksIcon: true
+        ))
+        XCTAssertFalse(LauncherLayout.shouldPlayFolderPreviewGlyphFlight(
+            reducesMotion: false, isDismissing: false, isVisible: true, tracksIcon: false
+        ))
+        XCTAssertFalse(LauncherLayout.shouldPlayFolderPreviewGlyphFlight(
+            reducesMotion: true, isDismissing: false, isVisible: true, tracksIcon: true
+        ))
+        XCTAssertFalse(LauncherLayout.shouldPlayFolderPreviewGlyphFlight(
+            reducesMotion: false, isDismissing: true, isVisible: true, tracksIcon: true
+        ))
+        XCTAssertFalse(LauncherLayout.shouldPlayFolderPreviewGlyphFlight(
+            reducesMotion: false, isDismissing: false, isVisible: false, tracksIcon: true
+        ))
+    }
+
+    /// Closing a folder sends each icon back along the path it opened on.
+    /// The cell is the start and the glyph on the plate is the end. The clock
+    /// stays 0.34s, with no stagger. Reduced motion, a bad frame, a repeat,
+    /// and a hop under a point stay put. The gate matches the flight in.
+    func testFolderPreviewGlyphReturnUsesTheOpenPathInReverse() {
+        let well = CGRect(x: 10, y: 20, width: 64, height: 64)
+        let glyphs = LauncherLayout.folderPreviewGlyphFrames(well: well, count: 3)
+        XCTAssertEqual(glyphs.count, 3)
+        let cells = [
+            CGRect(x: 200, y: 300, width: 64, height: 64),
+            CGRect(x: 280, y: 300, width: 64, height: 64),
+            CGRect(x: 360, y: 300, width: 64, height: 64)
+        ]
+        let ids = [UUID(), UUID(), UUID()]
+        var outboundPlacements: [LauncherLayout.FolderPreviewGlyphPlacement] = []
+        var returnPlacements: [LauncherLayout.FolderPreviewGlyphPlacement] = []
+        for index in 0..<3 {
+            outboundPlacements.append(LauncherLayout.FolderPreviewGlyphPlacement(
+                itemID: ids[index], source: glyphs[index], destination: cells[index]
+            ))
+            returnPlacements.append(LauncherLayout.FolderPreviewGlyphPlacement(
+                itemID: ids[index], source: cells[index], destination: glyphs[index]
+            ))
+        }
+        let outbound = LauncherLayout.folderPreviewGlyphFlights(
+            placements: outboundPlacements,
+            reducesMotion: false
+        )
+        let returning = LauncherLayout.folderPreviewGlyphReturnFlights(
+            placements: returnPlacements,
+            reducesMotion: false
+        )
+        XCTAssertEqual(returning.count, 3)
+        XCTAssertEqual(outbound.count, returning.count)
+        for index in 0..<3 {
+            XCTAssertEqual(returning[index].itemID, ids[index])
+            XCTAssertEqual(returning[index].source, cells[index])
+            XCTAssertEqual(returning[index].destination, glyphs[index])
+            XCTAssertEqual(outbound[index].source, returning[index].destination)
+            XCTAssertEqual(outbound[index].destination, returning[index].source)
+            XCTAssertEqual(returning[index].duration, 0.34, accuracy: 0.001)
+            XCTAssertEqual(returning[index].duration, outbound[index].duration, accuracy: 0.001)
+            XCTAssertEqual(returning[index].duration, LauncherLayout.folderChromeTravelDuration, accuracy: 0.001)
+        }
+
+        let repeated = ids[0]
+        XCTAssertEqual(
+            LauncherLayout.folderPreviewGlyphReturnFlights(
+                placements: [
+                    LauncherLayout.FolderPreviewGlyphPlacement(
+                        itemID: repeated, source: cells[0], destination: glyphs[0]
+                    ),
+                    LauncherLayout.FolderPreviewGlyphPlacement(
+                        itemID: repeated, source: cells[1], destination: glyphs[1]
+                    ),
+                    LauncherLayout.FolderPreviewGlyphPlacement(
+                        itemID: ids[1],
+                        source: cells[2],
+                        destination: CGRect(
+                            x: cells[2].minX + 0.2,
+                            y: cells[2].minY,
+                            width: cells[2].width,
+                            height: cells[2].height
+                        )
+                    )
+                ],
+                reducesMotion: false
+            ).map(\.itemID),
+            [repeated]
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderPreviewGlyphReturnFlights(
+                placements: returnPlacements,
+                reducesMotion: true
+            ),
+            []
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderPreviewGlyphReturnFlights(
+                placements: [
+                    LauncherLayout.FolderPreviewGlyphPlacement(
+                        itemID: ids[0], source: .zero, destination: glyphs[0]
+                    ),
+                    LauncherLayout.FolderPreviewGlyphPlacement(
+                        itemID: ids[1],
+                        source: cells[1],
+                        destination: CGRect(x: CGFloat.nan, y: 0, width: 16, height: 16)
+                    )
+                ],
+                reducesMotion: false
+            ),
+            []
+        )
+
+        let gates: [(Bool, Bool, Bool, Bool)] = [
+            (false, false, true, true),
+            (false, false, true, false),
+            (true, false, true, true),
+            (false, true, true, true),
+            (false, false, false, true)
+        ]
+        for gate in gates {
+            XCTAssertEqual(
+                LauncherLayout.shouldPlayFolderPreviewGlyphReturn(
+                    reducesMotion: gate.0,
+                    isDismissing: gate.1,
+                    isVisible: gate.2,
+                    tracksIcon: gate.3
+                ),
+                LauncherLayout.shouldPlayFolderPreviewGlyphFlight(
+                    reducesMotion: gate.0,
+                    isDismissing: gate.1,
+                    isVisible: gate.2,
+                    tracksIcon: gate.3
+                )
+            )
+        }
+        XCTAssertTrue(LauncherLayout.shouldPlayFolderPreviewGlyphReturn(
+            reducesMotion: false, isDismissing: false, isVisible: true, tracksIcon: true
+        ))
+        XCTAssertFalse(LauncherLayout.shouldPlayFolderPreviewGlyphReturn(
+            reducesMotion: false, isDismissing: false, isVisible: true, tracksIcon: false
+        ))
+    }
+
+    /// An icon past the nine preview slots sinks into the plate center when
+    /// the folder closes. That fade is the whole-cell dissolve, so the icon
+    /// is still bright halfway home. Opening fades it back in with the flight.
+    func testOverflowIconStaysVisibleUntilItSinksBackIntoThePlate() {
+        XCTAssertFalse(LauncherLayout.folderOverflowIconFadeSharesFlightEase(returningToPlate: true))
+        XCTAssertTrue(LauncherLayout.folderOverflowIconFadeSharesFlightEase(returningToPlate: false))
+        XCTAssertGreaterThan(LauncherLayout.wholeCellMergeFlightOpacity(at: 0.5), 0.8)
+        XCTAssertLessThan(LauncherLayout.wholeCellMergeFlightOpacity(at: 0.9), 0.4)
+        XCTAssertEqual(LauncherLayout.wholeCellMergeFlightOpacity(at: 0), 1, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.wholeCellMergeFlightOpacity(at: 1), 0, accuracy: 0.001)
+    }
+
+    /// Opening a folder used to pop icons past the nine preview slots on at
+    /// the last frame. They fade in on the same dissolve, still hidden
+    /// halfway through, and only as the folder settles. Closing does not
+    /// run that fade.
+    func testOverflowIconsFadeInAsTheFolderSettles() {
+        XCTAssertTrue(LauncherLayout.shouldFadeFolderOverflowIconsIn(opening: true))
+        XCTAssertFalse(LauncherLayout.shouldFadeFolderOverflowIconsIn(opening: false))
+        XCTAssertEqual(LauncherLayout.folderOverflowIconRevealOpacity(at: 0), 0, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.folderOverflowIconRevealOpacity(at: 1), 1, accuracy: 0.001)
+        XCTAssertLessThan(LauncherLayout.folderOverflowIconRevealOpacity(at: 0.5), 0.25)
+        XCTAssertGreaterThan(LauncherLayout.folderOverflowIconRevealOpacity(at: 0.9), 0.6)
+        XCTAssertEqual(
+            LauncherLayout.folderOverflowIconRevealOpacity(at: 0.5),
+            1 - LauncherLayout.wholeCellMergeFlightOpacity(at: 0.5),
+            accuracy: 0.001
+        )
+    }
+
+    /// Creating a folder lands the icon that was already there in the first
+    /// preview slot, and the dropped icon in the second. Same 3×3, same 0.34s
+    /// clock, no stagger. Reduced motion, a missing slot, a bad frame, and a
+    /// hop under a point do not travel, so the caller can keep the old flight.
+    func testFolderMergePreviewLandingsUseTheFirstTwoSlots() {
+        let well = CGRect(x: 10, y: 20, width: 64, height: 64)
+        let slots = LauncherLayout.folderPreviewGlyphFrames(well: well, count: 2)
+        XCTAssertEqual(slots.count, 2)
+        XCTAssertLessThan(slots[0].minX, slots[1].minX)
+        XCTAssertEqual(slots[0].minY, slots[1].minY)
+        XCTAssertEqual(slots[0], CGRect(x: 15, y: 63, width: 16, height: 16))
+        XCTAssertEqual(slots[1], CGRect(x: 33, y: 63, width: 16, height: 16))
+
+        let resident = CGRect(x: 100, y: 200, width: 64, height: 64)
+        let incoming = CGRect(x: 280, y: 180, width: 48, height: 48)
+        let landings = LauncherLayout.folderMergePreviewLandings(
+            resident: resident,
+            incoming: incoming,
+            destinations: slots,
+            reducesMotion: false
+        )
+        XCTAssertEqual(landings.count, 2)
+        XCTAssertEqual(landings[0].source, resident)
+        XCTAssertEqual(landings[0].destination, slots[0])
+        XCTAssertEqual(landings[1].source, incoming)
+        XCTAssertEqual(landings[1].destination, slots[1])
+        XCTAssertEqual(landings[0].duration, 0.34, accuracy: 0.001)
+        XCTAssertEqual(landings[1].duration, LauncherLayout.folderChromeTravelDuration, accuracy: 0.001)
+        XCTAssertEqual(landings[0].duration, landings[1].duration, accuracy: 0.001)
+
+        let nine = LauncherLayout.folderPreviewGlyphFrames(well: well, count: 9)
+        let trimmed = LauncherLayout.folderMergePreviewLandings(
+            resident: resident,
+            incoming: incoming,
+            destinations: nine,
+            reducesMotion: false
+        )
+        XCTAssertEqual(trimmed.count, 2)
+        XCTAssertEqual(trimmed[0].destination, nine[0])
+        XCTAssertEqual(trimmed[1].destination, nine[1])
+        XCTAssertNotEqual(trimmed[1].destination, nine[2])
+
+        XCTAssertEqual(
+            LauncherLayout.folderMergePreviewLandings(
+                resident: resident,
+                incoming: incoming,
+                destinations: slots,
+                reducesMotion: true
+            ),
+            []
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderMergePreviewLandings(
+                resident: resident,
+                incoming: incoming,
+                destinations: [slots[0]],
+                reducesMotion: false
+            ),
+            []
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderMergePreviewLandings(
+                resident: .zero,
+                incoming: incoming,
+                destinations: slots,
+                reducesMotion: false
+            ),
+            []
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderMergePreviewLandings(
+                resident: resident,
+                incoming: CGRect(x: CGFloat.nan, y: 0, width: 48, height: 48),
+                destinations: slots,
+                reducesMotion: false
+            ),
+            []
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderMergePreviewLandings(
+                resident: resident,
+                incoming: incoming,
+                destinations: [slots[0], .zero],
+                reducesMotion: false
+            ),
+            []
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderMergePreviewLandings(
+                resident: slots[0],
+                incoming: incoming,
+                destinations: slots,
+                reducesMotion: false
+            ),
+            []
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderMergePreviewLandings(
+                resident: resident,
+                incoming: slots[1].offsetBy(dx: 0.2, dy: 0),
+                destinations: slots,
+                reducesMotion: false
+            ),
+            []
+        )
+    }
+
+    /// Creating a folder used to show the plate at full opacity on the first
+    /// frame. It now fades in over the early part of the 0.34s flight, ahead
+    /// of a straight line, and is solid before the icons land.
+    func testNewFolderPlateFadesInBeforeTheIconsLand() {
+        XCTAssertEqual(LauncherLayout.folderMergePlateRevealFraction, 0.45, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.folderMergePlateRevealX1, 0.22, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.folderMergePlateRevealY1, 0.7, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.folderMergePlateRevealX2, 0.3, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.folderMergePlateRevealY2, 1, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.folderMergePlateRevealOpacity(at: 0), 0, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.folderMergePlateRevealOpacity(at: -0.2), 0, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.folderMergePlateRevealOpacity(at: 0.45), 1, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.folderMergePlateRevealOpacity(at: 1), 1, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.folderMergePlateRevealOpacity(at: 1.4), 1, accuracy: 0.001)
+
+        let early = LauncherLayout.folderMergePlateRevealOpacity(at: 0.1)
+        XCTAssertGreaterThan(early, 0.5)
+        XCTAssertLessThan(early, 0.75)
+        XCTAssertGreaterThan(
+            LauncherLayout.folderMergePlateRevealOpacity(at: 0.2),
+            0.2 / LauncherLayout.folderMergePlateRevealFraction
+        )
+        XCTAssertGreaterThan(LauncherLayout.folderMergePlateRevealOpacity(at: 0.3), 0.9)
+        let opening = LauncherLayout.folderMergePlateRevealOpacity(at: 0.15)
+        let settling = 1 - LauncherLayout.folderMergePlateRevealOpacity(at: 0.3)
+        XCTAssertGreaterThan(opening, settling * 4)
+
+        var previous: CGFloat = -0.001
+        for step in 0...20 {
+            let opacity = LauncherLayout.folderMergePlateRevealOpacity(at: CGFloat(step) / 20)
+            if previous < 1 {
+                XCTAssertGreaterThan(opacity, previous)
+            } else {
+                XCTAssertEqual(opacity, 1, accuracy: 0.001)
+            }
+            XCTAssertLessThanOrEqual(opacity, 1)
+            previous = opacity
+        }
+
+        let flight = LauncherLayout.folderChromeTravelDuration
+        let duration = LauncherLayout.folderMergePlateRevealDuration(flight: flight)
+        XCTAssertEqual(duration, flight * 0.45, accuracy: 0.000_1)
+        XCTAssertGreaterThan(duration, 0.1)
+        XCTAssertLessThan(duration, flight)
+        XCTAssertEqual(LauncherLayout.folderMergePlateRevealDuration(flight: 0), 0, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.folderMergePlateRevealDuration(flight: -0.2), 0, accuracy: 0.001)
+
+        let scale = LauncherLayout.folderMergePlateRevealScaleStart
+        XCTAssertGreaterThan(scale, 0.7)
+        XCTAssertLessThan(scale, 0.9)
+        let center = CGPoint(x: 48, y: 69)
+        let shift = LauncherLayout.folderMergePlateRevealTranslation(iconCenter: center)
+        XCTAssertEqual(shift.x, center.x * (1 - scale), accuracy: 0.001)
+        XCTAssertEqual(shift.y, center.y * (1 - scale), accuracy: 0.001)
+        XCTAssertGreaterThan(shift.x, 1)
+        XCTAssertGreaterThan(shift.y, 1)
+        XCTAssertEqual(center.x * scale + shift.x, center.x, accuracy: 0.001)
+        XCTAssertEqual(center.y * scale + shift.y, center.y, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.folderMergePlateRevealTranslation(iconCenter: .zero), .zero)
+        XCTAssertEqual(
+            LauncherLayout.folderMergePlateRevealTranslation(iconCenter: CGPoint(x: CGFloat.nan, y: 4)),
+            .zero
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderMergePlateRevealTranslation(iconCenter: CGPoint(x: 10, y: CGFloat.nan)),
+            .zero
+        )
+        let negative = CGPoint(x: -8, y: 20)
+        let negativeShift = LauncherLayout.folderMergePlateRevealTranslation(iconCenter: negative)
+        XCTAssertEqual(negativeShift.x, negative.x * (1 - scale), accuracy: 0.001)
+        XCTAssertEqual(negative.y * scale + negativeShift.y, negative.y, accuracy: 0.001)
+    }
+
+    /// Dropping into a folder that already exists lands the new icon in the
+    /// next empty preview slot. Two icons already on the plate means the
+    /// third cell, not the second. A full plate of nine does not grow.
+    /// Same 0.34s clock. Reduced motion, a bad frame, and a hop under a
+    /// point do not travel.
+    func testFolderIncomingPreviewLandingUsesTheNextEmptySlot() throws {
+        XCTAssertEqual(LauncherLayout.folderIncomingPreviewSlotIndex(glyphsBefore: 0, glyphsAfter: 1), 0)
+        XCTAssertEqual(LauncherLayout.folderIncomingPreviewSlotIndex(glyphsBefore: 2, glyphsAfter: 3), 2)
+        XCTAssertEqual(LauncherLayout.folderIncomingPreviewSlotIndex(glyphsBefore: 8, glyphsAfter: 9), 8)
+        XCTAssertNil(LauncherLayout.folderIncomingPreviewSlotIndex(glyphsBefore: 9, glyphsAfter: 9))
+        XCTAssertNil(LauncherLayout.folderIncomingPreviewSlotIndex(glyphsBefore: 9, glyphsAfter: 10))
+        XCTAssertNil(LauncherLayout.folderIncomingPreviewSlotIndex(glyphsBefore: 3, glyphsAfter: 3))
+        XCTAssertNil(LauncherLayout.folderIncomingPreviewSlotIndex(glyphsBefore: 3, glyphsAfter: 5))
+        XCTAssertNil(LauncherLayout.folderIncomingPreviewSlotIndex(glyphsBefore: -1, glyphsAfter: 0))
+        XCTAssertNil(LauncherLayout.folderIncomingPreviewSlotIndex(glyphsBefore: 1, glyphsAfter: 0))
+
+        let well = CGRect(x: 10, y: 20, width: 64, height: 64)
+        let three = LauncherLayout.folderPreviewGlyphFrames(well: well, count: 3)
+        XCTAssertEqual(three.count, 3)
+        XCTAssertEqual(three[2], CGRect(x: 51, y: 63, width: 16, height: 16))
+        XCTAssertNotEqual(three[2], three[1])
+
+        let incoming = CGRect(x: 280, y: 180, width: 48, height: 48)
+        let landing = LauncherLayout.folderIncomingPreviewLanding(
+            incoming: incoming,
+            destination: three[2],
+            reducesMotion: false
+        )
+        XCTAssertEqual(landing?.source, incoming)
+        XCTAssertEqual(landing?.destination, three[2])
+        let duration = try XCTUnwrap(landing?.duration)
+        XCTAssertEqual(duration, 0.34, accuracy: 0.001)
+        XCTAssertEqual(duration, LauncherLayout.folderChromeTravelDuration, accuracy: 0.001)
+        let created = LauncherLayout.folderMergePreviewLandings(
+            resident: CGRect(x: 100, y: 200, width: 64, height: 64),
+            incoming: incoming,
+            destinations: Array(three.prefix(2)),
+            reducesMotion: false
+        )
+        XCTAssertEqual(duration, try XCTUnwrap(created.first?.duration), accuracy: 0.001)
+
+        let nine = LauncherLayout.folderPreviewGlyphFrames(well: well, count: 9)
+        XCTAssertEqual(nine[8], CGRect(x: 51, y: 27, width: 16, height: 16))
+        let lastSlot = LauncherLayout.folderIncomingPreviewLanding(
+            incoming: incoming,
+            destination: nine[8],
+            reducesMotion: false
+        )
+        XCTAssertEqual(lastSlot?.destination, nine[8])
+        XCTAssertNotEqual(lastSlot?.destination, nine[0])
+
+        XCTAssertNil(LauncherLayout.folderIncomingPreviewLanding(
+            incoming: incoming,
+            destination: three[2],
+            reducesMotion: true
+        ))
+        XCTAssertNil(LauncherLayout.folderIncomingPreviewLanding(
+            incoming: .zero,
+            destination: three[2],
+            reducesMotion: false
+        ))
+        XCTAssertNil(LauncherLayout.folderIncomingPreviewLanding(
+            incoming: incoming,
+            destination: .zero,
+            reducesMotion: false
+        ))
+        XCTAssertNil(LauncherLayout.folderIncomingPreviewLanding(
+            incoming: CGRect(x: CGFloat.nan, y: 0, width: 48, height: 48),
+            destination: three[2],
+            reducesMotion: false
+        ))
+        XCTAssertNil(LauncherLayout.folderIncomingPreviewLanding(
+            incoming: three[2].offsetBy(dx: 0.2, dy: 0),
+            destination: three[2],
+            reducesMotion: false
+        ))
+    }
+
+    /// A full plate has no empty slot, so the dropped icon shrinks into the
+    /// middle of the plate instead of the whole cell. Same 0.34s clock.
+    /// The fade is the whole-cell dissolve: still bright halfway through the
+    /// shrink, gone as it settles. The square stays centered and is not one
+    /// of the nine glyphs. Reduced motion, a bad frame, and a hop under a
+    /// point do not travel.
+    func testFolderIncomingPreviewCenterLandingShrinksIntoAFullPlate() throws {
+        XCTAssertEqual(LauncherLayout.folderPreviewPlateCenterInsetFraction, 0.36, accuracy: 0.001)
+        XCTAssertNil(LauncherLayout.folderIncomingPreviewSlotIndex(glyphsBefore: 9, glyphsAfter: 9))
+        XCTAssertNil(LauncherLayout.folderIncomingPreviewSlotIndex(glyphsBefore: 9, glyphsAfter: 10))
+
+        let well = CGRect(x: 10, y: 20, width: 64, height: 64)
+        let center = try XCTUnwrap(LauncherLayout.folderPreviewPlateCenterFrame(well: well))
+        XCTAssertEqual(center, CGRect(x: 33, y: 43, width: 18, height: 18))
+        XCTAssertEqual(center.midX, well.midX, accuracy: 0.001)
+        XCTAssertEqual(center.midY, well.midY, accuracy: 0.001)
+        XCTAssertLessThan(center.width, well.width * 0.5)
+        XCTAssertLessThan(center.height, well.height * 0.5)
+        XCTAssertTrue(well.contains(center))
+
+        let nine = LauncherLayout.folderPreviewGlyphFrames(well: well, count: 9)
+        XCTAssertEqual(nine.count, 9)
+        XCTAssertFalse(nine.contains(center))
+
+        let wide = CGRect(x: 0, y: 0, width: 100, height: 40)
+        let wideCenter = try XCTUnwrap(LauncherLayout.folderPreviewPlateCenterFrame(well: wide))
+        XCTAssertEqual(wideCenter, CGRect(x: 36, y: 14, width: 28, height: 12))
+        XCTAssertEqual(wideCenter.midX, wide.midX, accuracy: 0.001)
+        XCTAssertEqual(wideCenter.midY, wide.midY, accuracy: 0.001)
+
+        let incoming = CGRect(x: 280, y: 180, width: 48, height: 48)
+        let landing = LauncherLayout.folderIncomingPreviewCenterLanding(
+            incoming: incoming,
+            well: well,
+            reducesMotion: false
+        )
+        XCTAssertEqual(landing?.source, incoming)
+        XCTAssertEqual(landing?.destination, center)
+        let duration = try XCTUnwrap(landing?.duration)
+        XCTAssertEqual(duration, 0.34, accuracy: 0.001)
+        XCTAssertEqual(duration, LauncherLayout.folderChromeTravelDuration, accuracy: 0.001)
+        // The shrink keeps this clock. The fade is the whole-cell dissolve,
+        // so halfway through the shrink the icon is still bright.
+        XCTAssertGreaterThan(LauncherLayout.wholeCellMergeFlightOpacity(at: 0.5), 0.8)
+        XCTAssertLessThan(LauncherLayout.wholeCellMergeFlightOpacity(at: 0.9), 0.4)
+        let slotLanding = LauncherLayout.folderIncomingPreviewLanding(
+            incoming: incoming,
+            destination: nine[8],
+            reducesMotion: false
+        )
+        XCTAssertEqual(duration, try XCTUnwrap(slotLanding?.duration), accuracy: 0.001)
+        XCTAssertNotEqual(landing?.destination, slotLanding?.destination)
+
+        XCTAssertNil(LauncherLayout.folderIncomingPreviewCenterLanding(
+            incoming: incoming,
+            well: well,
+            reducesMotion: true
+        ))
+        XCTAssertNil(LauncherLayout.folderPreviewPlateCenterFrame(well: .zero))
+        XCTAssertNil(LauncherLayout.folderPreviewPlateCenterFrame(
+            well: CGRect(x: 0, y: 0, width: 0.4, height: 40)
+        ))
+        XCTAssertNil(LauncherLayout.folderPreviewPlateCenterFrame(
+            well: CGRect(x: CGFloat.nan, y: 0, width: 64, height: 64)
+        ))
+        XCTAssertNil(LauncherLayout.folderIncomingPreviewCenterLanding(
+            incoming: .zero,
+            well: well,
+            reducesMotion: false
+        ))
+        XCTAssertNil(LauncherLayout.folderIncomingPreviewCenterLanding(
+            incoming: CGRect(x: CGFloat.nan, y: 0, width: 48, height: 48),
+            well: well,
+            reducesMotion: false
+        ))
+        XCTAssertNil(LauncherLayout.folderIncomingPreviewCenterLanding(
+            incoming: incoming,
+            well: .zero,
+            reducesMotion: false
+        ))
+        XCTAssertNil(LauncherLayout.folderIncomingPreviewCenterLanding(
+            incoming: center.offsetBy(dx: 0.2, dy: 0),
+            well: well,
+            reducesMotion: false
+        ))
+    }
+
+    /// A merge that cannot measure a preview slot still flies onto the whole
+    /// cell. Opacity used to share that flight's ease-out, so the icon was
+    /// already faint before it arrived. It now stays readable through the
+    /// first half and dissolves only as the flight settles.
+    func testWholeCellMergeStaysVisibleUntilTheIconReachesTheCell() {
+        XCTAssertEqual(LauncherLayout.wholeCellMergeFadeX1, 0.55, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.wholeCellMergeFadeY1, 0, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.wholeCellMergeFadeX2, 0.82, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.wholeCellMergeFadeY2, 0.28, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.wholeCellMergeFlightOpacity(at: 0), 1, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.wholeCellMergeFlightOpacity(at: 1), 0, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.wholeCellMergeFlightOpacity(at: -0.2), 1, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.wholeCellMergeFlightOpacity(at: 1.4), 0, accuracy: 0.001)
+
+        let early = LauncherLayout.wholeCellMergeFlightOpacity(at: 0.3)
+        let halfway = LauncherLayout.wholeCellMergeFlightOpacity(at: 0.5)
+        let settling = LauncherLayout.wholeCellMergeFlightOpacity(at: 0.85)
+        XCTAssertGreaterThan(early, 0.9)
+        XCTAssertGreaterThan(halfway, 0.8)
+        XCTAssertLessThan(settling, 0.5)
+        XCTAssertGreaterThan(settling, 0.3)
+        let earlyDrop = LauncherLayout.wholeCellMergeFlightOpacity(at: 0.1)
+            - LauncherLayout.wholeCellMergeFlightOpacity(at: 0.3)
+        let lateDrop = LauncherLayout.wholeCellMergeFlightOpacity(at: 0.7)
+            - LauncherLayout.wholeCellMergeFlightOpacity(at: 0.9)
+        XCTAssertGreaterThan(lateDrop, earlyDrop * 4)
+        XCTAssertLessThan(earlyDrop, 0.08)
+    }
+
+    /// A whole-cell merge flies the lifted cell, and the drag image's shadow
+    /// is not in that picture. The shadow fades on the same early clock as a
+    /// drop into a cell, and is gone while the icon is still readable. The
+    /// icon itself dissolves later.
+    func testWholeCellMergeDropsTheLiftShadowWhileTheIconStaysVisible() {
+        let gone = LauncherLayout.dropLandingShadowFadeFraction
+        XCTAssertEqual(LauncherLayout.dropLandingShadowOpacity(at: gone), 0, accuracy: 0.001)
+        XCTAssertGreaterThan(LauncherLayout.wholeCellMergeFlightOpacity(at: gone), 0.8)
+        XCTAssertGreaterThan(LauncherLayout.wholeCellMergeFlightOpacity(at: 0.3), 0.9)
+        XCTAssertLessThan(
+            LauncherLayout.dropLandingShadowOpacity(at: 0.3),
+            LauncherLayout.dragLiftShadowOpacity * 0.15
+        )
+        XCTAssertEqual(
+            LauncherLayout.dropLandingShadowFadeDuration(
+                flight: LauncherLayout.folderChromeTravelDuration
+            ),
+            LauncherLayout.folderChromeTravelDuration * gone,
+            accuracy: 0.000_1
+        )
+    }
+
+    /// The icon dropped onto a folder was lifted. Its preview flyer fades the
+    /// drag shadow on the same early clock as a drop into a cell, and the
+    /// shadow is gone while the icon is still in the air. The icon that was
+    /// already on the grid was not lifted, so it does not grow a shadow.
+    /// Reduced motion never lifted.
+    func testIncomingMergeFadesTheLiftShadowAndTheResidentDoesNot() {
+        XCTAssertTrue(LauncherLayout.shouldFadeIncomingMergeShadow(
+            isIncoming: true, reducesMotion: false
+        ))
+        XCTAssertFalse(LauncherLayout.shouldFadeIncomingMergeShadow(
+            isIncoming: false, reducesMotion: false
+        ))
+        XCTAssertFalse(LauncherLayout.shouldFadeIncomingMergeShadow(
+            isIncoming: true, reducesMotion: true
+        ))
+        XCTAssertFalse(LauncherLayout.shouldFadeIncomingMergeShadow(
+            isIncoming: false, reducesMotion: true
+        ))
+
+        let gone = LauncherLayout.dropLandingShadowFadeFraction
+        XCTAssertEqual(LauncherLayout.dropLandingShadowOpacity(at: gone), 0, accuracy: 0.001)
+        XCTAssertLessThan(gone, 1)
+        let flight = LauncherLayout.folderPreviewGlyphFlightDuration
+        XCTAssertEqual(
+            LauncherLayout.dropLandingShadowFadeDuration(flight: flight),
+            flight * gone,
+            accuracy: 0.000_1
+        )
+        XCTAssertLessThan(
+            LauncherLayout.dropLandingShadowFadeDuration(flight: flight),
+            flight
+        )
+    }
+
+    /// A whole-cell merge used to fade the new folder in at 60% of the flight.
+    /// The icon is still about four fifths visible then, so the folder stacked
+    /// on it. The folder now stays hidden until the icon has started to
+    /// dissolve, then takes only the opacity the icon gives up, and is solid
+    /// when the icon is gone. The two layers never add up to more than one.
+    func testWholeCellMergeFolderWaitsUntilTheIconStartsDissolving() {
+        XCTAssertEqual(LauncherLayout.wholeCellMergeFolderRevealIconOpacity, 0.78, accuracy: 0.001)
+        XCTAssertGreaterThan(LauncherLayout.wholeCellMergeFlightOpacity(at: 0.6), 0.8)
+        XCTAssertEqual(LauncherLayout.wholeCellMergeFolderRevealOpacity(at: 0), 0, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.wholeCellMergeFolderRevealOpacity(at: 0.5), 0, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.wholeCellMergeFolderRevealOpacity(at: 0.6), 0, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.wholeCellMergeFolderRevealOpacity(at: -0.2), 0, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.wholeCellMergeFolderRevealOpacity(at: 1), 1, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.wholeCellMergeFolderRevealOpacity(at: 1.4), 1, accuracy: 0.001)
+
+        let fraction = LauncherLayout.wholeCellMergeFolderRevealFraction()
+        XCTAssertGreaterThan(fraction, 0.6)
+        XCTAssertLessThan(fraction, 0.75)
+        XCTAssertLessThanOrEqual(
+            LauncherLayout.wholeCellMergeFlightOpacity(at: fraction),
+            LauncherLayout.wholeCellMergeFolderRevealIconOpacity + 0.001
+        )
+        XCTAssertEqual(
+            LauncherLayout.wholeCellMergeFolderRevealOpacity(at: fraction - 0.02),
+            0,
+            accuracy: 0.001
+        )
+        XCTAssertGreaterThan(LauncherLayout.wholeCellMergeFolderRevealOpacity(at: fraction + 0.05), 0.02)
+
+        let iconAtSettle = LauncherLayout.wholeCellMergeFlightOpacity(at: 0.9)
+        let folderAtSettle = LauncherLayout.wholeCellMergeFolderRevealOpacity(at: 0.9)
+        XCTAssertLessThan(iconAtSettle, 0.4)
+        XCTAssertGreaterThan(folderAtSettle, 0.5)
+        XCTAssertGreaterThan(LauncherLayout.wholeCellMergeFolderRevealOpacity(at: 0.85), 0.35)
+        XCTAssertLessThan(LauncherLayout.wholeCellMergeFolderRevealOpacity(at: 0.85), 0.55)
+
+        var previous: CGFloat = 0
+        for step in 0...20 {
+            let time = CGFloat(step) / 20
+            let icon = LauncherLayout.wholeCellMergeFlightOpacity(at: time)
+            let folder = LauncherLayout.wholeCellMergeFolderRevealOpacity(at: time)
+            XCTAssertGreaterThanOrEqual(folder + 0.000_1, previous)
+            XCTAssertLessThanOrEqual(icon + folder, 1.001)
+            XCTAssertGreaterThanOrEqual(
+                icon + folder + 0.001,
+                LauncherLayout.wholeCellMergeFolderRevealIconOpacity
+            )
+            previous = folder
+        }
+    }
+
+    /// The whole-cell folder used to spring from 0.86 for about 0.68s, so it
+    /// was still moving after the icon had dissolved. The scale now follows
+    /// the fade: it stays at the start size while the folder is hidden, and
+    /// it is full size when the icon is gone.
+    func testWholeCellMergeFolderScaleLandsWithTheFade() {
+        XCTAssertEqual(LauncherLayout.wholeCellMergeFolderScaleStart, 0.94, accuracy: 0.001)
+        XCTAssertGreaterThan(LauncherLayout.wholeCellMergeFolderScaleStart, 0.9)
+        XCTAssertLessThan(LauncherLayout.wholeCellMergeFolderScaleStart, 1)
+        XCTAssertEqual(
+            LauncherLayout.wholeCellMergeFolderScale(at: 0),
+            LauncherLayout.wholeCellMergeFolderScaleStart,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            LauncherLayout.wholeCellMergeFolderScale(at: 0.6),
+            LauncherLayout.wholeCellMergeFolderScaleStart,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(LauncherLayout.wholeCellMergeFolderScale(at: 1), 1, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.wholeCellMergeFolderScale(at: 1.4), 1, accuracy: 0.001)
+        let settling = LauncherLayout.wholeCellMergeFolderScale(at: 0.9)
+        let start = LauncherLayout.wholeCellMergeFolderScaleStart
+        let reveal = LauncherLayout.wholeCellMergeFolderRevealOpacity(at: 0.9)
+        XCTAssertEqual(settling, start + (1 - start) * reveal, accuracy: 0.001)
+        XCTAssertGreaterThan(settling, start)
+        XCTAssertLessThan(settling, 1)
+        var previous = start
+        for step in 0...20 {
+            let scale = LauncherLayout.wholeCellMergeFolderScale(at: CGFloat(step) / 20)
+            XCTAssertGreaterThanOrEqual(scale + 0.000_1, previous)
+            previous = scale
+        }
+    }
+
+    /// A whole-cell merge used to inset the cell by 18% on every side, so the
+    /// picture shrank into the geometric middle. The icon sits 14 points
+    /// above that middle. The same shrink now stays on the icon.
+    func testWholeCellMergeShrinksTowardTheIconNotTheCellCenter() {
+        let cell = CGRect(x: 40, y: 80, width: 158, height: 129)
+        XCTAssertEqual(LauncherLayout.iconCenterLift, 14, accuracy: 0.001)
+        let icon = LauncherLayout.iconFrame(in: cell)
+        XCTAssertEqual(icon.width, LauncherLayout.iconPointSize(in: cell.size), accuracy: 0.001)
+        XCTAssertEqual(icon.height, icon.width, accuracy: 0.001)
+        XCTAssertEqual(icon.midX, cell.midX, accuracy: 0.001)
+        XCTAssertEqual(icon.midY, cell.midY + LauncherLayout.iconCenterLift, accuracy: 0.001)
+        XCTAssertGreaterThan(icon.minY, cell.minY)
+        XCTAssertLessThan(icon.maxY, cell.maxY)
+
+        let dest = LauncherLayout.wholeCellMergeDestination(in: cell)
+        let centered = cell.insetBy(
+            dx: cell.width * LauncherLayout.wholeCellMergeInsetFraction,
+            dy: cell.height * LauncherLayout.wholeCellMergeInsetFraction
+        )
+        XCTAssertEqual(LauncherLayout.wholeCellMergeInsetFraction, 0.18, accuracy: 0.001)
+        XCTAssertEqual(dest.width, centered.width, accuracy: 0.001)
+        XCTAssertEqual(dest.height, centered.height, accuracy: 0.001)
+        XCTAssertLessThan(dest.width, cell.width * 0.7)
+        XCTAssertEqual(dest.midX, cell.midX, accuracy: 0.001)
+        XCTAssertEqual(dest.minX, centered.minX, accuracy: 0.001)
+        XCTAssertGreaterThan(dest.midY, centered.midY + 4)
+        XCTAssertLessThan(dest.midY, icon.midY)
+
+        let fx = (icon.midX - cell.minX) / cell.width
+        let fy = (icon.midY - cell.minY) / cell.height
+        let landed = CGPoint(
+            x: dest.minX + fx * dest.width,
+            y: dest.minY + fy * dest.height
+        )
+        XCTAssertEqual(landed.x, icon.midX, accuracy: 0.001)
+        XCTAssertEqual(landed.y, icon.midY, accuracy: 0.001)
+
+        let above = cell.maxY - dest.maxY
+        let below = dest.minY - cell.minY
+        XCTAssertGreaterThan(below, above + 8)
+        XCTAssertGreaterThan(above, 0)
+        XCTAssertLessThan(dest.maxY, cell.maxY)
+
+        let shorter = CGRect(x: 0, y: 0, width: 120, height: 105)
+        let shortIcon = LauncherLayout.iconFrame(in: shorter)
+        XCTAssertEqual(shortIcon.midY, shorter.midY + 14, accuracy: 0.001)
+        XCTAssertGreaterThan(
+            LauncherLayout.wholeCellMergeDestination(in: shorter).midY,
+            shorter.midY
+        )
+
+        XCTAssertEqual(LauncherLayout.iconFrame(in: .zero), .zero)
+        XCTAssertEqual(LauncherLayout.wholeCellMergeDestination(in: .zero), .zero)
+        let degenerate = CGRect(x: 10, y: 10, width: 0.2, height: 40)
+        XCTAssertEqual(LauncherLayout.wholeCellMergeDestination(in: degenerate), degenerate)
+    }
+
+    /// A merge used to start on the resting cell, while the drag image was
+    /// the lifted picture. The whole-cell flight now leaves from that picture.
+    /// A preview flight leaves from the icon inside it, not the smaller icon.
+    /// Reduced motion never lifted, so both stay on the resting frames.
+    func testMergeFlightLeavesFromTheLiftedDragPicture() {
+        let cell = CGRect(x: 40, y: 80, width: 158, height: 129)
+        let lifted = LauncherLayout.dropLandingStartFrame(cell: cell, reducesMotion: false)
+        XCTAssertEqual(
+            LauncherLayout.mergeFlightSourceFrame(cell: cell, reducesMotion: false),
+            lifted
+        )
+        XCTAssertGreaterThan(lifted.width, cell.width)
+        XCTAssertEqual(
+            LauncherLayout.mergeFlightSourceFrame(cell: cell, reducesMotion: true),
+            cell
+        )
+        XCTAssertEqual(LauncherLayout.mergeFlightSourceFrame(cell: .zero, reducesMotion: false), .zero)
+
+        let icon = LauncherLayout.iconFrame(in: cell)
+        let carried = LauncherLayout.iconFrameInLiftedDrag(
+            icon: icon,
+            cell: cell,
+            reducesMotion: false
+        )
+        let sx = lifted.width / cell.width
+        let sy = lifted.height / cell.height
+        XCTAssertEqual(sx, LauncherLayout.dragLiftScale, accuracy: 0.001)
+        XCTAssertEqual(sy, LauncherLayout.dragLiftScale, accuracy: 0.001)
+        XCTAssertEqual(carried.width, icon.width * sx, accuracy: 0.001)
+        XCTAssertEqual(carried.height, icon.height * sy, accuracy: 0.001)
+        XCTAssertGreaterThan(carried.width, icon.width)
+        let carriedCenter = CGPoint(
+            x: lifted.minX + (icon.midX - cell.minX) * sx,
+            y: lifted.minY + (icon.midY - cell.minY) * sy
+        )
+        XCTAssertEqual(carried.midX, carriedCenter.x, accuracy: 0.001)
+        XCTAssertEqual(carried.midY, carriedCenter.y, accuracy: 0.001)
+        XCTAssertGreaterThan(carried.midY, icon.midY)
+
+        XCTAssertEqual(
+            LauncherLayout.iconFrameInLiftedDrag(icon: icon, cell: cell, reducesMotion: true),
+            icon
+        )
+        XCTAssertEqual(
+            LauncherLayout.iconFrameInLiftedDrag(icon: .zero, cell: cell, reducesMotion: false),
+            .zero
+        )
+        XCTAssertEqual(
+            LauncherLayout.iconFrameInLiftedDrag(icon: icon, cell: .zero, reducesMotion: false),
+            icon
+        )
+        let broken = CGRect(x: CGFloat.nan, y: 0, width: 64, height: 64)
+        let returned = LauncherLayout.iconFrameInLiftedDrag(icon: broken, cell: cell, reducesMotion: false)
+        // NaN is not equal to itself, so compare the parts a bad icon must keep.
+        XCTAssertTrue(returned.origin.x.isNaN)
+        XCTAssertEqual(returned.origin.y, broken.origin.y)
+        XCTAssertEqual(returned.size, broken.size)
+    }
+
+    /// Letting go of a reorder flies from the lifted drag picture into the
+    /// cell. The start frame is the scaled cell inside the drag image, not
+    /// the smaller cell, so removing the drag image does not pop. Same 0.34s
+    /// clock as the folder flights. Reduced motion, a bad frame, and a hop
+    /// under a point do not travel.
+    func testDropLandingFliesFromTheLiftedPictureIntoTheCell() throws {
+        let cell = CGRect(x: 0, y: 0, width: 100, height: 100)
+        let lifted = LauncherLayout.dropLandingStartFrame(cell: cell, reducesMotion: false)
+        let scaled = 100 * LauncherLayout.dragLiftScale
+        XCTAssertEqual(lifted.width, scaled, accuracy: 0.001)
+        XCTAssertEqual(lifted.height, scaled, accuracy: 0.001)
+        // The shadow sits below the icon, so the picture in the drag image
+        // is 2pt above the cell's center. The flight has to leave from there.
+        XCTAssertEqual(lifted.midX, cell.midX, accuracy: 0.001)
+        XCTAssertEqual(lifted.midY, cell.midY + 2, accuracy: 0.001)
+        XCTAssertGreaterThan(lifted.width, cell.width)
+        XCTAssertEqual(
+            LauncherLayout.dropLandingStartFrame(cell: cell, reducesMotion: true),
+            cell
+        )
+        let bad = CGRect(x: CGFloat.nan, y: 0, width: 100, height: 100)
+        let returnedBad = LauncherLayout.dropLandingStartFrame(cell: bad, reducesMotion: false)
+        // NaN is not equal to itself, so compare the parts a bad cell must keep.
+        XCTAssertTrue(returnedBad.origin.x.isNaN)
+        XCTAssertEqual(returnedBad.origin.y, bad.origin.y)
+        XCTAssertEqual(returnedBad.size, bad.size)
+        XCTAssertEqual(LauncherLayout.dropLandingStartFrame(cell: .zero, reducesMotion: false), .zero)
+
+        let destination = CGRect(x: 180, y: 40, width: 100, height: 100)
+        let flight = LauncherLayout.dropLandingFlight(from: lifted, to: destination, reducesMotion: false)
+        XCTAssertEqual(flight?.source, lifted)
+        XCTAssertEqual(flight?.destination, destination)
+        let duration = try XCTUnwrap(flight?.duration)
+        XCTAssertEqual(duration, 0.34, accuracy: 0.001)
+        XCTAssertEqual(duration, LauncherLayout.folderChromeTravelDuration, accuracy: 0.001)
+        XCTAssertEqual(duration, LauncherLayout.dropLandingFlightDuration, accuracy: 0.001)
+
+        XCTAssertNil(LauncherLayout.dropLandingFlight(from: lifted, to: destination, reducesMotion: true))
+        XCTAssertNil(LauncherLayout.dropLandingFlight(from: .zero, to: destination, reducesMotion: false))
+        XCTAssertNil(LauncherLayout.dropLandingFlight(
+            from: CGRect(x: CGFloat.nan, y: 0, width: 106, height: 106),
+            to: destination,
+            reducesMotion: false
+        ))
+        XCTAssertNil(LauncherLayout.dropLandingFlight(from: lifted, to: .zero, reducesMotion: false))
+        XCTAssertNil(LauncherLayout.dropLandingFlight(
+            from: destination.offsetBy(dx: 0.2, dy: 0),
+            to: destination,
+            reducesMotion: false
+        ))
+        // Letting go on the same slot still travels. The picture in hand is
+        // the lifted cell, and the slot is the smaller one.
+        let sameSlot = LauncherLayout.dropLandingFlight(from: lifted, to: cell, reducesMotion: false)
+        XCTAssertEqual(sameSlot?.source, lifted)
+        XCTAssertEqual(sameSlot?.destination, cell)
+        XCTAssertNotEqual(sameSlot?.source.size, cell.size)
+
+        XCTAssertTrue(LauncherLayout.shouldPlayDropLanding(
+            reducesMotion: false, isDismissing: false, isVisible: true
+        ))
+        XCTAssertFalse(LauncherLayout.shouldPlayDropLanding(
+            reducesMotion: true, isDismissing: false, isVisible: true
+        ))
+        XCTAssertFalse(LauncherLayout.shouldPlayDropLanding(
+            reducesMotion: false, isDismissing: true, isVisible: true
+        ))
+        XCTAssertFalse(LauncherLayout.shouldPlayDropLanding(
+            reducesMotion: false, isDismissing: false, isVisible: false
+        ))
+        XCTAssertEqual(
+            LauncherLayout.shouldHoldDropLanding(isDismissing: true, isVisible: true),
+            LauncherLayout.shouldHoldMergeFlight(isDismissing: true, isVisible: true)
+        )
+        XCTAssertEqual(
+            LauncherLayout.shouldAdvanceDropLanding(isDismissing: false, isVisible: true),
+            LauncherLayout.shouldAdvanceMergeFlight(isDismissing: false, isVisible: true)
+        )
+        XCTAssertEqual(
+            LauncherLayout.shouldSnapInFlightDropLanding(isDismissing: false, isVisible: true),
+            LauncherLayout.shouldSnapInFlightMergeFlight(isDismissing: false, isVisible: true)
+        )
+    }
+
+    /// The lift shadow lives in the drag image. The flyer is the cell, so the
+    /// shadow used to vanish when that image left. It now fades over the early
+    /// part of the 0.34s flight, ahead of a straight line, and is gone before
+    /// the icon lands. A bad clock keeps the lift shadow.
+    func testDropLandingShadowFadesBeforeTheIconLands() {
+        XCTAssertEqual(LauncherLayout.dropLandingShadowFadeFraction, 0.45, accuracy: 0.001)
+        XCTAssertEqual(
+            LauncherLayout.dropLandingShadowOpacity(at: 0),
+            LauncherLayout.dragLiftShadowOpacity,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            LauncherLayout.dropLandingShadowOpacity(at: -0.2),
+            LauncherLayout.dragLiftShadowOpacity,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(LauncherLayout.dropLandingShadowOpacity(at: 0.45), 0, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.dropLandingShadowOpacity(at: 1), 0, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.dropLandingShadowOpacity(at: 1.4), 0, accuracy: 0.001)
+        XCTAssertEqual(
+            LauncherLayout.dropLandingShadowOpacity(at: .nan),
+            LauncherLayout.dragLiftShadowOpacity,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            LauncherLayout.dropLandingShadowOpacity(at: .infinity),
+            LauncherLayout.dragLiftShadowOpacity,
+            accuracy: 0.001
+        )
+
+        let early = LauncherLayout.dropLandingShadowOpacity(at: 0.1)
+        let linear = LauncherLayout.dragLiftShadowOpacity * (1 - 0.1 / 0.45)
+        XCTAssertGreaterThan(early, 0)
+        XCTAssertLessThan(early, linear)
+        XCTAssertLessThan(early, LauncherLayout.dragLiftShadowOpacity * 0.5)
+        XCTAssertLessThan(
+            LauncherLayout.dropLandingShadowOpacity(at: 0.2),
+            LauncherLayout.dragLiftShadowOpacity * 0.25
+        )
+        XCTAssertLessThan(LauncherLayout.dropLandingShadowOpacity(at: 0.3), 0.02)
+
+        var previous = LauncherLayout.dragLiftShadowOpacity + 1
+        for step in 0...20 {
+            let opacity = LauncherLayout.dropLandingShadowOpacity(at: CGFloat(step) / 20)
+            if previous > 0 {
+                XCTAssertLessThan(opacity, previous)
+            } else {
+                XCTAssertEqual(opacity, 0, accuracy: 0.001)
+            }
+            XCTAssertGreaterThanOrEqual(opacity, 0)
+            previous = opacity
+        }
+
+        let flight = LauncherLayout.dropLandingFlightDuration
+        let duration = LauncherLayout.dropLandingShadowFadeDuration(flight: flight)
+        XCTAssertEqual(duration, flight * 0.45, accuracy: 0.000_1)
+        XCTAssertGreaterThan(duration, 0.1)
+        XCTAssertLessThan(duration, flight)
+        XCTAssertEqual(LauncherLayout.dropLandingShadowFadeDuration(flight: 0), 0, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.dropLandingShadowFadeDuration(flight: -0.2), 0, accuracy: 0.001)
     }
 
     func testSearchFieldUsesTheSpecifiedChromeSize() {
@@ -3378,6 +6331,87 @@ final class LaunchIconCoreTests: XCTestCase {
             XCTAssertEqual(Set(occupied).count, occupied.count)
             XCTAssertFalse(occupied.contains(preview.gapIndex))
         }
+    }
+
+    func testReorderSpringKeepsMotionContinuousWhenGapChanges() {
+        var motion = (position: CGSize.zero, velocity: CGSize.zero)
+        for _ in 0..<6 {
+            motion = LauncherLayout.reorderSpringStep(
+                position: motion.position, velocity: motion.velocity,
+                target: CGSize(width: 90, height: 0), elapsed: 1.0 / 60.0
+            )
+        }
+        XCTAssertGreaterThan(motion.position.width, 0)
+        XCTAssertLessThan(motion.position.width, 90)
+        XCTAssertGreaterThan(motion.velocity.width, 0)
+
+        let retargeted = LauncherLayout.reorderSpringStep(
+            position: motion.position, velocity: motion.velocity,
+            target: CGSize(width: -90, height: 0), elapsed: 0
+        )
+        XCTAssertEqual(retargeted.position.width, motion.position.width, accuracy: 0.001)
+        XCTAssertEqual(retargeted.velocity.width, motion.velocity.width, accuracy: 0.001)
+
+        motion = retargeted
+        for _ in 0..<40 {
+            motion = LauncherLayout.reorderSpringStep(
+                position: motion.position, velocity: motion.velocity,
+                target: CGSize(width: -90, height: 0), elapsed: 1.0 / 60.0
+            )
+        }
+        XCTAssertEqual(motion.position.width, -90, accuracy: 0.5)
+        XCTAssertEqual(motion.velocity.width, 0, accuracy: 2)
+    }
+
+    func testReorderSpringUsesElapsedTimeAcrossFrameRates() {
+        let start = (position: CGSize(width: 12, height: -8), velocity: CGSize(width: 180, height: -90))
+        let target = CGSize(width: 90, height: 60)
+        var reference = start
+        for _ in 0..<12 {
+            reference = LauncherLayout.reorderSpringStep(
+                position: reference.position, velocity: reference.velocity,
+                target: target, elapsed: 1.0 / 60.0
+            )
+        }
+        // The same 200ms must produce the same frame, including after a delayed tick.
+        for frames in [4, 2, 1] {
+            var motion = start
+            for _ in 0..<frames {
+                motion = LauncherLayout.reorderSpringStep(
+                    position: motion.position, velocity: motion.velocity,
+                    target: target, elapsed: 0.2 / Double(frames)
+                )
+            }
+            XCTAssertEqual(motion.position.width, reference.position.width, accuracy: 0.001)
+            XCTAssertEqual(motion.position.height, reference.position.height, accuracy: 0.001)
+            XCTAssertEqual(motion.velocity.width, reference.velocity.width, accuracy: 0.001)
+            XCTAssertEqual(motion.velocity.height, reference.velocity.height, accuracy: 0.001)
+        }
+    }
+
+    /// Neighbors used to wait out a timer interval, then jump. The spring
+    /// integrates the time until the frame about to draw. A clock behind
+    /// the last frame does not rewind that mark.
+    func testReorderSlideKeepsTheTimeUntilTheFrameAboutToDraw() {
+        XCTAssertEqual(LauncherLayout.reorderSlideElapsed(now: 10, lastTick: 10), 0, accuracy: 0.000_001)
+        XCTAssertEqual(
+            LauncherLayout.reorderSlideElapsed(now: 10 + 1.0 / 120.0, lastTick: 10),
+            1.0 / 120.0,
+            accuracy: 0.000_001
+        )
+        XCTAssertEqual(LauncherLayout.reorderSlideElapsed(now: 9.9, lastTick: 10), 0, accuracy: 0.000_001)
+        XCTAssertEqual(LauncherLayout.reorderSlideElapsed(now: .nan, lastTick: 10), 0, accuracy: 0.000_001)
+        XCTAssertEqual(LauncherLayout.reorderSlideElapsed(now: 10, lastTick: .infinity), 0, accuracy: 0.000_001)
+        let start = CGSize(width: 12, height: -4)
+        let stayed = LauncherLayout.reorderSpringStep(
+            position: start,
+            velocity: CGSize(width: 40, height: 0),
+            target: CGSize(width: 90, height: 0),
+            elapsed: LauncherLayout.reorderSlideElapsed(now: 1, lastTick: 2)
+        )
+        XCTAssertEqual(stayed.position.width, start.width, accuracy: 0.000_001)
+        XCTAssertEqual(stayed.position.height, start.height, accuracy: 0.000_001)
+        XCTAssertEqual(stayed.velocity.width, 40, accuracy: 0.000_001)
     }
 
     func testReorderUsesPreRemovalDropIndexSoDragRightDoesNotOvershoot() throws {

@@ -129,18 +129,18 @@
         }
       }
     },
-    "扫描仍不完整，暂时无法整理": {
+    "暂时无法整理，请查看主界面提示": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Scan is still incomplete; organizing is unavailable"
+            "value": "Organizing is unavailable; see the main window for details"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "扫描仍不完整，暂时无法整理"
+            "value": "暂时无法整理，请查看主界面提示"
           }
         }
       }
@@ -493,6 +493,22 @@
           "stringUnit": {
             "state": "translated",
             "value": "全选"
+          }
+        }
+      }
+    },
+    "粘贴": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Paste"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "粘贴"
           }
         }
       }

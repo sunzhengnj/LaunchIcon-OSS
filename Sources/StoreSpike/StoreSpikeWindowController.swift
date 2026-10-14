@@ -31,6 +31,7 @@ final class StoreSpikeWindowController: NSWindowController {
     func toggleVisibility() {
         guard let window else { return }
         if window.isVisible { window.orderOut(nil) } else { showWindow(nil) }
+        append("Hotkey window visibility: \(window.isVisible ? "visible" : "hidden")")
     }
 
     func setHotKeyResult(_ result: String) {

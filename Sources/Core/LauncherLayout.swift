@@ -41,16 +41,200 @@ public enum LauncherLayout {
     public static let folderRows = 5
     public static let pageIndicatorLimit = 7
     public static let pageAnimationDuration: TimeInterval = 0.28
+    /// Cubic control points of the page slide. Dots sample the same curve.
+    public static let pageTurnCurveX1: CGFloat = 0.2
+    public static let pageTurnCurveY1: CGFloat = 0.8
+    public static let pageTurnCurveX2: CGFloat = 0.2
+    public static let pageTurnCurveY2: CGFloat = 1
+    /// How far a finger must travel, as a fraction of the page, before the
+    /// page turns. A fast flick can still turn below this. This is not how
+    /// far the pages slide.
     public static let pageTurnDistanceFraction: CGFloat = 0.18
+    /// How far the pages follow a finger, as a fraction of the page width at
+    /// a full-width drag. A full pull still docks the incoming page. Arrow
+    /// and keyboard turns do not use this.
+    public static let pageDragSlideFraction: CGFloat = 0.18
+    /// Arrow, keyboard, and page-dot turns. The old jump used the drag
+    /// fraction, so the fade finished before the page had moved enough to
+    /// read as a turn. Same ease-out as the drag. The drag-to-turn threshold
+    /// stays `pageTurnDistanceFraction`.
+    public static let discretePageSlideFraction: CGFloat = 0.36
     public static let discretePageTurnThreshold: CGFloat = 3
     public static let dragLiftScale: CGFloat = 1.06
     public static let dragLiftShadowOpacity: CGFloat = 0.18
     public static let reorderSlideDuration: TimeInterval = 0.18
+    /// Time to feed `reorderSpringStep`, measured to the frame about to draw.
+    /// A timer that waits a full interval first holds the icon, then jumps.
+    /// A late frame is kept whole. A clock that runs backwards, or a bad
+    /// clock, integrates nothing so the mark does not rewind.
+    public static func reorderSlideElapsed(now: TimeInterval, lastTick: TimeInterval) -> TimeInterval {
+        guard now.isFinite, lastTick.isFinite else { return 0 }
+        return max(now - lastTick, 0)
+    }
+
+    /// Critical damping keeps a neighbor's velocity when the drag gap changes.
+    /// About 95% of a stationary start's travel completes in reorderSlideDuration.
+    public static func reorderSpringStep(
+        position: CGSize, velocity: CGSize, target: CGSize, elapsed: TimeInterval
+    ) -> (position: CGSize, velocity: CGSize) {
+        // This closed-form solution is stable across delayed frames; do not
+        // discard elapsed time when the main run loop delivers a late tick.
+        let step = CGFloat(max(elapsed, 0))
+        let response = CGFloat(4.8 / reorderSlideDuration)
+        let decay = CGFloat(exp(Double(-response * step)))
+        func axis(_ position: CGFloat, _ velocity: CGFloat, _ target: CGFloat) -> (CGFloat, CGFloat) {
+            let displacement = position - target
+            let slope = velocity + response * displacement
+            return (
+                target + (displacement + slope * step) * decay,
+                (velocity - response * slope * step) * decay
+            )
+        }
+        let x = axis(position.width, velocity.width, target.width)
+        let y = axis(position.height, velocity.height, target.height)
+        return (CGSize(width: x.0, height: y.0), CGSize(width: x.1, height: y.1))
+    }
+
+    /// How far a page host travels. `discrete` is an arrow, key, or dot.
+    /// A finger drag stays on `pageDragSlideFraction`, so a full-width pull
+    /// still docks the incoming page and the turn threshold is unchanged.
+    /// A width that cannot be measured travels nowhere.
+    public static func pageSlideDistance(pageWidth: CGFloat, discrete: Bool) -> CGFloat {
+        guard pageWidth.isFinite else { return 0 }
+        let width = max(pageWidth, 0)
+        let fraction = discrete ? discretePageSlideFraction : pageDragSlideFraction
+        return width * fraction
+    }
+
+    /// Offsets while a finger is down. `distance` is the finger travel in
+    /// points, negative when the next page is coming in from the right.
+    /// `direction` is +1 toward the next page. At a full page of travel the
+    /// incoming page sits at 0 and the outgoing page has moved by
+    /// `pageDragSlideFraction`. The rubber band at the ends is the caller's.
+    public static func pageDragFollowOffsets(
+        distance: CGFloat,
+        pageWidth: CGFloat,
+        direction: Int
+    ) -> (activeX: CGFloat, stagingX: CGFloat) {
+        let width = pageWidth.isFinite ? max(pageWidth, 1) : 1
+        let clamped = distance.isFinite ? min(max(distance, -width), width) : 0
+        let follow = clamped * pageDragSlideFraction
+        let travel = pageSlideDistance(pageWidth: width, discrete: false)
+        return (follow, CGFloat(direction) * travel + follow)
+    }
+
+    /// Where a page dot is along the same ease-out as the page slide.
+    /// `elapsed` is measured to the frame about to draw, not to a timer that
+    /// waits a full interval first. That wait lands on the steep part of
+    /// this curve, so the dot jumps. 0 is the old page. 1 is the new page.
+    /// A bad clock stays on the old page. A duration that is not positive
+    /// has already finished once any time has passed.
+    public static func pageDotWeightProgress(elapsed: TimeInterval, duration: TimeInterval) -> CGFloat {
+        guard elapsed.isFinite, duration.isFinite else { return 0 }
+        guard duration > 0 else { return elapsed > 0 ? 1 : 0 }
+        let linear = min(max(elapsed / duration, 0), 1)
+        return pageTurnCurveProgress(CGFloat(linear))
+    }
+
+    /// Clock time 0...1 along the page slide, mapped through `pageTurnCurve*`.
+    /// Ease-out: halfway through the clock, most of the visual change is done.
+    public static func pageTurnCurveProgress(_ time: CGFloat) -> CGFloat {
+        let time = min(max(time, 0), 1)
+        if time == 0 || time == 1 { return time }
+        let parameter = unitBezierParameter(
+            forX: time, x1: pageTurnCurveX1, x2: pageTurnCurveX2
+        )
+        return unitBezierComponent(parameter, c1: pageTurnCurveY1, c2: pageTurnCurveY2)
+    }
+
+    private static func unitBezierComponent(_ t: CGFloat, c1: CGFloat, c2: CGFloat) -> CGFloat {
+        let oneMinus = 1 - t
+        return 3 * oneMinus * oneMinus * t * c1
+            + 3 * oneMinus * t * t * c2
+            + t * t * t
+    }
+
+    private static func unitBezierDerivative(_ t: CGFloat, c1: CGFloat, c2: CGFloat) -> CGFloat {
+        let oneMinus = 1 - t
+        return 3 * oneMinus * oneMinus * c1
+            + 6 * oneMinus * t * (c2 - c1)
+            + 3 * t * t * (1 - c2)
+    }
+
+    /// Newton, then bisection. The page curve's x controls stay inside (0, 1).
+    private static func unitBezierParameter(forX x: CGFloat, x1: CGFloat, x2: CGFloat) -> CGFloat {
+        var t = x
+        for _ in 0..<8 {
+            let delta = unitBezierComponent(t, c1: x1, c2: x2) - x
+            if abs(delta) < 0.000_01 { return min(max(t, 0), 1) }
+            let slope = unitBezierDerivative(t, c1: x1, c2: x2)
+            if abs(slope) < 0.000_001 { break }
+            t -= delta / slope
+        }
+        var low: CGFloat = 0
+        var high: CGFloat = 1
+        t = min(max(t, 0), 1)
+        for _ in 0..<12 {
+            let estimate = unitBezierComponent(t, c1: x1, c2: x2)
+            if abs(estimate - x) < 0.000_01 { return t }
+            if estimate < x {
+                low = t
+            } else {
+                high = t
+            }
+            t = (low + high) / 2
+        }
+        return t
+    }
+
     /// Open-folder backdrop. Reduced motion keeps this opacity and drops the scale and blur.
     public static let folderBackdropOpenOpacity: CGFloat = 0.45
     public static let folderBackdropOpenScale: CGFloat = 0.96
     /// PRD `motion.fast`: search results appear or the grid returns.
     public static let searchTransitionDuration: TimeInterval = 0.12
+
+    /// Search and the grid trade places. The outgoing surface stays drawn and
+    /// fades out with the incoming one, so the page does not vanish first.
+    /// Reduced motion, a launcher fade, or an open-folder backdrop skip that
+    /// and land immediately. The backdrop keeps its own dim. The outgoing
+    /// surface does not take clicks while it fades: the new page does.
+    public struct SearchChromeFade: Equatable, Sendable {
+        public var incomingOpacity: CGFloat
+        public var outgoingOpacity: CGFloat
+        public var duration: TimeInterval
+        public var keepsOutgoingVisible: Bool
+
+        public init(
+            incomingOpacity: CGFloat,
+            outgoingOpacity: CGFloat,
+            duration: TimeInterval,
+            keepsOutgoingVisible: Bool
+        ) {
+            self.incomingOpacity = incomingOpacity
+            self.outgoingOpacity = outgoingOpacity
+            self.duration = duration
+            self.keepsOutgoingVisible = keepsOutgoingVisible
+        }
+    }
+
+    public static func searchChromeFade(
+        reducesMotion: Bool,
+        holdsForLauncherFade: Bool,
+        incomingIsFolderBackdrop: Bool
+    ) -> SearchChromeFade {
+        let incoming = incomingIsFolderBackdrop ? folderBackdropOpenOpacity : 1
+        let crossfade = !reducesMotion && !holdsForLauncherFade && !incomingIsFolderBackdrop
+        return SearchChromeFade(
+            incomingOpacity: incoming,
+            outgoingOpacity: crossfade ? 0 : 1,
+            duration: crossfade ? searchTransitionDuration : 0,
+            keepsOutgoingVisible: crossfade
+        )
+    }
+
+    public static func searchChromeOutgoingAcceptsClicks(fadingOut: Bool) -> Bool {
+        !fadingOut
+    }
     public static let searchFieldWidth: CGFloat = 400
     public static let searchFieldHeight: CGFloat = 42
     public static let searchFieldCornerRadius: CGFloat = 21
@@ -211,6 +395,29 @@ public enum LauncherLayout {
         return currentEntries[previous].id
     }
 
+    /// Apps that should fly out of an open folder when it breaks apart.
+    /// Only members that landed on the grid. The icon still on the pointer
+    /// is excluded: its drag image is already moving. Order follows the
+    /// folder. A member that did not become a top-level app stays out.
+    public static func appsScatteredFromDissolvedFolder(
+        memberIDs: [UUID],
+        draggedItemID: UUID?,
+        currentEntries: [LauncherEntry]
+    ) -> [UUID] {
+        let topLevel = Set(currentEntries.compactMap { entry -> UUID? in
+            if case .app(let id) = entry { return id }
+            return nil
+        })
+        var seen = Set<UUID>()
+        var scattered: [UUID] = []
+        for id in memberIDs {
+            guard seen.insert(id).inserted else { continue }
+            guard id != draggedItemID, topLevel.contains(id) else { continue }
+            scattered.append(id)
+        }
+        return scattered
+    }
+
     private static func topLevelLandingID(_ drop: LayoutDrop, in state: LayoutState) -> UUID? {
         switch drop.destination {
         case .folderIndex:
@@ -279,6 +486,28 @@ public enum LauncherLayout {
         let heightLimited = itemSize.height - 40
         let preferred = min(84, max(60, floor(min(widthLimited, heightLimited))))
         return max(1, min(preferred, floor(heightLimited), floor(itemSize.width)))
+    }
+
+    /// How far the icon sits above the cell's center, in y-up points. The
+    /// tile's centerY constraint uses the negation: AppKit applies a vertical
+    /// constant from the top, so a constant of -14 lands the icon 14 points
+    /// above center. The title sits under that icon.
+    public static let iconCenterLift: CGFloat = 14
+
+    /// The icon's place in a grid cell when the live tile cannot be measured.
+    /// Same size and the same lift as the tile. Horizontally centered.
+    public static func iconFrame(in cell: CGRect) -> CGRect {
+        guard cell.width >= 1, cell.height >= 1,
+              cell.origin.x.isFinite, cell.origin.y.isFinite,
+              cell.size.width.isFinite, cell.size.height.isFinite else { return .zero }
+        let iconSize = iconPointSize(in: cell.size)
+        guard iconSize >= 1 else { return .zero }
+        return CGRect(
+            x: cell.midX - iconSize / 2,
+            y: cell.midY + iconCenterLift - iconSize / 2,
+            width: iconSize,
+            height: iconSize
+        )
     }
 
     public static func folderDisplayColumns(forItemCount count: Int) -> Int {
@@ -358,6 +587,171 @@ public enum LauncherLayout {
         currentGeneration: Int
     ) -> Bool {
         hidesAfterLaunch && launchGeneration == currentGeneration
+    }
+
+    /// Launchpad releases launcher chrome before asking Launch Services to open.
+    /// Keeping `.hideDock` / `.hideMenuBar` across an async open wait blocked
+    /// some Electron apps (for example Devin). When the preference is on,
+    /// release those options on the click stack before the Finder-style open.
+    public static func shouldReleasePresentationBeforeOpen(hidesAfterLaunch: Bool) -> Bool {
+        hidesAfterLaunch
+    }
+
+    /// After a Finder-style open, clear「正在启动…」immediately. The dismiss fade
+    /// must not gate that reload — otherwise the label sticks under the fade.
+    public static func shouldForceReloadLaunchHighlightAfterImmediateOpen(
+        isDismissing: Bool
+    ) -> Bool {
+        _ = isDismissing
+        return true
+    }
+
+    /// preview.74–75: `collectionView.reloadItems` inside `setLaunchPending`
+    /// before `/usr/bin/open` raised a swallowed ObjC inconsistency exception
+    /// (Devin never reached "Launch open begin"). Highlight is restored via
+    /// in-place tile updates; do **not** skip the feedback entirely.
+    public static func shouldSkipLaunchPendingHighlightBeforeOpen() -> Bool {
+        false
+    }
+
+    /// Launch pending UI must update visible tiles in place. Never call
+    /// `NSCollectionView.reloadItems` / `reloadData` on the click stack before
+    /// open — that path is what aborted Devin under preview.74.
+    public static func shouldApplyLaunchPendingHighlightInPlaceOnly() -> Bool {
+        true
+    }
+
+    /// What `Contents/Info.plist` says about a Mac bundle's executable.
+    /// Gathered without `Bundle` or `NSWorkspace` — those entry points on the
+    /// click stack can raise an ObjC exception that aborts the open (Devin).
+    public enum OpenBundleExecutable: Equatable, Sendable {
+        /// The file `/usr/bin/open` stops on. The plist string is used as-is:
+        /// `open` does not trim it, so a name of spaces can be a real file.
+        /// Symlinks are followed. A non-empty regular file with the execute
+        /// bit is not format-checked: a script can be accepted by `open`,
+        /// and sniffing Mach-O would reject it.
+        public enum NamedFile: Equatable, Sendable {
+            /// Nothing at the path, including a dangling symlink.
+            case missing
+            /// A directory, or a symlink to a directory.
+            case directory
+            /// A non-directory file the current user cannot execute.
+            case notExecutable
+            /// A fifo, socket, device, or other non-regular file. `open` can
+            /// block on a fifo instead of exiting.
+            case notRegularFile
+            /// A regular file of size 0. Not a script; `open` reports an
+            /// incorrect executable format.
+            case emptyFile
+            /// A non-empty regular file with the execute bit.
+            case executableFile
+        }
+
+        /// No `Contents/Info.plist` node, including a dangling symlink.
+        /// Not judged here. A node that exists but is not a property list
+        /// is not this case: `open` uses the bundle filename instead.
+        /// A missing node whose bundle-name file is a fifo is
+        /// `.named(.notRegularFile)`, not this case.
+        case notMacInfoPlist
+        /// Bundle-filename lookup found nothing `open` will launch. The
+        /// filename drops only the last extension (`Foo.bar.app` → `Foo.bar`).
+        /// That happens when `CFBundleExecutable` is missing, `""`, or not a
+        /// string — except a missing key whose `NSExecutable` is a non-empty
+        /// string, which is a real filename instead of this fallback — and
+        /// when a plist node exists but is not a property list. A
+        /// whitespace-only string is a filename, not this case. A fifo
+        /// bundle-name file is `.named(.notRegularFile)`, not this case.
+        case absent
+        /// The first existing file for a relative name, inside the bundle.
+        /// `open` checks `Contents/MacOS`, then `Contents`, then the bundle
+        /// root, and stops at the first path that exists.
+        case named(NamedFile)
+        /// The name is absolute. The file exists. `open` still reports an
+        /// incorrect executable format, including when the path is this
+        /// bundle's own binary.
+        case absolute
+        /// The first existing file is lexically outside the bundle. `open`
+        /// reports an incorrect executable format even if that file can run.
+        case outsideBundle
+    }
+
+    /// A Mac bundle whose Info.plist already shows `/usr/bin/open` cannot run
+    /// it fails before spawn, so the click toasts「无法打开」without hiding.
+    /// Relative names (including `./Tool`, `Sub/Tool`, and `../Resources/Tool`)
+    /// are resolved under `Contents/MacOS`, then `Contents`, then the bundle
+    /// root. The first path that exists wins, so a directory, a non-executable
+    /// file, a zero-byte file, or a fifo there fails even when a later
+    /// directory has a good binary. A fifo must not reach `open`: it does not
+    /// return, and Launch Services stays stuck in `open()`. An absolute name,
+    /// or a relative name whose first existing file sits outside the bundle,
+    /// fails the same way. A missing `CFBundleExecutable` uses `NSExecutable`
+    /// when that value is a non-empty string; `""` and non-strings use the
+    /// bundle filename and do not consult `NSExecutable`. A plist node that
+    /// exists but is not a property list uses that same bundle filename; if
+    /// the file cannot run, the click fails before spawn. No plist node
+    /// still goes to `/usr/bin/open`, except when that bundle filename is a
+    /// fifo or other non-regular file: `open` then blocks in Launch Services.
+    public static func shouldRejectOpenBeforeSpawn(executable: OpenBundleExecutable) -> Bool {
+        switch executable {
+        case .notMacInfoPlist, .named(.executableFile):
+            return false
+        case .absent, .absolute, .outsideBundle,
+             .named(.missing), .named(.directory), .named(.notExecutable),
+             .named(.notRegularFile), .named(.emptyFile):
+            return true
+        }
+    }
+
+    /// `/usr/bin/open` is spawned without waiting on the click stack. A later
+    /// non-zero exit means Launch Services rejected the request after spawn.
+    public static func shouldReportOpenProcessFailure(terminationStatus: Int32) -> Bool {
+        terminationStatus != 0
+    }
+
+    /// A late `open` exit belongs to the click that spawned it. A newer click
+    /// on the same app replaces that attempt. Applying the old non-zero exit
+    /// would toast「无法打开」after the later request had already taken over.
+    /// Status 0 is success and never applies. Attempt numbers start at 1.
+    public static func shouldApplyDelayedOpenFailure(
+        finishedAttempt: Int,
+        latestAttempt: Int,
+        terminationStatus: Int32
+    ) -> Bool {
+        shouldReportOpenProcessFailure(terminationStatus: terminationStatus)
+            && finishedAttempt > 0
+            && finishedAttempt == latestAttempt
+    }
+
+    /// Spawn returns before `/usr/bin/open` exits, and a hide for that click
+    /// may already be in progress. Bring the launcher back only for the
+    /// failure that still belongs to that click. A newer click, a successful
+    /// exit, or a `show()` since the hide (generation bump) leaves the
+    /// launcher where the user put it.
+    public static func shouldReshowLauncherAfterDelayedOpenFailure(
+        hidForThisLaunch: Bool,
+        launchDismissGeneration: Int,
+        currentDismissGeneration: Int,
+        finishedAttempt: Int,
+        latestAttempt: Int,
+        terminationStatus: Int32
+    ) -> Bool {
+        hidForThisLaunch
+            && launchDismissGeneration == currentDismissGeneration
+            && shouldApplyDelayedOpenFailure(
+                finishedAttempt: finishedAttempt,
+                latestAttempt: latestAttempt,
+                terminationStatus: terminationStatus
+            )
+    }
+
+    /// Surface that late failure in the UI only while the launcher can still
+    /// show a toast. A hide already in progress (or ordered out) relies on the
+    /// deferred-toast path inside showToast instead.
+    public static func shouldSurfaceDelayedOpenFailureWhileLauncherVisible(
+        isDismissing: Bool,
+        isVisible: Bool
+    ) -> Bool {
+        !isDismissing && isVisible
     }
 
     /// `show()` while the fade is still up must leave the first responder
@@ -666,6 +1060,17 @@ public enum LauncherLayout {
         }
     }
 
+    /// The scrim, the grid's brightness, and the backdrop blur on a close that
+    /// shrinks into the icon. The panel stays readable, then dissolves. Those
+    /// layers used to lift on the travel curve, so the grid was already bright
+    /// and sharp while the panel was still solid. They now use the panel's
+    /// late dissolve (`wholeCellMergeFlightOpacity`). Scale stays on the
+    /// travel curve, so the icons grow back while the folder is still veiling
+    /// them. An open, reduced motion, and a centered pop keep one curve.
+    public static func folderCloseVeilUsesLateDissolve(tracksIcon: Bool, closing: Bool) -> Bool {
+        tracksIcon && closing
+    }
+
     public static func folderBackdropStyle(open: Bool, reducesMotion: Bool) -> FolderBackdropStyle {
         guard open else {
             return FolderBackdropStyle(opacity: 1, scale: 1, blurs: false)
@@ -675,6 +1080,992 @@ public enum LauncherLayout {
             scale: reducesMotion ? 1 : folderBackdropOpenScale,
             blurs: !reducesMotion
         )
+    }
+
+    /// How the grid behind a folder scales. The layer anchor is the view
+    /// origin, and the transform is `scale * point + shift`. A shift measured
+    /// from the window center leaves a folder in the middle sliding toward
+    /// that corner. The shift is the focus itself times `(1 - scale)`, so the
+    /// icon stays put. Close travels back along the same shift. `focus` is in
+    /// `bounds`. A missing focus, reduced motion, or a closed folder does not
+    /// shift. A focus outside the bounds is clamped to the edge.
+    public struct FolderBackdropRecede: Equatable, Sendable {
+        public var scale: CGFloat
+        public var translationX: CGFloat
+        public var translationY: CGFloat
+
+        public init(scale: CGFloat, translationX: CGFloat, translationY: CGFloat) {
+            self.scale = scale
+            self.translationX = translationX
+            self.translationY = translationY
+        }
+    }
+
+    public static func folderBackdropRecede(
+        open: Bool,
+        reducesMotion: Bool,
+        bounds: CGRect,
+        focus: CGPoint?
+    ) -> FolderBackdropRecede {
+        let style = folderBackdropStyle(open: open, reducesMotion: reducesMotion)
+        guard !reducesMotion,
+              style.scale != 1,
+              let focus,
+              usableChromeFrame(bounds),
+              focus.x.isFinite, focus.y.isFinite else {
+            return FolderBackdropRecede(scale: style.scale, translationX: 0, translationY: 0)
+        }
+        let clamped = CGPoint(
+            x: min(max(focus.x, bounds.minX), bounds.maxX),
+            y: min(max(focus.y, bounds.minY), bounds.maxY)
+        )
+        let shift = 1 - style.scale
+        return FolderBackdropRecede(
+            scale: style.scale,
+            translationX: clamped.x * shift,
+            translationY: clamped.y * shift
+        )
+    }
+
+    /// Collapsed pose of the folder panel. Open starts here and close ends
+    /// here, so the panel leaves and returns along the same path. When the
+    /// folder preview is on screen, that pose sits on the preview: scale
+    /// around the panel center, then translate so the scaled center lands on
+    /// the preview. The length matches the merge flight (0.34s). Reduced
+    /// motion is a short fade with no transform. A missing or unusable
+    /// preview keeps the old centered 0.92 pop so a folder we cannot see
+    /// does not fly in from nowhere.
+    public struct FolderChromeCollapse: Equatable, Sendable {
+        public var scale: CGFloat
+        public var translationX: CGFloat
+        public var translationY: CGFloat
+        public var animatesTransform: Bool
+        /// Panel opacity at the start of an open. 1 keeps the panel visible
+        /// while it travels out of the icon. The dimmer still fades. Close
+        /// always fades the panel to 0 so hiding it does not pop.
+        public var panelOpacity: CGFloat
+        public var duration: TimeInterval
+        public var tracksIcon: Bool
+        /// Corner radius on the panel layer at the collapsed pose. The layer
+        /// scales with the panel, so this is larger than the plate's radius.
+        /// After the scale it matches the plate. A pose that does not sit on
+        /// the plate keeps `folderPanelCornerRadius`.
+        public var collapsedCornerRadius: CGFloat
+
+        public init(
+            scale: CGFloat,
+            translationX: CGFloat,
+            translationY: CGFloat,
+            animatesTransform: Bool,
+            panelOpacity: CGFloat,
+            duration: TimeInterval,
+            tracksIcon: Bool,
+            collapsedCornerRadius: CGFloat
+        ) {
+            self.scale = scale
+            self.translationX = translationX
+            self.translationY = translationY
+            self.animatesTransform = animatesTransform
+            self.panelOpacity = panelOpacity
+            self.duration = duration
+            self.tracksIcon = tracksIcon
+            self.collapsedCornerRadius = collapsedCornerRadius
+        }
+    }
+
+    /// Full-size folder panel. The preview plate is rounder for its size.
+    /// `folderPreviewPlateCornerFraction` is the plate's radius over its side,
+    /// the same fraction the tile fills.
+    public static let folderPanelCornerRadius: CGFloat = 22
+    public static let folderPreviewPlateCornerFraction: CGFloat = 0.24
+
+    public static let folderChromeTravelDuration: TimeInterval = 0.34
+    /// Cubic control points of a tracked open and of the grid recede.
+    /// Leave quickly, then settle. A reversed close fades the plate back out
+    /// on this same curve, so it stays complementary with the panel.
+    public static let folderChromeTravelX1: CGFloat = 0.22
+    public static let folderChromeTravelY1: CGFloat = 0.7
+    public static let folderChromeTravelX2: CGFloat = 0.3
+    public static let folderChromeTravelY2: CGFloat = 1
+    public static let folderChromeFallbackDuration: TimeInterval = 0.22
+    public static let folderChromeReducedDuration: TimeInterval = 0.12
+    public static let folderChromeFallbackScale: CGFloat = 0.92
+    public static let folderChromeMinimumScale: CGFloat = 0.12
+    public static let folderChromeMaximumScale: CGFloat = 0.86
+
+    public static func folderChromeCollapse(
+        panelFrame: CGRect,
+        iconFrame: CGRect?,
+        reducesMotion: Bool
+    ) -> FolderChromeCollapse {
+        if reducesMotion {
+            return FolderChromeCollapse(
+                scale: 1,
+                translationX: 0,
+                translationY: 0,
+                animatesTransform: false,
+                panelOpacity: 0,
+                duration: folderChromeReducedDuration,
+                tracksIcon: false,
+                collapsedCornerRadius: folderPanelCornerRadius
+            )
+        }
+        let fallback = FolderChromeCollapse(
+            scale: folderChromeFallbackScale,
+            translationX: 0,
+            translationY: 0,
+            animatesTransform: true,
+            panelOpacity: 0,
+            duration: folderChromeFallbackDuration,
+            tracksIcon: false,
+            collapsedCornerRadius: folderPanelCornerRadius
+        )
+        guard let iconFrame, usableChromeFrame(panelFrame), usableChromeFrame(iconFrame) else {
+            return fallback
+        }
+        let raw = min(iconFrame.width / panelFrame.width, iconFrame.height / panelFrame.height)
+        let scale = min(max(raw, folderChromeMinimumScale), folderChromeMaximumScale)
+        let iconSide = min(iconFrame.width, iconFrame.height)
+        return FolderChromeCollapse(
+            scale: scale,
+            translationX: iconFrame.midX - panelFrame.midX,
+            translationY: iconFrame.midY - panelFrame.midY,
+            animatesTransform: true,
+            panelOpacity: 1,
+            duration: folderChromeTravelDuration,
+            tracksIcon: true,
+            collapsedCornerRadius: folderPanelCollapsedCornerRadius(
+                scale: scale,
+                iconSide: iconSide,
+                tracksIcon: true
+            )
+        )
+    }
+
+    /// Layer corner radius at the collapsed pose. Dividing the plate radius
+    /// by the scale puts the scaled corner on the plate. A full-size panel,
+    /// a bad scale, or a pose that does not track the icon stays at 22.
+    public static func folderPanelCollapsedCornerRadius(
+        scale: CGFloat,
+        iconSide: CGFloat,
+        tracksIcon: Bool
+    ) -> CGFloat {
+        guard tracksIcon,
+              scale.isFinite, scale > 0, scale < 1,
+              iconSide.isFinite, iconSide >= 1 else {
+            return folderPanelCornerRadius
+        }
+        let expanded = iconSide * folderPreviewPlateCornerFraction / scale
+        guard expanded.isFinite, expanded > 0 else { return folderPanelCornerRadius }
+        return expanded
+    }
+
+    /// The preview plate relative to the panel that grows out of it.
+    /// `resting` draws the plate solid. `borrowed` is the open flight and the
+    /// time the folder stays open. `returning` is the close flight: the plate
+    /// is drawn at `folderPreviewPlateReturnOpacity` until the close lands.
+    /// `yielding` is that close reversed: the plate fades back out on
+    /// `folderChromeTravelProgress` while the panel fades back in.
+    public enum FolderPreviewPlatePhase: Equatable, Sendable {
+        case resting
+        case borrowed
+        case returning
+        case yielding
+    }
+
+    /// The open panel is that same rounded plate, grown up. Drawing the small
+    /// one under the flight stacks two copies. Hide it while the folder is
+    /// opening and while it stays open. The close draws it again, on the
+    /// opacity the panel is giving up, so the panel dissolves into the plate.
+    /// A reversed close keeps drawing it while it fades back out (`yielding`).
+    /// Reduced motion and a centered pop never leave the plate, so they keep
+    /// drawing it solid. An immediate close has already landed (`resting`).
+    public static func shouldHideFolderPreviewPlate(
+        tracksIcon: Bool,
+        phase: FolderPreviewPlatePhase
+    ) -> Bool {
+        tracksIcon && phase == .borrowed
+    }
+
+    /// Clock time 0...1 along a tracked open, mapped through
+    /// `folderChromeTravel*`. Ease-out: halfway through the clock, most of
+    /// the visual change is done. A non-finite clock stays at the start.
+    public static func folderChromeTravelProgress(at time: CGFloat) -> CGFloat {
+        guard time.isFinite else { return 0 }
+        let time = min(max(time, 0), 1)
+        if time == 0 || time == 1 { return time }
+        let parameter = unitBezierParameter(
+            forX: time, x1: folderChromeTravelX1, x2: folderChromeTravelX2
+        )
+        return unitBezierComponent(parameter, c1: folderChromeTravelY1, c2: folderChromeTravelY2)
+    }
+
+    /// Linear clock 0...1 for the preview plate, measured to the frame about
+    /// to draw. A timer that waits a full interval first lands on the steep
+    /// part of a reversed close, so the plate jumps while the panel has
+    /// already moved. 0 is the opacity the fade started from. 1 has arrived.
+    /// A bad clock stays at the start. A duration that is not positive has
+    /// already finished once any time has passed.
+    public static func previewPlateFadeTime(elapsed: TimeInterval, duration: TimeInterval) -> CGFloat {
+        guard elapsed.isFinite, duration.isFinite else { return 0 }
+        guard duration > 0 else { return elapsed > 0 ? 1 : 0 }
+        return CGFloat(min(max(elapsed / duration, 0), 1))
+    }
+
+    /// Opacity of the preview plate while the panel shrinks back onto it.
+    /// The panel fades on `wholeCellMergeFlightOpacity` and stays readable
+    /// until it is sitting on the icon. The plate takes the opacity the panel
+    /// gives up, so the two meet instead of the plate popping on after the
+    /// panel is already gone. Clock time is 0...1 over `folderChromeTravelDuration`.
+    /// 0 draws nothing. 1 is the resting plate. A non-finite clock stays hidden.
+    /// Reduced motion and a close that does not track the icon do not use this.
+    public static func folderPreviewPlateReturnOpacity(at time: CGFloat) -> CGFloat {
+        guard time.isFinite else { return 0 }
+        return 1 - wholeCellMergeFlightOpacity(at: time)
+    }
+
+    /// Same dissolve, starting from the opacity already on screen. A fresh
+    /// close passes 0, because the plate was hidden. A close that interrupts
+    /// a reversed open passes the opacity still drawn, so the plate does not
+    /// snap off and fade back up. 1 is the resting plate. A non-finite start
+    /// or clock stays hidden.
+    public static func folderPreviewPlateReturnOpacity(from start: CGFloat, at time: CGFloat) -> CGFloat {
+        guard start.isFinite, time.isFinite else { return 0 }
+        let origin = min(max(start, 0), 1)
+        return origin + (1 - origin) * folderPreviewPlateReturnOpacity(at: time)
+    }
+
+    /// Opacity while a close is reversed into an open. `start` is the plate
+    /// already on screen. The panel fades back up on `folderChromeTravelProgress`,
+    /// and the plate gives that same progress back, so the two stay
+    /// complementary when they began that way. Clock time is 0...1 over the
+    /// open duration. 0 hides the plate. A non-finite start or clock stays hidden.
+    /// Reduced motion does not yield: that path draws the plate solid.
+    public static func folderPreviewPlateYieldOpacity(from start: CGFloat, at time: CGFloat) -> CGFloat {
+        guard start.isFinite, time.isFinite else { return 0 }
+        let origin = min(max(start, 0), 1)
+        return origin * (1 - folderChromeTravelProgress(at: time))
+    }
+
+    /// Shift stored after an origin-anchored scale, so the panel center lands
+    /// on `center + translation`. AppKit pins the layer on the view origin.
+    /// A bare scale would shrink toward that corner. `(1 - scale)` times the
+    /// bounds center keeps the center put, and `translation` then carries it
+    /// onto the folder icon. The layer matrix has to store this shift itself
+    /// (`scale * point + shift`). Multiplying the shift by the scale misses
+    /// the icon. A bad scale or panel size does not shift.
+    public static func folderPanelCollapseShift(
+        scale: CGFloat,
+        translationX: CGFloat,
+        translationY: CGFloat,
+        panelBounds: CGRect
+    ) -> CGPoint {
+        guard scale.isFinite, scale > 0,
+              translationX.isFinite, translationY.isFinite,
+              usableChromeFrame(panelBounds) else { return .zero }
+        return CGPoint(
+            x: translationX + (1 - scale) * panelBounds.midX,
+            y: translationY + (1 - scale) * panelBounds.midY
+        )
+    }
+
+    private static func usableChromeFrame(_ frame: CGRect) -> Bool {
+        guard frame.width >= 1, frame.height >= 1 else { return false }
+        return [frame.origin.x, frame.origin.y, frame.width, frame.height].allSatisfy(\.isFinite)
+    }
+
+    /// Where one leftover icon flies when a folder breaks apart. The source
+    /// is its icon inside the open folder. The destination is its icon on
+    /// the grid. The length matches the merge flight.
+    public struct FolderDissolveIconPlacement: Equatable, Sendable {
+        public var itemID: UUID
+        public var source: CGRect
+        public var destination: CGRect
+
+        public init(itemID: UUID, source: CGRect, destination: CGRect) {
+            self.itemID = itemID
+            self.source = source
+            self.destination = destination
+        }
+    }
+
+    public struct FolderDissolveFlight: Equatable, Sendable {
+        public var itemID: UUID
+        public var source: CGRect
+        public var destination: CGRect
+        public var duration: TimeInterval
+
+        public init(itemID: UUID, source: CGRect, destination: CGRect, duration: TimeInterval) {
+            self.itemID = itemID
+            self.source = source
+            self.destination = destination
+            self.duration = duration
+        }
+    }
+
+    public static let folderDissolveFlightDuration: TimeInterval = folderChromeTravelDuration
+
+    /// Fly leftover icons from the open folder back onto the grid. Reduced
+    /// motion does not travel. An unusable frame, a repeated id, or a hop
+    /// shorter than a point stays put, so an icon that is already home does
+    /// not flicker. Icons start together; a stagger would break the one gesture.
+    public static func folderDissolveFlights(
+        placements: [FolderDissolveIconPlacement],
+        reducesMotion: Bool
+    ) -> [FolderDissolveFlight] {
+        guard !reducesMotion else { return [] }
+        var seen = Set<UUID>()
+        var flights: [FolderDissolveFlight] = []
+        for placement in placements {
+            guard seen.insert(placement.itemID).inserted else { continue }
+            guard usableChromeFrame(placement.source), usableChromeFrame(placement.destination) else { continue }
+            guard !framesNearlyEqual(placement.source, placement.destination) else { continue }
+            flights.append(FolderDissolveFlight(
+                itemID: placement.itemID,
+                source: placement.source,
+                destination: placement.destination,
+                duration: folderDissolveFlightDuration
+            ))
+        }
+        return flights
+    }
+
+    /// The folder is gone, so the panel cannot shrink back into a preview.
+    /// It fades and settles by the same amount the grid was scaled, while
+    /// the leftover icon flies to its cell. Same length as that flight.
+    /// Reduced motion is the short fade with no scale.
+    public static func folderDissolveChrome(reducesMotion: Bool) -> FolderChromeCollapse {
+        if reducesMotion {
+            return FolderChromeCollapse(
+                scale: 1,
+                translationX: 0,
+                translationY: 0,
+                animatesTransform: false,
+                panelOpacity: 0,
+                duration: folderChromeReducedDuration,
+                tracksIcon: false,
+                collapsedCornerRadius: folderPanelCornerRadius
+            )
+        }
+        return FolderChromeCollapse(
+            scale: folderBackdropOpenScale,
+            translationX: 0,
+            translationY: 0,
+            animatesTransform: true,
+            panelOpacity: 0,
+            duration: folderDissolveFlightDuration,
+            tracksIcon: false,
+            collapsedCornerRadius: folderPanelCornerRadius
+        )
+    }
+
+    /// A dissolve flight only while the launcher is up and motion is allowed.
+    /// The launcher fade must not grow a new flight underneath it. A hidden
+    /// window shows the grid already in place.
+    public static func shouldPlayFolderDissolveScatter(
+        reducesMotion: Bool,
+        isDismissing: Bool,
+        isVisible: Bool
+    ) -> Bool {
+        !reducesMotion && isVisible && !isDismissing
+    }
+
+    /// A flight completion is already on the main thread. Hopping to the next
+    /// turn leaves the flying picture sitting on the cell. Commit on this turn.
+    /// A callback that is not on the main thread still has to hop.
+    public static func flightLandingCommitsOnThisTurn(isMainThread: Bool) -> Bool {
+        isMainThread
+    }
+
+    private static func framesNearlyEqual(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
+        abs(lhs.minX - rhs.minX) < 0.5
+            && abs(lhs.minY - rhs.minY) < 0.5
+            && abs(lhs.width - rhs.width) < 0.5
+            && abs(lhs.height - rhs.height) < 0.5
+    }
+
+    /// Mini icons inside a folder preview. The tile draws this same 3×3, so a
+    /// flight can leave the pixels that are already on screen. At most nine,
+    /// row-major, top row first. `well` is the rounded plate. A plate that
+    /// cannot hold a 1pt glyph draws none.
+    public static let folderPreviewGlyphColumns = 3
+    public static let folderPreviewGlyphCapacity = 9
+    public static let folderPreviewGlyphInset: CGFloat = 5
+    public static let folderPreviewGlyphGap: CGFloat = 2
+
+    public static func folderPreviewGlyphFrames(well: CGRect, count: Int) -> [CGRect] {
+        guard count > 0, usableChromeFrame(well) else { return [] }
+        let tile = floor((well.width - folderPreviewGlyphInset * 2 - folderPreviewGlyphGap * 2) / CGFloat(folderPreviewGlyphColumns))
+        guard tile >= 1 else { return [] }
+        let shown = min(count, folderPreviewGlyphCapacity)
+        var frames: [CGRect] = []
+        frames.reserveCapacity(shown)
+        let stride = tile + folderPreviewGlyphGap
+        for index in 0..<shown {
+            let column = index % folderPreviewGlyphColumns
+            let row = index / folderPreviewGlyphColumns
+            frames.append(CGRect(
+                x: well.minX + folderPreviewGlyphInset + CGFloat(column) * stride,
+                y: well.maxY - folderPreviewGlyphInset - tile - CGFloat(row) * stride,
+                width: tile,
+                height: tile
+            ))
+        }
+        return frames
+    }
+
+    /// One mini icon flying from the preview plate into its cell in the open
+    /// folder. The length matches the panel growing out of that plate.
+    public struct FolderPreviewGlyphPlacement: Equatable, Sendable {
+        public var itemID: UUID
+        public var source: CGRect
+        public var destination: CGRect
+
+        public init(itemID: UUID, source: CGRect, destination: CGRect) {
+            self.itemID = itemID
+            self.source = source
+            self.destination = destination
+        }
+    }
+
+    public struct FolderPreviewGlyphFlight: Equatable, Sendable {
+        public var itemID: UUID
+        public var source: CGRect
+        public var destination: CGRect
+        public var duration: TimeInterval
+
+        public init(itemID: UUID, source: CGRect, destination: CGRect, duration: TimeInterval) {
+            self.itemID = itemID
+            self.source = source
+            self.destination = destination
+            self.duration = duration
+        }
+    }
+
+    public static let folderPreviewGlyphFlightDuration: TimeInterval = folderChromeTravelDuration
+
+    /// Fly the preview glyphs into the open folder. Reduced motion does not
+    /// travel. An unusable frame, a repeated id, or a hop shorter than a
+    /// point stays put. Icons start together; a stagger would break the one gesture.
+    public static func folderPreviewGlyphFlights(
+        placements: [FolderPreviewGlyphPlacement],
+        reducesMotion: Bool
+    ) -> [FolderPreviewGlyphFlight] {
+        guard !reducesMotion else { return [] }
+        var seen = Set<UUID>()
+        var flights: [FolderPreviewGlyphFlight] = []
+        for placement in placements {
+            guard seen.insert(placement.itemID).inserted else { continue }
+            guard usableChromeFrame(placement.source), usableChromeFrame(placement.destination) else { continue }
+            guard !framesNearlyEqual(placement.source, placement.destination) else { continue }
+            flights.append(FolderPreviewGlyphFlight(
+                itemID: placement.itemID,
+                source: placement.source,
+                destination: placement.destination,
+                duration: folderPreviewGlyphFlightDuration
+            ))
+        }
+        return flights
+    }
+
+    /// Glyphs fly only when the panel itself is growing out of the preview.
+    /// A centered pop has no plate to leave. The launcher fade must not grow
+    /// a new flight underneath it.
+    public static func shouldPlayFolderPreviewGlyphFlight(
+        reducesMotion: Bool,
+        isDismissing: Bool,
+        isVisible: Bool,
+        tracksIcon: Bool
+    ) -> Bool {
+        tracksIcon && !reducesMotion && isVisible && !isDismissing
+    }
+
+    /// Fly the open folder's icons back onto the preview plate. `source` is
+    /// the cell, `destination` is the glyph. Same clock and the same skips as
+    /// the flight in, so the two trips are one path. Reduced motion, a bad
+    /// frame, a repeated id, or a hop under a point stays in the panel.
+    public static func folderPreviewGlyphReturnFlights(
+        placements: [FolderPreviewGlyphPlacement],
+        reducesMotion: Bool
+    ) -> [FolderPreviewGlyphFlight] {
+        folderPreviewGlyphFlights(placements: placements, reducesMotion: reducesMotion)
+    }
+
+    /// Return only when the panel is shrinking back into the preview. A
+    /// centered pop, a dissolve, and a launcher fade have no plate to land on.
+    /// Same gate as the flight in: a plate you can leave is a plate you can
+    /// come back to.
+    public static func shouldPlayFolderPreviewGlyphReturn(
+        reducesMotion: Bool,
+        isDismissing: Bool,
+        isVisible: Bool,
+        tracksIcon: Bool
+    ) -> Bool {
+        shouldPlayFolderPreviewGlyphFlight(
+            reducesMotion: reducesMotion,
+            isDismissing: isDismissing,
+            isVisible: isVisible,
+            tracksIcon: tracksIcon
+        )
+    }
+
+    /// An icon past the nine preview slots has nowhere on the plate to land.
+    /// Closing sinks it into the center. That fade is the whole-cell dissolve
+    /// (`wholeCellMergeFlightOpacity`), so it stays readable until it arrives.
+    /// Opening brings the same icon back out, and that fade shares the flight
+    /// ease so the icon is visible while it travels to its cell.
+    public static func folderOverflowIconFadeSharesFlightEase(returningToPlate: Bool) -> Bool {
+        !returningToPlate
+    }
+
+    /// An icon past the nine preview slots has no glyph to fly in with.
+    /// It used to stay hidden for the whole open, then pop on at the end.
+    /// It now fades in on the whole-cell dissolve, so it is still hidden
+    /// halfway through the open and appears as the folder settles. 0 is
+    /// hidden. A close does not use this fade.
+    public static func folderOverflowIconRevealOpacity(at time: CGFloat) -> CGFloat {
+        1 - wholeCellMergeFlightOpacity(at: time)
+    }
+
+    /// Only the opening flight fades those icons in. Closing leaves icons
+    /// that are already in the panel alone. Reversing an open hides the
+    /// ones that had not landed.
+    public static func shouldFadeFolderOverflowIconsIn(opening: Bool) -> Bool {
+        opening
+    }
+
+    /// Two app icons becoming a folder. The icon that was already on the grid
+    /// lands in `destinations[0]`, the one that was dropped in `destinations[1]`.
+    /// Those rects are the preview plate's first two glyphs. The clock matches
+    /// the other folder flights, with no stagger. Reduced motion does not
+    /// travel. Both icons have to move: a short hop, a bad frame, or fewer
+    /// than two slots lands nowhere, and the caller keeps the older flight
+    /// onto the whole cell. Extra slots are ignored. A new folder only has
+    /// these two icons.
+    public struct FolderMergePreviewLanding: Equatable, Sendable {
+        public var source: CGRect
+        public var destination: CGRect
+        public var duration: TimeInterval
+
+        public init(source: CGRect, destination: CGRect, duration: TimeInterval) {
+            self.source = source
+            self.destination = destination
+            self.duration = duration
+        }
+    }
+
+    public static func folderMergePreviewLandings(
+        resident: CGRect,
+        incoming: CGRect,
+        destinations: [CGRect],
+        reducesMotion: Bool
+    ) -> [FolderMergePreviewLanding] {
+        guard !reducesMotion, destinations.count >= 2 else { return [] }
+        let pairs = [(resident, destinations[0]), (incoming, destinations[1])]
+        guard pairs.allSatisfy({ source, destination in
+            usableChromeFrame(source)
+                && usableChromeFrame(destination)
+                && !framesNearlyEqual(source, destination)
+        }) else { return [] }
+        return pairs.map { source, destination in
+            FolderMergePreviewLanding(
+                source: source,
+                destination: destination,
+                duration: folderChromeTravelDuration
+            )
+        }
+    }
+
+    /// A new folder's plate used to jump from hidden to solid on the first
+    /// frame, while the two icons were still full size. It now fades in over
+    /// the early part of the same flight and is solid before the icons land.
+    /// Clock time is 0...1 over `folderChromeTravelDuration`. The ease is the
+    /// icon flight's: quick at first, then settled. Reduced motion does not
+    /// use this path.
+    public static let folderMergePlateRevealFraction: CGFloat = 0.45
+    public static let folderMergePlateRevealX1: CGFloat = 0.22
+    public static let folderMergePlateRevealY1: CGFloat = 0.7
+    public static let folderMergePlateRevealX2: CGFloat = 0.3
+    public static let folderMergePlateRevealY2: CGFloat = 1
+
+    public static func folderMergePlateRevealOpacity(at time: CGFloat) -> CGFloat {
+        let time = min(max(time, 0), 1)
+        if time == 0 { return 0 }
+        let span = folderMergePlateRevealFraction
+        if span <= 0 || time >= span { return 1 }
+        let local = time / span
+        let parameter = unitBezierParameter(
+            forX: local, x1: folderMergePlateRevealX1, x2: folderMergePlateRevealX2
+        )
+        return unitBezierComponent(
+            parameter, c1: folderMergePlateRevealY1, c2: folderMergePlateRevealY2
+        )
+    }
+
+    /// How long the plate fade runs. The rest of the flight keeps it solid.
+    public static func folderMergePlateRevealDuration(flight: TimeInterval) -> TimeInterval {
+        guard flight > 0 else { return 0 }
+        return flight * TimeInterval(folderMergePlateRevealFraction)
+    }
+
+    /// Scale of a new folder's tile at the first frame of the plate fade.
+    /// The tile used to appear at full size and only fade. It now grows to 1
+    /// on that same fade, and is full size before the icons land. Closer than
+    /// a shrink-from-nothing: the visible part of the fade is short.
+    public static let folderMergePlateRevealScaleStart: CGFloat = 0.8
+
+    /// Shift applied after the scale that keeps `iconCenter` fixed while an
+    /// origin-anchored tile grows from `folderMergePlateRevealScaleStart` to 1.
+    /// AppKit pins a view's layer on its origin, so a shift measured from the
+    /// tile center would slide the plate toward that corner. The transform is
+    /// `scale * point + shift`. Positive is up and to the right. A non-finite
+    /// center does not shift.
+    public static func folderMergePlateRevealTranslation(iconCenter: CGPoint) -> CGPoint {
+        originPinnedScaleTranslation(point: iconCenter, scale: folderMergePlateRevealScaleStart)
+    }
+
+    /// Shift that keeps `point` fixed while an origin-anchored layer scales.
+    /// The transform is `scale * point + shift`. A non-finite point, or a
+    /// scale that is not a positive finite number, does not shift.
+    public static func originPinnedScaleTranslation(point: CGPoint, scale: CGFloat) -> CGPoint {
+        guard point.x.isFinite, point.y.isFinite, scale.isFinite, scale > 0 else { return .zero }
+        let factor = 1 - scale
+        return CGPoint(x: point.x * factor, y: point.y * factor)
+    }
+
+    /// One app dropped onto a folder that already exists. The plate already
+    /// shows `glyphsBefore` mini icons. After the drop it shows `glyphsAfter`.
+    /// The new icon is appended, so it occupies the first new slot. Icons
+    /// already on the plate stay put. A plate that does not grow by exactly
+    /// one glyph has no empty slot. Nine is full. The caller sinks that icon
+    /// into the plate's center instead of flying it onto the whole cell.
+    public static func folderIncomingPreviewSlotIndex(glyphsBefore: Int, glyphsAfter: Int) -> Int? {
+        guard glyphsBefore >= 0,
+              glyphsAfter == glyphsBefore + 1,
+              glyphsAfter <= folderPreviewGlyphCapacity else { return nil }
+        return glyphsBefore
+    }
+
+    /// The dropped icon flies into that empty preview slot. The clock matches
+    /// the other folder flights. Reduced motion does not travel. A short hop
+    /// or a bad frame lands nowhere, and the caller keeps the older flight
+    /// onto the whole cell.
+    public static func folderIncomingPreviewLanding(
+        incoming: CGRect,
+        destination: CGRect,
+        reducesMotion: Bool
+    ) -> FolderMergePreviewLanding? {
+        guard !reducesMotion else { return nil }
+        guard usableChromeFrame(incoming),
+              usableChromeFrame(destination),
+              !framesNearlyEqual(incoming, destination) else { return nil }
+        return FolderMergePreviewLanding(
+            source: incoming,
+            destination: destination,
+            duration: folderChromeTravelDuration
+        )
+    }
+
+    /// How far a full plate pulls an incoming icon in from each edge.
+    /// Leaving a little over a quarter of the plate keeps the icon going
+    /// into the middle, not covering the plate or landing on one glyph.
+    public static let folderPreviewPlateCenterInsetFraction: CGFloat = 0.36
+
+    /// The square at the middle of `well` that a full plate sinks an icon
+    /// into. Nil when the plate cannot be measured. The result stays centered
+    /// on the plate, in the same coordinate space.
+    public static func folderPreviewPlateCenterFrame(well: CGRect) -> CGRect? {
+        guard usableChromeFrame(well) else { return nil }
+        let insetX = floor(well.width * folderPreviewPlateCenterInsetFraction)
+        let insetY = floor(well.height * folderPreviewPlateCenterInsetFraction)
+        let frame = well.insetBy(dx: insetX, dy: insetY)
+        guard usableChromeFrame(frame) else { return nil }
+        return frame
+    }
+
+    /// The dropped icon shrinks into the middle of a plate that has no empty
+    /// slot. Same clock as the other folder flights. Reduced motion does not
+    /// travel. A bad frame or a hop under a point lands nowhere, and the
+    /// caller keeps the older flight onto the whole cell. The plate does not
+    /// gain a glyph, so the icon dissolves as it settles. That fade is
+    /// `wholeCellMergeFlightOpacity`, not the flight ease: sharing the ease
+    /// made the icon faint before it reached the center.
+    public static func folderIncomingPreviewCenterLanding(
+        incoming: CGRect,
+        well: CGRect,
+        reducesMotion: Bool
+    ) -> FolderMergePreviewLanding? {
+        guard !reducesMotion,
+              let destination = folderPreviewPlateCenterFrame(well: well),
+              usableChromeFrame(incoming),
+              !framesNearlyEqual(incoming, destination) else { return nil }
+        return FolderMergePreviewLanding(
+            source: incoming,
+            destination: destination,
+            duration: folderChromeTravelDuration
+        )
+    }
+
+    /// Fade for a merge that cannot land in a preview slot, so the icon flies
+    /// onto the whole cell instead. The old fade shared the flight's ease-out
+    /// and was already faint before the icon arrived (about a tenth left at
+    /// the halfway mark). This one stays readable while the icon travels,
+    /// then dissolves as the flight settles onto the cell. Clock time is
+    /// 0...1 over `folderChromeTravelDuration`. Reduced motion does not use
+    /// it: that path is a short fade with no travel.
+    public static let wholeCellMergeFadeX1: CGFloat = 0.55
+    public static let wholeCellMergeFadeY1: CGFloat = 0
+    public static let wholeCellMergeFadeX2: CGFloat = 0.82
+    public static let wholeCellMergeFadeY2: CGFloat = 0.28
+
+    /// 1 is fully visible. Halfway through the clock the icon is still mostly
+    /// there; the dissolve happens in the last part of the flight.
+    public static func wholeCellMergeFlightOpacity(at time: CGFloat) -> CGFloat {
+        let time = min(max(time, 0), 1)
+        if time == 0 { return 1 }
+        if time == 1 { return 0 }
+        let parameter = unitBezierParameter(
+            forX: time, x1: wholeCellMergeFadeX1, x2: wholeCellMergeFadeX2
+        )
+        let progress = unitBezierComponent(
+            parameter, c1: wholeCellMergeFadeY1, c2: wholeCellMergeFadeY2
+        )
+        return 1 - progress
+    }
+
+    /// A whole-cell merge used to reveal the new folder at 60% of the flight.
+    /// The flying icon is still about four fifths visible then, so the folder
+    /// stacked on a second clear layer. Hold the folder until the icon has
+    /// fallen through this opacity, then hand the folder the opacity the icon
+    /// is giving up. The folder is solid when the icon is gone. Reduced
+    /// motion does not use this curve: that path is the short fade.
+    public static let wholeCellMergeFolderRevealIconOpacity: CGFloat = 0.78
+
+    /// 0 hides the folder. 1 is fully visible. Before the icon drops through
+    /// `wholeCellMergeFolderRevealIconOpacity` this stays 0, including at 60%
+    /// of the flight. Clock time is 0...1 over `folderChromeTravelDuration`.
+    public static func wholeCellMergeFolderRevealOpacity(at time: CGFloat) -> CGFloat {
+        let icon = wholeCellMergeFlightOpacity(at: time)
+        let gate = wholeCellMergeFolderRevealIconOpacity
+        guard icon < gate, gate > 0 else { return icon <= 0 ? 1 : 0 }
+        return (gate - icon) / gate
+    }
+
+    /// First clock, in 0...1, where the flying icon has reached the gate and
+    /// the folder may start to appear. The scale spring waits for this. The
+    /// opacity curve already stays at 0 until then.
+    public static func wholeCellMergeFolderRevealFraction() -> CGFloat {
+        var low: CGFloat = 0
+        var high: CGFloat = 1
+        for _ in 0..<24 {
+            let mid = (low + high) / 2
+            if wholeCellMergeFlightOpacity(at: mid) > wholeCellMergeFolderRevealIconOpacity {
+                low = mid
+            } else {
+                high = mid
+            }
+        }
+        return high
+    }
+
+    /// Scale of a new whole-cell folder at the moment it is still hidden.
+    /// It eases to 1 on the same curve as the fade, and reaches 1 when the
+    /// icon is gone. The old spring started at 0.86 and kept moving for about
+    /// half a second after that. This start is closer, because the visible
+    /// part of the fade is only the last stretch of the flight.
+    public static let wholeCellMergeFolderScaleStart: CGFloat = 0.94
+
+    /// 1 is full size. While the folder opacity is still 0, including at 60%
+    /// of the flight, the scale stays at `wholeCellMergeFolderScaleStart`.
+    public static func wholeCellMergeFolderScale(at time: CGFloat) -> CGFloat {
+        let start = wholeCellMergeFolderScaleStart
+        let reveal = wholeCellMergeFolderRevealOpacity(at: time)
+        return start + (1 - start) * reveal
+    }
+
+    /// Equal inset used when a whole-cell merge shrinks around the cell
+    /// center. 0.18 on each side leaves 64% of the cell. The destination
+    /// below keeps this scale and moves the anchor up onto the icon.
+    public static let wholeCellMergeInsetFraction: CGFloat = 0.18
+
+    /// Where a merge flyer ends when no preview slot can be measured.
+    /// Insetting the cell equally shrank the picture into the geometric
+    /// middle, below the folder icon. This uses the same scale, around the
+    /// icon's center, so the icon in the picture stays put and the rest of
+    /// the cell closes in on it. Reduced motion does not travel and does not
+    /// call this. A cell that cannot be measured is returned unchanged.
+    public static func wholeCellMergeDestination(in cell: CGRect) -> CGRect {
+        guard cell.width >= 1, cell.height >= 1,
+              cell.origin.x.isFinite, cell.origin.y.isFinite,
+              cell.size.width.isFinite, cell.size.height.isFinite else { return cell }
+        let fraction = min(max(wholeCellMergeInsetFraction, 0), 0.49)
+        let scale = 1 - 2 * fraction
+        guard scale > 0, scale < 1 else { return cell }
+        let icon = iconFrame(in: cell)
+        guard icon.width >= 1, icon.height >= 1 else {
+            return cell.insetBy(dx: cell.width * fraction, dy: cell.height * fraction)
+        }
+        let anchor = CGPoint(x: icon.midX, y: icon.midY)
+        let size = CGSize(width: cell.width * scale, height: cell.height * scale)
+        let midX = anchor.x + (cell.midX - anchor.x) * scale
+        let midY = anchor.y + (cell.midY - anchor.y) * scale
+        return CGRect(
+            x: midX - size.width / 2,
+            y: midY - size.height / 2,
+            width: size.width,
+            height: size.height
+        )
+    }
+
+    /// Where the released drag picture already is. The drag image is the cell
+    /// plus the lift (scale and shadow). The flight has to leave from that
+    /// picture, not from the smaller cell, or the icon pops when the drag
+    /// image is removed. Reduced motion has no lift, so this is the cell.
+    /// A cell that cannot be measured is returned unchanged.
+    public static func dropLandingStartFrame(cell: CGRect, reducesMotion: Bool) -> CGRect {
+        guard usableChromeFrame(cell) else { return cell }
+        let presentation = dragLiftPresentation(for: cell.size, reducesMotion: reducesMotion)
+        let canvas = presentation.canvasFrame(centering: cell)
+        return CGRect(
+            origin: CGPoint(
+                x: canvas.minX + presentation.contentOrigin.x,
+                y: canvas.minY + presentation.contentOrigin.y
+            ),
+            size: presentation.contentSize
+        )
+    }
+
+    /// Where a merge flyer starts once the drag image is gone. The picture in
+    /// hand is the lifted cell, same as a reorder. Leaving from the resting
+    /// cell pops that scale off before the flight. Reduced motion never
+    /// lifted, so this is the cell. A cell that cannot be measured is unchanged.
+    public static func mergeFlightSourceFrame(cell: CGRect, reducesMotion: Bool) -> CGRect {
+        dropLandingStartFrame(cell: cell, reducesMotion: reducesMotion)
+    }
+
+    /// The icon's place inside the lifted drag picture. `icon` and `cell` are
+    /// the resting frames, in one coordinate space. The drag image draws the
+    /// whole cell into the lifted rect, so the icon keeps its fraction of that
+    /// rect. A preview flight that starts on the resting icon pops down to
+    /// that size when the drag image goes away. Reduced motion never lifted.
+    /// A frame that cannot be measured returns `icon`.
+    public static func iconFrameInLiftedDrag(icon: CGRect, cell: CGRect, reducesMotion: Bool) -> CGRect {
+        guard !reducesMotion else { return icon }
+        guard usableChromeFrame(icon), usableChromeFrame(cell) else { return icon }
+        let lifted = dropLandingStartFrame(cell: cell, reducesMotion: false)
+        guard usableChromeFrame(lifted) else { return icon }
+        let sx = lifted.width / cell.width
+        let sy = lifted.height / cell.height
+        guard sx.isFinite, sy.isFinite, sx > 0, sy > 0 else { return icon }
+        return CGRect(
+            x: lifted.minX + (icon.minX - cell.minX) * sx,
+            y: lifted.minY + (icon.minY - cell.minY) * sy,
+            width: icon.width * sx,
+            height: icon.height * sy
+        )
+    }
+
+    /// The icon let go onto a grid or folder slot. Same clock as the other
+    /// folder flights. Reduced motion does not travel. A bad frame or a hop
+    /// under a point stays put, and the caller shows the cell immediately.
+    /// A merge has its own flight; this is the reorder and the move in or
+    /// out of an open folder.
+    public struct DropLandingFlight: Equatable, Sendable {
+        public var source: CGRect
+        public var destination: CGRect
+        public var duration: TimeInterval
+
+        public init(source: CGRect, destination: CGRect, duration: TimeInterval) {
+            self.source = source
+            self.destination = destination
+            self.duration = duration
+        }
+    }
+
+    public static let dropLandingFlightDuration: TimeInterval = folderChromeTravelDuration
+
+    /// The lift shadow is drawn into the drag image. The flyer is only the
+    /// cell, so the shadow used to vanish on the frame the drag image left.
+    /// It now fades across the early part of this flight and is gone before
+    /// the icon sits in the cell. Clock time is 0...1 over
+    /// `dropLandingFlightDuration`. The ease is the flight's: quick at first,
+    /// then settled. 0 draws no shadow. The value at 0 is
+    /// `dragLiftShadowOpacity`. A non-finite clock keeps that lift shadow.
+    /// Reduced motion does not travel and does not use this.
+    public static let dropLandingShadowFadeFraction: CGFloat = 0.45
+
+    public static func dropLandingShadowOpacity(at time: CGFloat) -> CGFloat {
+        guard time.isFinite else { return dragLiftShadowOpacity }
+        let time = min(max(time, 0), 1)
+        if time == 0 { return dragLiftShadowOpacity }
+        let span = dropLandingShadowFadeFraction
+        if span <= 0 || time >= span { return 0 }
+        let local = time / span
+        let parameter = unitBezierParameter(
+            forX: local, x1: folderChromeTravelX1, x2: folderChromeTravelX2
+        )
+        let faded = unitBezierComponent(
+            parameter, c1: folderChromeTravelY1, c2: folderChromeTravelY2
+        )
+        return dragLiftShadowOpacity * (1 - faded)
+    }
+
+    /// How long the shadow fade runs. The rest of the flight keeps it off.
+    public static func dropLandingShadowFadeDuration(flight: TimeInterval) -> TimeInterval {
+        guard flight > 0 else { return 0 }
+        return flight * TimeInterval(dropLandingShadowFadeFraction)
+    }
+
+    /// The icon dropped onto a folder was lifted, so its preview flyer keeps
+    /// the drag shadow and fades it on `dropLandingShadowOpacity`. The icon
+    /// already on the grid was not lifted. A shadow on that one would appear
+    /// from nothing. Reduced motion never lifted.
+    public static func shouldFadeIncomingMergeShadow(isIncoming: Bool, reducesMotion: Bool) -> Bool {
+        isIncoming && !reducesMotion
+    }
+
+    public static func dropLandingFlight(
+        from source: CGRect,
+        to destination: CGRect,
+        reducesMotion: Bool
+    ) -> DropLandingFlight? {
+        guard !reducesMotion,
+              usableChromeFrame(source),
+              usableChromeFrame(destination),
+              !framesNearlyEqual(source, destination) else { return nil }
+        return DropLandingFlight(
+            source: source,
+            destination: destination,
+            duration: dropLandingFlightDuration
+        )
+    }
+
+    /// A reorder flight only while the launcher is up. The fade must not
+    /// grow a new one underneath it. A hidden window shows the cell in place.
+    public static func shouldPlayDropLanding(
+        reducesMotion: Bool,
+        isDismissing: Bool,
+        isVisible: Bool
+    ) -> Bool {
+        shouldPlayFolderDissolveScatter(
+            reducesMotion: reducesMotion,
+            isDismissing: isDismissing,
+            isVisible: isVisible
+        )
+    }
+
+    /// Same hold as the merge flight. The drag session can end during the
+    /// fade, and a picture already in the air must stay on the frame drawn.
+    public static func shouldHoldDropLanding(isDismissing: Bool, isVisible: Bool) -> Bool {
+        shouldHoldMergeFlight(isDismissing: isDismissing, isVisible: isVisible)
+    }
+
+    public static func shouldAdvanceDropLanding(isDismissing: Bool, isVisible: Bool) -> Bool {
+        shouldAdvanceMergeFlight(isDismissing: isDismissing, isVisible: isVisible)
+    }
+
+    public static func shouldSnapInFlightDropLanding(isDismissing: Bool, isVisible: Bool) -> Bool {
+        shouldSnapInFlightMergeFlight(isDismissing: isDismissing, isVisible: isVisible)
     }
 
     /// Changing reduced motion restyles an open folder's backdrop. A launcher
@@ -751,6 +2142,90 @@ public enum LauncherLayout {
     public static func shouldSnapInFlightPageSlide(isDismissing: Bool, isVisible: Bool) -> Bool {
         !shouldHoldPageSlide(isDismissing: isDismissing, isVisible: isVisible)
     }
+
+    // MARK: - Visual effect registries (fade-deferred apply vs Reduce Motion snap)
+    //
+    // These two ordered lists used to live as parallel hand-maintained call
+    // sites in `LauncherRootView`. Keep the historical order exactly; only
+    // the dispatch indirection is new. Direct switches on each slot.
+
+    /// Work held during a launcher fade, applied when the fade ends/cancels.
+    public enum DeferredVisualSlot: String, CaseIterable, Equatable, Sendable {
+        case dropHighlightClear
+        case folderLanding
+        case mergeFlight
+        case folderChrome
+        case searchChrome
+        case dissolvedGridFade
+        case launchFeedback
+        case dragLiftDrop
+        case pageDragRest
+        case contentScrollRest
+        case pageButtonHover
+        case toastFade
+        case dropLanding
+    }
+
+    /// Historical order of `applyDeferredVisualState()` — do not reorder.
+    /// `dropLanding` is appended: a reorder flight held by the fade.
+    public static let deferredVisualStateOrder: [DeferredVisualSlot] = [
+        .dropHighlightClear,
+        .folderLanding,
+        .mergeFlight,
+        .folderChrome,
+        .searchChrome,
+        .dissolvedGridFade,
+        .launchFeedback,
+        .dragLiftDrop,
+        .pageDragRest,
+        .contentScrollRest,
+        .pageButtonHover,
+        .toastFade,
+        .dropLanding
+    ]
+
+    /// Work snapped when the effective Reduce Motion preference changes.
+    public enum ReducedMotionSnapSlot: String, CaseIterable, Equatable, Sendable {
+        case pageButtonHover
+        case folderBackdrop
+        case toastFade
+        case searchChrome
+        case dissolvedGridFade
+        case pageSlide
+        case launchFeedback
+        case folderChrome
+        case mergeFlight
+        case folderLanding
+        case launcherPresence
+        case dragLiftDrop
+        case pageDragRest
+        case contentScrollRest
+        case reloadVisibleCollections
+        case reorderSlideLand
+        case dropLanding
+    }
+
+    /// Historical order of `applyCurrentReducedMotion()` snaps — do not reorder.
+    /// `dropLanding` is appended: a reorder flight already in the air.
+    public static let reducedMotionSnapOrder: [ReducedMotionSnapSlot] = [
+        .pageButtonHover,
+        .folderBackdrop,
+        .toastFade,
+        .searchChrome,
+        .dissolvedGridFade,
+        .pageSlide,
+        .launchFeedback,
+        .folderChrome,
+        .mergeFlight,
+        .folderLanding,
+        .launcherPresence,
+        .dragLiftDrop,
+        .pageDragRest,
+        .contentScrollRest,
+        .reloadVisibleCollections,
+        .reorderSlideLand,
+        .dropLanding
+    ]
 
     /// App and system preferences can change independently. Only a change in
     /// their effective result should interrupt an animation already in flight.
@@ -832,6 +2307,14 @@ public enum LauncherLayout {
 
     /// Do not start that pulse during the fade. Reduced motion has none.
     /// The "正在启动…" label is separate and is not a scale.
+    /// The scale is 1 → `launchPressScale` → 1. Each half is
+    /// `launchPressHalfDuration`, so the whole press is about 0.09s.
+    /// The layer anchor is the view origin. Pair the scale with
+    /// `originPinnedScaleTranslation` or the icon slides toward that corner.
+    public static let launchPressScale: CGFloat = 0.93
+    public static let launchPressHalfDuration: TimeInterval = 0.045
+
+    /// Do not start that pulse during the fade. Reduced motion has none.
     public static func shouldPlayLaunchFeedback(isDismissing: Bool, reducesMotion: Bool) -> Bool {
         !isDismissing && !reducesMotion
     }
@@ -846,17 +2329,18 @@ public enum LauncherLayout {
     }
 
     /// Neighbors ease toward a drag gap for about 0.18s. The target is the
-    /// gap immediately, and a timer moves the picture. That timer can still
-    /// be running when the launcher fades, so icons keep sliding under it.
+    /// gap immediately, and the picture follows on the frame about to draw.
+    /// That slide can still be running when the launcher fades, so icons
+    /// keep sliding under it.
     /// Hold only while the fade is up. A hidden window, or a cancelled fade,
     /// jumps to the gap if the drag is still down, or back to the cell if the
-    /// drag has ended. The ease is not replayed. Same condition as holding
+    /// drag has ended. The slide is not replayed. Same condition as holding
     /// the launch pulse.
     public static func shouldHoldReorderSlide(isDismissing: Bool, isVisible: Bool) -> Bool {
         shouldHoldLaunchFeedback(isDismissing: isDismissing, isVisible: isVisible)
     }
 
-    /// Do not start that ease during the fade. Reduced motion never eases.
+    /// Do not start that slide during the fade. Reduced motion never slides.
     public static func shouldAnimateReorderSlide(
         isDismissing: Bool,
         isVisible: Bool,
@@ -865,28 +2349,28 @@ public enum LauncherLayout {
         !reducesMotion && !shouldHoldReorderSlide(isDismissing: isDismissing, isVisible: isVisible)
     }
 
-    /// Changing reduced motion snaps a reorder ease that is already running.
+    /// Changing reduced motion snaps a reorder slide that is already running.
     /// Reduced motion is already on the gap, and turning motion back on does
-    /// not finish the old ease either. A launcher fade that is still on
+    /// not finish the old slide either. A launcher fade that is still on
     /// screen is holding the frame already drawn, so this snap waits. Same
-    /// hold as the ease. The gap is already the target; the caller lands there.
+    /// hold as the slide. The gap is already the target; the caller lands there.
     public static func shouldSnapInFlightReorderSlide(isDismissing: Bool, isVisible: Bool) -> Bool {
         !shouldHoldReorderSlide(isDismissing: isDismissing, isVisible: isVisible)
     }
 
-    /// The page arrows fade in while the pointer is over them. That fade is
-    /// about a quarter of a second, so it can still be running when the
-    /// launcher fades, and a mouse exit during the fade would start another.
-    /// Hold only while the fade is up. A hidden window, or a cancelled fade,
-    /// snaps to the arrow's real visibility instead of replaying the fade.
-    /// Same condition as holding the reorder slide.
+    /// The page arrows fade while the pointer is over them. That fade can
+    /// still be running when the launcher fades, and a mouse exit during the
+    /// fade would start another. Hold only while the fade is up. A hidden
+    /// window, or a cancelled fade, snaps to the arrow's real visibility
+    /// instead of replaying the fade. Same condition as holding the reorder slide.
     public static func shouldHoldPageButtonHover(isDismissing: Bool, isVisible: Bool) -> Bool {
         shouldHoldReorderSlide(isDismissing: isDismissing, isVisible: isVisible)
     }
 
     /// Do not start that fade during the launcher fade, while the window is
     /// already hidden, or when the user asked for less motion. Reduced motion
-    /// snaps to hover or focus. The unreduced fade stays the system default.
+    /// snaps to hover or focus. The unreduced fade is the page-turn ease-out
+    /// below, not the system ease-in.
     public static func shouldAnimatePageButtonHover(
         isDismissing: Bool,
         isVisible: Bool,
@@ -895,6 +2379,64 @@ public enum LauncherLayout {
         !reducesMotion
             && isVisible
             && !shouldHoldPageButtonHover(isDismissing: isDismissing, isVisible: isVisible)
+    }
+
+    /// Hover on a page arrow. The old fade was the system default: it eased
+    /// in, so the first moments barely moved, and the plate was cleared in
+    /// the same turn the arrow started leaving. This one uses the page-turn
+    /// ease-out (`pageTurnCurveProgress`) and keeps the plate painted. The
+    /// control opacity carries the plate, so the two leave together.
+    public static let pageButtonHoverFadeDuration: TimeInterval = 0.2
+    public static let pageButtonHoverShownOpacity: CGFloat = 0.9
+    public static let pageButtonHoverPlateAlpha: CGFloat = 0.22
+
+    public struct PageButtonHoverFade: Equatable, Sendable {
+        public var opacity: CGFloat
+        public var plateAlpha: CGFloat
+        public var duration: TimeInterval
+
+        public init(opacity: CGFloat, plateAlpha: CGFloat, duration: TimeInterval) {
+            self.opacity = opacity
+            self.plateAlpha = plateAlpha
+            self.duration = duration
+        }
+    }
+
+    public static func pageButtonHoverFade(shown: Bool) -> PageButtonHoverFade {
+        PageButtonHoverFade(
+            opacity: shown ? pageButtonHoverShownOpacity : 0,
+            plateAlpha: pageButtonHoverPlateAlpha,
+            duration: pageButtonHoverFadeDuration
+        )
+    }
+
+    /// The plate and arrow are up for a pointer hover, a drag sitting on the
+    /// arrow, or keyboard focus. A drag does not turn the page by itself.
+    /// The turn still waits `pageButtonDragHoverDelay`. The arrow's own area
+    /// is the only target, so this is not an edge-of-grid page.
+    public static let pageButtonDragHoverDelay: TimeInterval = 0.5
+
+    public static func pageButtonHoverShown(
+        pointerInside: Bool,
+        dragInside: Bool,
+        focused: Bool
+    ) -> Bool {
+        pointerInside || dragInside || focused
+    }
+
+    /// Clock time 0...1 along a hover fade. Appearing goes hidden to shown.
+    /// Leaving goes shown to hidden. The plate alpha stays painted for the
+    /// whole fade; only the control opacity hides it. Sampling the page-turn
+    /// curve means the first slice of the clock already moves.
+    public static func pageButtonHoverSample(
+        appearing: Bool,
+        time: CGFloat
+    ) -> (controlOpacity: CGFloat, plateAlpha: CGFloat) {
+        let progress = pageTurnCurveProgress(time)
+        let control = appearing
+            ? pageButtonHoverShownOpacity * progress
+            : pageButtonHoverShownOpacity * (1 - progress)
+        return (control, pageButtonHoverPlateAlpha)
     }
 
     /// `orderOut` resigns the field editor, and AppKit then commits its text.
@@ -1306,6 +2848,12 @@ public enum LauncherLayout {
         if !hasContent(stored) { return memory }
         if memory.updatedAt >= stored.updatedAt { return memory }
         return stored
+    }
+
+    /// A user-selected cached list stays visible until a complete scan can
+    /// replace it. A partial or empty retry must not erase that recovery view.
+    public static func shouldReplaceCachedCatalog(isShowingCache: Bool, newScanPersistable: Bool) -> Bool {
+        !isShowingCache || newScanPersistable
     }
 
     public static func reconcile(candidates: [AppCandidate], into state: LayoutState) -> LayoutState {

@@ -215,6 +215,7 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
         let editItem = NSMenuItem()
         let editMenu = NSMenu(title: L("编辑"))
         editMenu.addItem(withTitle: L("全选"), action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editMenu.addItem(withTitle: L("粘贴"), action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         editItem.submenu = editMenu
         mainMenu.addItem(editItem)
         NSApplication.shared.mainMenu = mainMenu

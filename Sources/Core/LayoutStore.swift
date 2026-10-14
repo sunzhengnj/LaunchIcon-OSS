@@ -12,6 +12,10 @@ public enum LayoutStoreIssue: Error, Equatable {
 }
 
 public actor JSONLayoutStore: LayoutStoring {
+    private struct SchemaHeader: Decodable {
+        let schemaVersion: Int
+    }
+
     public nonisolated static var defaultFileURL: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appending(path: "LaunchIcon/layout-v1.json", directoryHint: .notDirectory)
@@ -34,6 +38,7 @@ public actor JSONLayoutStore: LayoutStoring {
     }
 
     public func load() throws -> LayoutState? {
+        try Task.checkCancellation()
         recoveredCorruptPrimary = nil
         guard fileManager.fileExists(atPath: fileURL.path) else { return nil }
         do {
@@ -52,16 +57,22 @@ public actor JSONLayoutStore: LayoutStoring {
     }
 
     public func save(_ state: LayoutState) throws {
+        try Task.checkCancellation()
         guard state.schemaVersion == LayoutState.currentSchemaVersion else {
             throw LayoutStoreIssue.unsupportedSchema(state.schemaVersion)
         }
         try fileManager.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         if fileManager.fileExists(atPath: fileURL.path) {
             let previousData = try Data(contentsOf: fileURL)
-            if let previousState = try? decoder.decode(LayoutState.self, from: previousData) {
-                guard previousState.schemaVersion == LayoutState.currentSchemaVersion else {
-                    throw LayoutStoreIssue.unsupportedSchema(previousState.schemaVersion)
-                }
+            let previousState: LayoutState?
+            do {
+                previousState = try decode(previousData)
+            } catch LayoutStoreIssue.unsupportedSchema(let version) {
+                throw LayoutStoreIssue.unsupportedSchema(version)
+            } catch {
+                previousState = nil
+            }
+            if let previousState {
                 if previousState == state { return }
                 try previousData.write(to: backupURL, options: .atomic)
             } else {
@@ -86,11 +97,17 @@ public actor JSONLayoutStore: LayoutStoring {
     }
 
     private func decode(at url: URL) throws -> LayoutState {
-        let state = try decoder.decode(LayoutState.self, from: Data(contentsOf: url))
-        guard state.schemaVersion == LayoutState.currentSchemaVersion else {
-            throw LayoutStoreIssue.unsupportedSchema(state.schemaVersion)
+        try decode(Data(contentsOf: url))
+    }
+
+    private func decode(_ data: Data) throws -> LayoutState {
+        // A newer schema can change every other field, so check its version
+        // before interpreting the current layout or recovering an old backup.
+        let header = try decoder.decode(SchemaHeader.self, from: data)
+        guard header.schemaVersion == LayoutState.currentSchemaVersion else {
+            throw LayoutStoreIssue.unsupportedSchema(header.schemaVersion)
         }
-        return state
+        return try decoder.decode(LayoutState.self, from: data)
     }
 
     private func preserve(_ url: URL) throws {

@@ -1,3 +1,4 @@
+import AppKit
 import XCTest
 
 final class LauncherDragUITests: XCTestCase {
@@ -55,7 +56,17 @@ final class LauncherDragUITests: XCTestCase {
             add(settledFrame)
             let saved = expectation(for: NSPredicate(format: "isTrue == YES"), evaluatedWith: LayoutHasFolder(layout), handler: nil)
             wait(for: [saved], timeout: 5)
-            assertMergeVisualsStarted(beside: layout, reducedMotion: false)
+            let diagnosticLog = layout.deletingLastPathComponent().appendingPathComponent("diagnostics.log")
+            assertMergeVisualsStarted(at: diagnosticLog, reducedMotion: false)
+            let cleaned = expectation(
+                for: NSPredicate { _, _ in
+                    let text = (try? String(contentsOf: diagnosticLog, encoding: .utf8)) ?? ""
+                    return text.contains("Merge cleanup: flyers=2 remaining=0 detached=true plateReady=true")
+                },
+                evaluatedWith: diagnosticLog,
+                handler: nil
+            )
+            wait(for: [cleaned], timeout: 5)
             XCTAssertTrue(app.windows.firstMatch.exists)
         }
     }
@@ -68,7 +79,7 @@ final class LauncherDragUITests: XCTestCase {
             dragCalculatorOntoClock(in: app)
             let saved = expectation(for: NSPredicate(format: "isTrue == YES"), evaluatedWith: LayoutHasFolder(layout), handler: nil)
             wait(for: [saved], timeout: 5)
-            assertMergeVisualsStarted(beside: layout, reducedMotion: true)
+            assertMergeVisualsStarted(at: layout.deletingLastPathComponent().appendingPathComponent("diagnostics.log"), reducedMotion: true)
 
             let folder = app.buttons["文件夹 新建文件夹"]
             XCTAssertTrue(folder.waitForExistence(timeout: 5))
@@ -366,22 +377,13 @@ final class LauncherDragUITests: XCTestCase {
             let nextPage = app.buttons["下一页"]
             XCTAssertTrue(calculator.waitForExistence(timeout: 15))
             XCTAssertTrue(nextPage.exists)
-
-            calculator.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
-                .press(forDuration: 0.3,
-                       thenDragTo: nextPage.coordinate(withNormalizedOffset: CGVector(dx: 0.95, dy: 0.2)),
-                       withVelocity: .slow,
-                       thenHoldForDuration: 1.7)
-            let thirdPageApp = app.buttons["Fixture 68"]
+            calculator.click(forDuration: 0.3, thenDragTo: nextPage, withVelocity: .slow, thenHoldForDuration: 1.7)
+            let thirdPageApp = app.buttons["Fixture 70"]
             XCTAssertTrue(thirdPageApp.waitForExistence(timeout: 5))
 
             let previousPage = app.buttons["上一页"]
             XCTAssertTrue(previousPage.exists)
-            thirdPageApp.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
-                .press(forDuration: 0.3,
-                       thenDragTo: previousPage.coordinate(withNormalizedOffset: CGVector(dx: 0.05, dy: 0.8)),
-                       withVelocity: .slow,
-                       thenHoldForDuration: 1.7)
+            thirdPageApp.click(forDuration: 0.3, thenDragTo: previousPage, withVelocity: .slow, thenHoldForDuration: 1.7)
             XCTAssertTrue(calculator.waitForExistence(timeout: 5))
             app.terminate()
             XCTAssertEqual(try Data(contentsOf: layout), original)
@@ -473,7 +475,7 @@ final class LauncherDragUITests: XCTestCase {
 
     @MainActor
     func testEmptyScanCanRestoreLastCompleteCatalogReadOnly() throws {
-        try withFixture { app, layout in
+        try withFixture(mergeDiagnostics: true) { app, layout in
             let applications = layout.deletingLastPathComponent().appendingPathComponent("Applications")
             let snapshot = layout.deletingLastPathComponent().appendingPathComponent("catalog-v1.json")
             let originalLayout = try Data(contentsOf: layout)
@@ -484,7 +486,7 @@ final class LauncherDragUITests: XCTestCase {
             app.launch()
 
             XCTAssertTrue(app.staticTexts["未找到可用的应用"].waitForExistence(timeout: 15))
-            let restore = app.buttons["使用上次应用列表"]
+            let restore = app.buttons["cachedCatalog.empty"]
             XCTAssertTrue(restore.waitForExistence(timeout: 15))
             XCTAssertFalse(app.buttons["计算器"].exists)
             restore.click()
@@ -492,13 +494,12 @@ final class LauncherDragUITests: XCTestCase {
             XCTAssertTrue(app.buttons["计算器"].waitForExistence(timeout: 5))
             XCTAssertTrue(app.buttons["时钟"].exists)
             XCTAssertTrue(app.staticTexts["正在显示上次应用列表；重新扫描后可整理"].exists)
+            let completedBefore = catalogReloadCompletionCount(beside: layout)
             app.buttons["重新扫描"].click()
-            XCTAssertTrue(app.staticTexts["未找到可用的应用"].waitForExistence(timeout: 15))
-            let restoreAgain = app.buttons["使用上次应用列表"]
-            XCTAssertTrue(restoreAgain.waitForExistence(timeout: 5))
-            restoreAgain.click()
+            waitForCatalogReload(after: completedBefore, beside: layout)
             XCTAssertTrue(app.buttons["计算器"].waitForExistence(timeout: 5))
             XCTAssertTrue(app.buttons["时钟"].exists)
+            XCTAssertTrue(app.staticTexts["正在显示上次应用列表；重新扫描后可整理"].exists)
             app.terminate()
             XCTAssertEqual(try Data(contentsOf: layout), originalLayout)
             XCTAssertEqual(try Data(contentsOf: snapshot), originalSnapshot)
@@ -507,7 +508,7 @@ final class LauncherDragUITests: XCTestCase {
 
     @MainActor
     func testIncompleteScanCanRestoreLastCompleteCatalogReadOnly() throws {
-        try withFixture { app, layout in
+        try withFixture(mergeDiagnostics: true) { app, layout in
             let applications = layout.deletingLastPathComponent().appendingPathComponent("Applications")
             let snapshot = layout.deletingLastPathComponent().appendingPathComponent("catalog-v1.json")
             let originalLayout = try Data(contentsOf: layout)
@@ -523,11 +524,16 @@ final class LauncherDragUITests: XCTestCase {
             XCTAssertTrue(app.staticTexts["应用扫描不完整，暂时无法整理；请重新扫描"].waitForExistence(timeout: 15))
             XCTAssertTrue(app.buttons["计算器"].exists)
             XCTAssertFalse(app.buttons["时钟"].exists)
-            let restore = app.buttons["使用上次应用列表"]
+            let restore = app.buttons["cachedCatalog.readOnly"]
             XCTAssertTrue(restore.waitForExistence(timeout: 5))
             restore.click()
             XCTAssertTrue(app.windows.firstMatch.exists)
             XCTAssertTrue(app.buttons["时钟"].waitForExistence(timeout: 5))
+            XCTAssertTrue(app.staticTexts["正在显示上次应用列表；重新扫描后可整理"].exists)
+            let completedBefore = catalogReloadCompletionCount(beside: layout)
+            app.buttons["重新扫描"].click()
+            waitForCatalogReload(after: completedBefore, beside: layout)
+            XCTAssertTrue(app.buttons["时钟"].waitForExistence(timeout: 15))
             XCTAssertTrue(app.staticTexts["正在显示上次应用列表；重新扫描后可整理"].exists)
             app.terminate()
             XCTAssertEqual(try Data(contentsOf: layout), originalLayout)
@@ -997,6 +1003,12 @@ final class LauncherDragUITests: XCTestCase {
             "LAUNCHICON_DIAGNOSTICS_PATH": "\(fixturePath)/diagnostics-\(runID).log",
             "LAUNCHICON_SHOW_ON_LAUNCH": "1"
         ]
+        if ProcessInfo.processInfo.environment["LAUNCHICON_UI_INJECT_RPAC"] == "1" {
+            app.launchEnvironment["DYLD_INSERT_LIBRARIES"] = "/usr/lib/libRPAC.dylib"
+            app.launchEnvironment["PERFC_ENABLE_EXTENDED_DIAGNOSTIC_FORMAT"] = "1"
+            app.launchEnvironment["PERFC_ENABLE_PROFILE_MODE"] = "1"
+            app.launchEnvironment["PERFC_SUPPRESS_SYSTEM_REPORTS"] = "1"
+        }
         app.launch()
         defer { app.terminate() }
 
@@ -1044,7 +1056,7 @@ final class LauncherDragUITests: XCTestCase {
             handler: nil
         )
         wait(for: [saved], timeout: 5)
-        assertMergeVisualsStarted(beside: layoutURL, reducedMotion: false)
+        assertMergeVisualsStarted(at: URL(fileURLWithPath: "\(fixturePath)/diagnostics-\(runID).log"), reducedMotion: false)
 
         let folder = app.buttons["文件夹 新建文件夹"]
         let opened = app.groups["打开的文件夹 新建文件夹"]
@@ -1056,6 +1068,42 @@ final class LauncherDragUITests: XCTestCase {
             assertFolderCloses(opened)
             XCTAssertNotEqual(app.state, .notRunning)
         }
+
+        folder.click()
+        let title = app.textFields["文件夹名称"]
+        XCTAssertTrue(title.waitForExistence(timeout: 5))
+        title.click()
+        app.typeKey("a", modifierFlags: .command)
+        title.typeText("日常工具")
+        app.typeKey(XCUIKeyboardKey.return, modifierFlags: [])
+        app.buttons["关闭文件夹"].click()
+
+        let renamed = app.buttons["文件夹 日常工具"]
+        XCTAssertTrue(renamed.waitForExistence(timeout: 5))
+        renamed.click()
+        title.click()
+        app.typeKey(XCUIKeyboardKey.tab, modifierFlags: [])
+        XCTAssertEqual(title.value as? String, "日常工具")
+        title.click()
+        app.typeKey("a", modifierFlags: .command)
+        title.typeText("DiscardReleaseDraft")
+        app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
+        XCTAssertEqual(title.value as? String, "日常工具")
+        app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
+        XCTAssertTrue(renamed.waitForExistence(timeout: 5))
+
+        search.click()
+        search.typeText("Calculator")
+        XCTAssertTrue(app.buttons["计算器"].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.buttons["时钟"].exists)
+        app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
+        XCTAssertTrue(renamed.waitForExistence(timeout: 5))
+        app.terminate()
+        app.launch()
+        XCTAssertTrue(renamed.waitForExistence(timeout: 15))
+        renamed.click()
+        XCTAssertTrue(title.waitForExistence(timeout: 5))
+        XCTAssertEqual(title.value as? String, "日常工具")
     }
 
     @MainActor
@@ -1120,13 +1168,13 @@ final class LauncherDragUITests: XCTestCase {
         try withFixture(additionalApps: 34) { app, _ in
             let search = app.searchFields["搜索应用"]
             XCTAssertTrue(search.waitForExistence(timeout: 15))
-            XCTAssertTrue(app.staticTexts["拖拽整理"].exists)
+            XCTAssertTrue(app.staticTexts["拖拽整理 · 悬停左右边缘跨页"].exists)
             XCTAssertTrue(app.staticTexts["← → 翻页 · Esc 返回"].exists)
 
             search.click()
             search.typeText("Calculator")
             XCTAssertTrue(app.staticTexts["Esc 清除搜索"].waitForExistence(timeout: 5))
-            XCTAssertFalse(app.staticTexts["拖拽整理"].exists)
+            XCTAssertFalse(app.staticTexts["拖拽整理 · 悬停左右边缘跨页"].exists)
             XCTAssertFalse(app.staticTexts["← → 翻页 · Esc 返回"].exists)
         }
     }
@@ -1182,7 +1230,18 @@ final class LauncherDragUITests: XCTestCase {
             app.searchFields["搜索应用"].click()
             app.typeText("我的")
             XCTAssertTrue(app.buttons["我的计算器"].waitForExistence(timeout: 5))
-            XCTAssertFalse(app.buttons["时钟"].exists)
+            let clockExistsAfterRestart = app.buttons["时钟"].exists
+            if clockExistsAfterRestart {
+                let hierarchy = XCTAttachment(string: app.debugDescription)
+                hierarchy.name = "Alias restart unexpected clock hierarchy"
+                hierarchy.lifetime = .keepAlways
+                add(hierarchy)
+                let frame = XCTAttachment(screenshot: app.windows.firstMatch.screenshot())
+                frame.name = "Alias restart unexpected clock frame"
+                frame.lifetime = .keepAlways
+                add(frame)
+            }
+            XCTAssertFalse(clockExistsAfterRestart)
         }
     }
 
@@ -1291,8 +1350,25 @@ final class LauncherDragUITests: XCTestCase {
             let search = app.searchFields["搜索应用"]
             XCTAssertTrue(search.waitForExistence(timeout: 15))
             search.click()
-            search.typeText("\u{FF23}\u{FF4C}\u{FF4F}\u{FF43}\u{FF4B}")
+            let pasteboard = NSPasteboard.general
+            let previousItems = pasteboard.pasteboardItems?.map { item in
+                let copy = NSPasteboardItem()
+                for type in item.types {
+                    if let data = item.data(forType: type) { copy.setData(data, forType: type) }
+                }
+                return copy
+            }
+            defer {
+                pasteboard.clearContents()
+                if let previousItems { _ = pasteboard.writeObjects(previousItems) }
+            }
+            let query = "\u{FF23}\u{FF4C}\u{FF4F}\u{FF43}\u{FF4B}"
+            pasteboard.clearContents()
+            XCTAssertTrue(pasteboard.setString(query, forType: .string))
+            search.typeKey("v", modifierFlags: .command)
+            XCTAssertEqual(search.value as? String, query)
             XCTAssertTrue(app.buttons["时钟"].waitForExistence(timeout: 5))
+            XCTAssertTrue(app.buttons["时钟"].isHittable)
             XCTAssertFalse(app.buttons["计算器"].exists)
         }
     }
@@ -1316,6 +1392,75 @@ final class LauncherDragUITests: XCTestCase {
             app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
             XCTAssertTrue(app.buttons["文件夹 新建文件夹"].waitForExistence(timeout: 5))
             XCTAssertFalse(app.groups["打开的文件夹 新建文件夹"].exists)
+        }
+    }
+
+    @MainActor
+    func testFolderRenameThenSearchKeepsIndependentEditing() throws {
+        try withFixture { app, layout in
+            dragCalculatorOntoClock(in: app)
+            let created = expectation(for: NSPredicate(format: "isTrue == YES"), evaluatedWith: LayoutHasFolder(layout), handler: nil)
+            wait(for: [created], timeout: 5)
+
+            app.buttons["文件夹 新建文件夹"].click()
+            let title = app.textFields["文件夹名称"]
+            XCTAssertTrue(title.waitForExistence(timeout: 5))
+            title.click()
+            app.typeKey("a", modifierFlags: .command)
+            title.typeText("日常工具")
+            app.typeKey(XCUIKeyboardKey.return, modifierFlags: [])
+            app.buttons["关闭文件夹"].click()
+
+            let search = app.searchFields["搜索应用"]
+            search.click()
+            search.typeText("Calculator")
+            XCTAssertTrue(app.buttons["计算器"].waitForExistence(timeout: 5))
+            XCTAssertFalse(app.buttons["时钟"].exists)
+            app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
+            let renamed = app.buttons["文件夹 日常工具"]
+            XCTAssertTrue(renamed.waitForExistence(timeout: 5))
+            renamed.click()
+            XCTAssertTrue(title.waitForExistence(timeout: 5))
+            XCTAssertEqual(title.value as? String, "日常工具")
+        }
+    }
+
+    @MainActor
+    func testFolderRenameDraftIsDiscardedWhenAnotherAppBecomesActive() throws {
+        let calculator = XCUIApplication(bundleIdentifier: "com.apple.calculator")
+        guard calculator.state == .notRunning else {
+            throw XCTSkip("Calculator is already running; preserve the user's instance")
+        }
+        try withFixture(mergeDiagnostics: true) { app, layout in
+            dragCalculatorOntoClock(in: app)
+            let created = expectation(for: NSPredicate(format: "isTrue == YES"), evaluatedWith: LayoutHasFolder(layout), handler: nil)
+            wait(for: [created], timeout: 5)
+            let original = try Data(contentsOf: layout)
+
+            app.buttons["文件夹 新建文件夹"].click()
+            let title = app.textFields["文件夹名称"]
+            XCTAssertTrue(title.waitForExistence(timeout: 5))
+            title.click()
+            app.typeKey("a", modifierFlags: .command)
+            title.typeText("UncommittedFolderDraft")
+            XCTAssertEqual(title.value as? String, "UncommittedFolderDraft")
+
+            guard calculator.state == .notRunning else {
+                throw XCTSkip("Calculator started during fixture setup; preserve that instance")
+            }
+            calculator.launch()
+            defer { calculator.terminate() }
+            XCTAssertTrue(calculator.windows.firstMatch.waitForExistence(timeout: 5))
+            XCTAssertEqual(calculator.state, .runningForeground)
+            app.activate()
+            XCTAssertTrue(title.waitForExistence(timeout: 5))
+            XCTAssertEqual(title.value as? String, "新建文件夹")
+            XCTAssertEqual(try Data(contentsOf: layout), original)
+
+            app.terminate()
+            app.launch()
+            XCTAssertTrue(app.buttons["文件夹 新建文件夹"].waitForExistence(timeout: 15))
+            XCTAssertEqual(try Data(contentsOf: layout), original)
         }
     }
 
@@ -1489,6 +1634,36 @@ final class LauncherDragUITests: XCTestCase {
     }
 
     @MainActor
+    func testSystemReducedMotionUpdatesOpenFolderBackdropAndScrollElasticity() throws {
+        try withFixture(mergeDiagnostics: true, buttonScript: true) { app, layout in
+            dragCalculatorOntoClock(in: app)
+            let saved = expectation(for: NSPredicate(format: "isTrue == YES"), evaluatedWith: LayoutHasFolder(layout), handler: nil)
+            wait(for: [saved], timeout: 5)
+            let folder = app.buttons["文件夹 新建文件夹"]
+            XCTAssertTrue(folder.waitForExistence(timeout: 5))
+            folder.click()
+            XCTAssertTrue(app.buttons["计算器"].waitForExistence(timeout: 5))
+
+            let normal = try sendTestSystemMotion(false, layout: layout)
+            XCTAssertTrue(normal.contains("effective=false"), normal)
+            XCTAssertTrue(normal.contains("folderOpen=true scaled=true blurred=true searchElasticityNone=false folderElasticityNone=false"), normal)
+            let reduced = try sendTestSystemMotion(true, layout: layout)
+            XCTAssertTrue(reduced.contains("effective=true changed=true folderOpen=true scaled=false blurred=false searchElasticityNone=true folderElasticityNone=true"), reduced)
+
+            app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
+            app.buttons["设置"].click()
+            let settings = app.windows["LaunchIcon 设置"]
+            XCTAssertTrue(settings.waitForExistence(timeout: 5))
+            let appMotion = settings.checkBoxes["减少动态效果"]
+            XCTAssertTrue(appMotion.waitForExistence(timeout: 5))
+            appMotion.click()
+            XCTAssertEqual(appMotion.value as? Int, 1)
+            let unchanged = try sendTestSystemMotion(false, layout: layout)
+            XCTAssertTrue(unchanged.contains("effective=true changed=false"), unchanged)
+        }
+    }
+
+    @MainActor
     func testSearchClearButtonRestoresPageAndKeepsSearchReady() throws {
         try withFixture(additionalApps: 34) { app, _ in
             let secondPage = app.buttons["第 2 页"]
@@ -1500,7 +1675,9 @@ final class LauncherDragUITests: XCTestCase {
             search.click()
             search.typeText("Fixture 34")
             XCTAssertTrue(app.buttons["Fixture 34"].waitForExistence(timeout: 5))
-            let clear = search.buttons["cancel"]
+            let clear = search.buttons.matching(
+                NSPredicate(format: "label IN %@", ["cancel", "Cancel", "取消"])
+            ).firstMatch
             XCTAssertTrue(clear.waitForExistence(timeout: 5))
             clear.click()
             XCTAssertEqual(search.value as? String, "")
@@ -1520,6 +1697,7 @@ final class LauncherDragUITests: XCTestCase {
         windowSize: String = "1024x768",
         dismissDelayMS: Int? = nil,
         mergeDiagnostics: Bool = false,
+        buttonScript: Bool = false,
         _ body: (XCUIApplication, URL) throws -> Void
     ) throws {
         let directory = FileManager.default.temporaryDirectory
@@ -1557,8 +1735,20 @@ final class LauncherDragUITests: XCTestCase {
             "LAUNCHICON_TEST_WINDOW_SIZE": windowSize,
             "LAUNCHICON_SHOW_ON_LAUNCH": "1"
         ]
+        if ProcessInfo.processInfo.environment["LAUNCHICON_UI_INJECT_RPAC"] == "1" {
+            app.launchEnvironment["DYLD_INSERT_LIBRARIES"] = "/usr/lib/libRPAC.dylib"
+            app.launchEnvironment["PERFC_ENABLE_EXTENDED_DIAGNOSTIC_FORMAT"] = "1"
+            app.launchEnvironment["PERFC_ENABLE_PROFILE_MODE"] = "1"
+            app.launchEnvironment["PERFC_SUPPRESS_SYSTEM_REPORTS"] = "1"
+        }
+        if ProcessInfo.processInfo.environment["LAUNCHICON_UI_FIELD_EDITOR_AUDIT"] == "1" {
+            app.launchEnvironment["LAUNCHICON_TEST_FIELD_EDITOR_AUDIT"] = "1"
+        }
         if mergeDiagnostics {
             app.launchEnvironment["LAUNCHICON_DIAGNOSTICS_PATH"] = directory.appendingPathComponent("diagnostics.log").path
+        }
+        if buttonScript {
+            app.launchEnvironment["LAUNCHICON_TEST_BUTTON_SCRIPT"] = directory.appendingPathComponent("button-script").path
         }
         if let dismissDelayMS {
             app.launchEnvironment["LAUNCHICON_TEST_DISMISS_DELAY_MS"] = String(dismissDelayMS)
@@ -1574,6 +1764,25 @@ final class LauncherDragUITests: XCTestCase {
         wait(for: [ready], timeout: 15)
 
         try body(app, layout)
+    }
+
+    @MainActor
+    private func sendTestSystemMotion(_ enabled: Bool, layout: URL) throws -> String {
+        let directory = layout.deletingLastPathComponent()
+        let script = directory.appendingPathComponent("button-script")
+        let diagnostics = directory.appendingPathComponent("diagnostics.log")
+        try Data("system-reduce-motion:\(enabled ? "on" : "off")".utf8).write(to: script, options: .atomic)
+        for _ in 0..<50 {
+            let pending = (try? Data(contentsOf: script)) ?? Data()
+            let lines = ((try? String(contentsOf: diagnostics, encoding: .utf8)) ?? "")
+                .split(separator: "\n")
+            if pending.isEmpty, let event = lines.last(where: { $0.contains("System motion:") }) {
+                return String(event)
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        XCTFail("System motion test command was not handled")
+        return ""
     }
 
     @MainActor
@@ -1610,12 +1819,19 @@ final class LauncherDragUITests: XCTestCase {
     }
 
     @MainActor
-    private func assertMergeVisualsStarted(beside layout: URL, reducedMotion: Bool) {
-        let log = layout.deletingLastPathComponent().appendingPathComponent("diagnostics.log")
-        let expected = [
-            "Merge flyer started: reducedMotion=\(reducedMotion)",
-            "Folder landing started: reducedMotion=\(reducedMotion)"
-        ]
+    private func assertMergeVisualsStarted(at log: URL, reducedMotion: Bool) {
+        // A new folder sends both icons into the preview slots. Dropping onto a
+        // folder that already exists logs icons=1 and does not spring the tile.
+        // A full plate logs the center landing instead. Reduced motion still
+        // fades the dragged picture and the folder tile.
+        let expected = reducedMotion
+            ? [
+                "Merge flyer started: reducedMotion=true",
+                "Folder landing started: reducedMotion=true"
+            ]
+            : [
+                "Merge preview landing started: icons=2 reducedMotion=false"
+            ]
         for _ in 0..<30 {
             let text = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
             if expected.allSatisfy(text.contains) { return }
@@ -1623,6 +1839,20 @@ final class LauncherDragUITests: XCTestCase {
         }
         let actual = (try? String(contentsOf: log, encoding: .utf8)) ?? "<no diagnostic log>"
         XCTFail("Merge visual callbacks did not start: \(actual)")
+    }
+
+    private func catalogReloadCompletionCount(beside layout: URL) -> Int {
+        let log = layout.deletingLastPathComponent().appendingPathComponent("diagnostics.log")
+        return ((try? String(contentsOf: log, encoding: .utf8)) ?? "")
+            .components(separatedBy: "Catalog reload finished:").count - 1
+    }
+
+    private func waitForCatalogReload(after count: Int, beside layout: URL) {
+        for _ in 0..<150 {
+            if catalogReloadCompletionCount(beside: layout) > count { return }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        XCTFail("Catalog reload did not finish after the recovery view requested a retry")
     }
 
     @MainActor

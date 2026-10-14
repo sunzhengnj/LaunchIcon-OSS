@@ -1,3 +1,9 @@
+# 2026-10-14 preview.78 public sync (WIP)
+
+Current public checkout: `./script/validate_background.sh` passed on macOS/Xcode27; Core194/194, windowless cleanup33/33, folder title readiness and landing checks, explicit-network guard, Direct/StoreSpike Release analyze, and UI build-for-testing. No App/UI Runner was launched.
+
+Historical product UI:55 passed/1 failed/2 skipped,56 main-thread warnings. Alias search after restart remains unresolved; new merge cleanup assertion was only compiled. Physical input/IME, rendered animation continuity, VoiceOver, multiple displays, Store distribution and notarization remain open. Existing historical rows below are archival evidence, not new public checks. Public preview.78 package validation will be listed on its Release page.
+
 # M0/M1 测试矩阵
 
 | 范围 | 场景 | 通过标准 | 证据 |

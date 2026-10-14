@@ -11,7 +11,7 @@ Press <kbd>⌥ Space</kbd> to see your apps in a 7 × 5 grid. Sort them into fol
 Native AppKit · no account · no network · your layout stays on your Mac.</p>
 
 <p align="center">
-  <a href="https://github.com/sunzhengnj/LaunchIcon-OSS/releases/latest"><img src="https://img.shields.io/github/v/release/sunzhengnj/LaunchIcon-OSS?label=release" alt="Latest release"></a>
+  <a href="https://github.com/sunzhengnj/LaunchIcon-OSS/releases/tag/v1.0.0-preview.78"><img src="https://img.shields.io/github/v/release/sunzhengnj/LaunchIcon-OSS?label=release" alt="Latest release"></a>
   <a href="https://github.com/sunzhengnj/LaunchIcon-OSS/actions/workflows/macos-validation.yml"><img src="https://github.com/sunzhengnj/LaunchIcon-OSS/actions/workflows/macos-validation.yml/badge.svg" alt="macOS validation"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache-2.0 license"></a>
   <img src="https://img.shields.io/badge/macOS-26%2B-black" alt="macOS 26 or later">
@@ -19,7 +19,7 @@ Native AppKit · no account · no network · your layout stays on your Mac.</p>
 </p>
 
 <p align="center">
-  <a href="https://github.com/sunzhengnj/LaunchIcon-OSS/releases/latest"><strong>⬇ Download (unnotarized preview)</strong></a> ·
+  <a href="https://github.com/sunzhengnj/LaunchIcon-OSS/releases/tag/v1.0.0-preview.78"><strong>⬇ Download (unnotarized preview)</strong></a> ·
   <a href="#install">Install</a> ·
   <a href="#known-limitations">Known limitations</a> ·
   <a href="#build-from-source">Build from source</a> ·
@@ -52,7 +52,7 @@ Native AppKit · no account · no network · your layout stays on your Mac.</p>
 > **Early release, feedback welcome.** The installer is ad-hoc signed and **not notarized** (see [Install](#install)). The full UI test suite is not all green yet, and drag and drop across pages is still being fixed. See [Known limitations](#known-limitations).
 
 > [!IMPORTANT]
-> **The source and installer are at different revisions.** `main` contains a newer **work-in-progress source snapshot**. The [v1.0.0 installer](https://github.com/sunzhengnj/LaunchIcon-OSS/releases/tag/v1.0.0) was built from an earlier revision and does not include the changes listed below. There is no installer for the current `main` snapshot. See the [snapshot notes](Docs/SOURCE_SNAPSHOT_2026-10-09.md).
+> **Current WIP preview:78 / build78.** [Download preview.78](https://github.com/sunzhengnj/LaunchIcon-OSS/releases/tag/v1.0.0-preview.78). The public installer is built from the public release tag; internal signing settings are excluded. The new merge cleanup UI assertion has not been run, and alias search after restart remains unresolved. See [snapshot notes](Docs/SOURCE_SNAPSHOT_2026-10-14.md).
 
 ## Highlights
 
@@ -75,31 +75,31 @@ LaunchIcon uses its own visual design. It does not read the system Launchpad dat
 
 ### New in the current source snapshot
 
-- App launch requests stop showing a perpetual loading state after 10 seconds and display a timeout notice. LaunchIcon now shows its main window when opened.
+- App launch requests use `/usr/bin/open`, with bundle prechecks and asynchronous failure reporting. LaunchIcon shows its main window when opened.
 - Holding a drag near either screen edge can turn pages. Folders have no 25-app cap, and their cover previews up to nine icons.
-- Folder merge motion starts at the drop position. The Direct app now includes English and Chinese UI strings.
+- Folder open/close/merge/dissolve and drag landing continue from the displayed state. Tile outlines use subtle feedback; folder-title accessibility follows animation hit testing. English/Chinese UI strings are included.
 
 These changes still need complete UI and physical-input verification. **A dark-mode Dock/Finder app icon is not yet implemented**; the existing dark brand image is not an AppIcon appearance variant.
 
 ## Install
 
-1. Download `LaunchIcon-v1.0.0-macOS-unnotarized.dmg` and its `.sha256` file from the [v1.0.0 release](https://github.com/sunzhengnj/LaunchIcon-OSS/releases/tag/v1.0.0), then verify the download in the folder that holds both files:
+1. Download `LaunchIcon-v1.0.0-preview.78-macOS-unnotarized.dmg` and its `.sha256` file from [preview.78](https://github.com/sunzhengnj/LaunchIcon-OSS/releases/tag/v1.0.0-preview.78), then verify both files:
    ```bash
-   shasum -a 256 -c LaunchIcon-v1.0.0-macOS-unnotarized.dmg.sha256
+   shasum -a 256 -c LaunchIcon-v1.0.0-preview.78-macOS-unnotarized.dmg.sha256
    ```
 2. Open the DMG and drag `LaunchIcon.app` to Applications. Quit an older copy before replacing it; your saved layout and preferences live outside the app bundle.
 3. Open LaunchIcon once. macOS will say it can't verify the developer. This is expected: the app is **ad-hoc signed and not notarized yet**.
 4. Only if you trust the download from this repository, go to **System Settings → Privacy & Security**, scroll to **Security**, click **Open Anyway** next to LaunchIcon, and confirm with your password or Touch ID. On macOS 15 and later, Control-click → Open no longer bypasses this prompt. See [Apple's guidance](https://support.apple.com/102445).
-5. **The v1.0.0 build starts in the background.** Press `⌥ Space` or click the menu bar icon to show the grid. (The newer source snapshot opens its main window on launch.)
+5. LaunchIcon opens its main window on launch. Press `⌥ Space` or use the menu bar icon to hide or show the grid.
 
 Please don't disable Gatekeeper or run quarantine-removal commands you don't trust. If you'd rather not run an unnotarized build, [build from source](#build-from-source) with Xcode.
 
 ## Known limitations
 
 - The installer is ad-hoc signed, not Developer ID signed or notarized.
-- The last full UI suite recorded **47 passed / 5 failed / 2 skipped** and has not been rerun on the current snapshot.
+- The last full development UI batch recorded **55 passed / 1 failed / 2 skipped**; alias search after restart remains unresolved. No UI suite was run for this public sync.
 - Drag and drop across pages is still being fixed. Physical-input, VoiceOver, large-folder, and dark Dock/Finder icon checks are still open.
-- The v1.0.0 installer starts in the background (use `⌥ Space` or the menu bar icon).
+
 - Requires macOS 26 or later.
 
 ## Build from source
@@ -126,12 +126,12 @@ LAUNCHICON_ALLOW_VISIBLE_TESTS=1 ./script/test_direct_bootstrap.sh
 
 | Area | Current evidence |
 | --- | --- |
-| Core and build | Current public snapshot: Core **129/129** locally, Direct/StoreSpike Release analysis, UI target build, and [GitHub macOS validation](https://github.com/sunzhengnj/LaunchIcon-OSS/actions/workflows/macos-validation.yml) passed. A Direct Release build also passed locally. |
-| Full UI | The most recent full suite recorded before this snapshot had **47 passed / 5 failed / 2 skipped**. It has not been rerun on this public snapshot. |
-| Distribution | No installer was produced for the current `main`. The v1.0.0 DMG remains ad-hoc signed and unnotarized. |
+| Core and build | Public checkout background gate passed: Core194/194, windowless cleanup33/33, Direct/StoreSpike Release analysis and UI target compile. See [test matrix](Docs/TEST_MATRIX.md). |
+| Full UI | Historical preview.77 product batch: **55 passed / 1 failed / 2 skipped**,56 main-thread warnings. Alias search after restart remains unresolved; no new public UI run. |
+| Distribution | [preview.78](https://github.com/sunzhengnj/LaunchIcon-OSS/releases/tag/v1.0.0-preview.78) is a WIP prerelease, ad-hoc signed and unnotarized. Packaging evidence is recorded in the release notes; no new visible UI/cold-start run is claimed. |
 | Open checks | Physical drag and drop, large folders, individual app launches, VoiceOver, Store sandbox behavior, and the dark Dock/Finder icon. |
 
-The CI badge reports **background validation only**. It is not a claim that the full UI suite or distribution checks passed. See the [test matrix](Docs/TEST_MATRIX.md) and [snapshot notes](Docs/SOURCE_SNAPSHOT_2026-10-09.md).
+The CI badge reports **background validation only**. It is not a claim that the full UI suite or distribution checks passed. See the [test matrix](Docs/TEST_MATRIX.md) and [snapshot notes](Docs/SOURCE_SNAPSHOT_2026-10-14.md).
 
 ## Contributing
 

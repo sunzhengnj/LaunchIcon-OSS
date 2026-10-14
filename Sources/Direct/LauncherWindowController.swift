@@ -21,6 +21,67 @@ private func pinLayerToPresentedFrame(_ layer: CALayer?, removing keys: [String]
     CATransaction.commit()
 }
 
+/// Merge flight uses the same curve: leave quickly, then settle.
+private func folderChromeTiming(tracksIcon: Bool) -> CAMediaTimingFunction {
+    if tracksIcon {
+        return CAMediaTimingFunction(
+            controlPoints: Float(LauncherLayout.folderChromeTravelX1),
+            Float(LauncherLayout.folderChromeTravelY1),
+            Float(LauncherLayout.folderChromeTravelX2),
+            Float(LauncherLayout.folderChromeTravelY2)
+        )
+    }
+    return CAMediaTimingFunction(controlPoints: 0.2, 0.8, 0.2, 1)
+}
+
+/// Close keeps the panel readable while it travels back, then lets it
+/// dissolve into the icon. A centered pop fades with the same curve as the scale.
+/// The scrim, the grid's brightness, and the backdrop blur use this same
+/// late dissolve when the close tracks the icon. Scale stays on the travel curve.
+private func folderCloseVeilTiming(tracksIcon: Bool, closing: Bool) -> CAMediaTimingFunction {
+    if LauncherLayout.folderCloseVeilUsesLateDissolve(tracksIcon: tracksIcon, closing: closing) {
+        return folderCloseOpacityTiming(tracksIcon: true)
+    }
+    return folderChromeTiming(tracksIcon: tracksIcon)
+}
+
+private func folderCloseOpacityTiming(tracksIcon: Bool) -> CAMediaTimingFunction {
+    if tracksIcon {
+        return CAMediaTimingFunction(controlPoints: 0.55, 0.0, 0.82, 0.28)
+    }
+    return folderChromeTiming(tracksIcon: false)
+}
+
+/// Whole-cell merge fade. The icon stays up while it flies, then dissolves
+/// on the cell. Not the flight ease: that one would fade it in the air.
+private func wholeCellMergeFadeTiming() -> CAMediaTimingFunction {
+    CAMediaTimingFunction(
+        controlPoints: Float(LauncherLayout.wholeCellMergeFadeX1),
+        Float(LauncherLayout.wholeCellMergeFadeY1),
+        Float(LauncherLayout.wholeCellMergeFadeX2),
+        Float(LauncherLayout.wholeCellMergeFadeY2)
+    )
+}
+
+/// The animation group finishes on the main thread. Another hop leaves the
+/// flying picture sitting on the cell after it has already arrived. Commit
+/// on this turn. A callback off the main thread still hops.
+private func finishFlightOnLandingTurn(_ body: @escaping @MainActor @Sendable () -> Void) {
+    if LauncherLayout.flightLandingCommitsOnThisTurn(isMainThread: Thread.isMainThread) {
+        MainActor.assumeIsolated(body)
+    } else {
+        Task { @MainActor in
+            body()
+        }
+    }
+}
+
+/// A flyer sits above the panel. Clicks pass through to the folder that is
+/// still opening, so the traveling icon does not eat the press.
+private final class FlightImageView: NSImageView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
 @MainActor
 final class LauncherWindowController: NSWindowController {
     var onCatalogLoaded: ((CatalogScanReport) -> Void)?
@@ -45,7 +106,15 @@ final class LauncherWindowController: NSWindowController {
     private var persistTask: Task<Void, Never>?
     private var persistGeneration = 0
     private var launchesInFlight: [String: AppCandidate] = [:]
+    /// Monotonic per app. A delayed `/usr/bin/open` failure applies only when
+    /// its attempt is still the latest click for that key.
+    private var launchAttempts: [String: Int] = [:]
+    /// Dismiss generation captured after this attempt's hide. Missing when
+    /// that click did not hide. The open-exit callback reads it on the main
+    /// actor; it must not capture a mutable local across the sendable spawn.
+    private var launchHideGenerations: [String: (attempt: Int, generation: Int)] = [:]
     private var persistableLayout = false
+    private var isShowingCachedCatalog = false
     private var isScanning = false
     private var catalogReloadGeneration = 0
     private var cachedCandidates: [AppCandidate] = []
@@ -97,6 +166,7 @@ final class LauncherWindowController: NSWindowController {
         panel.hasShadow = false
         panel.contentView = rootView
         super.init(window: panel)
+        panel.delegate = panel
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(windowDidUpdate),
@@ -157,12 +227,44 @@ final class LauncherWindowController: NSWindowController {
         #endif
     }
 
+    /// Release-safe verification hook. Set `LAUNCHICON_TEST_AUTO_LAUNCH_PATH` to
+    /// an absolute `.app` path; after the window is shown, calls the same
+    /// `launch(AppCandidate)` path as a user click (no highlight UI beforehand).
+    /// Armed once per process so a later `show()` does not re-fire.
+    private var automatedLaunchVerificationArmed = false
+    private func scheduleAutomatedLaunchVerificationIfNeeded() {
+        guard !automatedLaunchVerificationArmed else { return }
+        let environment = ProcessInfo.processInfo.environment
+        guard let path = environment["LAUNCHICON_TEST_AUTO_LAUNCH_PATH"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !path.isEmpty else { return }
+        automatedLaunchVerificationArmed = true
+        let delayMs = Double(environment["LAUNCHICON_TEST_AUTO_LAUNCH_DELAY_MS"] ?? "500") ?? 500
+        DispatchQueue.main.asyncAfter(deadline: .now() + delayMs / 1000) { [weak self] in
+            guard let self else { return }
+            // Wait until the window is actually accepting clicks.
+            guard LauncherLayout.shouldAcceptPointerActivation(
+                isDismissing: self.isDismissing,
+                isVisible: self.window?.isVisible == true
+            ) else {
+                self.automatedLaunchVerificationArmed = false
+                self.scheduleAutomatedLaunchVerificationIfNeeded()
+                return
+            }
+            self.launchForAutomatedVerification(path: path)
+        }
+    }
+
     #if DEBUG
     private func consumeTestButtonScript(at path: String) {
         guard let title = try? String(contentsOfFile: path, encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines),
-              !title.isEmpty,
-              rootView.pressVisibleButton(titled: title) else { return }
+              !title.isEmpty else { return }
+        if title == "system-reduce-motion:on" || title == "system-reduce-motion:off" {
+            rootView.setTestSystemReducedMotion(title == "system-reduce-motion:on")
+        } else if !rootView.pressVisibleButton(titled: title) {
+            return
+        }
         try? Data().write(to: URL(fileURLWithPath: path), options: .atomic)
         fputs("TEST_UI pressed \(title)\n", stderr)
     }
@@ -274,6 +376,7 @@ final class LauncherWindowController: NSWindowController {
             reloadCatalogIfIdle()
         }
         onVisibilityChanged?()
+        scheduleAutomatedLaunchVerificationIfNeeded()
     }
 
     func hide() {
@@ -308,6 +411,9 @@ final class LauncherWindowController: NSWindowController {
         // yet. Leave the image where it is; do not start the flight under
         // the fade.
         rootView.settleMergeFlightForDismissal()
+        // A reorder picture can still be flying into its cell. Leave it on
+        // the frame already drawn; do not start that flight under the fade.
+        rootView.settleDropLandingForDismissal()
         // An opening or closing folder keeps scaling under the fade, and the
         // close completion can hide the panel before the window leaves.
         rootView.settleFolderChromeForDismissal()
@@ -461,8 +567,8 @@ final class LauncherWindowController: NSWindowController {
         catalogLoadingTask?.cancel()
         catalogReloadGeneration &+= 1
         let generation = catalogReloadGeneration
+        onDiagnosticEvent?("Catalog reload started: generation=\(generation)")
         isScanning = true
-        cachedCandidates = []
         rootView.setCachedCatalogAvailable(false)
         rootView.setRescanVisible(false)
         rootView.setLayoutEditingEnabled(false, explanation: L("正在扫描应用，暂时无法整理"))
@@ -518,11 +624,23 @@ final class LauncherWindowController: NSWindowController {
             }
             guard !Task.isCancelled else { return }
             persistableLayout = persistable && report.canPersistReconciledLayout
+            let replaceCache = LauncherLayout.shouldReplaceCachedCatalog(
+                isShowingCache: isShowingCachedCatalog,
+                newScanPersistable: persistableLayout
+            )
             let base = LauncherLayout.layoutBaseForCatalogReload(memory: rootView.layoutState, stored: stored)
             let layout = LauncherLayout.reconcile(candidates: report.candidates, into: base)
-            rootView.setCatalog(report.candidates, layout: layout)
+            if replaceCache {
+                isShowingCachedCatalog = false
+                rootView.setCatalog(report.candidates, layout: layout)
+            } else {
+                onDiagnosticEvent?("Catalog reload retained selected cache: generation=\(generation)")
+                rootView.setCachedCatalogAvailable(false)
+            }
             rootView.setLoading(false)
-            let editingExplanation: String? = if !persistable {
+            let editingExplanation: String? = if !replaceCache {
+                L("正在显示上次应用列表；重新扫描后可整理")
+            } else if !persistable {
                 L("布局文件无法读取，暂时无法整理；原文件已保留")
             } else if !report.canPersistReconciledLayout {
                 L("应用扫描不完整，暂时无法整理；请重新扫描")
@@ -530,13 +648,16 @@ final class LauncherWindowController: NSWindowController {
                 nil
             }
             rootView.setLayoutEditingEnabled(persistableLayout, explanation: editingExplanation)
-            rootView.setRescanVisible(persistable && !report.canPersistReconciledLayout)
+            rootView.setRescanVisible(!replaceCache || (persistable && !report.canPersistReconciledLayout))
+            onDiagnosticEvent?("Catalog reload finished: generation=\(generation); persistable=\(persistableLayout)")
             onCatalogLoaded?(report)
             onCatalogReloadFinished?(persistableLayout)
             if persistableLayout {
                 schedulePersist(layout)
                 do {
                     try await catalogSnapshotStore.save(report)
+                } catch is CancellationError {
+                    return
                 } catch {
                     onCatalogSnapshotSaveFailed?(error)
                 }
@@ -561,12 +682,20 @@ final class LauncherWindowController: NSWindowController {
 
     private func cancelScanAndUseCachedCatalog() {
         guard !cachedCandidates.isEmpty,
-              isScanning || rootView.isCatalogEmpty || !persistableLayout else { return }
+              isScanning || rootView.isCatalogEmpty || !persistableLayout else {
+            onDiagnosticEvent?(
+                "Cached catalog request ignored: candidates=\(cachedCandidates.count); "
+                    + "scanning=\(isScanning); empty=\(rootView.isCatalogEmpty); persistable=\(persistableLayout)"
+            )
+            return
+        }
+        onDiagnosticEvent?("Cached catalog selected: candidates=\(cachedCandidates.count)")
         catalogReloadGeneration &+= 1
         catalogLoadingTask?.cancel()
         catalogLoadingTask = nil
         isScanning = false
         persistableLayout = false
+        isShowingCachedCatalog = true
         rootView.setCachedCatalogAvailable(false)
         rootView.setCatalog(cachedCandidates, layout: LauncherLayout.reconcile(candidates: cachedCandidates, into: cachedLayout))
         rootView.setLoading(false)
@@ -622,45 +751,186 @@ final class LauncherWindowController: NSWindowController {
         // A different app must still launch; the old single task dropped it.
         guard launchesInFlight[key] == nil else { return }
         launchesInFlight[key] = candidate
-        rootView.hideToast(animated: false)
-        rootView.setLaunchPending(candidate)
-        // show() bumps this. A hotkey that cancels the dismiss animation and
-        // brings the launcher back must not be undone when this wait ends.
-        let launchGeneration = dismissGeneration
-        Task { [weak self] in
-            guard let self else { return }
-            defer {
-                self.launchesInFlight[key] = nil
-                let nextKey = LauncherLayout.launchHighlightChange(
-                    finishedKey: key,
-                    highlightedKey: self.rootView.highlightedLaunchKey,
-                    remainingKeys: Set(self.launchesInFlight.keys)
-                )
-                if case .show(let highlighted) = nextKey {
-                    let next = highlighted.flatMap { self.launchesInFlight[$0] }
-                    self.rootView.setLaunchPending(next)
+        let attempt = (launchAttempts[key] ?? 0) + 1
+        launchAttempts[key] = attempt
+        let url = candidate.canonicalURL
+        let path = url.path
+        onDiagnosticEvent?("Launch requested: \(key) path:\(path)")
+
+        // preview.74–75: reloadItems-based setLaunchPending before open raised a
+        // swallowed ObjC exception. In-place tile highlight is safe; restore
+        // brief「正在启动…」before open. Still skip toast hide on this stack.
+        if !LauncherLayout.shouldSkipLaunchPendingHighlightBeforeOpen() {
+            rootView.setLaunchPending(candidate)
+            onDiagnosticEvent?("Launch pending highlight applied (in-place): \(key)")
+        }
+
+        if LauncherLayout.shouldReleasePresentationBeforeOpen(hidesAfterLaunch: hidesAfterLaunch) {
+            releasePresentationOptionsForOutgoingLaunch()
+            onDiagnosticEvent?("Launch presentation released: \(key)")
+        }
+
+        // Always clear launchesInFlight even if open aborts mid-call.
+        var openFinished = false
+        defer {
+            if !openFinished {
+                finishesLaunchInFlight(key: key)
+            }
+        }
+
+        do {
+            onDiagnosticEvent?("Launch open begin (/usr/bin/open): \(key) path:\(path)")
+            let launcher = WorkspaceAppLauncher { [weak self] finishedURL, status in
+                let finishedAttempt = attempt
+                Task { @MainActor in
+                    guard let self else { return }
+                    guard LauncherLayout.shouldApplyDelayedOpenFailure(
+                        finishedAttempt: finishedAttempt,
+                        latestAttempt: self.launchAttempts[key] ?? 0,
+                        terminationStatus: status
+                    ) else {
+                        if LauncherLayout.shouldReportOpenProcessFailure(terminationStatus: status) {
+                            self.onDiagnosticEvent?(
+                                "Launch open process failure superseded: \(key) attempt:\(finishedAttempt)"
+                            )
+                        }
+                        return
+                    }
+                    self.handleDelayedOpenProcessFailure(
+                        candidate: candidate,
+                        key: key,
+                        url: finishedURL,
+                        status: status,
+                        finishedAttempt: finishedAttempt
+                    )
                 }
             }
-            do {
-                try await WorkspaceAppLauncher().launch(candidate.canonicalURL)
-                try await Task.sleep(nanoseconds: 120_000_000)
-                if LauncherLayout.shouldDismissAfterSuccessfulLaunch(
-                    hidesAfterLaunch: self.hidesAfterLaunch,
-                    launchGeneration: launchGeneration,
-                    currentGeneration: self.dismissGeneration
-                ) {
-                    self.hide()
-                }
-            } catch is CancellationError {
-                return
-            } catch {
-                onLaunchFailed?(candidate, error)
-                rootView.showLaunchError(for: candidate, error: error)
+            let result = try launcher.openImmediately(url)
+            openFinished = true
+            switch result {
+            case .activated:
+                onDiagnosticEvent?("Launch activated: \(key) path:\(path)")
+            case .opened:
+                onDiagnosticEvent?("Launch open ok (/usr/bin/open): \(key) path:\(path)")
             }
+        } catch {
+            openFinished = true
+            onDiagnosticEvent?("Launch open fail (/usr/bin/open): \(key) path:\(path) error:\(error)")
+            finishesLaunchInFlight(key: key)
+            // Spawn never happened, so this click does not hide. Put back the
+            // dock/menu options released above; a successful spawn leaves them
+            // off so the opened app can come forward. Test windows never took
+            // those options (see show()).
+            if LauncherLayout.shouldReleasePresentationBeforeOpen(hidesAfterLaunch: hidesAfterLaunch),
+               testWindowSize == nil {
+                NSApp.presentationOptions.formUnion(launcherPresentationOptions)
+            }
+            onLaunchFailed?(candidate, error)
+            rootView.showLaunchError(for: candidate, error: error)
+            onDiagnosticEvent?("Launch failed: \(key) path:\(path)")
+            return
+        }
+
+        finishesLaunchInFlight(key: key)
+        if hidesAfterLaunch {
+            hide()
+            launchHideGenerations[key] = (attempt: attempt, generation: dismissGeneration)
+        } else {
+            launchHideGenerations[key] = nil
+        }
+    }
+
+    /// Test/integration only: invoke the same `launch(AppCandidate)` path used
+    /// by icon clicks, without going through collection-view highlight UI.
+    func launchForAutomatedVerification(path: String) {
+        let url = URL(fileURLWithPath: path)
+        let candidate = AppCandidate(
+            canonicalURL: url,
+            bundleIdentifier: nil,
+            displayName: url.deletingPathExtension().lastPathComponent,
+            sourcePriority: 0,
+            discoveredAt: .now
+        )
+        launch(candidate)
+    }
+
+    /// Clears the in-flight mark and forces the tile off「正在启动…」even while
+    /// the launcher is already dismissing (normal highlight present skips reload).
+    private func finishesLaunchInFlight(key: String) {
+        launchesInFlight[key] = nil
+        onDiagnosticEvent?("Launch pending cleared: \(key)")
+        switch LauncherLayout.launchHighlightChange(
+            finishedKey: key,
+            highlightedKey: rootView.highlightedLaunchKey,
+            remainingKeys: Set(launchesInFlight.keys)
+        ) {
+        case .keep:
+            break
+        case .show(let highlighted):
+            let next = highlighted.flatMap { launchesInFlight[$0] }
+            rootView.setLaunchPending(next, forceReload: true)
+        }
+    }
+
+    /// Drops launcher-only presentation options so the opened app can activate.
+    /// `hide()` also subtracts them after the fade; doing it here is idempotent
+    /// and must happen before the open request, not after it returns.
+    private func releasePresentationOptionsForOutgoingLaunch() {
+        NSApp.presentationOptions.subtract(launcherPresentationOptions)
+    }
+
+    /// `/usr/bin/open` returned non-zero after spawn. Log always; toast only if
+    /// the launcher can still present (otherwise showToast defers under fade).
+    /// A hide that this click already started comes back so the failure is
+    /// not only a toast on the next manual show.
+    private func handleDelayedOpenProcessFailure(
+        candidate: AppCandidate,
+        key: String,
+        url: URL,
+        status: Int32,
+        finishedAttempt: Int
+    ) {
+        onDiagnosticEvent?(
+            "Launch open process failed: \(key) path:\(url.path) status:\(status)"
+        )
+        let error = WorkspaceLaunchError.requestRejected(url)
+        onLaunchFailed?(candidate, error)
+        let stamp = launchHideGenerations[key]
+        let hidForThisLaunch = stamp?.attempt == finishedAttempt
+        if LauncherLayout.shouldReshowLauncherAfterDelayedOpenFailure(
+            hidForThisLaunch: hidForThisLaunch,
+            launchDismissGeneration: stamp?.generation ?? 0,
+            currentDismissGeneration: dismissGeneration,
+            finishedAttempt: finishedAttempt,
+            latestAttempt: launchAttempts[key] ?? 0,
+            terminationStatus: status
+        ) {
+            onDiagnosticEvent?("Launch open process failure reshows launcher: \(key)")
+            show()
+        }
+        // finishesLaunchInFlight already cleared pending on the click stack.
+        rootView.showLaunchError(for: candidate, error: error)
+        if LauncherLayout.shouldSurfaceDelayedOpenFailureWhileLauncherVisible(
+            isDismissing: isDismissing,
+            isVisible: window?.isVisible == true
+        ) {
+            onDiagnosticEvent?("Launch open process failure surfaced: \(key)")
+        } else {
+            onDiagnosticEvent?("Launch open process failure deferred-or-hidden: \(key)")
         }
     }
 }
-private final class LauncherPanel: NSPanel {
+private final class LauncherPanel: NSPanel, NSWindowDelegate {
+    private let folderTitleEditor = NSTextView.fieldEditor()
+
+    func windowWillReturnFieldEditor(_ sender: NSWindow, to client: Any?) -> Any? {
+        guard client is FolderTitleField else { return nil }
+        // Configure before focus, including a Tab away without changing text.
+        // The dedicated editor keeps search's text checking options independent.
+        folderTitleEditor.enabledTextCheckingTypes = 0
+        return folderTitleEditor
+    }
+
     var dismissHandler: (() -> Void)?
     /// True while the window is still visible but interaction is already off.
     var keyboardSuspended: () -> Bool = { false }
@@ -996,8 +1266,44 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     private weak var dropTargetTile: AppGridTileView?
     private weak var dragSourceTile: AppGridTileView?
     private var reorderSlideSignature: ReorderSlideSignature?
-    private var pendingMergeAnimation: (source: CGRect?, target: CGRect?, image: NSImage, folderID: UUID?, createdFolder: Bool)?
+    /// `source` is the dragged cell. A new folder records both icons so they
+    /// can land in the first two preview slots. A drop onto a folder that
+    /// already exists records the incoming icon and the empty slot it grows.
+    private struct PendingMergeAnimation {
+        var source: CGRect?
+        var target: CGRect?
+        var image: NSImage
+        var folderID: UUID?
+        var createdFolder: Bool
+        var residentIconFrame: CGRect?
+        var residentIcon: NSImage?
+        var incomingIconFrame: CGRect?
+        var incomingIcon: NSImage?
+        var incomingPreviewSlot: Int?
+        /// Set when the new icon will not appear on the plate. Opening the
+        /// folder mid-flight carries this icon into its own cell.
+        var incomingItemID: UUID?
+    }
+    private var pendingMergeAnimation: PendingMergeAnimation?
     private weak var mergeAnimationView: NSImageView?
+    /// Both icons of a new folder, flying into the preview plate. Cleared with
+    /// the single-cell flyer: a fade pins them, and removing that flyer shows
+    /// the plate glyphs.
+    private struct MergePreviewFlyer {
+        let view: FlightImageView
+        var destination: CGRect
+        /// The app that is sinking into a full plate. Slot landings leave
+        /// this nil and match the glyph by frame instead.
+        var itemID: UUID? = nil
+    }
+    private var mergePreviewFlyers: [MergePreviewFlyer] = []
+    private weak var mergePreviewFolderTile: AppGridTileView?
+    /// The folder whose newest preview glyph stays hidden until the flyer
+    /// lands. A reload configures that tile again and would draw the glyph
+    /// under the flyer. Cleared when the glyph is allowed to show.
+    private var incomingPreviewLimitedFolderID: UUID?
+    private var incomingPreviewGlyphLimit: Int?
+    private var mergePreviewFlightGeneration: UInt64 = 0
     /// Bumped when a flight is frozen or removed, so its completion does not
     /// take the image away after the fade asked to keep the current frame.
     private var mergeFlightGeneration = 0
@@ -1006,12 +1312,29 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     /// the window is hidden. A flight that already started stays on screen
     /// until that same moment, then the image is removed.
     private var mergeFlightWaitsForLauncher = false
+    /// A reorder, or a move into or out of an open folder, that still has to
+    /// fly from the released picture into its cell. Cleared once that flight
+    /// starts. The item id stays until the cell is allowed to draw again.
+    private struct PendingDropLanding {
+        var itemID: UUID
+        var source: CGRect
+        var image: NSImage
+        var inOpenFolder: Bool
+        var retried: Bool
+    }
+    private var pendingDropLanding: PendingDropLanding?
+    private var dropLandingItemID: UUID?
+    private weak var dropLandingView: FlightImageView?
+    private var dropLandingGeneration: UInt64 = 0
+    private var dropLandingWaitsForLauncher = false
     /// The fade pinned an opening or closing folder panel, or the grid
     /// behind it. Applied once the launcher is up, or once the window is hidden.
     private var folderChromeWaitsForLauncher = false
     /// Reduced motion changed while the fade was holding the backdrop.
     /// Applied with the folder chrome, once that hold ends.
     private var folderBackdropStyleWaitsForLauncher = false
+    /// Invalidates a closing backdrop's cleanup when it reopens or is pinned.
+    private var folderBackdropAnimationGeneration = 0
     private let mergeFlightDuration: TimeInterval = 0.34
     private var folderLandingGeneration = 0
     /// Every landing that has not committed yet. A later tile must not drop
@@ -1052,7 +1375,11 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     private var layoutSaveFailed = false
     private var reducesMotionOverride = false
     private var appliedReducedMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    #if DEBUG
+    private var testSystemReducedMotion: Bool?
+    #endif
     private var searchChromeVisible = false
+    private var searchChromeFading = false
     private var searchChromeGeneration = 0
     /// The fade pinned a search/grid crossfade that had already started.
     /// Applied once the launcher is up, or once the window is hidden.
@@ -1060,13 +1387,76 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     /// The fade pinned a grid fade-in that follows a dissolved folder.
     /// Applied once the launcher is up, or once the window is hidden.
     private var dissolvedGridFadeWaitsForLauncher = false
+    /// The member still on the pointer when this drop breaks the folder.
+    /// Its drag image is already moving, so the scatter flight skips it.
+    private var dissolveScatterExcludedItemID: UUID?
+    /// Bumped when a scatter flight is frozen or removed, so its completion
+    /// does not reveal the grid icon after the fade asked to keep the frame.
+    private var dissolveScatterGeneration: UInt64 = 0
+    private var dissolveScatterFlyers: [NSImageView] = []
+    private struct ScatterHiddenTile {
+        weak var tile: AppGridTileView?
+    }
+    private var dissolveScatterHiddenTiles: [ScatterHiddenTile] = []
+    /// The fade pinned leftover icons that were flying back to the grid.
+    /// Applied once the launcher is up, or once the window is hidden.
+    private var dissolveScatterWaitsForLauncher = false
+    /// Preview glyphs flying between the plate and the open cells. Bumped when
+    /// the flight is frozen or retargeted, so an old completion does not
+    /// uncover the cells after a fade asked to keep the frame.
+    private var previewGlyphFlightGeneration: UInt64 = 0
+    private struct PreviewGlyphFlyer {
+        var itemID: UUID
+        let view: FlightImageView
+        var glyphFrame: CGRect
+        var cellFrame: CGRect
+        /// This icon has no preview slot. Closing sinks it into the plate
+        /// center and fades it as it arrives. Opening fades it back in
+        /// along the flight.
+        var sinksIntoPlate: Bool = false
+    }
+    private var previewGlyphFlyerBoxes: [PreviewGlyphFlyer] = []
+    private var previewGlyphFlyers: [NSImageView] {
+        previewGlyphFlyerBoxes.map { $0.view }
+    }
+    private struct PreviewGlyphHiddenContent {
+        var itemID: UUID
+        weak var tile: AppGridTileView?
+    }
+    private var previewGlyphHiddenContent: [PreviewGlyphHiddenContent] = []
+    /// The folder plate whose mini icons are in flight. Restored with the cells.
+    private weak var previewGlyphSourceTile: AppGridTileView?
+    /// The grid folder whose plate the open panel borrowed. Nil once the close
+    /// has landed, or when the open never left that plate. A reload configures
+    /// the tile again and would draw the plate under the panel, so the flag
+    /// is put back while this id is set.
+    private var borrowedPreviewPlateFolderID: UUID?
+    private var borrowedPreviewPlatePhase: LauncherLayout.FolderPreviewPlatePhase = .resting
+    /// Opacity already drawn on the plate during a close or a reversed open.
+    /// A reload configures the tile back to solid, so this value is put back
+    /// while the phase is `.returning` or `.yielding`. 1 once the plate rests.
+    private var previewPlateReturnPresentedOpacity: CGFloat = 1
+    /// Opacity the current fade started from. The presented value moves;
+    /// this one stays, so a late sample does not ease from the wrong place.
+    private var previewPlateFadeStart: CGFloat = 0
+    private let previewPlateClock = PreviewPlateClock()
+    private var previewPlateReturnGeneration: UInt64 = 0
+    /// The fade pinned glyphs that were flying. Applied once the launcher is
+    /// up, or once the window is hidden.
+    private var previewGlyphFlightWaitsForLauncher = false
+    /// Close direction. Finishing it leaves the cell icons hidden so they do
+    /// not pop back into a panel that is still shrinking onto the plate.
+    private var previewGlyphFlightReturnsHome = false
     /// Layers whose launch pulse was pinned mid-scale. Reset once the
     /// launcher is up, or once the window is hidden, so the icon is not
     /// left small. The pulse is not replayed.
     private var heldLaunchFeedbackLayers: [CALayer] = []
 
     private var prefersReducedMotion: Bool {
-        reducesMotionOverride || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        #if DEBUG
+        if let testSystemReducedMotion { return reducesMotionOverride || testSystemReducedMotion }
+        #endif
+        return reducesMotionOverride || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
     }
 
     var isCatalogEmpty: Bool { allCandidates.isEmpty }
@@ -1099,6 +1489,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         stagingHost.collectionView.collectionViewLayout = Self.makeGridLayout()
         searchCollectionView.collectionViewLayout = Self.makeGridLayout()
         super.init(frame: frameRect)
+        previewPlateClock.owner = self
         wantsLayer = true
         layer?.backgroundColor = NSColor(calibratedRed: 0.05, green: 0.07, blue: 0.12, alpha: 1).cgColor
 
@@ -1187,6 +1578,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         readOnlyCachedButton.isHidden = true
         readOnlyCachedButton.target = self
         readOnlyCachedButton.action = #selector(useCachedCatalog)
+        readOnlyCachedButton.setAccessibilityIdentifier("cachedCatalog.readOnly")
         readOnlyCachedButton.setAccessibilityHelp(L("使用本机上次完整扫描的应用列表；整理功能暂不可用"))
         readOnlyCachedButton.translatesAutoresizingMaskIntoConstraints = false
         readOnlyStatusRow.orientation = .horizontal
@@ -1210,8 +1602,13 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         for collectionView in [activeCollectionView, stagingCollectionView, searchCollectionView] {
             collectionView.dataSource = self
             collectionView.delegate = self
-            collectionView.dragSessionEndedHandler = { [weak self] in self?.finishItemDragSession() }
-            collectionView.dragExitedHandler = { [weak self] in self?.clearDropHighlightIfAllowed() }
+            collectionView.dragSessionEndedHandler = { [weak self] operation, screenPoint in
+                self?.finishItemDragSession(operation: operation, screenPoint: screenPoint)
+            }
+            collectionView.dragExitedHandler = { [weak self] in
+                guard let self else { return }
+                self.clearDropHighlightIfAllowed(animatedReorder: self.dragPreview != nil)
+            }
             collectionView.isSelectable = false
             collectionView.setAccessibilityEnabled(true)
             collectionView.backgroundColors = [.clear]
@@ -1358,13 +1755,20 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         folderOverlay.isHidden = true
         folderOverlay.translatesAutoresizingMaskIntoConstraints = false
         folderOverlay.onClose = { [weak self] in self?.closeFolder() }
+        folderOverlay.onChromeCloseLanded = { [weak self] in
+            self?.releaseBorrowedPreviewPlate()
+        }
         folderOverlay.acceptsPointerActivation = { [weak self] in
             self?.acceptsPointerActivation() ?? false
         }
         folderOverlay.onActivateApp = { [weak self] candidate in self?.onCandidateSelected?(candidate) }
-        folderOverlay.onDrop = { [weak self] drop in
+        folderOverlay.onDrop = { [weak self] drop, pointInOverlay in
             guard let self else { return false }
-            return self.applyDrop(self.placingUnspecifiedFolderExtraction(drop))
+            let release = self.convert(pointInOverlay, from: self.folderOverlay)
+            return self.applyDrop(
+                self.placingUnspecifiedFolderExtraction(drop),
+                releasePoint: release
+            )
         }
         folderOverlay.acceptsDrop = { [weak self] in
             LauncherLayout.shouldAcceptLayoutDrop(isDismissing: self?.launcherIsDismissing() ?? false)
@@ -1401,8 +1805,13 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         }
         folderOverlay.collectionView.dataSource = self
         folderOverlay.collectionView.delegate = self
-        folderOverlay.collectionView.dragSessionEndedHandler = { [weak self] in self?.finishItemDragSession() }
-        folderOverlay.collectionView.dragExitedHandler = { [weak self] in self?.clearDropHighlightIfAllowed() }
+        folderOverlay.collectionView.dragSessionEndedHandler = { [weak self] operation, screenPoint in
+            self?.finishItemDragSession(operation: operation, screenPoint: screenPoint)
+        }
+        folderOverlay.collectionView.dragExitedHandler = { [weak self] in
+            guard let self else { return }
+            self.clearDropHighlightIfAllowed(animatedReorder: self.dragPreview != nil)
+        }
         folderOverlay.collectionView.isSelectable = false
         folderOverlay.collectionView.setAccessibilityEnabled(true)
         folderOverlay.collectionView.backgroundColors = [.clear]
@@ -1423,6 +1832,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         cachedCatalogButton.isHidden = true
         cachedCatalogButton.target = self
         cachedCatalogButton.action = #selector(useCachedCatalog)
+        cachedCatalogButton.setAccessibilityIdentifier("cachedCatalog.loading")
         cachedCatalogButton.setAccessibilityHelp(L("取消当前扫描，使用本机上次完整扫描的应用列表；整理功能暂不可用"))
         cachedCatalogButton.translatesAutoresizingMaskIntoConstraints = false
         card.addSubview(cachedCatalogButton)
@@ -1461,6 +1871,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         emptyStateCachedButton.isHidden = true
         emptyStateCachedButton.target = self
         emptyStateCachedButton.action = #selector(useCachedCatalog)
+        emptyStateCachedButton.setAccessibilityIdentifier("cachedCatalog.empty")
         emptyStateCachedButton.setAccessibilityHelp(L("使用本机上次完整扫描的应用列表；整理功能暂不可用"))
 
         for view in [emptyStateIcon, emptyStateTitle, emptyStateDetail, emptyStateReloadButton, emptyStateCachedButton] {
@@ -1589,6 +2000,12 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         syncContentScrollMotionForPreference()
     }
 
+    /// The plate link retains its driver. Releasing this view has to
+    /// invalidate it, or a hidden window never gets another callback.
+    isolated deinit {
+        previewPlateClock.stop()
+    }
+
     @available(*, unavailable)
     required init?(coder: NSCoder) { nil }
 
@@ -1610,11 +2027,18 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         fade.toValue = visible ? 1 : 0
         fade.duration = duration
         fade.timingFunction = timing
+        // The model below is already the end opacity. Hold the picture on
+        // screen until this animation is attached, or the commit frame
+        // flashes the launcher full or gone.
+        fade.fillMode = .backwards
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         layer.opacity = visible ? 1 : 0
         layer.add(fade, forKey: "launcherFade")
 
         if reduced {
             cardLayer.transform = CATransform3DIdentity
+            CATransaction.commit()
             return duration
         }
         let targetY: CGFloat = visible ? 0 : -4
@@ -1631,8 +2055,10 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         rise.toValue = targetY
         rise.duration = duration
         rise.timingFunction = timing
+        rise.fillMode = .backwards
         cardLayer.transform = CATransform3DMakeTranslation(0, targetY, 0)
         cardLayer.add(rise, forKey: "launcherRise")
+        CATransaction.commit()
         return duration
     }
 
@@ -1854,6 +2280,25 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         applyCurrentReducedMotion()
     }
 
+    #if DEBUG
+    func setTestSystemReducedMotion(_ enabled: Bool) {
+        guard ProcessInfo.processInfo.environment["LAUNCHICON_TEST_LAYOUT_PATH"] != nil else { return }
+        let previous = appliedReducedMotion
+        testSystemReducedMotion = enabled
+        refreshReducedMotionForSystemChange()
+        let backdrop = isSearching ? searchScrollView : gridViewport
+        let scale = backdrop.layer?.transform.m11 ?? 1
+        let blurred = backdrop.layer?.filters?.isEmpty == false
+        let folderElasticityNone = folderOverlay.testContentScrollElasticityIsNone
+        onDiagnosticEvent?(
+            "System motion: effective=\(prefersReducedMotion) changed=\(previous != appliedReducedMotion) " +
+            "folderOpen=\(openedFolderID != nil) scaled=\(abs(scale - 1) > 0.001) blurred=\(blurred) " +
+            "searchElasticityNone=\(searchScrollView.verticalScrollElasticity == .none) " +
+            "folderElasticityNone=\(folderElasticityNone)"
+        )
+    }
+    #endif
+
     private func applyCurrentReducedMotion() {
         let effective = prefersReducedMotion
         let changed = LauncherLayout.shouldApplyReducedMotionChange(
@@ -1862,37 +2307,56 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         )
         appliedReducedMotion = effective
         guard changed else { return }
-        // A hover fade already running is about a quarter of a second. Snap
-        // it when the preference changes, instead of finishing that fade.
-        previousPageButton.snapHoverVisibility()
-        nextPageButton.snapHoverVisibility()
-        // An open folder's backdrop follows the new preference at once.
-        // Reduced motion is opacity only. A close that is still scaling
-        // drops that scale the same way.
-        applyFolderBackdropStyleForMotionChange()
-        // Toast, search/grid, a dissolved-folder fade, a page slide, a press
-        // pulse, a folder open or close, a merge flight, a folder landing,
-        // and the launcher's own fade and card rise would keep running after
-        // this preference changes. Snap them only when the effective value
-        // changes, so saving another setting does not cut them short.
-        // A reorder ease is the same, but the reload below puts every tile
-        // back in its cell, so that gap is put back after the reload.
-        // A search or folder coast is not a tile animation. Pin it only when
-        // this preference actually changes.
-        snapInFlightToastFadeForMotionChange()
-        snapInFlightSearchChromeFadeForMotionChange()
-        snapInFlightDissolvedGridFadeForMotionChange()
-        snapInFlightPageSlideForMotionChange()
-        snapInFlightLaunchFeedbackForMotionChange()
-        snapInFlightFolderChromeForMotionChange()
-        snapInFlightMergeFlightForMotionChange()
-        snapInFlightFolderLandingForMotionChange()
-        snapInFlightLauncherPresenceForMotionChange()
-        dropInFlightDragLiftForMotionChange()
-        restInFlightPageDragForMotionChange()
-        restInFlightContentScrollForMotionChange()
-        reloadVisibleCollections()
-        landInFlightReorderSlideForMotionChange()
+        // Snap in-flight visuals only when the effective preference changes,
+        // so saving another setting does not cut animations short. Order is
+        // `LauncherLayout.reducedMotionSnapOrder` — do not reorder without
+        // updating that Core registry and its tests.
+        for slot in LauncherLayout.reducedMotionSnapOrder {
+            applyReducedMotionSnapSlot(slot)
+        }
+    }
+
+    private func applyReducedMotionSnapSlot(_ slot: LauncherLayout.ReducedMotionSnapSlot) {
+        switch slot {
+        case .pageButtonHover:
+            // A hover fade already running is about a quarter of a second.
+            previousPageButton.snapHoverVisibility()
+            nextPageButton.snapHoverVisibility()
+        case .folderBackdrop:
+            // Open-folder backdrop follows at once; reduced motion is opacity only.
+            applyFolderBackdropStyleForMotionChange()
+        case .toastFade:
+            snapInFlightToastFadeForMotionChange()
+        case .searchChrome:
+            snapInFlightSearchChromeFadeForMotionChange()
+        case .dissolvedGridFade:
+            snapInFlightDissolvedGridFadeForMotionChange()
+        case .pageSlide:
+            snapInFlightPageSlideForMotionChange()
+        case .launchFeedback:
+            snapInFlightLaunchFeedbackForMotionChange()
+        case .folderChrome:
+            snapInFlightFolderChromeForMotionChange()
+        case .mergeFlight:
+            snapInFlightMergeFlightForMotionChange()
+        case .folderLanding:
+            snapInFlightFolderLandingForMotionChange()
+        case .launcherPresence:
+            snapInFlightLauncherPresenceForMotionChange()
+        case .dragLiftDrop:
+            dropInFlightDragLiftForMotionChange()
+        case .pageDragRest:
+            restInFlightPageDragForMotionChange()
+        case .contentScrollRest:
+            restInFlightContentScrollForMotionChange()
+        case .reloadVisibleCollections:
+            // Reload puts every tile back in its cell before reorder lands.
+            reloadVisibleCollections()
+        case .reorderSlideLand:
+            landInFlightReorderSlideForMotionChange()
+        case .dropLanding:
+            snapInFlightDropLandingForMotionChange()
+        }
     }
 
     func hiddenApplications() -> [HiddenApplication] {
@@ -1981,9 +2445,16 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     /// fresh appearance orders the window in.
     private func presentCatalogChange(_ snapshot: DeferredCatalogPresentation) {
         let dissolvedOpenFolder = snapshot.closingFolder.map { layoutState.folders[$0] == nil } ?? false
+        commitFolderDissolveScatter()
+        let scatterSeeds = dissolvedOpenFolder
+            ? folderDissolveScatterSeeds(
+                memberIDs: snapshot.previouslyOpenedFolder?.itemIDs ?? [],
+                nextEntries: layoutState.orderedEntries
+            )
+            : []
         if dissolvedOpenFolder {
             // The reloads below throw away a focus set here.
-            closeFolder(restoreFocus: false)
+            closeFolder(restoreFocus: false, dissolveScatter: !scatterSeeds.isEmpty)
         }
         applySearch(
             preservedGridFocus: snapshot.preservedGridFocus,
@@ -2011,6 +2482,9 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
                currentEntries: layoutState.orderedEntries
            ) {
             focusGridEntry(focusID)
+        }
+        if !scatterSeeds.isEmpty {
+            _ = playFolderDissolveScatter(scatterSeeds)
         }
     }
 
@@ -2095,19 +2569,43 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
 
     /// Finish visual work held by a launcher fade. Both a cancelled fade and
     /// an ordered-out window use this order before deferred model updates.
+    /// Order comes from `LauncherLayout.deferredVisualStateOrder` — do not
+    /// reorder slots without updating that Core registry and its tests.
     func applyDeferredVisualState() {
-        applyDeferredDropHighlightClear()
-        applyDeferredFolderLanding()
-        applyDeferredMergeFlight()
-        applyDeferredFolderChrome()
-        applyDeferredSearchChrome()
-        applyDeferredDissolvedGridFade()
-        applyDeferredLaunchFeedback()
-        applyDeferredDragLiftDrop()
-        applyDeferredPageDragRest()
-        applyDeferredContentScrollRest()
-        applyDeferredPageButtonHover()
-        applyDeferredToastFade()
+        for slot in LauncherLayout.deferredVisualStateOrder {
+            applyDeferredVisualSlot(slot)
+        }
+    }
+
+    private func applyDeferredVisualSlot(_ slot: LauncherLayout.DeferredVisualSlot) {
+        switch slot {
+        case .dropHighlightClear:
+            applyDeferredDropHighlightClear()
+        case .folderLanding:
+            applyDeferredFolderLanding()
+        case .mergeFlight:
+            applyDeferredMergeFlight()
+        case .folderChrome:
+            applyDeferredFolderChrome()
+        case .searchChrome:
+            applyDeferredSearchChrome()
+        case .dissolvedGridFade:
+            applyDeferredDissolvedGridFade()
+        case .launchFeedback:
+            applyDeferredLaunchFeedback()
+        case .dragLiftDrop:
+            applyDeferredDragLiftDrop()
+        case .pageDragRest:
+            applyDeferredPageDragRest()
+        case .contentScrollRest:
+            applyDeferredContentScrollRest()
+        case .pageButtonHover:
+            applyDeferredPageButtonHover()
+        case .toastFade:
+            applyDeferredToastFade()
+        case .dropLanding:
+            applyDeferredDropLanding()
+        }
     }
 
     /// The page the grid should show the next time the launcher appears.
@@ -2273,6 +2771,18 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         }
     }
 
+    #if DEBUG
+    func controlTextDidBeginEditing(_ obj: Notification) {
+        let environment = ProcessInfo.processInfo.environment
+        guard (obj.object as? NSTextField) === searchField,
+              environment["LAUNCHICON_TEST_FIELD_EDITOR_AUDIT"] == "1",
+              environment["LAUNCHICON_TEST_SCAN_ROOT"] != nil,
+              let editor = searchField.currentEditor() as? NSTextView else { return }
+        let logger = Logger(subsystem: "com.sunzheng.LaunchIcon", category: "FieldEditorAudit")
+        logger.info("search stage=begin checkingTypes=\(editor.enabledTextCheckingTypes, privacy: .public) sharedEditor=\(editor === self.window?.fieldEditor(false, for: nil), privacy: .public)")
+    }
+    #endif
+
     func controlTextDidEndEditing(_ obj: Notification) {
         guard (obj.object as? NSTextField) === searchField else { return }
         refilterSearchIfFieldEditorDroppedComposition()
@@ -2341,18 +2851,27 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
 
     var highlightedLaunchKey: String? { launchingID }
 
-    func setLaunchPending(_ candidate: AppCandidate?) {
+    func setLaunchPending(_ candidate: AppCandidate?, forceReload: Bool = false) {
         launchingID = candidate?.id
+        // Always prefer in-place tile updates. `reloadItems` on the click stack
+        // raised a swallowed NSInternalInconsistencyException before open (Devin).
+        if forceReload {
+            // Dismiss already started: the present-while-up gate would skip work
+            // and leave tiles on「正在启动…」under the fade.
+            launchHighlightWaitsForLauncher = false
+            applyLaunchHighlightInPlace(pendingKey: launchingID)
+            return
+        }
         guard shouldPresentLaunchHighlightNow() else {
             launchHighlightWaitsForLauncher = true
             return
         }
-        reloadVisibleLaunchHighlight()
+        launchHighlightWaitsForLauncher = false
+        applyLaunchHighlightInPlace(pendingKey: launchingID)
     }
 
-    /// `force` reloads every grid. The window is still hidden, so the items
-    /// that were on screen may no longer count as visible. Cancelling a fade
-    /// reloads only the visible tiles.
+    /// `force` reloads every grid when reappearing (tiles may not exist yet).
+    /// Cancelling a fade only updates visible tiles in place — never reloadItems.
     func applyDeferredLaunchHighlight(force: Bool = false) {
         guard launchHighlightWaitsForLauncher else { return }
         guard force || shouldPresentLaunchHighlightNow() else { return }
@@ -2362,7 +2881,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
                 collectionView.reloadData()
             }
         } else {
-            reloadVisibleLaunchHighlight()
+            applyLaunchHighlightInPlace(pendingKey: launchingID)
         }
     }
 
@@ -2377,11 +2896,14 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         )
     }
 
-    private func reloadVisibleLaunchHighlight() {
+    /// Walk visible tiles and flip「正在启动…」without `reloadItems` / `reloadData`.
+    /// Core gate `shouldApplyLaunchPendingHighlightInPlaceOnly` documents the
+    /// policy; do not crash the click stack if a future experiment flips it.
+    private func applyLaunchHighlightInPlace(pendingKey: String?) {
         for collectionView in launchHighlightCollections {
-            let paths = collectionView.indexPathsForVisibleItems()
-            guard !paths.isEmpty else { continue }
-            collectionView.reloadItems(at: paths)
+            for item in collectionView.visibleItems() {
+                (item as? AppGridItem)?.applyLaunchHighlightState(pendingKey: pendingKey)
+            }
         }
     }
 
@@ -2601,7 +3123,9 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             context.timingFunction = CAMediaTimingFunction(name: .easeOut)
             toastView.animator().alphaValue = 0
         }, completionHandler: { [weak self] in
-            Task { @MainActor in
+            // Already on the main thread. A Task would leave the faded
+            // bubble drawn for another turn.
+            finishFlightOnLandingTurn { [weak self] in
                 guard self?.toastGeneration == generation else { return }
                 self?.toastView.isHidden = true
             }
@@ -2688,7 +3212,10 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     }
 
     @objc private func useCachedCatalog() {
-        guard acceptsPointerActivation() else { return }
+        guard acceptsPointerActivation() else {
+            onDiagnosticEvent?("Cached catalog request ignored: pointer activation unavailable")
+            return
+        }
         didConsumeClick = true
         onUseCachedCatalogRequested?()
     }
@@ -3072,8 +3599,54 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             ), displayName: folder.name, isLaunching: false, isFolder: true, preview: preview,
                 reducesMotion: prefersReducedMotion, onActivate: activate, onDragStart: beginDrag,
                 onRenameAlias: nil, onHideApplication: nil)
+            if pendingMergeAnimation?.createdFolder == true,
+               pendingMergeAnimation?.folderID == folder.id,
+               collectionView === activeCollectionView || collectionView === stagingCollectionView {
+                // The data source must update during the drop, before AppKit ends
+                // the drag image. Keep the new tile out of that first frame.
+                item.view.layer?.opacity = 0
+            }
+            if let tile = item.view as? AppGridTileView {
+                // Configure clears the hide and the fade. The open panel is
+                // still this plate, including after a reload, so keep the
+                // second copy off. A close that is dissolving into the plate
+                // puts the opacity it has already reached back on the tile.
+                if borrowedPreviewPlateFolderID == folder.id {
+                    if LauncherLayout.shouldHideFolderPreviewPlate(
+                        tracksIcon: true,
+                        phase: borrowedPreviewPlatePhase
+                    ) {
+                        tile.chromeHidesPlate = true
+                    }
+                    if borrowedPreviewPlatePhase == .returning || borrowedPreviewPlatePhase == .yielding {
+                        tile.previewPlateOpacity = previewPlateReturnPresentedOpacity
+                        if !previewGlyphFlyerBoxes.isEmpty {
+                            tile.openFlightHidesPreviewGlyphs = true
+                        }
+                    }
+                }
+                // Configure clears the limit. Put it back while this icon is
+                // still flying into the new slot, including after a reload.
+                if pendingMergeAnimation?.createdFolder == false,
+                   pendingMergeAnimation?.folderID == folder.id,
+                   let slot = pendingMergeAnimation?.incomingPreviewSlot,
+                   !prefersReducedMotion {
+                    tile.previewGlyphDrawLimit = slot
+                    incomingPreviewLimitedFolderID = folder.id
+                    incomingPreviewGlyphLimit = slot
+                } else if incomingPreviewLimitedFolderID == folder.id,
+                          let limit = incomingPreviewGlyphLimit {
+                    tile.previewGlyphDrawLimit = limit
+                }
+            }
         }
         if let tile = item.view as? AppGridTileView {
+            if dropLandingItemID == representedID {
+                // A reload configures this cell again while its picture is
+                // still flying. Keep the icon and title hidden so they do
+                // not sit under that picture.
+                hideDropLandingContents(on: tile)
+            }
             tile.onContextMenuTracking = { [weak self] menu in
                 self?.noteIconContextMenuTracking(menu)
             }
@@ -3182,17 +3755,38 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         return .move
     }
 
-    private func finishItemDragSession() {
+    private func finishItemDragSession(operation _: NSDragOperation, screenPoint: NSPoint) {
         previousPageButton.cancelDragHover()
         nextPageButton.cancelDragHover()
+        // A rejected or cancelled drag never queued a flight. The picture is
+        // still the preview; fly it home from where the pointer let go.
+        if pendingDropLanding == nil, pendingMergeAnimation == nil,
+           let release = pointInRoot(fromScreen: screenPoint) {
+            queueCancelledDropLanding(at: release)
+        }
         // The drag image is gone. Put the source icon back now, even during
-        // the fade: a blank cell is the jump. The neighbors stay where the
-        // gap left them until the window is hidden or the launcher is up.
+        // the fade: a blank cell is the jump. Content that is flying stays
+        // hidden, so this only fills a cell that is not already in the air.
+        // Neighbors ease home unless a merge is about to replace them.
         activeDragLift = nil
         dragLiftDropWaitsForLauncher = false
         restoreDragSourceTile()
-        clearDropHighlightIfAllowed()
+        clearDropHighlightIfAllowed(animatedReorder: pendingMergeAnimation == nil)
+        dragPreview = nil
+        // The drag image is gone. A reorder still has to fly into its cell.
+        // A merge keeps its own picture and does not also fly the cell.
+        if pendingMergeAnimation == nil {
+            beginPendingDropLanding()
+        } else {
+            commitDropLanding()
+        }
         guard pendingMergeAnimation != nil else { return }
+        if pendingMergeAnimation?.createdFolder == true,
+           let folderID = pendingMergeAnimation?.folderID {
+            // The drag source view may have been reused for the new folder.
+            // Restoring that old source must not reveal it before the flight.
+            materializedFolderItem(folderID)?.view.layer?.opacity = 0
+        }
         let dismissing = launcherIsDismissing()
         let visible = window?.isVisible == true
         if LauncherLayout.shouldHoldMergeFlight(isDismissing: dismissing, isVisible: visible) {
@@ -3203,6 +3797,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             return
         }
         if !LauncherLayout.shouldAdvanceMergeFlight(isDismissing: dismissing, isVisible: visible) {
+            revealPendingMergeFolder()
             pendingMergeAnimation = nil
             mergeFlightWaitsForLauncher = false
             removeMergeFlyer()
@@ -3215,6 +3810,16 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         guard let pending = pendingMergeAnimation else { return }
         pendingMergeAnimation = nil
         mergeFlightWaitsForLauncher = false
+        if playMergePreviewLanding(pending) {
+            return
+        }
+        if playIncomingFolderPreviewLanding(pending) {
+            return
+        }
+        if playIncomingFolderPreviewCenterLanding(pending) {
+            return
+        }
+        revealIncomingPreviewGlyphs()
         let startsFlight = pending.target != nil
         if let target = pending.target {
             playMergeAnimation(
@@ -3224,9 +3829,16 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             )
         }
         if let folderID = pending.folderID {
+            // The preview landings already returned. This is the whole-cell
+            // flight. Opacity and scale share the dissolve curve: hidden
+            // while the icon is still clear, full size when the icon is gone.
+            // A spring delay would keep scaling after that. Reduced motion
+            // keeps the short fade and does not scale.
+            let dissolve = startsFlight && pending.createdFolder && !prefersReducedMotion
             playFolderLandingAnimation(
                 folderID,
-                after: startsFlight && pending.createdFolder && !prefersReducedMotion ? mergeFlightDuration * 0.6 : 0
+                after: 0,
+                dissolveFadeDuration: dissolve ? mergeFlightDuration : nil
             )
         }
     }
@@ -3244,12 +3856,14 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             if let flyer = mergeAnimationView {
                 freezeMergeFlyer(flyer)
             }
-            if mergeAnimationView != nil || pendingMergeAnimation != nil {
+            pinMergePreviewFlyers()
+            if mergeAnimationView != nil || pendingMergeAnimation != nil || !mergePreviewFlyers.isEmpty {
                 mergeFlightWaitsForLauncher = true
             }
             return
         }
         guard LauncherLayout.shouldAdvanceMergeFlight(isDismissing: dismissing, isVisible: visible) else {
+            revealPendingMergeFolder()
             pendingMergeAnimation = nil
             mergeFlightWaitsForLauncher = false
             removeMergeFlyer()
@@ -3271,9 +3885,16 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             beginPendingMergeFlight()
             return
         }
+        revealPendingMergeFolder()
         pendingMergeAnimation = nil
         mergeFlightWaitsForLauncher = false
         removeMergeFlyer()
+    }
+
+    private func revealPendingMergeFolder() {
+        guard pendingMergeAnimation?.createdFolder == true,
+              let folderID = pendingMergeAnimation?.folderID else { return }
+        materializedFolderItem(folderID)?.view.layer?.opacity = 1
     }
 
     private func freezeMergeFlyer(_ flyer: NSView) {
@@ -3286,6 +3907,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         // The presentation frame is the one on screen. It is already in the
         // superview's coordinates for this layer-backed image view.
         let frame = presented?.frame ?? flyer.frame
+        let shadowOpacity = presented?.shadowOpacity ?? layer.shadowOpacity
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         layer.speed = 1
@@ -3294,6 +3916,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         layer.removeAllAnimations()
         flyer.alphaValue = CGFloat(opacity)
         flyer.frame = frame
+        layer.shadowOpacity = shadowOpacity
         CATransaction.commit()
     }
 
@@ -3303,6 +3926,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         mergeAnimationView = nil
         flyer?.layer?.removeAllAnimations()
         flyer?.removeFromSuperview()
+        commitMergePreviewLanding()
     }
 
     /// The preference changed. A flight that is still running is removed.
@@ -3317,7 +3941,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             isDismissing: launcherIsDismissing(),
             isVisible: window?.isVisible == true
         ) else { return }
-        guard mergeAnimationView != nil else { return }
+        guard mergeAnimationView != nil || !mergePreviewFlyers.isEmpty else { return }
         removeMergeFlyer()
         mergeFlightWaitsForLauncher = false
         commitLandingsStillWaitingOnMergeFlight()
@@ -3371,10 +3995,19 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         let dismissing = launcherIsDismissing()
         let visible = window?.isVisible == true
         if LauncherLayout.shouldHoldFolderChromeAnimation(isDismissing: dismissing, isVisible: visible) {
-            if folderOverlay.freezeChromeForDismissal() || freezeFolderBackdropIfAnimating() {
+            let panelHeld = folderOverlay.freezeChromeForDismissal()
+            let backdropHeld = freezeFolderBackdropIfAnimating()
+            if pinInFlightFolderPreviewGlyphFlight() {
+                previewGlyphFlightWaitsForLauncher = true
+            }
+            pinPreviewPlateReturnForDismissal()
+            if panelHeld || backdropHeld {
                 folderChromeWaitsForLauncher = true
             }
             return
+        }
+        if previewGlyphFlightWaitsForLauncher || (!visible && !previewGlyphFlyers.isEmpty) {
+            commitFolderPreviewGlyphFlight()
         }
         if folderChromeWaitsForLauncher || folderOverlay.isAnimatingClose {
             applyDeferredFolderChrome()
@@ -3391,6 +4024,9 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             folderBackdropStyleWaitsForLauncher = false
             restyleOpenFolderBackdrop()
         }
+        if previewGlyphFlightWaitsForLauncher || (!visible && !previewGlyphFlyers.isEmpty) {
+            commitFolderPreviewGlyphFlight()
+        }
         // An open or close that was not held keeps going. `show()` on an
         // already-open launcher must not finish it early. A hidden window
         // still jumps a close to the end, so the next appearance does not
@@ -3399,6 +4035,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         guard folderChromeWaitsForLauncher || folderOverlay.isAnimatingClose else { return }
         folderChromeWaitsForLauncher = false
         folderOverlay.commitHeldChrome()
+        settlePreviewPlateAfterChromeSnap()
         commitFolderBackdrop()
     }
 
@@ -3429,8 +4066,8 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     }
 
     /// Scale and blur match the current reduced-motion preference. Opacity
-    /// stays at the open-folder value. A folder that is not open is left
-    /// alone; closing already reset the grid.
+    /// stays at the open-folder value. A closed folder is settled separately
+    /// with the panel when the preference changes.
     private func restyleOpenFolderBackdrop() {
         guard openedFolderID != nil else { return }
         let backdrop = isSearching ? searchScrollView : gridViewport
@@ -3444,11 +4081,19 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     private func freezeFolderBackdropIfAnimating() -> Bool {
         let views = [gridViewport, searchScrollView].filter(backdropIsAnimating)
         guard !views.isEmpty else { return false }
+        folderBackdropAnimationGeneration &+= 1
         for view in views {
+            let radius = folderBackdropBlurRadius(view.layer?.presentation() ?? view.layer)
             pinLayerToPresentedFrame(
                 view.layer,
-                removing: ["folderBackdropOpacity", "folderBackdropScale"]
+                removing: ["folderBackdropOpacity", "folderBackdropScale", "folderBackdropBlur"]
             )
+            if folderBackdropBlurRadius(view.layer) != nil, let radius {
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                view.layer?.setValue(radius, forKeyPath: "filters.folderBackdropBlur.inputRadius")
+                CATransaction.commit()
+            }
         }
         return true
     }
@@ -3456,6 +4101,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     private func backdropIsAnimating(_ view: NSView) -> Bool {
         guard let keys = view.layer?.animationKeys() else { return false }
         return keys.contains("folderBackdropOpacity") || keys.contains("folderBackdropScale")
+            || keys.contains("folderBackdropBlur")
     }
 
     /// The open animation's model values are already the end state until a
@@ -3475,21 +4121,24 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     private func finishFolderBackdropOpen(_ view: NSView) {
         view.wantsLayer = true
         guard let layer = view.layer else { return }
+        folderBackdropAnimationGeneration &+= 1
         let style = LauncherLayout.folderBackdropStyle(open: true, reducesMotion: prefersReducedMotion)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         layer.removeAnimation(forKey: "folderBackdropOpacity")
         layer.removeAnimation(forKey: "folderBackdropScale")
+        layer.removeAnimation(forKey: "folderBackdropBlur")
         layer.opacity = Float(style.opacity)
-        if style.scale == 1 {
-            layer.transform = CATransform3DIdentity
-        } else {
-            layer.transform = CATransform3DMakeScale(style.scale, style.scale, 1)
-        }
+        layer.transform = folderBackdropTransform(recede: LauncherLayout.folderBackdropRecede(
+            open: true,
+            reducesMotion: prefersReducedMotion,
+            bounds: view.bounds,
+            focus: folderBackdropFocusPoint(in: view)
+        ))
         if style.blurs {
             view.layerUsesCoreImageFilters = true
-            if layer.filters == nil,
-               let blur = CIFilter(name: "CIGaussianBlur", parameters: [kCIInputRadiusKey: 6]) {
+            if let blur = CIFilter(name: "CIGaussianBlur", parameters: [kCIInputRadiusKey: 6]) {
+                blur.name = "folderBackdropBlur"
                 layer.filters = [blur]
             }
         } else {
@@ -3498,19 +4147,18 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         CATransaction.commit()
     }
 
-    private func clearDragHighlight() {
+    private func clearDragHighlight(animatedReorder: Bool = false) {
         setDropTarget(nil)
-        clearReorderSlides()
+        clearReorderSlides(animated: animatedReorder)
     }
 
     /// True once a fade asked to drop the ring and the gap, and that clear
     /// has not run yet. A drag that is still down keeps owning the highlight.
     private var dropHighlightClearWaitsForLauncher = false
 
-    /// Snapping the merge ring and the reorder gap back to the grid jumps
-    /// those tiles. Do it when the launcher is up, or when the window is
-    /// already hidden. While the fade is on screen, remember the request.
-    private func clearDropHighlightIfAllowed() {
+    /// Clearing the ring and gap during the launcher fade changes the visible
+    /// frame underneath it. Wait until the launcher is up or fully hidden.
+    private func clearDropHighlightIfAllowed(animatedReorder: Bool = false) {
         guard LauncherLayout.shouldClearDropHighlight(
             isDismissing: launcherIsDismissing(),
             isVisible: window?.isVisible == true
@@ -3519,7 +4167,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             return
         }
         dropHighlightClearWaitsForLauncher = false
-        clearDragHighlight()
+        clearDragHighlight(animatedReorder: animatedReorder)
     }
 
     /// `hide()` asked to clear the highlight and then left it on screen.
@@ -3542,7 +4190,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         settleReorderSlideForDismissal()
     }
 
-    /// The reorder ease keeps moving icons after the gap has been left on
+    /// The reorder slide keeps moving icons after the gap has been left on
     /// screen. While the fade is up, stop each timer on the frame already
     /// drawn. A hidden window, or a cancelled fade, jumps a drag that is
     /// still down to its gap. A drag that already ended is cleared by the
@@ -3629,24 +4277,24 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         }
     }
 
-    private func clearReorderSlides() {
+    private func clearReorderSlides(animated: Bool = false) {
         reorderSlideSignature = nil
         for collectionView in reorderSlideCollections {
-            clearReorderSlide(in: collectionView)
+            clearReorderSlide(in: collectionView, animated: animated)
         }
     }
 
-    private func clearReorderSlide(in collectionView: NSCollectionView) {
+    private func clearReorderSlide(in collectionView: NSCollectionView, animated: Bool = false) {
         for item in collectionView.visibleItems() {
-            (item.view as? AppGridTileView)?.setReorderTranslation(.zero, animated: false)
+            (item.view as? AppGridTileView)?.setReorderTranslation(.zero, animated: animated)
         }
     }
 
-    /// The preference changed. Neighbors were easing toward a gap. Reduced
+    /// The preference changed. Neighbors were moving toward a gap. Reduced
     /// motion is already on that gap, and turning motion back on does not
     /// finish the old ease. Reloading the grid has just put every tile back
     /// in its cell, so put them on the gap again without starting another
-    /// 0.18s ease. A launcher fade that is holding the frame is left alone.
+    /// spring. A launcher fade that is holding the frame is left alone.
     private func landInFlightReorderSlideForMotionChange() {
         guard LauncherLayout.shouldSnapInFlightReorderSlide(
             isDismissing: launcherIsDismissing(),
@@ -3665,7 +4313,14 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         in collectionView: NSCollectionView
     ) -> Bool {
         guard let preview else {
-            clearReorderSlide(in: collectionView)
+            clearReorderSlide(
+                in: collectionView,
+                animated: LauncherLayout.shouldAnimateReorderSlide(
+                    isDismissing: launcherIsDismissing(),
+                    isVisible: window?.isVisible == true,
+                    reducesMotion: prefersReducedMotion
+                )
+            )
             return true
         }
         return applyReorderSlots(preview.slotByItem, in: collectionView, animated: nil)
@@ -4029,13 +4684,13 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         guard searchChromeWaitsForLauncher else { return }
         searchChromeWaitsForLauncher = false
         searchChromeGeneration &+= 1
-        finishSearchChromeFade(on: searchChromeVisible ? searchScrollView : gridViewport)
+        landSearchChrome()
     }
 
-    /// The preference changed. A crossfade that is still running jumps to
-    /// full opacity. Reduced motion has no fade, and turning it off does not
-    /// finish the old one. A launcher fade that is holding the frame is left
-    /// alone. An open folder's backdrop keeps its dimmed opacity.
+    /// The preference changed. A crossfade that is still running lands on the
+    /// page already chosen. Reduced motion has no fade, and turning it off
+    /// does not finish the old one. A launcher fade that is holding the frame
+    /// is left alone. An open folder's backdrop keeps its dimmed opacity.
     private func snapInFlightSearchChromeFadeForMotionChange() {
         guard LauncherLayout.shouldSnapInFlightSearchChromeFade(
             isDismissing: launcherIsDismissing(),
@@ -4047,53 +4702,79 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             return !searchChromeFadeKeys(on: layer).isEmpty
         }
         guard !fading.isEmpty else { return }
-        // Drop the completion that would still force full opacity. An open
-        // folder's backdrop must keep the dim it already has.
         searchChromeGeneration &+= 1
-        for view in fading {
-            finishSearchChromeFade(on: view)
-        }
+        landSearchChrome()
     }
 
-    /// The incoming surface is the one fading in. Its model opacity is already
-    /// 1; the presentation opacity is the frame on screen.
+    /// Both surfaces can be moving. Pin whichever opacity is on screen.
+    /// The completion that would hide the outgoing page is dropped.
     private func pinInFlightSearchChrome() -> Bool {
-        let incoming: NSView = searchChromeVisible ? searchScrollView : gridViewport
-        incoming.wantsLayer = true
-        guard let layer = incoming.layer else { return false }
-        let keys = searchChromeFadeKeys(on: layer)
-        guard !keys.isEmpty else { return false }
-        let opacity = layer.presentation()?.opacity ?? layer.opacity
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        for key in keys {
-            layer.removeAnimation(forKey: key)
+        var pinned = false
+        for view in [searchScrollView, gridViewport] {
+            view.wantsLayer = true
+            guard let layer = view.layer else { continue }
+            let keys = searchChromeFadeKeys(on: layer)
+            guard !keys.isEmpty else { continue }
+            let opacity = layer.presentation()?.opacity ?? layer.opacity
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            for key in keys {
+                layer.removeAnimation(forKey: key)
+            }
+            view.alphaValue = CGFloat(opacity)
+            layer.opacity = opacity
+            CATransaction.commit()
+            pinned = true
         }
-        incoming.alphaValue = CGFloat(opacity)
-        layer.opacity = opacity
-        CATransaction.commit()
+        guard pinned else { return false }
         searchChromeGeneration &+= 1
         return true
     }
 
-    /// Drop a crossfade and show the surface at full opacity. A folder
-    /// backdrop owns that same opacity, so leave it alone while the folder
-    /// is open or its dim animation is still on the layer.
-    private func finishSearchChromeFade(on view: NSView) {
-        view.wantsLayer = true
-        guard let layer = view.layer else {
-            view.alphaValue = 1
-            return
-        }
+    /// Show the page that is current and hide the other one. A folder
+    /// backdrop owns that opacity, so leave it alone while the folder is
+    /// open or its dim animation is still on the layer. The hidden page is
+    /// put back to full opacity so the next fade does not start from nothing.
+    private func landSearchChrome() {
+        searchChromeFading = false
+        let incoming: NSView = searchChromeVisible ? searchScrollView : gridViewport
+        let outgoing: NSView = searchChromeVisible ? gridViewport : searchScrollView
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        for key in searchChromeFadeKeys(on: layer) {
-            layer.removeAnimation(forKey: key)
+        for view in [incoming, outgoing] {
+            view.wantsLayer = true
+            if let layer = view.layer {
+                for key in searchChromeFadeKeys(on: layer) {
+                    layer.removeAnimation(forKey: key)
+                }
+            }
         }
-        if !backdropIsAnimating(view), !isOpenFolderBackdrop(view) {
-            view.alphaValue = 1
-            layer.opacity = 1
+        outgoing.isHidden = true
+        outgoing.alphaValue = 1
+        outgoing.layer?.opacity = 1
+        setSearchChromePointer(outgoing, accepts: true)
+        incoming.isHidden = false
+        setSearchChromePointer(incoming, accepts: true)
+        if !backdropIsAnimating(incoming), !isOpenFolderBackdrop(incoming) {
+            incoming.alphaValue = 1
+            incoming.layer?.opacity = 1
         }
+        CATransaction.commit()
+        guard openedFolderID == nil else { return }
+        incoming.setAccessibilityHidden(false)
+        outgoing.setAccessibilityHidden(true)
+    }
+
+    private func setSearchChromePointer(_ view: NSView, accepts: Bool) {
+        (view as? LauncherScrollView)?.acceptsPointer = accepts
+    }
+
+    private func setSearchChromeOpacity(_ view: NSView, _ alpha: CGFloat) {
+        view.wantsLayer = true
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        view.alphaValue = alpha
+        view.layer?.opacity = Float(alpha)
         CATransaction.commit()
     }
 
@@ -4113,42 +4794,62 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         }
     }
 
-    /// The surface that is leaving search or the grid is removed at once, so clicks
-    /// and accessibility match the mode. The surface that is appearing fades in.
+    /// Search and the grid fade across each other. The page that is leaving
+    /// stays drawn until the fade ends, and it does not take clicks. Reduced
+    /// motion, a launcher fade, or an open-folder backdrop lands at once.
     private func updateSearchChrome(searching: Bool) {
         let incoming: NSView = searching ? searchScrollView : gridViewport
         let outgoing: NSView = searching ? gridViewport : searchScrollView
         guard searching != searchChromeVisible else {
-            outgoing.isHidden = true
-            incoming.isHidden = false
+            if searchChromeFading { return }
+            landSearchChrome()
             return
         }
         searchChromeGeneration &+= 1
         let generation = searchChromeGeneration
         searchChromeVisible = searching
-        outgoing.isHidden = true
-        outgoing.alphaValue = 1
-        incoming.isHidden = false
         let holdCrossfade = LauncherLayout.shouldHoldSearchChromeAnimation(
             isDismissing: launcherIsDismissing(),
             isVisible: window?.isVisible == true
         )
-        guard !holdCrossfade, !prefersReducedMotion, window?.isVisible == true else {
-            // A mode change during the fade must not start another crossfade.
-            // The results were already swapped above this call.
-            finishSearchChromeFade(on: incoming)
-            finishSearchChromeFade(on: outgoing)
+        let fade = LauncherLayout.searchChromeFade(
+            reducesMotion: prefersReducedMotion || window?.isVisible != true,
+            holdsForLauncherFade: holdCrossfade,
+            incomingIsFolderBackdrop: isOpenFolderBackdrop(incoming)
+        )
+        guard fade.keepsOutgoingVisible else {
+            landSearchChrome()
             return
         }
-        incoming.alphaValue = 0
+        searchChromeFading = true
+        if openedFolderID == nil {
+            outgoing.setAccessibilityHidden(true)
+            incoming.setAccessibilityHidden(false)
+        }
+        let incomingStart: CGFloat = incoming.isHidden
+            ? 0
+            : CGFloat(incoming.layer?.presentation()?.opacity ?? Float(incoming.alphaValue))
+        let outgoingStart = CGFloat(outgoing.layer?.presentation()?.opacity ?? Float(outgoing.alphaValue))
+        incoming.isHidden = false
+        outgoing.isHidden = false
+        setSearchChromeOpacity(incoming, incomingStart)
+        setSearchChromeOpacity(outgoing, outgoingStart)
+        setSearchChromePointer(
+            outgoing,
+            accepts: LauncherLayout.searchChromeOutgoingAcceptsClicks(fadingOut: true)
+        )
+        setSearchChromePointer(incoming, accepts: true)
         NSAnimationContext.runAnimationGroup({ context in
-            context.duration = LauncherLayout.searchTransitionDuration
+            context.duration = fade.duration
             context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            incoming.animator().alphaValue = 1
+            incoming.animator().alphaValue = fade.incomingOpacity
+            outgoing.animator().alphaValue = fade.outgoingOpacity
         }, completionHandler: { [weak self] in
-            Task { @MainActor in
+            // Already on the main thread. A Task would leave the page that
+            // is leaving drawn for another turn after the fade has finished.
+            finishFlightOnLandingTurn { [weak self] in
                 guard let self, self.searchChromeGeneration == generation else { return }
-                incoming.alphaValue = 1
+                self.landSearchChrome()
             }
         })
     }
@@ -4294,6 +4995,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             ? capturedSearchFocus
             : ((openedFolderID == nil) ? focusedSearchResultID() : nil)
         let preservedGridFocus = gridFocusCaptured ? capturedGridFocus : focusedGridEntryID()
+        commitFolderPreviewGlyphFlight()
         activeCollectionView.reloadData()
         stagingCollectionView.reloadData()
         searchCollectionView.reloadData()
@@ -4439,12 +5141,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         let existingFolderIDs = Set(layoutState.folders.keys)
         let sourceFrame: CGRect?
         if let preview, let releasePoint {
-            sourceFrame = CGRect(
-                x: releasePoint.x - preview.pointerOffset.x - preview.frame.width / 2,
-                y: releasePoint.y - preview.pointerOffset.y - preview.frame.height / 2,
-                width: preview.frame.width,
-                height: preview.frame.height
-            )
+            sourceFrame = releasedDragCellFrame(preview: preview, releasePoint: releasePoint)
         } else {
             sourceFrame = preview?.frame ?? frameInRoot(for: drop.source)
         }
@@ -4455,14 +5152,124 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             targetFrame = nil
         }
         let flyingIcon = preview?.image ?? iconImage(for: drop.source)
+        // Measured before the drop replaces the two cells. The icon that stays
+        // is the first preview glyph; the one on the pointer is the second.
+        var residentIconFrame: CGRect?
+        var residentIcon: NSImage?
+        var incomingIconFrame: CGRect?
+        var incomingIcon: NSImage?
+        if case .merge(let target) = drop.destination,
+           case .topLevel(let targetID) = target {
+            // Measured before the drop moves the cells. A new folder needs the
+            // icon that stays. Both kinds of merge need the icon on the pointer.
+            if layoutState.folders[targetID] == nil, let frame = iconFrameInRoot(for: target) {
+                residentIconFrame = frame
+                residentIcon = iconImage(for: target)
+            }
+            if let sourceFrame, let tile = dragSourceTile,
+               let frame = iconFrame(insideReleasedCell: sourceFrame, matching: tile) {
+                // The drag image is the lifted cell. The icon inside it is
+                // larger than the resting icon. Start there, or the flyer
+                // pops down when that image goes away.
+                incomingIconFrame = LauncherLayout.iconFrameInLiftedDrag(
+                    icon: frame,
+                    cell: sourceFrame,
+                    reducesMotion: prefersReducedMotion
+                )
+                incomingIcon = iconImage(for: drop.source)
+            }
+        }
 
         switch LauncherLayout.applyDrop(drop, to: layoutState, newFolderName: L("新建文件夹")) {
         case .success(let next):
-            guard next != layoutState else { return true }
+            if next == layoutState {
+                // Same slot. The drag picture is still lifted; showing the
+                // cell at full size would pop the scale off. Fly it in.
+                queueDropLanding(
+                    sourceFrame: sourceFrame,
+                    image: preview?.image,
+                    itemID: incomingItemID(drop.source),
+                    inOpenFolder: dropLandsInOpenFolder(drop)
+                )
+                return true
+            }
+            // The previous picture, if any, has to reveal its cell before this
+            // drop hides a new one. Layout state below does not own that picture.
+            commitDropLanding()
             // NSCollectionView expects its data source to reflect an accepted drop
             // before the drag session finishes. Animation must not own layout state.
             let landingPage = LauncherLayout.pageContainingDrop(drop, in: next)
+            if case .merge(let target) = drop.destination {
+                let folderID: UUID?
+                if case .topLevel(let id) = target, next.folders[id] != nil {
+                    folderID = id
+                } else {
+                    folderID = next.folders.keys.first { !existingFolderIDs.contains($0) }
+                }
+                let createdFolder = folderID.map { !existingFolderIDs.contains($0) } ?? false
+                let incomingSlot: Int?
+                if let folderID, !createdFolder {
+                    incomingSlot = LauncherLayout.folderIncomingPreviewSlotIndex(
+                        glyphsBefore: previewGlyphCount(in: layoutState, folderID: folderID),
+                        glyphsAfter: previewGlyphCount(in: next, folderID: folderID)
+                    )
+                } else {
+                    incomingSlot = nil
+                }
+                pendingMergeAnimation = PendingMergeAnimation(
+                    source: sourceFrame,
+                    target: targetFrame,
+                    image: flyingIcon,
+                    folderID: folderID,
+                    createdFolder: createdFolder,
+                    residentIconFrame: createdFolder ? residentIconFrame : nil,
+                    residentIcon: createdFolder ? residentIcon : nil,
+                    incomingIconFrame: incomingIconFrame,
+                    incomingIcon: incomingIcon,
+                    incomingPreviewSlot: createdFolder ? nil : incomingSlot,
+                    incomingItemID: createdFolder ? nil : incomingItemID(drop.source)
+                )
+            }
+            if case .folderMember(let folderID, let itemID) = drop.source,
+               next.folders[folderID] == nil {
+                dissolveScatterExcludedItemID = itemID
+            }
+            let inOpenFolder: Bool
+            if case .folderIndex = drop.destination {
+                inOpenFolder = true
+            } else {
+                inOpenFolder = false
+            }
+            // A merge uses its own flight. A page that is about to slide
+            // carries the cell; flying at the off-screen frame would leave
+            // the picture in the wrong place.
+            let landsOnThisPage = inOpenFolder
+                || (landingPage == currentPage && !isPageTransitioning)
+            let isMerge: Bool
+            if case .merge = drop.destination {
+                isMerge = true
+            } else {
+                isMerge = false
+            }
+            if landsOnThisPage, !isMerge {
+                queueDropLanding(
+                    sourceFrame: sourceFrame,
+                    image: preview?.image,
+                    itemID: incomingItemID(drop.source),
+                    inOpenFolder: inOpenFolder
+                )
+            }
             commitLayout(next)
+            dissolveScatterExcludedItemID = nil
+            if var pending = pendingMergeAnimation,
+               pending.createdFolder,
+               let folderID = pending.folderID,
+               let landingFrame = frameInRoot(for: .topLevel(folderID)) {
+                // Removing the source can shift the target's grid slot. Fly
+                // toward the folder's actual post-drop frame.
+                pending.target = landingFrame
+                pendingMergeAnimation = pending
+            }
             // A full page has no empty cell after the last icon. The item is on
             // the next page; staying here makes it look lost. Not an edge-drag page turn.
             if let landingPage,
@@ -4473,25 +5280,87 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
                landingPage != currentPage {
                 showPage(landingPage)
             }
-            if case .merge(let target) = drop.destination {
-                let folderID: UUID?
-                if case .topLevel(let id) = target, next.folders[id] != nil {
-                    folderID = id
-                } else {
-                    folderID = next.folders.keys.first { !existingFolderIDs.contains($0) }
-                }
-                pendingMergeAnimation = (
-                    sourceFrame, targetFrame, flyingIcon, folderID,
-                    folderID.map { !existingFolderIDs.contains($0) } ?? false
-                )
-            }
             return true
         case .failure(let error):
             if error == .nestedFolder {
                 showToast(L("不能将文件夹放入另一个文件夹"))
             }
+            // The drag image is still up. Put the preview back so the session
+            // end can fly it home instead of popping the cell in.
+            dragPreview = preview
             return false
         }
+    }
+
+    private func dropLandsInOpenFolder(_ drop: LayoutDrop) -> Bool {
+        if case .folderIndex = drop.destination { return true }
+        return false
+    }
+
+    /// The cell under the pointer, in this view. The drag image kept the
+    /// pointer's offset from the cell center, so this is where that cell is
+    /// now, not where the gesture began.
+    private func releasedDragCellFrame(
+        preview: (ref: LayoutItemRef, frame: CGRect, image: NSImage, pointerOffset: CGPoint),
+        releasePoint: CGPoint
+    ) -> CGRect {
+        CGRect(
+            x: releasePoint.x - preview.pointerOffset.x - preview.frame.width / 2,
+            y: releasePoint.y - preview.pointerOffset.y - preview.frame.height / 2,
+            width: preview.frame.width,
+            height: preview.frame.height
+        )
+    }
+
+    /// Remember a picture that should fly into its cell once the drag image
+    /// is gone. Reduced motion, a fade, and a hidden window leave the cell
+    /// where it is. The cell is hidden now so the session end can show the
+    /// tile again without a second copy of the icon.
+    private func queueDropLanding(
+        sourceFrame: CGRect?,
+        image: NSImage?,
+        itemID: UUID,
+        inOpenFolder: Bool
+    ) {
+        guard let sourceFrame, let image,
+              LauncherLayout.shouldPlayDropLanding(
+                reducesMotion: prefersReducedMotion,
+                isDismissing: launcherIsDismissing(),
+                isVisible: window?.isVisible == true
+              ) else { return }
+        let start = LauncherLayout.dropLandingStartFrame(cell: sourceFrame, reducesMotion: false)
+        pendingDropLanding = PendingDropLanding(
+            itemID: itemID,
+            source: start,
+            image: image,
+            inOpenFolder: inOpenFolder,
+            retried: false
+        )
+        dropLandingItemID = itemID
+        hideDropLandingContents(for: itemID, inOpenFolder: inOpenFolder)
+    }
+
+    /// A drag that did not change the layout. `dragPreview` is still the
+    /// picture from the gesture. Fly it back to the cell it left.
+    private func queueCancelledDropLanding(at releasePoint: CGPoint) {
+        guard let preview = dragPreview else { return }
+        let inOpenFolder: Bool
+        if case .folderMember = preview.ref, openedFolderID != nil {
+            inOpenFolder = true
+        } else {
+            inOpenFolder = false
+        }
+        queueDropLanding(
+            sourceFrame: releasedDragCellFrame(preview: preview, releasePoint: releasePoint),
+            image: preview.image,
+            itemID: incomingItemID(preview.ref),
+            inOpenFolder: inOpenFolder
+        )
+    }
+
+    private func pointInRoot(fromScreen screenPoint: NSPoint) -> CGPoint? {
+        guard let window else { return nil }
+        return convert(window.convertPoint(fromScreen: screenPoint), from: nil)
     }
 
     private func promptForAlias(of candidate: AppCandidate, focusID: UUID, in collectionView: NSCollectionView) {
@@ -4573,9 +5442,12 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             if pinInFlightDissolvedGridFade() {
                 dissolvedGridFadeWaitsForLauncher = true
             }
+            if pinInFlightDissolveScatter() {
+                dissolveScatterWaitsForLauncher = true
+            }
             return
         }
-        if dissolvedGridFadeWaitsForLauncher {
+        if dissolvedGridFadeWaitsForLauncher || dissolveScatterWaitsForLauncher {
             applyDeferredDissolvedGridFade()
         }
     }
@@ -4642,9 +5514,10 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         }
     }
 
-    /// The model scale stays at 1. The presentation scale is the frame on
-    /// screen. Remember each layer so a later pass can restore it even if
-    /// the tile has been reused.
+    /// The model transform stays at identity. The presentation transform is
+    /// the frame on screen, including the shift that keeps the icon put.
+    /// Remember each layer so a later pass can restore it even if the tile
+    /// has been reused.
     private func pinInFlightLaunchFeedback() {
         for tile in visibleGridTiles() {
             guard let layer = tile.layer,
@@ -4689,8 +5562,17 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             isDismissing: launcherIsDismissing(),
             isVisible: window?.isVisible == true
         ) else { return }
-        guard folderOverlay.snapInFlightChromeForMotionChange() else { return }
+        if !previewGlyphFlyers.isEmpty {
+            commitFolderPreviewGlyphFlight()
+        }
+        let backdropAnimating = [gridViewport, searchScrollView].contains(where: backdropIsAnimating)
+        let panelSnapped = folderOverlay.snapInFlightChromeForMotionChange()
+        if panelSnapped {
+            settlePreviewPlateAfterChromeSnap()
+        }
+        guard panelSnapped || backdropAnimating else { return }
         folderChromeWaitsForLauncher = false
+        commitFolderBackdrop()
     }
 
     /// The preference changed. A fade that is still running jumps to full
@@ -4702,6 +5584,9 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             isDismissing: launcherIsDismissing(),
             isVisible: window?.isVisible == true
         ) else { return }
+        if !dissolveScatterFlyers.isEmpty {
+            commitFolderDissolveScatter()
+        }
         var snapped = false
         for view in [activeCollectionView, stagingCollectionView] {
             view.wantsLayer = true
@@ -4728,6 +5613,9 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         let visible = window?.isVisible == true
         if LauncherLayout.shouldHoldDissolvedGridFade(isDismissing: dismissing, isVisible: visible) {
             return
+        }
+        if dissolveScatterWaitsForLauncher || (!visible && !dissolveScatterFlyers.isEmpty) {
+            commitFolderDissolveScatter()
         }
         guard dissolvedGridFadeWaitsForLauncher else { return }
         dissolvedGridFadeWaitsForLauncher = false
@@ -4783,7 +5671,883 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         }
     }
 
+    private struct DissolveScatterSeed {
+        var itemID: UUID
+        var source: CGRect
+        var image: NSImage
+    }
+
+    /// Icon frames inside the open folder, before the reload throws them away.
+    /// Empty when motion is reduced, the launcher is fading, or the icon is
+    /// not on screen. The dragged member is left to its drag image.
+    private func folderDissolveScatterSeeds(
+        memberIDs: [UUID],
+        nextEntries: [LauncherEntry]
+    ) -> [DissolveScatterSeed] {
+        guard LauncherLayout.shouldPlayFolderDissolveScatter(
+            reducesMotion: prefersReducedMotion,
+            isDismissing: launcherIsDismissing(),
+            isVisible: window?.isVisible == true
+        ) else { return [] }
+        let ids = LauncherLayout.appsScatteredFromDissolvedFolder(
+            memberIDs: memberIDs,
+            draggedItemID: dissolveScatterExcludedItemID,
+            currentEntries: nextEntries
+        )
+        guard !ids.isEmpty else { return [] }
+        folderOverlay.collectionView.layoutSubtreeIfNeeded()
+        let items = presentedItems(for: folderOverlay.collectionView)
+        var seeds: [DissolveScatterSeed] = []
+        for id in ids {
+            guard let index = items.firstIndex(where: { $0.id == id }),
+                  let tile = folderOverlay.collectionView.item(at: IndexPath(item: index, section: 0))?.view as? AppGridTileView,
+                  let source = tile.iconFrame(in: self) else { continue }
+            seeds.append(DissolveScatterSeed(
+                itemID: id,
+                source: source,
+                image: tile.iconView.image ?? WorkspaceIconCache.placeholder
+            ))
+        }
+        return seeds
+    }
+
+    /// Fly each leftover icon from the open folder onto its grid cell.
+    /// The cell stays hidden until the icon arrives, so the two do not stack.
+    /// Returns false when nothing traveled; the caller keeps the grid fade.
+    @discardableResult
+    private func playFolderDissolveScatter(_ seeds: [DissolveScatterSeed]) -> Bool {
+        guard !seeds.isEmpty else { return false }
+        guard LauncherLayout.shouldPlayFolderDissolveScatter(
+            reducesMotion: prefersReducedMotion,
+            isDismissing: launcherIsDismissing(),
+            isVisible: window?.isVisible == true
+        ) else { return false }
+        let collectionView = isSearching ? searchCollectionView : activeCollectionView
+        collectionView.layoutSubtreeIfNeeded()
+        var placements: [LauncherLayout.FolderDissolveIconPlacement] = []
+        var images: [UUID: NSImage] = [:]
+        var tiles: [UUID: AppGridTileView] = [:]
+        for seed in seeds {
+            guard let tile = tileForPresentedItem(seed.itemID, in: collectionView),
+                  let destination = tile.iconFrame(in: self) else { continue }
+            placements.append(LauncherLayout.FolderDissolveIconPlacement(
+                itemID: seed.itemID,
+                source: seed.source,
+                destination: destination
+            ))
+            images[seed.itemID] = seed.image
+            tiles[seed.itemID] = tile
+        }
+        let flights = LauncherLayout.folderDissolveFlights(placements: placements, reducesMotion: false)
+        guard !flights.isEmpty else { return false }
+
+        var flyers: [(view: NSImageView, destination: CGRect)] = []
+        var hidden: [ScatterHiddenTile] = []
+        for flight in flights {
+            guard let image = images[flight.itemID] else { continue }
+            let flyer = NSImageView(frame: flight.source)
+            flyer.image = image
+            flyer.imageScaling = .scaleProportionallyUpOrDown
+            flyer.wantsLayer = true
+            addSubview(flyer, positioned: .above, relativeTo: nil)
+            flyers.append((flyer, flight.destination))
+            if let tile = tiles[flight.itemID] {
+                tile.alphaValue = 0
+                hidden.append(ScatterHiddenTile(tile: tile))
+            }
+        }
+        guard !flyers.isEmpty else { return false }
+        dissolveScatterGeneration &+= 1
+        let generation = dissolveScatterGeneration
+        dissolveScatterFlyers = flyers.map(\.view)
+        dissolveScatterHiddenTiles = hidden
+        onDiagnosticEvent?(
+            "Folder dissolve scatter: icons=\(flyers.count) duration=\(String(format: "%.2f", LauncherLayout.folderDissolveFlightDuration))"
+        )
+
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = LauncherLayout.folderDissolveFlightDuration
+            // The folder is closing on this same travel curve. A second copy
+            // of the control points would drift, and the icons would leave early.
+            context.timingFunction = folderChromeTiming(tracksIcon: true)
+            for flyer in flyers {
+                flyer.view.animator().frame = flyer.destination
+            }
+        }, completionHandler: { [weak self] in
+            // Already on the main thread. A Task would hold the flying
+            // picture on the cell for another turn.
+            finishFlightOnLandingTurn { [weak self] in
+                guard let self, self.dissolveScatterGeneration == generation else { return }
+                self.commitFolderDissolveScatter()
+            }
+        })
+        return true
+    }
+
+    private func tileForPresentedItem(_ itemID: UUID, in collectionView: NSCollectionView) -> AppGridTileView? {
+        let items = presentedItems(for: collectionView)
+        guard let index = items.firstIndex(where: { $0.id == itemID }) else { return nil }
+        return collectionView.item(at: IndexPath(item: index, section: 0))?.view as? AppGridTileView
+    }
+
+    /// Show the grid icons and drop the flyers. A completion that lost the
+    /// race with a fade or a newer layout finds the generation already moved.
+    private func commitFolderDissolveScatter() {
+        dissolveScatterGeneration &+= 1
+        dissolveScatterWaitsForLauncher = false
+        for hidden in dissolveScatterHiddenTiles {
+            hidden.tile?.alphaValue = 1
+        }
+        dissolveScatterHiddenTiles.removeAll()
+        let flyers = dissolveScatterFlyers
+        dissolveScatterFlyers.removeAll()
+        for flyer in flyers {
+            flyer.layer?.removeAllAnimations()
+            flyer.removeFromSuperview()
+        }
+    }
+
+    /// Leave each flyer on the frame already on screen. The model frame is
+    /// already the grid cell. Bump the generation so the completion does not
+    /// reveal that cell while the launcher fade is still up.
+    private func pinInFlightDissolveScatter() -> Bool {
+        guard !dissolveScatterFlyers.isEmpty else { return false }
+        dissolveScatterGeneration &+= 1
+        for flyer in dissolveScatterFlyers {
+            flyer.wantsLayer = true
+            guard let layer = flyer.layer else { continue }
+            let presented = layer.presentation()
+            let frame = presented?.frame ?? flyer.frame
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.speed = 1
+            layer.timeOffset = 0
+            layer.beginTime = 0
+            layer.removeAllAnimations()
+            flyer.alphaValue = 1
+            flyer.frame = frame
+            CATransaction.commit()
+        }
+        return true
+    }
+
+    /// Hide the preview plate while the panel is that plate, grown up.
+    /// Search and both grid pages can each hold a copy after a reload.
+    /// `.returning` fades the plate in. `.yielding` fades it back out.
+    private func borrowFolderPreviewPlate(
+        _ folderID: UUID,
+        phase: LauncherLayout.FolderPreviewPlatePhase
+    ) {
+        guard LauncherLayout.shouldHideFolderPreviewPlate(tracksIcon: true, phase: phase) else {
+            releaseBorrowedPreviewPlate()
+            return
+        }
+        stopPreviewPlateReturnTicker()
+        if borrowedPreviewPlateFolderID != folderID {
+            clearBorrowedPreviewPlateTiles()
+        }
+        borrowedPreviewPlateFolderID = folderID
+        borrowedPreviewPlatePhase = phase
+        setBorrowedPreviewPlateHidden(true, folderID: folderID)
+        applyPreviewPlateOpacity(1, folderID: folderID)
+    }
+
+    /// The close landed, or this open never left the plate. Draw it solid.
+    private func releaseBorrowedPreviewPlate() {
+        stopPreviewPlateReturnTicker()
+        let folderID = borrowedPreviewPlateFolderID
+        borrowedPreviewPlateFolderID = nil
+        borrowedPreviewPlatePhase = .resting
+        if let folderID {
+            applyPreviewPlateOpacity(1, folderID: folderID)
+            setBorrowedPreviewPlateHidden(false, folderID: folderID)
+        } else {
+            previewPlateReturnPresentedOpacity = 1
+        }
+    }
+
+    /// The panel is shrinking onto the plate. Draw the plate at the opacity
+    /// the panel is giving up, on the same clock as that fade. A fresh close
+    /// starts from nothing, because the plate was hidden. A close that
+    /// interrupts a reversed open continues from the opacity already drawn.
+    private func beginFolderPreviewPlateReturn(_ folderID: UUID, duration: TimeInterval) {
+        let continues = borrowedPreviewPlateFolderID == folderID
+            && (borrowedPreviewPlatePhase == .returning || borrowedPreviewPlatePhase == .yielding)
+        let start: CGFloat = continues ? previewPlateReturnPresentedOpacity : 0
+        stopPreviewPlateReturnTicker()
+        if borrowedPreviewPlateFolderID != folderID {
+            clearBorrowedPreviewPlateTiles()
+        }
+        borrowedPreviewPlateFolderID = folderID
+        borrowedPreviewPlatePhase = .returning
+        previewPlateFadeStart = min(max(start.isFinite ? start : 0, 0), 1)
+        setBorrowedPreviewPlateHidden(false, folderID: folderID)
+        applyPreviewPlateOpacity(
+            LauncherLayout.folderPreviewPlateReturnOpacity(from: previewPlateFadeStart, at: 0),
+            folderID: folderID
+        )
+        let duration = duration.isFinite ? duration : 0
+        guard duration > 0 else {
+            applyPreviewPlateOpacity(1, folderID: folderID)
+            return
+        }
+        startPreviewPlateFadeTicker(folderID: folderID, duration: duration)
+    }
+
+    /// The plate is on screen from a close, faint or solid. A fresh open hides
+    /// it in one step, because the panel is already that plate at full opacity.
+    private func previewPlateIsYielding(folderID: UUID) -> Bool {
+        guard borrowedPreviewPlateFolderID == folderID else { return false }
+        guard borrowedPreviewPlatePhase == .returning || borrowedPreviewPlatePhase == .yielding else { return false }
+        return previewPlateReturnPresentedOpacity > 0.001
+    }
+
+    /// The close was reversed. The panel fades back up on the travel curve.
+    /// Fade the plate back out on that same curve instead of hiding it while
+    /// the panel is still faint. When the fade ends, hide the plate the way
+    /// a fresh open does. A stale sample cannot paint it under the panel.
+    private func beginFolderPreviewPlateYield(_ folderID: UUID, duration: TimeInterval) {
+        let start = previewPlateReturnPresentedOpacity
+        stopPreviewPlateReturnTicker()
+        if borrowedPreviewPlateFolderID != folderID {
+            clearBorrowedPreviewPlateTiles()
+        }
+        borrowedPreviewPlateFolderID = folderID
+        borrowedPreviewPlatePhase = .yielding
+        previewPlateFadeStart = min(max(start.isFinite ? start : 0, 0), 1)
+        setBorrowedPreviewPlateHidden(false, folderID: folderID)
+        applyPreviewPlateOpacity(
+            LauncherLayout.folderPreviewPlateYieldOpacity(from: previewPlateFadeStart, at: 0),
+            folderID: folderID
+        )
+        let duration = duration.isFinite ? duration : 0
+        guard duration > 0 else {
+            finishPreviewPlateYield(folderID)
+            return
+        }
+        startPreviewPlateFadeTicker(folderID: folderID, duration: duration)
+    }
+
+    private func startPreviewPlateFadeTicker(folderID: UUID, duration: TimeInterval) {
+        previewPlateReturnGeneration &+= 1
+        let generation = previewPlateReturnGeneration
+        let started = CACurrentMediaTime()
+        previewPlateClock.start(
+            on: self,
+            generation: generation,
+            folderID: folderID,
+            started: started,
+            duration: duration
+        )
+    }
+
+    /// Called on the frame that is about to draw. `generation` is the one
+    /// captured when that link started. Returns true when the link should stop.
+    fileprivate func receivePreviewPlateFrame(
+        at now: CFTimeInterval,
+        generation: UInt64,
+        folderID: UUID,
+        started: CFTimeInterval,
+        duration: TimeInterval
+    ) -> Bool {
+        advancePreviewPlateFade(
+            generation: generation,
+            folderID: folderID,
+            started: started,
+            duration: duration,
+            now: now
+        )
+    }
+
+    private func advancePreviewPlateFade(
+        generation: UInt64,
+        folderID: UUID,
+        started: CFTimeInterval,
+        duration: TimeInterval,
+        now: CFTimeInterval
+    ) -> Bool {
+        guard previewPlateReturnGeneration == generation else { return true }
+        let phase = borrowedPreviewPlatePhase
+        guard borrowedPreviewPlateFolderID == folderID,
+              phase == .returning || phase == .yielding else {
+            return true
+        }
+        let time = LauncherLayout.previewPlateFadeTime(elapsed: now - started, duration: duration)
+        let opacity = phase == .yielding
+            ? LauncherLayout.folderPreviewPlateYieldOpacity(from: previewPlateFadeStart, at: time)
+            : LauncherLayout.folderPreviewPlateReturnOpacity(from: previewPlateFadeStart, at: time)
+        applyPreviewPlateOpacity(opacity, folderID: folderID)
+        guard time >= 1 else { return false }
+        if phase == .yielding {
+            finishPreviewPlateYield(folderID)
+        }
+        return true
+    }
+
+    /// The reversed close has faded the plate out. Hide it, and store a solid
+    /// opacity while it is hidden, so the next close dissolves in from nothing.
+    private func finishPreviewPlateYield(_ folderID: UUID) {
+        guard borrowedPreviewPlateFolderID == folderID else { return }
+        borrowedPreviewPlatePhase = .borrowed
+        setBorrowedPreviewPlateHidden(true, folderID: folderID)
+        applyPreviewPlateOpacity(1, folderID: folderID)
+    }
+
+    /// An opening panel just landed fully open, from a dismissal or a motion
+    /// change. A plate that was still fading must not stay under it.
+    private func settlePreviewPlateAfterChromeSnap() {
+        guard let folderID = openedFolderID else { return }
+        guard borrowedPreviewPlatePhase == .yielding || borrowedPreviewPlatePhase == .returning else { return }
+        borrowFolderPreviewPlate(folderID, phase: .borrowed)
+    }
+
+    /// The launcher fade pinned the panel. Leave the plate on the opacity
+    /// already drawn. The close commit draws it solid. An open commit hides it.
+    private func pinPreviewPlateReturnForDismissal() {
+        guard previewPlateClock.isRunning else { return }
+        guard borrowedPreviewPlatePhase == .returning || borrowedPreviewPlatePhase == .yielding else { return }
+        stopPreviewPlateReturnTicker()
+    }
+
+    private func stopPreviewPlateReturnTicker() {
+        previewPlateReturnGeneration &+= 1
+        previewPlateClock.stop()
+    }
+
+    private func applyPreviewPlateOpacity(_ opacity: CGFloat, folderID: UUID) {
+        let clamped = min(max(opacity.isFinite ? opacity : 0, 0), 1)
+        previewPlateReturnPresentedOpacity = clamped
+        for collectionView in [activeCollectionView, stagingCollectionView, searchCollectionView] {
+            guard let tile = tileForPresentedItem(folderID, in: collectionView), tile.isFolder else { continue }
+            tile.previewPlateOpacity = clamped
+        }
+    }
+
+    private func clearBorrowedPreviewPlateTiles() {
+        guard let folderID = borrowedPreviewPlateFolderID else { return }
+        applyPreviewPlateOpacity(1, folderID: folderID)
+        setBorrowedPreviewPlateHidden(false, folderID: folderID)
+    }
+
+    private func setBorrowedPreviewPlateHidden(_ hidden: Bool, folderID: UUID) {
+        for collectionView in [activeCollectionView, stagingCollectionView, searchCollectionView] {
+            guard let tile = tileForPresentedItem(folderID, in: collectionView), tile.isFolder else { continue }
+            tile.chromeHidesPlate = hidden
+        }
+    }
+
+    /// The folder tile on the grid or in search. Its preview plate is where
+    /// the opening glyphs start.
+    private func folderGridTile(for id: UUID) -> AppGridTileView? {
+        let hosts: [NSCollectionView] = isSearching
+            ? [searchCollectionView]
+            : [activeCollectionView, stagingCollectionView]
+        for collectionView in hosts {
+            collectionView.layoutSubtreeIfNeeded()
+            guard let tile = tileForPresentedItem(id, in: collectionView), tile.isFolder else { continue }
+            return tile
+        }
+        return nil
+    }
+
+    /// Fly each preview glyph from the folder plate into its cell. The cell's
+    /// own icon stays hidden until the glyph arrives. Icons past the nine
+    /// have nothing to fly in, so they fade in as the folder settles instead
+    /// of popping on at the end. They stay faint through the first half, so
+    /// they do not scale up as a second copy of the glyphs.
+    /// A return that is already on screen turns around from the frame it has
+    /// reached. A flight that has already left the plate is not restarted.
+    /// Returns false when nothing traveled.
+    @discardableResult
+    private func playFolderPreviewGlyphFlight(folderID: UUID, tracksIcon: Bool) -> Bool {
+        let canFly = LauncherLayout.shouldPlayFolderPreviewGlyphFlight(
+            reducesMotion: prefersReducedMotion,
+            isDismissing: launcherIsDismissing(),
+            isVisible: window?.isVisible == true,
+            tracksIcon: tracksIcon
+        )
+        if !previewGlyphFlyerBoxes.isEmpty, !previewGlyphFlightReturnsHome {
+            return true
+        }
+        if !previewGlyphFlyerBoxes.isEmpty, previewGlyphFlightReturnsHome {
+            guard canFly else {
+                commitFolderPreviewGlyphFlight(revealCells: true)
+                return false
+            }
+            retargetPreviewGlyphFlight(towardGlyphs: false, folderID: folderID)
+            return true
+        }
+        guard canFly else { return false }
+        guard let sourceTile = folderGridTile(for: folderID) else { return false }
+        let glyphFrames = sourceTile.folderPreviewGlyphFrames(in: self)
+        guard !glyphFrames.isEmpty else { return false }
+        let items = presentedItems(for: folderOverlay.collectionView)
+        folderOverlay.collectionView.layoutSubtreeIfNeeded()
+        let paired = min(glyphFrames.count, items.count, sourceTile.previewImages.count)
+        guard paired > 0 else { return false }
+
+        var placements: [LauncherLayout.FolderPreviewGlyphPlacement] = []
+        var images: [UUID: NSImage] = [:]
+        for index in 0..<paired {
+            let itemID = items[index].id
+            guard let tile = tileForPresentedItem(itemID, in: folderOverlay.collectionView),
+                  let destination = tile.iconFrame(in: self) else { continue }
+            // A drop that has not reached this slot yet should keep going
+            // from the picture on screen, not jump back onto the plate.
+            let source = mergePreviewPresentedFrame(matching: glyphFrames[index]) ?? glyphFrames[index]
+            placements.append(LauncherLayout.FolderPreviewGlyphPlacement(
+                itemID: itemID,
+                source: source,
+                destination: destination
+            ))
+            images[itemID] = sourceTile.previewImages[index]
+        }
+        // A full plate has no glyph for the icon that is still sinking into
+        // its center. Carry that picture into the new icon's own cell.
+        var sinkingItemIDs = Set<UUID>()
+        var sinkTargets: [UUID: CGRect] = [:]
+        var carriedOpacity: [UUID: CGFloat] = [:]
+        let plateCenter = sourceTile.folderPreviewWellFrame(in: self).flatMap {
+            LauncherLayout.folderPreviewPlateCenterFrame(well: $0)
+        }
+        for flyer in mergePreviewFlyers {
+            guard let itemID = flyer.itemID else { continue }
+            guard !placements.contains(where: { $0.itemID == itemID }) else { continue }
+            guard let tile = tileForPresentedItem(itemID, in: folderOverlay.collectionView),
+                  let destination = tile.iconFrame(in: self) else { continue }
+            let presented = flyer.view.layer?.presentation()?.frame ?? flyer.view.frame
+            guard presented.width >= 1, presented.height >= 1,
+                  presented.origin.x.isFinite, presented.origin.y.isFinite else { continue }
+            guard let image = flyer.view.image else { continue }
+            placements.append(LauncherLayout.FolderPreviewGlyphPlacement(
+                itemID: itemID,
+                source: presented,
+                destination: destination
+            ))
+            images[itemID] = image
+            sinkingItemIDs.insert(itemID)
+            if let plateCenter {
+                sinkTargets[itemID] = plateCenter
+            }
+            let opacity = flyer.view.layer?.presentation()?.opacity ?? flyer.view.layer?.opacity ?? 1
+            carriedOpacity[itemID] = CGFloat(opacity)
+        }
+        let flights = LauncherLayout.folderPreviewGlyphFlights(placements: placements, reducesMotion: false)
+        guard !flights.isEmpty else { return false }
+
+        var hidden: [PreviewGlyphHiddenContent] = []
+        for item in items {
+            if let tile = tileForPresentedItem(item.id, in: folderOverlay.collectionView) {
+                tile.setOpenFlightContentHidden(true)
+                hidden.append(PreviewGlyphHiddenContent(itemID: item.id, tile: tile))
+            }
+        }
+        var boxes: [PreviewGlyphFlyer] = []
+        for flight in flights {
+            guard let image = images[flight.itemID] else { continue }
+            let sinks = sinkingItemIDs.contains(flight.itemID)
+            let view = makePreviewGlyphFlyer(frame: flight.source, image: image)
+            if sinks, let opacity = carriedOpacity[flight.itemID] {
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                view.alphaValue = opacity
+                CATransaction.commit()
+            }
+            boxes.append(PreviewGlyphFlyer(
+                itemID: flight.itemID,
+                view: view,
+                glyphFrame: sinkTargets[flight.itemID] ?? flight.source,
+                cellFrame: flight.destination,
+                sinksIntoPlate: sinks
+            ))
+        }
+        guard !boxes.isEmpty else {
+            for content in hidden {
+                content.tile?.setOpenFlightContentHidden(false)
+            }
+            return false
+        }
+        sourceTile.openFlightHidesPreviewGlyphs = true
+        if !mergePreviewFlyers.isEmpty {
+            // The open flight is now carrying those icons. Dropping the
+            // merge flyers here avoids a second copy sitting on the slot.
+            // Commit clears the hide flag, so put it back.
+            commitMergePreviewLanding()
+            sourceTile.openFlightHidesPreviewGlyphs = true
+        }
+        previewGlyphFlyerBoxes = boxes
+        previewGlyphHiddenContent = hidden
+        previewGlyphSourceTile = sourceTile
+        startPreviewGlyphFlightAnimation(towardGlyphs: false)
+        return true
+    }
+
+    /// Fly the open cells back onto the preview plate. Icons past the nine
+    /// stay in the panel and ride its close. A flight that is still coming in
+    /// turns around from the frame on screen. Returns false when nothing traveled.
+    @discardableResult
+    private func playFolderPreviewGlyphReturn(folderID: UUID, tracksIcon: Bool) -> Bool {
+        guard LauncherLayout.shouldPlayFolderPreviewGlyphReturn(
+            reducesMotion: prefersReducedMotion,
+            isDismissing: launcherIsDismissing(),
+            isVisible: window?.isVisible == true,
+            tracksIcon: tracksIcon
+        ) else { return false }
+        if !previewGlyphFlyerBoxes.isEmpty {
+            if !previewGlyphFlightReturnsHome {
+                retargetPreviewGlyphFlight(towardGlyphs: true, folderID: folderID)
+            }
+            return true
+        }
+        guard let sourceTile = folderGridTile(for: folderID) else { return false }
+        let glyphFrames = sourceTile.folderPreviewGlyphFrames(in: self)
+        guard !glyphFrames.isEmpty else { return false }
+        let items = presentedItems(for: folderOverlay.collectionView)
+        folderOverlay.collectionView.layoutSubtreeIfNeeded()
+        let paired = min(glyphFrames.count, items.count, sourceTile.previewImages.count)
+        guard paired > 0 else { return false }
+
+        var placements: [LauncherLayout.FolderPreviewGlyphPlacement] = []
+        var images: [UUID: NSImage] = [:]
+        var tiles: [UUID: AppGridTileView] = [:]
+        for index in 0..<paired {
+            let itemID = items[index].id
+            guard let tile = tileForPresentedItem(itemID, in: folderOverlay.collectionView),
+                  let source = tile.iconFrame(in: self) else { continue }
+            let image = tile.iconView.image ?? sourceTile.previewImages[index]
+            placements.append(LauncherLayout.FolderPreviewGlyphPlacement(
+                itemID: itemID,
+                source: source,
+                destination: glyphFrames[index]
+            ))
+            images[itemID] = image
+            tiles[itemID] = tile
+        }
+        let flights = LauncherLayout.folderPreviewGlyphReturnFlights(placements: placements, reducesMotion: false)
+        guard !flights.isEmpty else { return false }
+
+        var hidden: [PreviewGlyphHiddenContent] = []
+        var boxes: [PreviewGlyphFlyer] = []
+        for flight in flights {
+            guard let image = images[flight.itemID] else { continue }
+            if let tile = tiles[flight.itemID] {
+                tile.setOpenFlightContentHidden(true)
+                hidden.append(PreviewGlyphHiddenContent(itemID: flight.itemID, tile: tile))
+            }
+            boxes.append(PreviewGlyphFlyer(
+                itemID: flight.itemID,
+                view: makePreviewGlyphFlyer(frame: flight.source, image: image),
+                glyphFrame: flight.destination,
+                cellFrame: flight.source
+            ))
+        }
+        guard !boxes.isEmpty else {
+            for content in hidden {
+                content.tile?.setOpenFlightContentHidden(false)
+            }
+            return false
+        }
+        sourceTile.openFlightHidesPreviewGlyphs = true
+        previewGlyphFlyerBoxes = boxes
+        previewGlyphHiddenContent = hidden
+        previewGlyphSourceTile = sourceTile
+        startPreviewGlyphFlightAnimation(towardGlyphs: true)
+        return true
+    }
+
+    /// Point the flyers that are already up at the other end of the same path.
+    /// The model frame is moved to the pixels on screen first, so the turn
+    /// does not jump back to the previous target.
+    private func retargetPreviewGlyphFlight(towardGlyphs: Bool, folderID: UUID) {
+        let sourceTile = folderGridTile(for: folderID) ?? previewGlyphSourceTile
+        sourceTile?.openFlightHidesPreviewGlyphs = true
+        if let sourceTile {
+            previewGlyphSourceTile = sourceTile
+        }
+        if let sourceTile {
+            let glyphFrames = sourceTile.folderPreviewGlyphFrames(in: self)
+            let items = presentedItems(for: folderOverlay.collectionView)
+            folderOverlay.collectionView.layoutSubtreeIfNeeded()
+            var glyphByID: [UUID: CGRect] = [:]
+            let paired = min(glyphFrames.count, items.count)
+            for index in 0..<paired {
+                glyphByID[items[index].id] = glyphFrames[index]
+            }
+            var cellByID: [UUID: CGRect] = [:]
+            for item in items {
+                if let tile = tileForPresentedItem(item.id, in: folderOverlay.collectionView),
+                   let frame = tile.iconFrame(in: self) {
+                    cellByID[item.id] = frame
+                }
+            }
+            if !towardGlyphs {
+                previewGlyphHiddenContent.removeAll()
+                for item in items {
+                    if let tile = tileForPresentedItem(item.id, in: folderOverlay.collectionView) {
+                        tile.setOpenFlightContentHidden(true)
+                        previewGlyphHiddenContent.append(PreviewGlyphHiddenContent(itemID: item.id, tile: tile))
+                    }
+                }
+            }
+            let plateCenter = sourceTile.folderPreviewWellFrame(in: self).flatMap {
+                LauncherLayout.folderPreviewPlateCenterFrame(well: $0)
+            }
+            for index in previewGlyphFlyerBoxes.indices {
+                let itemID = previewGlyphFlyerBoxes[index].itemID
+                if let glyph = glyphByID[itemID] {
+                    previewGlyphFlyerBoxes[index].glyphFrame = glyph
+                } else if previewGlyphFlyerBoxes[index].sinksIntoPlate, let plateCenter {
+                    previewGlyphFlyerBoxes[index].glyphFrame = plateCenter
+                }
+                if let cell = cellByID[itemID] {
+                    previewGlyphFlyerBoxes[index].cellFrame = cell
+                }
+            }
+        }
+        startPreviewGlyphFlightAnimation(towardGlyphs: towardGlyphs)
+    }
+
+    private func makePreviewGlyphFlyer(frame: CGRect, image: NSImage) -> FlightImageView {
+        let flyer = FlightImageView(frame: frame)
+        flyer.image = image
+        flyer.imageScaling = .scaleProportionallyUpOrDown
+        flyer.wantsLayer = true
+        flyer.setAccessibilityElement(false)
+        addSubview(flyer, positioned: .above, relativeTo: nil)
+        return flyer
+    }
+
+    /// Run the flyers toward the plate or the cells. The curve matches the
+    /// panel, so the icons and the folder arrive together.
+    private func startPreviewGlyphFlightAnimation(towardGlyphs: Bool) {
+        guard !previewGlyphFlyerBoxes.isEmpty else { return }
+        previewGlyphFlightReturnsHome = towardGlyphs
+        previewGlyphFlightGeneration &+= 1
+        let generation = previewGlyphFlightGeneration
+        let duration = LauncherLayout.folderPreviewGlyphFlightDuration
+        var moves: [(view: FlightImageView, destination: CGRect, sinksIntoPlate: Bool)] = []
+        for box in previewGlyphFlyerBoxes {
+            let view = box.view
+            view.wantsLayer = true
+            let presentedLayer = view.layer?.presentation()
+            let presented = presentedLayer?.frame ?? view.frame
+            let start = presented.width >= 1 && presented.height >= 1 ? presented : view.frame
+            let opacity = presentedLayer?.opacity ?? view.layer?.opacity ?? 1
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            if let layer = view.layer {
+                layer.speed = 1
+                layer.timeOffset = 0
+                layer.beginTime = 0
+                layer.removeAllAnimations()
+            }
+            view.frame = start
+            view.alphaValue = CGFloat(opacity)
+            CATransaction.commit()
+            moves.append((view, towardGlyphs ? box.glyphFrame : box.cellFrame, box.sinksIntoPlate))
+        }
+        onDiagnosticEvent?(
+            towardGlyphs
+                ? "Folder preview glyph return: icons=\(moves.count) duration=\(String(format: "%.2f", duration))"
+                : "Folder preview glyph flight: icons=\(moves.count) duration=\(String(format: "%.2f", duration))"
+        )
+        // Closing an icon that has no preview slot sinks it into the plate
+        // center. The flight ease would fade it out in the air. Opacity stays
+        // up until it arrives, same dissolve as a whole-cell merge. Opening
+        // brings that icon back and fades it in with the flight, so it is
+        // visible on the way to its cell.
+        let fadeWithFlight = LauncherLayout.folderOverflowIconFadeSharesFlightEase(
+            returningToPlate: towardGlyphs
+        )
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = duration
+            context.timingFunction = folderChromeTiming(tracksIcon: true)
+            for move in moves {
+                move.view.animator().frame = move.destination
+            }
+        }, completionHandler: { [weak self] in
+            // Already on the main thread. A Task would hold the flying
+            // picture on the cell for another turn.
+            finishFlightOnLandingTurn { [weak self] in
+                guard let self, self.previewGlyphFlightGeneration == generation else { return }
+                self.commitFolderPreviewGlyphFlight()
+            }
+        })
+        if fadeWithFlight {
+            let rising = moves.filter(\.sinksIntoPlate)
+            if !rising.isEmpty {
+                // The model is fully shown. animator() wrote that 1 before the
+                // fade attached, so the commit frame flashed each icon on.
+                // Opening still fades them in with the flight. Hold the opacity
+                // already on screen until this fade is on. The shrink on the
+                // way home stays a separate animation.
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                let timing = folderChromeTiming(tracksIcon: true)
+                for move in rising {
+                    let view = move.view
+                    view.wantsLayer = true
+                    let fromOpacity = view.layer?.presentation()?.opacity ?? view.layer?.opacity ?? 0
+                    let fade = CABasicAnimation(keyPath: "opacity")
+                    fade.fromValue = fromOpacity
+                    fade.toValue = 1
+                    fade.duration = duration
+                    fade.timingFunction = timing
+                    fade.fillMode = .backwards
+                    view.alphaValue = 1
+                    view.layer?.opacity = 1
+                    view.layer?.add(fade, forKey: "glyph-rise-fade")
+                }
+                CATransaction.commit()
+            }
+        }
+        if !fadeWithFlight {
+            let sinking = moves.filter(\.sinksIntoPlate)
+            if !sinking.isEmpty {
+                // The model is hidden. animator() wrote that 0 before the fade
+                // attached, so the commit frame blanked each icon. The late
+                // dissolve still keeps them readable until they reach the
+                // plate. Hold the opacity already on screen until this fade
+                // is on. The shrink stays on the flight curve.
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                for move in sinking {
+                    let view = move.view
+                    view.wantsLayer = true
+                    let fromOpacity = view.layer?.presentation()?.opacity ?? view.layer?.opacity ?? 1
+                    let fade = CABasicAnimation(keyPath: "opacity")
+                    fade.fromValue = fromOpacity
+                    fade.toValue = 0
+                    fade.duration = duration
+                    fade.timingFunction = wholeCellMergeFadeTiming()
+                    fade.fillMode = .backwards
+                    view.alphaValue = 0
+                    view.layer?.opacity = 0
+                    view.layer?.add(fade, forKey: "glyph-sink-fade")
+                }
+                CATransaction.commit()
+            }
+        }
+        fadeOverflowIconsDuringPreviewFlight(towardGlyphs: towardGlyphs, duration: duration)
+    }
+
+    /// Icons with no flyer fade in as the folder settles. A close, or an
+    /// open that turns around, hides any reveal that has not finished so a
+    /// half-faded icon does not sit in the shrinking panel.
+    private func fadeOverflowIconsDuringPreviewFlight(towardGlyphs: Bool, duration: TimeInterval) {
+        let flying = Set(previewGlyphFlyerBoxes.map(\.itemID))
+        let overflow = previewGlyphHiddenContent.filter { !flying.contains($0.itemID) }
+        guard !overflow.isEmpty else { return }
+        if !LauncherLayout.shouldFadeFolderOverflowIconsIn(opening: !towardGlyphs) {
+            for content in overflow {
+                content.tile?.setOpenFlightContentHidden(true)
+            }
+            return
+        }
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = duration
+            context.timingFunction = wholeCellMergeFadeTiming()
+            for content in overflow {
+                guard let tile = content.tile else { continue }
+                tile.iconView.animator().alphaValue = 1
+                tile.titleLabel.animator().alphaValue = 1
+            }
+        })
+    }
+
+    /// Show the plate glyphs and drop the flyers. An opening flight also
+    /// uncovers its cells. A return leaves those cells hidden so they do not
+    /// pop back into the shrinking panel. Pass `revealCells` when the return
+    /// is aborted and the folder is opening again. A completion that lost the
+    /// race with a fade finds the generation already moved.
+    private func commitFolderPreviewGlyphFlight(revealCells: Bool? = nil) {
+        let reveal = revealCells ?? !previewGlyphFlightReturnsHome
+        previewGlyphFlightGeneration &+= 1
+        previewGlyphFlightWaitsForLauncher = false
+        previewGlyphFlightReturnsHome = false
+        previewGlyphSourceTile?.openFlightHidesPreviewGlyphs = false
+        if let folderID = borrowedPreviewPlateFolderID {
+            for collectionView in [activeCollectionView, stagingCollectionView, searchCollectionView] {
+                guard let tile = tileForPresentedItem(folderID, in: collectionView), tile.isFolder else { continue }
+                tile.openFlightHidesPreviewGlyphs = false
+            }
+        }
+        previewGlyphSourceTile = nil
+        if reveal {
+            for hidden in previewGlyphHiddenContent {
+                hidden.tile?.setOpenFlightContentHidden(false)
+            }
+        }
+        previewGlyphHiddenContent.removeAll()
+        let flyers = previewGlyphFlyers
+        previewGlyphFlyerBoxes.removeAll()
+        for flyer in flyers {
+            flyer.layer?.removeAllAnimations()
+            flyer.removeFromSuperview()
+        }
+    }
+
+    /// Leave each glyph on the frame already on screen. The model frame is
+    /// already the destination. Bump the generation so the completion does not
+    /// reveal the cells while the launcher fade is still up.
+    private func pinInFlightFolderPreviewGlyphFlight() -> Bool {
+        guard !previewGlyphFlyers.isEmpty else { return false }
+        previewGlyphFlightGeneration &+= 1
+        for flyer in previewGlyphFlyers {
+            flyer.wantsLayer = true
+            guard let layer = flyer.layer else { continue }
+            let presented = layer.presentation()
+            let frame = presented?.frame ?? flyer.frame
+            let opacity = presented?.opacity ?? layer.opacity
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.speed = 1
+            layer.timeOffset = 0
+            layer.beginTime = 0
+            layer.removeAllAnimations()
+            flyer.alphaValue = CGFloat(opacity)
+            flyer.frame = frame
+            CATransaction.commit()
+        }
+        for content in previewGlyphHiddenContent {
+            guard let tile = content.tile else { continue }
+            pinPresentedAlpha(tile.iconView)
+            pinPresentedAlpha(tile.titleLabel)
+        }
+        return true
+    }
+
+    /// Stop one view on the opacity already on screen. The model value is
+    /// often already the destination, which would pop the fade to its end.
+    private func pinPresentedAlpha(_ view: NSView) {
+        view.wantsLayer = true
+        guard let layer = view.layer else { return }
+        let opacity = layer.presentation()?.opacity ?? layer.opacity
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.removeAllAnimations()
+        view.alphaValue = CGFloat(opacity)
+        CATransaction.commit()
+    }
+
     private func commitLayout(_ next: LayoutState) {
+        // A picture already in the air lands now. A flight that has not
+        // started belongs to the drop that is calling this, so keep it.
+        if dropLandingView != nil {
+            // The picture in the air lands, and that cell is drawn again.
+            // A flight queued for a later drop, not yet drawn, is the one to keep.
+            let keptPending = pendingDropLanding
+            commitDropLanding()
+            if let keptPending {
+                pendingDropLanding = keptPending
+                dropLandingItemID = keptPending.itemID
+            }
+        }
+        commitFolderDissolveScatter()
+        commitFolderPreviewGlyphFlight()
+        // A reload configures the new folder tile again and would draw the
+        // glyphs under icons that are still flying. Land them first.
+        commitMergePreviewLanding()
         let previousEntries = layoutState.orderedEntries
         let closingFolder = openedFolderID
         let dissolvesOpenFolder = closingFolder.map { next.folders[$0] == nil } ?? false
@@ -4796,12 +6560,22 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             isVisible: window?.isVisible == true
         )
         // Blank the grid only when the fade-in is about to play. During the
-        // launcher fade, leave the opacity already on screen.
+        // launcher fade, leave the opacity already on screen. A scatter flight
+        // keeps the cells up: the leftover icon is flying toward one of them.
         let playDissolvedGridFade = dissolvesOpenFolder
             && !holdDissolvedGridFade
             && window?.isVisible == true
             && !launcherIsDismissing()
-        if playDissolvedGridFade {
+        let scatterSeeds: [DissolveScatterSeed]
+        if dissolvesOpenFolder, let closingFolder, let folder = layoutState.folders[closingFolder] {
+            scatterSeeds = folderDissolveScatterSeeds(
+                memberIDs: folder.itemIDs,
+                nextEntries: next.orderedEntries
+            )
+        } else {
+            scatterSeeds = []
+        }
+        if playDissolvedGridFade, scatterSeeds.isEmpty {
             activeCollectionView.alphaValue = 0
         }
         if next.appAliases != layoutState.appAliases {
@@ -4811,7 +6585,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         rebuildSearchableAppsCache()
         if let closingFolder, layoutState.folders[closingFolder] == nil {
             // The reload below throws away a focus set here. Restore it after.
-            closeFolder(restoreFocus: false)
+            closeFolder(restoreFocus: false, dissolveScatter: !scatterSeeds.isEmpty)
         }
         refreshPresentation(
             resetPage: false,
@@ -4830,8 +6604,12 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         } else if let preservedFolderMember, openedFolderID != nil {
             restoreOpenFolderMemberFocus(preservedFolderMember)
         }
-        if dissolvesOpenFolder {
+        let playedScatter = playFolderDissolveScatter(scatterSeeds)
+        if dissolvesOpenFolder, !playedScatter {
             if playDissolvedGridFade {
+                if scatterSeeds.isEmpty == false {
+                    activeCollectionView.alphaValue = 0
+                }
                 dissolvedGridFadeWaitsForLauncher = false
                 NSAnimationContext.runAnimationGroup { context in
                     context.duration = prefersReducedMotion ? 0.12 : 0.22
@@ -4849,6 +6627,33 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             }
         }
         onLayoutChanged?(next)
+    }
+
+    /// Folder preview well, in the overlay's coordinates. The panel opens
+    /// from this rect and closes back into it. Search and the grid each
+    /// have their own collection view.
+    private func folderIconFrameInOverlay(_ id: UUID) -> CGRect? {
+        let hosts: [NSCollectionView] = isSearching
+            ? [searchCollectionView]
+            : [activeCollectionView, stagingCollectionView]
+        for collectionView in hosts {
+            collectionView.layoutSubtreeIfNeeded()
+            let items = presentedItems(for: collectionView)
+            guard let index = items.firstIndex(where: { $0.id == id }) else { continue }
+            let indexPath = IndexPath(item: index, section: 0)
+            guard let itemView = collectionView.item(at: indexPath)?.view else { continue }
+            itemView.layoutSubtreeIfNeeded()
+            let source: CGRect
+            if let tile = itemView as? AppGridTileView, let well = tile.folderPreviewWellFrame() {
+                source = folderOverlay.convert(well, from: tile)
+            } else {
+                source = folderOverlay.convert(itemView.bounds, from: itemView)
+            }
+            guard source.width >= 1, source.height >= 1,
+                  source.origin.x.isFinite, source.origin.y.isFinite else { continue }
+            return source
+        }
+        return nil
     }
 
     private func frameInRoot(for ref: LayoutItemRef) -> CGRect? {
@@ -4871,6 +6676,66 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         return activeCollectionView.convert(attributes.frame, to: self)
     }
 
+    /// The app icon, in this view. The cell frame is taller than the icon, and
+    /// the preview slot is the icon's size, not the title's.
+    private func iconFrameInRoot(for ref: LayoutItemRef) -> CGRect? {
+        let id: UUID
+        switch ref {
+        case .topLevel(let value):
+            id = value
+        case .folderMember(_, let itemID):
+            id = itemID
+        }
+        for collectionView in [activeCollectionView, stagingCollectionView, folderOverlay.collectionView] {
+            collectionView.layoutSubtreeIfNeeded()
+            let items = presentedItems(for: collectionView)
+            guard let index = items.firstIndex(where: { $0.id == id }),
+                  let tile = collectionView.item(at: IndexPath(item: index, section: 0))?.view as? AppGridTileView,
+                  let frame = tile.iconFrame(in: self) else { continue }
+            return frame
+        }
+        return nil
+    }
+
+    /// Where the icon sits inside the cell-sized rect the pointer released.
+    /// The tile itself is still on the grid. Only the icon's place in that
+    /// cell is carried over to the release rect.
+    private func iconFrame(insideReleasedCell cell: CGRect, matching tile: AppGridTileView) -> CGRect? {
+        guard let icon = tile.iconFrame(in: self) else { return nil }
+        let originCell = tile.convert(tile.bounds, to: self)
+        guard originCell.width >= 1, originCell.height >= 1 else { return nil }
+        let frame = CGRect(
+            x: cell.minX + (icon.minX - originCell.minX),
+            y: cell.minY + (icon.minY - originCell.minY),
+            width: icon.width,
+            height: icon.height
+        )
+        guard frame.width >= 1, frame.height >= 1,
+              frame.origin.x.isFinite, frame.origin.y.isFinite else { return nil }
+        return frame
+    }
+
+    private func incomingItemID(_ ref: LayoutItemRef) -> UUID {
+        switch ref {
+        case .topLevel(let id):
+            return id
+        case .folderMember(_, let itemID):
+            return itemID
+        }
+    }
+
+    /// How many mini icons this folder's plate draws. Same nine-cap and the
+    /// same skipped members as the tile's preview. The new icon is appended,
+    /// so the difference before and after the drop is its slot.
+    private func previewGlyphCount(in state: LayoutState, folderID: UUID) -> Int {
+        guard let folder = state.folders[folderID] else { return 0 }
+        return folder.itemIDs.prefix(LauncherLayout.folderPreviewGlyphCapacity).reduce(into: 0) { count, itemID in
+            if state.appKeys[itemID].flatMap({ catalogByKey[$0] }) != nil {
+                count += 1
+            }
+        }
+    }
+
     private func iconImage(for ref: LayoutItemRef) -> NSImage {
         let id: UUID
         switch ref {
@@ -4887,11 +6752,389 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         return WorkspaceIconCache.placeholder
     }
 
+    /// New folder: the icon that was already there shrinks into the first
+    /// preview slot, and the dropped icon into the second. The plate fades
+    /// in over the early flight and is solid before the icons land. Its
+    /// glyphs stay hidden so they don't sit under the flyers. Reduced
+    /// motion, or a plate we can't measure, keeps the single picture flying
+    /// onto the cell. A folder that already exists uses
+    /// `playIncomingFolderPreviewLanding` instead.
+    private func playMergePreviewLanding(_ pending: PendingMergeAnimation) -> Bool {
+        guard pending.createdFolder, !prefersReducedMotion,
+              let folderID = pending.folderID,
+              let residentFrame = pending.residentIconFrame,
+              let incomingFrame = pending.incomingIconFrame,
+              let residentIcon = pending.residentIcon,
+              let incomingIcon = pending.incomingIcon,
+              let item = materializedFolderItem(folderID),
+              let tile = item.view as? AppGridTileView else { return false }
+        let glyphFrames = tile.folderPreviewGlyphFrames(in: self)
+        guard glyphFrames.count >= 2 else { return false }
+        let landings = LauncherLayout.folderMergePreviewLandings(
+            resident: residentFrame,
+            incoming: incomingFrame,
+            destinations: Array(glyphFrames.prefix(2)),
+            reducesMotion: false
+        )
+        guard landings.count == 2 else { return false }
+
+        removeMergeFlyer()
+        tile.openFlightHidesPreviewGlyphs = true
+        item.view.wantsLayer = true
+        mergePreviewFolderTile = tile
+
+        let images = [residentIcon, incomingIcon]
+        var boxes: [MergePreviewFlyer] = []
+        for (index, pair) in zip(landings, images).enumerated() {
+            let (landing, image) = pair
+            let view = makePreviewGlyphFlyer(frame: landing.source, image: image)
+            // The resident icon was sitting on the grid. Only the dropped
+            // icon was lifted, so only that flyer carries the shadow.
+            if LauncherLayout.shouldFadeIncomingMergeShadow(
+                isIncoming: index == images.count - 1,
+                reducesMotion: prefersReducedMotion
+            ) {
+                fadeLiftShadow(on: view, flightDuration: landing.duration)
+            }
+            boxes.append(MergePreviewFlyer(view: view, destination: landing.destination))
+        }
+        guard boxes.count == 2 else {
+            for box in boxes {
+                box.view.removeFromSuperview()
+            }
+            tile.openFlightHidesPreviewGlyphs = false
+            mergePreviewFolderTile = nil
+            return false
+        }
+        mergePreviewFlyers = boxes
+        mergePreviewFlightGeneration &+= 1
+        let generation = mergePreviewFlightGeneration
+        let duration = landings[0].duration
+        // The fade starts from hidden and the plate grows from the icon,
+        // so it does not pop in under the flying icons. The model is the
+        // open plate. Writing that model before the animations are attached
+        // flashes the full plate on the commit frame.
+        if let layer = item.view.layer {
+            let fade = CABasicAnimation(keyPath: "opacity")
+            fade.fromValue = 0
+            fade.toValue = 1
+            fade.duration = LauncherLayout.folderMergePlateRevealDuration(flight: duration)
+            fade.timingFunction = CAMediaTimingFunction(
+                controlPoints: Float(LauncherLayout.folderMergePlateRevealX1),
+                Float(LauncherLayout.folderMergePlateRevealY1),
+                Float(LauncherLayout.folderMergePlateRevealX2),
+                Float(LauncherLayout.folderMergePlateRevealY2)
+            )
+            fade.fillMode = .backwards
+            // Same clock as the fade. The plate used to be full size while it
+            // was still invisible. The layer anchor is the view origin, so the
+            // shift is the icon center times (1 - scale). Scale, then that
+            // shift: the plate stays put instead of sliding toward the corner.
+            let iconCenter = tile.iconFrame(in: tile).map {
+                CGPoint(x: $0.midX, y: $0.midY)
+            } ?? CGPoint(
+                x: tile.bounds.midX,
+                y: tile.bounds.midY + LauncherLayout.iconCenterLift
+            )
+            let shift = LauncherLayout.folderMergePlateRevealTranslation(iconCenter: iconCenter)
+            let grow = CABasicAnimation(keyPath: "transform")
+            grow.fromValue = NSValue(caTransform3D: folderBackdropTransform(
+                scale: LauncherLayout.folderMergePlateRevealScaleStart,
+                translationX: shift.x,
+                translationY: shift.y
+            ))
+            grow.toValue = NSValue(caTransform3D: CATransform3DIdentity)
+            grow.duration = fade.duration
+            grow.timingFunction = fade.timingFunction
+            grow.fillMode = .backwards
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.opacity = 1
+            layer.transform = CATransform3DIdentity
+            layer.add(fade, forKey: "folder-merge-plate")
+            layer.add(grow, forKey: "folder-merge-plate-scale")
+            CATransaction.commit()
+        }
+        onDiagnosticEvent?("Merge preview landing started: icons=\(boxes.count) reducedMotion=\(prefersReducedMotion)")
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = duration
+            context.timingFunction = folderChromeTiming(tracksIcon: true)
+            for box in boxes {
+                box.view.animator().frame = box.destination
+            }
+        }, completionHandler: { [weak self] in
+            // Already on the main thread. A Task would hold the flying
+            // picture on the preview slot for another turn.
+            finishFlightOnLandingTurn { [weak self] in
+                guard let self, self.mergePreviewFlightGeneration == generation else { return }
+                self.commitMergePreviewLanding()
+            }
+        })
+        return true
+    }
+
+    /// Dropped onto a folder that already exists. The new icon flies into the
+    /// next empty preview slot. Icons already on the plate stay. The new
+    /// glyph stays hidden until the flyer lands. Reduced motion, or a slot
+    /// we can't measure, keeps the single picture flying onto the cell, and
+    /// that path still springs the tile. A full plate uses
+    /// `playIncomingFolderPreviewCenterLanding` instead.
+    private func playIncomingFolderPreviewLanding(_ pending: PendingMergeAnimation) -> Bool {
+        guard !pending.createdFolder, !prefersReducedMotion,
+              let folderID = pending.folderID,
+              let slot = pending.incomingPreviewSlot,
+              let incomingFrame = pending.incomingIconFrame,
+              let incomingIcon = pending.incomingIcon,
+              let item = materializedFolderItem(folderID),
+              let tile = item.view as? AppGridTileView else { return false }
+        let frames = tile.folderPreviewGlyphFrames(in: self)
+        guard frames.indices.contains(slot),
+              let landing = LauncherLayout.folderIncomingPreviewLanding(
+                incoming: incomingFrame,
+                destination: frames[slot],
+                reducesMotion: false
+              ) else { return false }
+
+        removeMergeFlyer()
+        tile.previewGlyphDrawLimit = slot
+        incomingPreviewLimitedFolderID = folderID
+        incomingPreviewGlyphLimit = slot
+        mergePreviewFolderTile = tile
+        let view = makePreviewGlyphFlyer(frame: landing.source, image: incomingIcon)
+        if LauncherLayout.shouldFadeIncomingMergeShadow(isIncoming: true, reducesMotion: prefersReducedMotion) {
+            fadeLiftShadow(on: view, flightDuration: landing.duration)
+        }
+        mergePreviewFlyers = [MergePreviewFlyer(view: view, destination: landing.destination)]
+        mergePreviewFlightGeneration &+= 1
+        let generation = mergePreviewFlightGeneration
+        let duration = landing.duration
+        onDiagnosticEvent?("Merge preview landing started: icons=1 reducedMotion=\(prefersReducedMotion)")
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = duration
+            context.timingFunction = folderChromeTiming(tracksIcon: true)
+            view.animator().frame = landing.destination
+        }, completionHandler: { [weak self] in
+            // Already on the main thread. A Task would hold the flying
+            // picture on the preview slot for another turn.
+            finishFlightOnLandingTurn { [weak self] in
+                guard let self, self.mergePreviewFlightGeneration == generation else { return }
+                self.commitMergePreviewLanding()
+            }
+        })
+        return true
+    }
+
+    /// Dropped onto a folder whose preview has no empty slot. The icon
+    /// shrinks into the middle of the plate, then fades. The shrink uses the
+    /// flight ease. Opacity stays up until the icon is in the center, same
+    /// dissolve as a whole-cell merge. The glyphs already there stay, and
+    /// the plate does not spring. Reduced motion, a new folder, and a plate
+    /// we can't measure keep the older flight.
+    private func playIncomingFolderPreviewCenterLanding(_ pending: PendingMergeAnimation) -> Bool {
+        guard !pending.createdFolder, !prefersReducedMotion,
+              pending.incomingPreviewSlot == nil,
+              let folderID = pending.folderID,
+              let incomingFrame = pending.incomingIconFrame,
+              let incomingIcon = pending.incomingIcon,
+              let item = materializedFolderItem(folderID),
+              let tile = item.view as? AppGridTileView,
+              let well = tile.folderPreviewWellFrame(in: self),
+              let landing = LauncherLayout.folderIncomingPreviewCenterLanding(
+                incoming: incomingFrame,
+                well: well,
+                reducesMotion: false
+              ) else { return false }
+
+        removeMergeFlyer()
+        mergePreviewFolderTile = tile
+        let view = makePreviewGlyphFlyer(frame: landing.source, image: incomingIcon)
+        if LauncherLayout.shouldFadeIncomingMergeShadow(isIncoming: true, reducesMotion: prefersReducedMotion) {
+            fadeLiftShadow(on: view, flightDuration: landing.duration)
+        }
+        mergePreviewFlyers = [MergePreviewFlyer(
+            view: view,
+            destination: landing.destination,
+            itemID: pending.incomingItemID
+        )]
+        mergePreviewFlightGeneration &+= 1
+        let generation = mergePreviewFlightGeneration
+        let duration = landing.duration
+        onDiagnosticEvent?("Merge preview center landing started: icons=1 reducedMotion=\(prefersReducedMotion)")
+        // The model is hidden. animator() wrote that 0 before the fade
+        // attached, so the commit frame blanked the icon. The late dissolve
+        // still keeps it readable until it is in the plate. Hold the opacity
+        // already on screen until this fade is on. The shrink stays separate.
+        view.wantsLayer = true
+        let fromOpacity = view.layer?.presentation()?.opacity ?? view.layer?.opacity ?? 1
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = fromOpacity
+        fade.toValue = 0
+        fade.duration = duration
+        fade.timingFunction = wholeCellMergeFadeTiming()
+        fade.fillMode = .backwards
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        view.alphaValue = 0
+        view.layer?.opacity = 0
+        view.layer?.add(fade, forKey: "merge-center-fade")
+        CATransaction.commit()
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = duration
+            context.timingFunction = folderChromeTiming(tracksIcon: true)
+            view.animator().frame = landing.destination
+        }, completionHandler: { [weak self] in
+            // Already on the main thread. A Task would hold the flying
+            // picture on the preview slot for another turn.
+            finishFlightOnLandingTurn { [weak self] in
+                guard let self, self.mergePreviewFlightGeneration == generation else { return }
+                self.commitMergePreviewLanding()
+            }
+        })
+        return true
+    }
+
+    /// Leave each icon on the frame already on screen. Bump the generation so
+    /// the completion does not uncover the plate glyphs while the fade is up.
+    private func pinMergePreviewFlyers() {
+        pinMergePreviewPlate()
+        guard !mergePreviewFlyers.isEmpty else { return }
+        mergePreviewFlightGeneration &+= 1
+        for flyer in mergePreviewFlyers {
+            let view = flyer.view
+            view.wantsLayer = true
+            guard let layer = view.layer else { continue }
+            let presented = layer.presentation()
+            let frame = presented?.frame ?? view.frame
+            let opacity = presented?.opacity ?? layer.opacity
+            let shadowOpacity = presented?.shadowOpacity ?? layer.shadowOpacity
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.speed = 1
+            layer.timeOffset = 0
+            layer.beginTime = 0
+            layer.removeAllAnimations()
+            view.alphaValue = CGFloat(opacity)
+            view.frame = frame
+            layer.shadowOpacity = shadowOpacity
+            CATransaction.commit()
+        }
+    }
+
+    /// Leave the plate on the opacity and size already on screen. The fade
+    /// and the grow must not keep running under the launcher fade.
+    private func pinMergePreviewPlate() {
+        guard let layer = mergePreviewFolderTile?.layer else { return }
+        let fading = layer.animation(forKey: "folder-merge-plate") != nil
+        let growing = layer.animation(forKey: "folder-merge-plate-scale") != nil
+        guard fading || growing else { return }
+        let presented = layer.presentation()
+        let opacity = presented?.opacity ?? layer.opacity
+        let transform = presented?.transform ?? layer.transform
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.removeAnimation(forKey: "folder-merge-plate")
+        layer.removeAnimation(forKey: "folder-merge-plate-scale")
+        layer.opacity = opacity
+        layer.transform = transform
+        CATransaction.commit()
+    }
+
+    /// Show the plate glyphs and drop the flyers. A plate that was still
+    /// fading in finishes solid, so the next appearance is not half hidden.
+    /// A completion that lost the race with a fade finds the generation
+    /// already moved.
+    private func commitMergePreviewLanding() {
+        #if DEBUG
+        let cleanupPlate = mergePreviewFolderTile
+        #endif
+        mergePreviewFlightGeneration &+= 1
+        if let layer = mergePreviewFolderTile?.layer {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.removeAnimation(forKey: "folder-merge-plate")
+            layer.removeAnimation(forKey: "folder-merge-plate-scale")
+            layer.opacity = 1
+            layer.transform = CATransform3DIdentity
+            CATransaction.commit()
+        }
+        mergePreviewFolderTile?.openFlightHidesPreviewGlyphs = false
+        revealIncomingPreviewGlyphs()
+        mergePreviewFolderTile = nil
+        let flyers = mergePreviewFlyers
+        mergePreviewFlyers.removeAll()
+        for flyer in flyers {
+            flyer.view.layer?.removeAllAnimations()
+            flyer.view.removeFromSuperview()
+        }
+        #if DEBUG
+        let environment = ProcessInfo.processInfo.environment
+        if !flyers.isEmpty,
+           environment["LAUNCHICON_TEST_LAYOUT_PATH"] != nil,
+           environment["LAUNCHICON_DIAGNOSTICS_PATH"] != nil {
+            let detached = flyers.allSatisfy {
+                $0.view.superview == nil && $0.view.layer?.animationKeys()?.isEmpty != false
+            }
+            let plateReady = cleanupPlate.map { tile in
+                guard let layer = tile.layer else { return false }
+                return layer.opacity == 1 && CATransform3DIsIdentity(layer.transform)
+                    && layer.animation(forKey: "folder-merge-plate") == nil
+                    && layer.animation(forKey: "folder-merge-plate-scale") == nil
+                    && !tile.openFlightHidesPreviewGlyphs && tile.previewGlyphDrawLimit == nil
+            } ?? false
+            onDiagnosticEvent?(
+                "Merge cleanup: flyers=\(flyers.count) remaining=\(mergePreviewFlyers.count) " +
+                "detached=\(detached) plateReady=\(plateReady)"
+            )
+        }
+        #endif
+    }
+
+    /// Draw the glyph the flyer was carrying. The plate itself was already
+    /// visible. A folder that is still off screen is reconfigured later,
+    /// and that configure clears the limit too.
+    private func revealIncomingPreviewGlyphs() {
+        let folderID = incomingPreviewLimitedFolderID
+        mergePreviewFolderTile?.previewGlyphDrawLimit = nil
+        incomingPreviewLimitedFolderID = nil
+        incomingPreviewGlyphLimit = nil
+        guard let folderID else { return }
+        for collectionView in [activeCollectionView, stagingCollectionView, searchCollectionView] {
+            let items = presentedItems(for: collectionView)
+            guard let index = items.firstIndex(where: { $0.id == folderID }),
+                  let tile = collectionView.item(at: IndexPath(item: index, section: 0))?.view as? AppGridTileView else { continue }
+            tile.previewGlyphDrawLimit = nil
+        }
+    }
+
+    /// Where an in-flight merge icon actually is, when the open flight should
+    /// leave from that picture instead of the slot it has not reached.
+    private func mergePreviewPresentedFrame(matching destination: CGRect) -> CGRect? {
+        for flyer in mergePreviewFlyers {
+            let target = flyer.destination
+            let close = abs(target.minX - destination.minX) < 1
+                && abs(target.minY - destination.minY) < 1
+                && abs(target.width - destination.width) < 1
+                && abs(target.height - destination.height) < 1
+            guard close else { continue }
+            let presented = flyer.view.layer?.presentation()?.frame ?? flyer.view.frame
+            if presented.width >= 1, presented.height >= 1, presented.origin.x.isFinite, presented.origin.y.isFinite {
+                return presented
+            }
+        }
+        return nil
+    }
+
     private func playMergeAnimation(from source: CGRect, to target: CGRect, image: NSImage) {
         removeMergeFlyer()
         let generation = mergeFlightGeneration
 
-        let flyer = NSImageView(frame: source)
+        // The drag image was the lifted cell. A flyer that starts on the
+        // resting cell pops down before it flies.
+        let start = LauncherLayout.mergeFlightSourceFrame(
+            cell: source,
+            reducesMotion: prefersReducedMotion
+        )
+        let flyer = NSImageView(frame: start)
         flyer.image = image
         flyer.imageScaling = .scaleProportionallyUpOrDown
         flyer.wantsLayer = true
@@ -4899,30 +7142,74 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         mergeAnimationView = flyer
         onDiagnosticEvent?("Merge flyer started: reducedMotion=\(prefersReducedMotion)")
         if prefersReducedMotion {
-            NSAnimationContext.runAnimationGroup({ context in
-                context.duration = 0.12
-                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                flyer.animator().alphaValue = 0
-            }, completionHandler: { [weak self, weak flyer] in
-                Task { @MainActor [weak self, weak flyer] in
+            // The model is hidden. animator() wrote that 0 before the fade
+            // attached, so the commit frame blanked the icon. Hold the
+            // opacity already on screen until this fade is on. The icon
+            // still does not fly.
+            flyer.wantsLayer = true
+            let fromOpacity = flyer.layer?.presentation()?.opacity ?? flyer.layer?.opacity ?? 1
+            let fade = CABasicAnimation(keyPath: "opacity")
+            fade.fromValue = fromOpacity
+            fade.toValue = 0
+            fade.duration = 0.12
+            fade.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            fade.fillMode = .backwards
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            CATransaction.setCompletionBlock { [weak self, weak flyer] in
+                // Already on the main thread. A Task would leave the faded
+                // picture on the cell for another turn.
+                finishFlightOnLandingTurn { [weak self, weak flyer] in
                     guard let self, self.mergeFlightGeneration == generation else { return }
                     flyer?.removeFromSuperview()
                     if self.mergeAnimationView === flyer {
                         self.mergeAnimationView = nil
                     }
                 }
-            })
+            }
+            flyer.alphaValue = 0
+            flyer.layer?.opacity = 0
+            flyer.layer?.add(fade, forKey: "merge-reduced-fade")
+            CATransaction.commit()
             return
         }
 
-        let dest = target.insetBy(dx: target.width * 0.28, dy: target.height * 0.28)
+        // The drag image's shadow is not in this picture. Fade it while the
+        // icon is still readable. The icon itself dissolves later.
+        fadeLiftShadow(on: flyer, flightDuration: mergeFlightDuration)
+
+        // Shrink toward the icon's usual place, above the cell center.
+        // An equal inset landed on the geometric middle, under the folder.
+        let dest = LauncherLayout.wholeCellMergeDestination(in: target)
+        // Frame and opacity cannot share one timing function. The flight
+        // ease arrives quickly. Opacity stays up until the icon is on the
+        // cell, then dissolves. One group would fade it away in the air.
+        // The model is hidden. animator() wrote that 0 before the fade
+        // attached, so the commit frame blanked the icon. Hold the opacity
+        // already on screen until this fade is on.
+        flyer.wantsLayer = true
+        let fromOpacity = flyer.layer?.presentation()?.opacity ?? flyer.layer?.opacity ?? 1
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = fromOpacity
+        fade.toValue = 0
+        fade.duration = mergeFlightDuration
+        fade.timingFunction = wholeCellMergeFadeTiming()
+        fade.fillMode = .backwards
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        flyer.alphaValue = 0
+        flyer.layer?.opacity = 0
+        flyer.layer?.add(fade, forKey: "merge-flight-fade")
+        CATransaction.commit()
         NSAnimationContext.runAnimationGroup({ context in
             context.duration = mergeFlightDuration
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            // Same travel curve as the folder these icons are joining.
+            context.timingFunction = folderChromeTiming(tracksIcon: true)
             flyer.animator().frame = dest
-            flyer.animator().alphaValue = 0.15
         }, completionHandler: { [weak self, weak flyer] in
-            Task { @MainActor [weak self, weak flyer] in
+            // Already on the main thread. A Task would leave the flying
+            // picture on the cell for another turn.
+            finishFlightOnLandingTurn { [weak self, weak flyer] in
                 guard let self, self.mergeFlightGeneration == generation else { return }
                 flyer?.removeFromSuperview()
                 if self.mergeAnimationView === flyer {
@@ -4958,7 +7245,11 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         return nil
     }
 
-    private func playFolderLandingAnimation(_ folderID: UUID, after delay: TimeInterval) {
+    private func playFolderLandingAnimation(
+        _ folderID: UUID,
+        after delay: TimeInterval,
+        dissolveFadeDuration: TimeInterval? = nil
+    ) {
         guard let item = materializedFolderItem(folderID) else { return }
 
         onDiagnosticEvent?("Folder landing started: reducedMotion=\(prefersReducedMotion)")
@@ -4985,57 +7276,143 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
                 }
                 return
             }
-            layer.opacity = 1
-            layer.transform = CATransform3DIdentity
+            // The model is the shown folder. The fade starts from hidden.
+            // Writing full opacity before the animation is attached flashes
+            // the new folder solid on the commit frame.
             let animation = CABasicAnimation(keyPath: "opacity")
             animation.fromValue = 0
             animation.toValue = 1
             animation.duration = 0.12
             animation.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            animation.fillMode = .backwards
             let generation = beginTrackedFolderLanding(on: layer)
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.opacity = 1
+            layer.transform = CATransform3DIdentity
             layer.add(animation, forKey: "folder-created")
+            CATransaction.commit()
             finishFolderLandingLater(on: layer, generation: generation, after: 0.12)
             return
         }
 
-        var immediateSpringGeneration: Int?
-        if delay > 0 {
+        let revealDuration: TimeInterval = 0.22
+        var landingGeneration: Int?
+        if let dissolveFadeDuration, dissolveFadeDuration > 0 {
+            // Same clock as the flying icon. The sampled curve stays at 0
+            // while that icon is still clear, then rises as it dissolves.
+            // Model opacity stays 0 so a new layer does not flash solid
+            // before the first frame of the curve.
+            folderLandingGeneration &+= 1
+            let generation = folderLandingGeneration
+            landingGeneration = generation
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.opacity = 0
+            CATransaction.commit()
+            let reveal = CAKeyframeAnimation(keyPath: "opacity")
+            let steps = 20
+            var keyTimes: [NSNumber] = []
+            var values: [NSNumber] = []
+            keyTimes.reserveCapacity(steps + 1)
+            values.reserveCapacity(steps + 1)
+            for step in 0...steps {
+                let time = CGFloat(step) / CGFloat(steps)
+                keyTimes.append(NSNumber(value: Double(time)))
+                values.append(NSNumber(value: Double(
+                    LauncherLayout.wholeCellMergeFolderRevealOpacity(at: time)
+                )))
+            }
+            reveal.keyTimes = keyTimes
+            reveal.values = values
+            reveal.duration = dissolveFadeDuration
+            reveal.calculationMode = .linear
+            reveal.fillMode = .both
+            reveal.isRemovedOnCompletion = false
+            beginTrackedFolderLanding(on: layer, generation: generation)
+            layer.add(reveal, forKey: "folder-created-opacity")
+            // Same samples as the fade. The scale stays put while the folder
+            // is hidden, then grows to 1 as the icon dissolves. It is not a
+            // spring, and a delay passed in must not keep it moving after
+            // the flight: the curve already holds the start scale.
+            let scale = CAKeyframeAnimation(keyPath: "transform.scale")
+            var scaleValues: [NSNumber] = []
+            scaleValues.reserveCapacity(steps + 1)
+            for step in 0...steps {
+                let time = CGFloat(step) / CGFloat(steps)
+                scaleValues.append(NSNumber(value: Double(
+                    LauncherLayout.wholeCellMergeFolderScale(at: time)
+                )))
+            }
+            scale.keyTimes = keyTimes
+            scale.values = scaleValues
+            scale.duration = dissolveFadeDuration
+            scale.calculationMode = .linear
+            scale.fillMode = .both
+            scale.isRemovedOnCompletion = false
+            layer.add(scale, forKey: "folder-created")
+        } else if delay > 0 {
             // Model opacity stays 0 until the reveal starts. fillMode alone does not
             // hide a tile whose layer was just created for this drop.
             folderLandingGeneration &+= 1
             let generation = folderLandingGeneration
+            landingGeneration = generation
             layer.opacity = 0
             let reveal = CABasicAnimation(keyPath: "opacity")
             reveal.fromValue = 0
             reveal.toValue = 1
             reveal.beginTime = layer.convertTime(CACurrentMediaTime(), from: nil) + delay
-            reveal.duration = 0.22
+            reveal.duration = revealDuration
             reveal.fillMode = .both
             reveal.isRemovedOnCompletion = false
             reveal.timingFunction = CAMediaTimingFunction(name: .easeOut)
             beginTrackedFolderLanding(on: layer, generation: generation)
             layer.add(reveal, forKey: "folder-created-opacity")
-            finishFolderLandingLater(on: layer, generation: generation, after: delay + reveal.duration)
         }
-        let animation = CASpringAnimation(keyPath: "transform.scale")
-        animation.fromValue = 0.68
-        animation.toValue = 1.0
-        animation.damping = 13
-        animation.initialVelocity = 1.0
-        animation.mass = 0.8
-        animation.stiffness = 180
-        animation.duration = animation.settlingDuration
-        if delay > 0 {
-            animation.beginTime = layer.convertTime(CACurrentMediaTime(), from: nil) + delay
-            animation.fillMode = .backwards
+        let scaleEnd: TimeInterval
+        if let dissolveFadeDuration, dissolveFadeDuration > 0 {
+            // Already added with the fade. `delay` is not added again.
+            scaleEnd = dissolveFadeDuration
         } else {
-            // A drop into an existing folder does not wait for the flight.
-            // That spring used to keep scaling under the launcher fade.
-            immediateSpringGeneration = beginTrackedFolderLanding(on: layer)
+            let animation = CASpringAnimation(keyPath: "transform.scale")
+            animation.fromValue = 0.86
+            animation.toValue = 1.0
+            animation.damping = 18
+            animation.initialVelocity = 0.5
+            animation.mass = 0.8
+            animation.stiffness = 180
+            animation.duration = animation.settlingDuration
+            // The model scale is the settled tile. Hold 0.86 until this
+            // spring is attached, or the commit frame shows full size and
+            // then pops smaller. A delayed spring already waited this way.
+            animation.fillMode = .backwards
+            if delay > 0 {
+                animation.beginTime = layer.convertTime(CACurrentMediaTime(), from: nil) + delay
+            } else if landingGeneration == nil {
+                // A drop into an existing folder does not wait for the flight.
+                // That spring used to keep scaling under the launcher fade.
+                landingGeneration = beginTrackedFolderLanding(on: layer)
+            }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.transform = CATransform3DIdentity
+            layer.add(animation, forKey: "folder-created")
+            CATransaction.commit()
+            scaleEnd = delay + animation.duration
         }
-        layer.add(animation, forKey: "folder-created")
-        if let generation = immediateSpringGeneration {
-            finishFolderLandingLater(on: layer, generation: generation, after: animation.duration)
+        // The opacity reveal can finish before the spring settles. A dissolve
+        // fade already covers the whole flight, so it is not delayed again.
+        let opacityEnd: TimeInterval
+        if let dissolveFadeDuration, dissolveFadeDuration > 0 {
+            opacityEnd = dissolveFadeDuration
+        } else if delay > 0 {
+            opacityEnd = delay + revealDuration
+        } else {
+            opacityEnd = 0
+        }
+        let duration = max(scaleEnd, opacityEnd)
+        if let generation = landingGeneration {
+            finishFolderLandingLater(on: layer, generation: generation, after: duration)
         }
     }
 
@@ -5169,6 +7546,243 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         layer.setValue(nil, forKey: "folderLandingToken")
     }
 
+    /// The drag image has gone. Fly the released cell into its slot. A fade
+    /// that is still up keeps the request. A hidden window, reduced motion,
+    /// or a cell we cannot measure shows the icon where it already is.
+    private func beginPendingDropLanding() {
+        guard pendingDropLanding != nil else { return }
+        let dismissing = launcherIsDismissing()
+        let visible = window?.isVisible == true
+        if LauncherLayout.shouldHoldDropLanding(isDismissing: dismissing, isVisible: visible) {
+            dropLandingWaitsForLauncher = true
+            return
+        }
+        if !LauncherLayout.shouldAdvanceDropLanding(isDismissing: dismissing, isVisible: visible) {
+            commitDropLanding()
+            return
+        }
+        startDropLandingFlight()
+    }
+
+    /// A picture remembered during the fade. Does nothing while the fade is
+    /// still holding the frame. A hidden window shows the cell. A flight that
+    /// already started, and was not held, keeps going.
+    func applyDeferredDropLanding() {
+        let dismissing = launcherIsDismissing()
+        let visible = window?.isVisible == true
+        if LauncherLayout.shouldHoldDropLanding(isDismissing: dismissing, isVisible: visible) {
+            return
+        }
+        guard dropLandingWaitsForLauncher || !visible else { return }
+        if LauncherLayout.shouldAdvanceDropLanding(isDismissing: dismissing, isVisible: visible),
+           pendingDropLanding != nil,
+           dropLandingView == nil {
+            dropLandingWaitsForLauncher = false
+            startDropLandingFlight()
+            return
+        }
+        commitDropLanding()
+    }
+
+    /// The preference changed. A picture already in the air is removed and
+    /// the cell draws. Reduced motion does not finish the old path, and
+    /// turning motion back on does not either. A fade that is holding the
+    /// frame is left alone. A flight that has not started stays pending.
+    private func snapInFlightDropLandingForMotionChange() {
+        guard LauncherLayout.shouldSnapInFlightDropLanding(
+            isDismissing: launcherIsDismissing(),
+            isVisible: window?.isVisible == true
+        ) else { return }
+        guard dropLandingView != nil else { return }
+        commitDropLanding()
+    }
+
+    /// While the fade is up, pin the picture to the frame on screen. A hidden
+    /// window, or a cancelled fade, shows the cell and removes the picture.
+    func settleDropLandingForDismissal() {
+        let dismissing = launcherIsDismissing()
+        let visible = window?.isVisible == true
+        if LauncherLayout.shouldHoldDropLanding(isDismissing: dismissing, isVisible: visible) {
+            if let flyer = dropLandingView {
+                freezeDropLandingFlyer(flyer)
+            }
+            if dropLandingView != nil || pendingDropLanding != nil {
+                dropLandingWaitsForLauncher = true
+            }
+            return
+        }
+        guard LauncherLayout.shouldAdvanceDropLanding(isDismissing: dismissing, isVisible: visible) else {
+            commitDropLanding()
+            return
+        }
+    }
+
+    private func startDropLandingFlight() {
+        guard var pending = pendingDropLanding else { return }
+        guard let destination = dropLandingDestinationFrame(for: pending) else {
+            guard !pending.retried else {
+                commitDropLanding()
+                return
+            }
+            pending.retried = true
+            pendingDropLanding = pending
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.pendingDropLanding?.itemID == pending.itemID else { return }
+                self.startDropLandingFlight()
+            }
+            return
+        }
+        guard let flight = LauncherLayout.dropLandingFlight(
+            from: pending.source,
+            to: destination,
+            reducesMotion: prefersReducedMotion
+        ) else {
+            commitDropLanding()
+            return
+        }
+        pendingDropLanding = nil
+        dropLandingWaitsForLauncher = false
+        dropLandingItemID = pending.itemID
+        hideDropLandingContents(for: pending.itemID, inOpenFolder: pending.inOpenFolder)
+        let flyer = makePreviewGlyphFlyer(frame: flight.source, image: pending.image)
+        fadeLiftShadow(on: flyer, flightDuration: flight.duration)
+        dropLandingView = flyer
+        dropLandingGeneration &+= 1
+        let generation = dropLandingGeneration
+        onDiagnosticEvent?("Drop landing started: reducedMotion=\(prefersReducedMotion)")
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = flight.duration
+            context.timingFunction = folderChromeTiming(tracksIcon: true)
+            flyer.animator().frame = flight.destination
+        }, completionHandler: { [weak self] in
+            // Already on the main thread. A Task would hold the flying
+            // picture on the cell for another turn.
+            finishFlightOnLandingTurn { [weak self] in
+                guard let self, self.dropLandingGeneration == generation else { return }
+                self.commitDropLanding()
+            }
+        })
+    }
+
+    private func dropLandingDestinationFrame(for pending: PendingDropLanding) -> CGRect? {
+        let collections: [NSCollectionView] = pending.inOpenFolder
+            ? [folderOverlay.collectionView]
+            : [activeCollectionView, stagingCollectionView]
+        for collectionView in collections {
+            collectionView.layoutSubtreeIfNeeded()
+            guard let tile = tileForPresentedItem(pending.itemID, in: collectionView) else { continue }
+            let frame = tile.convert(tile.bounds, to: self)
+            guard frame.width >= 1, frame.height >= 1,
+                  frame.origin.x.isFinite, frame.origin.y.isFinite else { continue }
+            return frame
+        }
+        return nil
+    }
+
+    private func hideDropLandingContents(for itemID: UUID, inOpenFolder: Bool) {
+        let collections: [NSCollectionView] = inOpenFolder
+            ? [folderOverlay.collectionView]
+            : [activeCollectionView, stagingCollectionView]
+        for collectionView in collections {
+            guard let tile = tileForPresentedItem(itemID, in: collectionView) else { continue }
+            hideDropLandingContents(on: tile)
+        }
+    }
+
+    private func hideDropLandingContents(on tile: AppGridTileView) {
+        tile.setOpenFlightContentHidden(true)
+        // The plate is drawn by the tile, not the icon view. Leave it up and
+        // the flying snapshot sits on a second copy. The cell still hits.
+        tile.openFlightHidesPreviewGlyphs = true
+        tile.openFlightHidesPlate = true
+    }
+
+    private func revealDropLandingContents() {
+        let itemID = dropLandingItemID
+        dropLandingItemID = nil
+        guard let itemID else { return }
+        for collectionView in [
+            activeCollectionView,
+            stagingCollectionView,
+            folderOverlay.collectionView,
+            searchCollectionView
+        ] {
+            guard let tile = tileForPresentedItem(itemID, in: collectionView) else { continue }
+            tile.setOpenFlightContentHidden(false)
+            tile.openFlightHidesPreviewGlyphs = false
+            tile.openFlightHidesPlate = false
+        }
+    }
+
+    /// Show the cell and drop the picture. A completion that lost the race
+    /// with a fade finds the generation already moved.
+    private func commitDropLanding() {
+        dropLandingGeneration &+= 1
+        dropLandingWaitsForLauncher = false
+        pendingDropLanding = nil
+        let flyer = dropLandingView
+        dropLandingView = nil
+        flyer?.layer?.removeAllAnimations()
+        flyer?.removeFromSuperview()
+        revealDropLandingContents()
+    }
+
+    private func freezeDropLandingFlyer(_ flyer: NSView) {
+        dropLandingGeneration &+= 1
+        flyer.wantsLayer = true
+        guard let layer = flyer.layer else { return }
+        let presented = layer.presentation()
+        let opacity = presented?.opacity ?? layer.opacity
+        let frame = presented?.frame ?? flyer.frame
+        let shadowOpacity = presented?.shadowOpacity ?? layer.shadowOpacity
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.speed = 1
+        layer.timeOffset = 0
+        layer.beginTime = 0
+        layer.removeAllAnimations()
+        flyer.alphaValue = CGFloat(opacity)
+        flyer.frame = frame
+        layer.shadowOpacity = shadowOpacity
+        CATransaction.commit()
+    }
+
+    /// The drag image carries the lift shadow. A flyer that continues the
+    /// cell does not, so the shadow would vanish on the first frame. Fade it
+    /// over the early part of the flight. The model ends at 0. That write
+    /// and the fade share one transaction: committing the model first drops
+    /// the shadow before `fillMode` backwards can hold it. A launcher fade
+    /// copies the opacity already on screen. Reduced motion never lifted,
+    /// and does not call this.
+    private func fadeLiftShadow(on flyer: NSView, flightDuration: TimeInterval) {
+        let duration = LauncherLayout.dropLandingShadowFadeDuration(flight: flightDuration)
+        guard duration > 0 else { return }
+        flyer.wantsLayer = true
+        guard let layer = flyer.layer else { return }
+        let lift = LauncherLayout.dragLiftPresentation(for: flyer.bounds.size, reducesMotion: false)
+        guard lift.shadowOpacity > 0, lift.shadowRadius > 0 else { return }
+        let fade = CABasicAnimation(keyPath: "shadowOpacity")
+        fade.fromValue = Float(lift.shadowOpacity)
+        fade.toValue = Float(0)
+        fade.duration = duration
+        fade.timingFunction = CAMediaTimingFunction(
+            controlPoints: Float(LauncherLayout.folderChromeTravelX1),
+            Float(LauncherLayout.folderChromeTravelY1),
+            Float(LauncherLayout.folderChromeTravelX2),
+            Float(LauncherLayout.folderChromeTravelY2)
+        )
+        fade.fillMode = .backwards
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.masksToBounds = false
+        layer.shadowColor = NSColor.black.cgColor
+        layer.shadowRadius = lift.shadowRadius
+        layer.shadowOffset = lift.shadowOffset
+        layer.shadowOpacity = 0
+        layer.add(fade, forKey: "lift-shadow")
+        CATransaction.commit()
+    }
+
     private func topLevelSourceIndex(_ source: LayoutItemRef) -> Int? {
         guard case .topLevel(let id) = source else { return nil }
         return layoutState.orderedEntries.firstIndex(where: { $0.id == id })
@@ -5289,6 +7903,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         pendingMergeAnimation = nil
         mergeFlightWaitsForLauncher = false
         removeMergeFlyer()
+        commitDropLanding()
         let indexPath = IndexPath(item: itemIndex, section: 0)
         let presented = items[itemIndex]
         restoreDragSourceTile()
@@ -5377,59 +7992,172 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         }
     }
 
-    private func setFolderBackdrop(open: Bool) {
-        if !open {
-            resetFolderBackdrop(gridViewport)
-            resetFolderBackdrop(searchScrollView)
-            return
-        }
+    private func setFolderBackdrop(
+        open: Bool,
+        immediately: Bool = false,
+        motion: LauncherLayout.FolderChromeCollapse? = nil
+    ) {
         let backdrop = isSearching ? searchScrollView : gridViewport
         resetFolderBackdrop(backdrop === gridViewport ? searchScrollView : gridViewport)
-        presentFolderBackdrop(backdrop)
+        if immediately {
+            resetFolderBackdrop(backdrop)
+        } else {
+            animateFolderBackdrop(backdrop, open: open, motion: motion)
+        }
     }
 
     private func resetFolderBackdrop(_ view: NSView) {
         guard let layer = view.layer else { return }
+        folderBackdropAnimationGeneration &+= 1
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         layer.removeAnimation(forKey: "folderBackdropScale")
         layer.removeAnimation(forKey: "folderBackdropOpacity")
+        layer.removeAnimation(forKey: "folderBackdropBlur")
         layer.opacity = 1
         layer.transform = CATransform3DIdentity
         layer.filters = nil
+        CATransaction.commit()
     }
 
-    private func presentFolderBackdrop(_ view: NSView) {
+    /// Scale, then shift in parent space. The other order would shrink the
+    /// shift with the grid, and the folder icon would drift. The shift is
+    /// measured from the origin anchor, not from the window center.
+    private func folderBackdropTransform(recede: LauncherLayout.FolderBackdropRecede) -> CATransform3D {
+        folderBackdropTransform(
+            scale: recede.scale,
+            translationX: recede.translationX,
+            translationY: recede.translationY
+        )
+    }
+
+    private func folderBackdropTransform(
+        scale: CGFloat,
+        translationX: CGFloat,
+        translationY: CGFloat
+    ) -> CATransform3D {
+        let safeScale = scale.isFinite && scale > 0 ? scale : 1
+        let safeX = translationX.isFinite ? translationX : 0
+        let safeY = translationY.isFinite ? translationY : 0
+        if abs(safeScale - 1) < 0.000_1, abs(safeX) < 0.000_1, abs(safeY) < 0.000_1 {
+            return CATransform3DIdentity
+        }
+        return CATransform3DConcat(
+            CATransform3DMakeScale(safeScale, safeScale, 1),
+            CATransform3DMakeTranslation(safeX, safeY, 0)
+        )
+    }
+
+    /// Folder icon center in the backdrop's bounds. Close does not ask: it
+    /// returns to an unshifted grid, starting from the shift already on screen.
+    private func folderBackdropFocusPoint(in backdrop: NSView) -> CGPoint? {
+        guard let id = openedFolderID, let icon = folderIconFrameInOverlay(id) else { return nil }
+        let center = backdrop.convert(CGPoint(x: icon.midX, y: icon.midY), from: folderOverlay)
+        guard center.x.isFinite, center.y.isFinite else { return nil }
+        return center
+    }
+
+    private func folderBackdropBlurRadius(_ layer: CALayer?) -> NSNumber? {
+        let blur = layer?.filters?.compactMap { $0 as? CIFilter }
+            .first { $0.name == "folderBackdropBlur" }
+        return blur?.value(forKey: kCIInputRadiusKey) as? NSNumber
+    }
+
+    private func animateFolderBackdrop(
+        _ view: NSView,
+        open: Bool,
+        motion: LauncherLayout.FolderChromeCollapse? = nil
+    ) {
         view.wantsLayer = true
         guard let layer = view.layer else { return }
+        // Read before removing the old animations, so rapid open/close reverses
+        // from the frame on screen rather than the previous destination.
+        let presented = layer.presentation() ?? layer
+        let currentOpacity = presented.opacity
+        let currentScale = presented.transform.m11
+        let currentShiftX = presented.transform.m41
+        let currentShiftY = presented.transform.m42
+        let currentRadius = folderBackdropBlurRadius(presented)?.doubleValue ?? 0
+        folderBackdropAnimationGeneration &+= 1
+        let generation = folderBackdropAnimationGeneration
+        let reduced = prefersReducedMotion
+        let style = LauncherLayout.folderBackdropStyle(open: open, reducesMotion: reduced)
+        let tracksIcon = motion?.tracksIcon == true && !reduced
+        // Close returns to the unshifted grid. The shift already on screen is
+        // the start, so the icon it was pinned to stays put on the way back.
+        let focus = (open && tracksIcon) ? folderBackdropFocusPoint(in: view) : nil
+        let recede = LauncherLayout.folderBackdropRecede(
+            open: open,
+            reducesMotion: reduced,
+            bounds: view.bounds,
+            focus: focus
+        )
+        let duration = motion?.duration ?? (reduced ? 0.12 : 0.22)
+        let timing = folderChromeTiming(tracksIcon: tracksIcon)
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        if !open {
+            CATransaction.setCompletionBlock { [weak self, weak view] in
+                // Already on the main thread. A Task would leave the
+                // zero-radius blur on the grid for another turn.
+                finishFlightOnLandingTurn { [weak self, weak view] in
+                    guard let self, let view,
+                          self.folderBackdropAnimationGeneration == generation,
+                          self.openedFolderID == nil else { return }
+                    // Remove the zero-radius filter only after the transition.
+                    self.resetFolderBackdrop(view)
+                }
+            }
+        }
         layer.removeAnimation(forKey: "folderBackdropScale")
         layer.removeAnimation(forKey: "folderBackdropOpacity")
-        let reduced = prefersReducedMotion
-        let style = LauncherLayout.folderBackdropStyle(open: true, reducesMotion: reduced)
-        let timing = CAMediaTimingFunction(controlPoints: 0.2, 0.8, 0.2, 1.0)
+        layer.removeAnimation(forKey: "folderBackdropBlur")
+        // A tracked close keeps this dim, and the blur below, until the panel
+        // dissolves. Scale still uses the travel curve, so the grid grows back first.
         let fade = CABasicAnimation(keyPath: "opacity")
-        fade.fromValue = layer.presentation()?.opacity ?? 1
+        fade.fromValue = currentOpacity
         fade.toValue = style.opacity
-        fade.duration = reduced ? 0.12 : 0.22
-        fade.timingFunction = timing
+        fade.duration = duration
+        fade.timingFunction = folderCloseVeilTiming(tracksIcon: tracksIcon, closing: !open)
+        // The model is the settled grid. Hold the opacity already on screen
+        // until the fade is attached, or the commit frame jumps to the end.
+        fade.fillMode = .backwards
         layer.opacity = Float(style.opacity)
         layer.add(fade, forKey: "folderBackdropOpacity")
-        guard style.scale != 1 || style.blurs else {
-            layer.transform = CATransform3DIdentity
-            layer.filters = nil
-            return
+        let endTransform = folderBackdropTransform(recede: recede)
+        layer.transform = endTransform
+        if !reduced {
+            // Scale and the shift are one transform. Separate scale would
+            // drop the shift, and the grid would slide toward the center.
+            let scale = CABasicAnimation(keyPath: "transform")
+            scale.fromValue = NSValue(caTransform3D: folderBackdropTransform(
+                scale: currentScale,
+                translationX: currentShiftX,
+                translationY: currentShiftY
+            ))
+            scale.toValue = NSValue(caTransform3D: endTransform)
+            scale.duration = duration
+            scale.timingFunction = timing
+            scale.fillMode = .backwards
+            layer.add(scale, forKey: "folderBackdropScale")
         }
-        let scale = CABasicAnimation(keyPath: "transform.scale")
-        scale.fromValue = 1
-        scale.toValue = style.scale
-        scale.duration = 0.22
-        scale.timingFunction = timing
-        layer.transform = CATransform3DMakeScale(style.scale, style.scale, 1)
-        layer.add(scale, forKey: "folderBackdropScale")
-        view.layerUsesCoreImageFilters = true
-        if style.blurs, let blur = CIFilter(name: "CIGaussianBlur", parameters: [kCIInputRadiusKey: 6]) {
+        if !reduced, style.blurs || currentRadius > 0,
+           let blur = CIFilter(name: "CIGaussianBlur", parameters: [kCIInputRadiusKey: style.blurs ? 6 : 0]) {
+            view.layerUsesCoreImageFilters = true
+            blur.name = "folderBackdropBlur"
             layer.filters = [blur]
+            let blurAnimation = CABasicAnimation(keyPath: "filters.folderBackdropBlur.inputRadius")
+            blurAnimation.fromValue = currentRadius
+            blurAnimation.toValue = style.blurs ? 6 : 0
+            blurAnimation.duration = duration
+            blurAnimation.timingFunction = folderCloseVeilTiming(tracksIcon: tracksIcon, closing: !open)
+            blurAnimation.fillMode = .backwards
+            layer.add(blurAnimation, forKey: "folderBackdropBlur")
         } else {
             layer.filters = nil
         }
+        CATransaction.commit()
     }
 
     private func openFolder(_ id: UUID) {
@@ -5448,13 +8176,53 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         folderOverlay.layoutSubtreeIfNeeded()
         folderOverlay.layoutFolderGrid(itemCount: items.count)
         folderOverlay.scrollContentsToTop()
-        folderOverlay.animateOpen(reducesMotion: prefersReducedMotion)
-        setFolderBackdrop(open: true)
+        let iconFrame = folderIconFrameInOverlay(id)
+        let collapse = LauncherLayout.folderChromeCollapse(
+            panelFrame: folderOverlay.panelFrame,
+            iconFrame: iconFrame,
+            reducesMotion: prefersReducedMotion
+        )
+        // The panel's first frame sits on the plate. Hide that plate before
+        // the flight, and keep it hidden until the close lands. A close that
+        // is still dissolving fades the plate back out with the panel.
+        if collapse.tracksIcon {
+            if previewPlateIsYielding(folderID: id) {
+                beginFolderPreviewPlateYield(id, duration: collapse.duration)
+            } else {
+                borrowFolderPreviewPlate(id, phase: .borrowed)
+            }
+        } else {
+            releaseBorrowedPreviewPlate()
+        }
+        folderOverlay.animateOpen(collapse: collapse)
+        setFolderBackdrop(open: true, motion: collapse)
+        let playedGlyphFlight = playFolderPreviewGlyphFlight(folderID: id, tracksIcon: collapse.tracksIcon)
+        onDiagnosticEvent?(
+            "Folder open motion: tracksIcon=\(collapse.tracksIcon) scale=\(String(format: "%.3f", Double(collapse.scale))) duration=\(String(format: "%.2f", collapse.duration)) reduced=\(prefersReducedMotion)"
+        )
         rebuildKeyViewLoop()
         onDiagnosticEvent?("Folder open prepared: id=\(id.uuidString); members=\(items.count)")
         Task { @MainActor in
             guard self.openedFolderID == id else { return }
             folderOverlay.layoutFolderGrid(itemCount: self.presentedItems(for: folderOverlay.collectionView).count)
+            // The first measure can miss the tile. The plate stays hidden
+            // once the cell exists. A close that already won does not borrow.
+            // A reversed close is still fading the plate out; don't hide it.
+            guard self.openedFolderID == id else { return }
+            if collapse.tracksIcon {
+                if self.borrowedPreviewPlatePhase == .yielding, self.borrowedPreviewPlateFolderID == id {
+                    self.setBorrowedPreviewPlateHidden(false, folderID: id)
+                    self.applyPreviewPlateOpacity(self.previewPlateReturnPresentedOpacity, folderID: id)
+                } else {
+                    self.borrowFolderPreviewPlate(id, phase: .borrowed)
+                }
+            }
+            // The first measure can run before the panel has a viewport. A
+            // flight that already started keeps its target; one that found
+            // nothing tries again now that the cells have frames.
+            if !playedGlyphFlight {
+                self.playFolderPreviewGlyphFlight(folderID: id, tracksIcon: collapse.tracksIcon)
+            }
             self.rebuildKeyViewLoop()
             // The title can already be editing by the time this hop runs.
             // Moving focus back to the first icon would cancel that edit.
@@ -5470,18 +8238,57 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         }
     }
 
-    private func closeFolder(immediately: Bool = false, restoreFocus: Bool = true) {
+    private func closeFolder(
+        immediately: Bool = false,
+        restoreFocus: Bool = true,
+        dissolveScatter: Bool = false
+    ) {
         let closingFolderID = openedFolderID
         guard closingFolderID != nil else { return }
         // Moving focus ends title editing and would save whatever is marked.
         folderOverlay.discardMarkedTitleComposition()
         let dissolved = closingFolderID.map { layoutState.folders[$0] == nil } ?? false
+        let iconFrame = closingFolderID.flatMap { folderIconFrameInOverlay($0) }
+        // A broken folder has no preview left to shrink into. Fade the panel
+        // on the same clock as the icon flying back to the grid.
+        let collapse = dissolveScatter
+            ? LauncherLayout.folderDissolveChrome(reducesMotion: prefersReducedMotion)
+            : LauncherLayout.folderChromeCollapse(
+                panelFrame: folderOverlay.panelFrame,
+                iconFrame: iconFrame,
+                reducesMotion: prefersReducedMotion
+            )
+        let snapClosed = immediately || (dissolved && !dissolveScatter)
+        // A close that shrinks into the plate fades that plate in on the
+        // same late dissolve as the panel. Reduced motion, a centered pop,
+        // a dissolve, and an immediate close draw the plate solid now.
+        if collapse.tracksIcon, !snapClosed, let closingFolderID {
+            beginFolderPreviewPlateReturn(closingFolderID, duration: collapse.duration)
+        } else {
+            releaseBorrowedPreviewPlate()
+        }
+        // Measure while the cells and the plate are still on this page.
+        // A flight that is still opening turns around. Reduced motion, a
+        // dissolve, and an immediate close keep the icons in the panel.
+        let playedReturn = !snapClosed && (closingFolderID.map { id in
+            playFolderPreviewGlyphReturn(folderID: id, tracksIcon: collapse.tracksIcon)
+        } ?? false)
+        if !playedReturn {
+            commitFolderPreviewGlyphFlight()
+        }
         if let closingFolderID {
             onDiagnosticEvent?("Folder close requested: id=\(closingFolderID.uuidString)")
         }
+        onDiagnosticEvent?(
+            "Folder close motion: tracksIcon=\(collapse.tracksIcon) immediate=\(snapClosed) reduced=\(prefersReducedMotion)"
+        )
         openedFolderID = nil
-        setFolderBackdrop(open: false)
-        folderOverlay.animateClose(reducesMotion: prefersReducedMotion, immediately: immediately || dissolved)
+        setFolderBackdrop(open: false, immediately: snapClosed, motion: collapse)
+        folderOverlay.animateClose(
+            reducesMotion: prefersReducedMotion,
+            immediately: snapClosed,
+            collapse: collapse
+        )
         updatePagingControls()
         setLauncherContentAccessibilityHidden(false)
         NSAccessibility.post(element: self, notification: .layoutChanged)
@@ -5677,7 +8484,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             return
         }
         guard boundedPage != currentPage else { return }
-        transitionToPage(boundedPage, direction: boundedPage > currentPage ? 1 : -1)
+        transitionToPage(boundedPage, direction: boundedPage > currentPage ? 1 : -1, discrete: true)
     }
 
     @objc private func showPreviousPage() {
@@ -5766,10 +8573,14 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
 
         prepareStagingPage(targetPage)
         pageIndicator.setTransition(from: currentPage, to: targetPage, progress: progress)
-        let travel = pageTravelDistance(for: pageWidth)
+        let follow = LauncherLayout.pageDragFollowOffsets(
+            distance: clampedDistance,
+            pageWidth: pageWidth,
+            direction: direction
+        )
         positionPages(
-            activeX: clampedDistance * 0.18,
-            stagingX: CGFloat(direction) * travel + clampedDistance * 0.18,
+            activeX: follow.activeX,
+            stagingX: follow.stagingX,
             activeAlpha: 1 - progress,
             stagingAlpha: progress
         )
@@ -5796,28 +8607,28 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         case .settle:
             settleCurrentPage()
         case .turn(let targetPage):
-            transitionToPage(targetPage, direction: targetPage > currentPage ? 1 : -1)
+            transitionToPage(targetPage, direction: targetPage > currentPage ? 1 : -1, discrete: false)
         }
     }
 
-    private func transitionToPage(_ targetPage: Int, direction: Int) {
+    private func transitionToPage(_ targetPage: Int, direction: Int, discrete: Bool) {
         transitionTargetPage = targetPage
         pageTurnGridSlot = focusedGridSlot(in: activeCollectionView)
         pageTurnFocusedTile = window?.firstResponder as? AppGridTileView
         prepareStagingPage(targetPage)
         let pageWidth = max(gridViewport.bounds.width, 1)
-        let travel = pageTravelDistance(for: pageWidth)
+        let travel = pageTravelDistance(for: pageWidth, discrete: discrete)
         isPagingGesture = true
         isPageTransitioning = true
         updatePagingControls()
-        pageIndicator.setTransition(from: currentPage, to: targetPage, progress: 1)
         positionPages(
             activeX: -CGFloat(direction) * travel,
             stagingX: 0,
             activeAlpha: 0,
             stagingAlpha: 1,
             animated: true,
-            finishPage: targetPage
+            finishPage: targetPage,
+            discreteSlide: discrete
         )
     }
 
@@ -5920,10 +8731,9 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
 
     private func settleCurrentPage() {
         let pageWidth = max(gridViewport.bounds.width, 1)
-        let travel = pageTravelDistance(for: pageWidth)
+        let travel = pageTravelDistance(for: pageWidth, discrete: false)
         let stagingX = stagingPage.map { $0 > currentPage ? travel : -travel }
         isPageTransitioning = true
-        pageIndicator.configure(pageCount: pageCount, selectedPage: currentPage)
         positionPages(
             activeX: 0,
             stagingX: stagingX,
@@ -5935,6 +8745,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     }
 
     private func finishSettle() {
+        pageIndicator.configure(pageCount: pageCount, selectedPage: currentPage)
         isPageTransitioning = false
         isPagingGesture = false
         discardInProgressPageGestures()
@@ -6032,8 +8843,10 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         }
     }
 
-    private func pageTravelDistance(for pageWidth: CGFloat) -> CGFloat {
-        pageWidth * 0.18
+    /// `discrete` is an arrow, key, or dot. A finger drag keeps the shorter
+    /// follow so a full pull still docks the incoming page.
+    private func pageTravelDistance(for pageWidth: CGFloat, discrete: Bool) -> CGFloat {
+        LauncherLayout.pageSlideDistance(pageWidth: pageWidth, discrete: discrete)
     }
 
     /// The preference changed. A finger drag writes its offset directly, so
@@ -6165,6 +8978,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     /// still sliding, and ignore the completion that would swap the pages.
     private func holdInFlightPageSlide() {
         pageTransitionGeneration &+= 1
+        pageIndicator.pinWeightAnimation()
         for host in [activeHost, stagingHost] {
             freezePageHostIfSliding(host)
         }
@@ -6197,7 +9011,8 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         stagingAlpha: CGFloat? = nil,
         animated: Bool = false,
         finishPage: Int? = nil,
-        settle: Bool = false
+        settle: Bool = false,
+        discreteSlide: Bool = false
     ) {
         if LauncherLayout.shouldHoldPageSlide(
             isDismissing: launcherIsDismissing(),
@@ -6206,7 +9021,9 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             // A turn requested during the fade must not start another slide
             // or write the destination into the model. The in-flight hosts
             // stay on the frame `holdInFlightPageSlide` already pinned.
+            // Dots stay on the weight already drawn, too.
             pageTransitionGeneration &+= 1
+            pageIndicator.pinWeightAnimation()
             return
         }
         let bounds = gridViewport.bounds
@@ -6235,13 +9052,23 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         }
         pageTransitionGeneration += 1
         let generation = pageTransitionGeneration
-        let travel = max(pageTravelDistance(for: bounds.width), 1)
+        let travel = max(pageTravelDistance(for: bounds.width, discrete: discreteSlide), 1)
         let remainingFraction = min(abs(activeX - activeHost.frame.minX) / travel, 1)
         let duration = max(0.12, LauncherLayout.pageAnimationDuration * pow(remainingFraction, 0.55))
+        if let finishPage {
+            pageIndicator.animateSelection(toPage: finishPage, duration: duration)
+        } else if settle {
+            pageIndicator.animateToRestingSelection(duration: duration)
+        }
         gridViewport.layoutSubtreeIfNeeded()
         NSAnimationContext.runAnimationGroup({ context in
             context.duration = duration
-            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.8, 0.2, 1.0)
+            context.timingFunction = CAMediaTimingFunction(
+                controlPoints: Float(LauncherLayout.pageTurnCurveX1),
+                Float(LauncherLayout.pageTurnCurveY1),
+                Float(LauncherLayout.pageTurnCurveX2),
+                Float(LauncherLayout.pageTurnCurveY2)
+            )
             self.activeHost.animator().frame = bounds.offsetBy(dx: activeX, dy: 0)
             self.activeHost.animator().alphaValue = activeAlpha
             if let stagingX {
@@ -6249,7 +9076,9 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
                 self.stagingHost.animator().alphaValue = stagingAlpha ?? 1
             }
         }, completionHandler: { [weak self] in
-            Task { @MainActor [weak self] in
+            // Already on the main thread. A Task would leave the pages
+            // sitting for another turn after the slide has arrived.
+            finishFlightOnLandingTurn { [weak self] in
                 guard let self, self.pageTransitionGeneration == generation else { return }
                 if let finishPage {
                     self.completePageTransition(to: finishPage)
@@ -6410,6 +9239,14 @@ private final class LauncherScrollView: NSScrollView {
     var isDismissing: () -> Bool = { false }
     var reducesMotion: () -> Bool = { false }
     var isWindowVisible: () -> Bool = { true }
+    /// False while this surface is the one fading out. Clicks belong to the
+    /// page that is arriving, even though this one is still drawn.
+    var acceptsPointer = true
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard acceptsPointer else { return nil }
+        return super.hitTest(point)
+    }
 
     /// Momentum events after the finger lifts. Cleared when that phase ends.
     private var isCoasting = false
@@ -6601,7 +9438,7 @@ private final class PagingCollectionView: NSCollectionView {
     /// True while the launcher is fading out. Scroll events already in flight
     /// still arrive; they must not turn a page.
     var isDismissing: () -> Bool = { false }
-    var dragSessionEndedHandler: (() -> Void)?
+    var dragSessionEndedHandler: ((NSDragOperation, NSPoint) -> Void)?
     var dragExitedHandler: (() -> Void)?
     private var accumulatedDelta: CGFloat = 0
     private var lastTimestamp: TimeInterval?
@@ -6641,7 +9478,7 @@ private final class PagingCollectionView: NSCollectionView {
 
     override func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
         super.draggingSession(session, endedAt: screenPoint, operation: operation)
-        dragSessionEndedHandler?()
+        dragSessionEndedHandler?(operation, screenPoint)
     }
 
     override func draggingExited(_ sender: NSDraggingInfo?) {
@@ -6799,6 +9636,12 @@ private final class PageIndicatorView: NSStackView {
     var onDelete: ((LauncherSearchDeletion) -> Bool)?
     private var configuredPageCount = -1
     private var configuredSelectedPage = -1
+    private let weightDriver = PageWeightDriver()
+    private var weightGeneration = 0
+    private var weightStartedAt: CFTimeInterval = 0
+    private var weightDuration: TimeInterval = 0
+    private var weightFrom: [Int: CGFloat] = [:]
+    private var weightTo: [Int: CGFloat] = [:]
 
     var keyViews: [NSView] {
         arrangedSubviews
@@ -6813,16 +9656,28 @@ private final class PageIndicatorView: NSStackView {
         alignment = .centerY
         distribution = .fill
         spacing = 0
+        weightDriver.owner = self
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { nil }
 
+    /// The link retains the driver. Releasing this view has to invalidate it,
+    /// or a hidden indicator never gets another callback and the pair leaks.
+    /// Isolated so the stop runs on the main actor instead of assuming it
+    /// from a nonisolated deinit.
+    isolated deinit {
+        weightDriver.stop()
+    }
+
     func configure(pageCount: Int, selectedPage: Int) {
+        stopWeightAnimation()
         let slots = LauncherLayout.pageIndicatorSlots(pageCount: pageCount, selectedPage: selectedPage)
         if configuredPageCount == pageCount, configuredSelectedPage == selectedPage, arrangedSubviews.count == slots.count {
             for case let dot as PageDotButton in arrangedSubviews {
-                dot.isCurrent = dot.tag == selectedPage
+                let current = dot.tag == selectedPage
+                dot.isCurrent = current
+                dot.visualWeight = current ? 1 : 0
             }
             isHidden = pageCount < 2
             return
@@ -6876,7 +9731,25 @@ private final class PageIndicatorView: NSStackView {
         }
     }
 
+    /// Stop on the weight already drawn. A fade that is holding the page
+    /// must not let the dots finish the turn by themselves.
+    func pinWeightAnimation() {
+        stopWeightAnimation()
+    }
+
+    /// The page is sliding to `targetPage`. Weights leave from whatever is
+    /// on screen and arrive with that slide, on the same curve.
+    func animateSelection(toPage targetPage: Int, duration: TimeInterval) {
+        startWeightAnimation(duration: duration) { $0.tag == targetPage ? 1 : 0 }
+    }
+
+    /// A drag let go without turning. Each dot returns to its resting selection.
+    func animateToRestingSelection(duration: TimeInterval) {
+        startWeightAnimation(duration: duration) { $0.isCurrent ? 1 : 0 }
+    }
+
     func setTransition(from currentPage: Int, to targetPage: Int, progress: CGFloat) {
+        stopWeightAnimation()
         let boundedProgress = min(max(progress, 0), 1)
         for case let dot as PageDotButton in arrangedSubviews {
             switch dot.tag {
@@ -6890,8 +9763,199 @@ private final class PageIndicatorView: NSStackView {
         }
     }
 
+    private func stopWeightAnimation() {
+        weightDriver.stop()
+        weightGeneration &+= 1
+    }
+
+    private func startWeightAnimation(duration: TimeInterval, destination: (PageDotButton) -> CGFloat) {
+        stopWeightAnimation()
+        let dots = arrangedSubviews.compactMap { $0 as? PageDotButton }
+        guard !dots.isEmpty else { return }
+        var from: [Int: CGFloat] = [:]
+        var to: [Int: CGFloat] = [:]
+        var needsMotion = false
+        for dot in dots {
+            let target = min(max(destination(dot), 0), 1)
+            from[dot.tag] = dot.visualWeight
+            to[dot.tag] = target
+            if abs(dot.visualWeight - target) > 0.001 {
+                needsMotion = true
+            }
+        }
+        guard needsMotion, duration > 0 else {
+            for dot in dots {
+                dot.visualWeight = to[dot.tag] ?? dot.visualWeight
+            }
+            return
+        }
+        weightFrom = from
+        weightTo = to
+        weightDuration = duration
+        weightStartedAt = CACurrentMediaTime()
+        weightGeneration &+= 1
+        weightDriver.start(on: self, generation: weightGeneration)
+    }
+
+    /// Called on the frame that is about to draw. `generation` is the one
+    /// captured when that link started, so a link that already stopped does
+    /// not paint the next turn. Returns true when the link should stop.
+    fileprivate func receivePageWeightFrame(at now: CFTimeInterval, generation: Int) -> Bool {
+        advancePageWeightAnimation(generation: generation, now: now)
+    }
+
+    private func advancePageWeightAnimation(generation: Int, now: CFTimeInterval) -> Bool {
+        guard weightGeneration == generation else { return true }
+        let elapsed = now - weightStartedAt
+        let progress = LauncherLayout.pageDotWeightProgress(elapsed: elapsed, duration: weightDuration)
+        let done = weightDuration <= 0 || elapsed >= weightDuration
+        for case let dot as PageDotButton in arrangedSubviews {
+            let target = weightTo[dot.tag] ?? (dot.isCurrent ? 1 : 0)
+            if done {
+                dot.visualWeight = target
+            } else {
+                let origin = weightFrom[dot.tag] ?? dot.visualWeight
+                dot.visualWeight = origin + (target - origin) * progress
+            }
+        }
+        return done
+    }
+
     @objc private func selectPage(_ sender: PageDotButton) {
         onPageSelected?(sender.tag)
+    }
+}
+
+/// Display link for a neighbor sliding into a drag gap. The spring keeps
+/// whatever time has passed, including a late frame. A fixed 60Hz timer
+/// waited out its first interval, so the icon sat still and then jumped.
+/// The link retains this object, so `owner` stays weak. A callback whose
+/// link was already replaced does not stop the new one.
+@MainActor
+private final class ReorderSlideClock: NSObject {
+    weak var owner: AppGridTileView?
+    private var link: CADisplayLink?
+    private var generation = 0
+
+    var isRunning: Bool { link != nil }
+
+    func start(on view: NSView, generation: Int) {
+        stop()
+        self.generation = generation
+        let link = view.displayLink(target: self, selector: #selector(step(_:)))
+        link.add(to: .main, forMode: .common)
+        self.link = link
+    }
+
+    func stop() {
+        link?.invalidate()
+        link = nil
+    }
+
+    @objc nonisolated private func step(_ link: CADisplayLink) {
+        let now = link.targetTimestamp
+        let token = ObjectIdentifier(link)
+        MainActor.assumeIsolated {
+            guard let current = self.link, ObjectIdentifier(current) == token else { return }
+            let finished = self.owner?.receiveReorderSlideFrame(at: now, generation: self.generation) ?? true
+            if finished { self.stop() }
+        }
+    }
+}
+
+/// Display link for the folder plate. The plate fades on the same clock as
+/// the panel. A timer that waited a full interval jumped a reversed close.
+/// The link retains this object, so `owner` stays weak. `stop` breaks that
+/// pair. A callback whose link was already replaced does not stop the new one.
+@MainActor
+private final class PreviewPlateClock: NSObject {
+    weak var owner: LauncherRootView?
+    private var link: CADisplayLink?
+    private var generation: UInt64 = 0
+    private var folderID: UUID?
+    private var started: CFTimeInterval = 0
+    private var duration: TimeInterval = 0
+
+    var isRunning: Bool { link != nil }
+
+    func start(
+        on view: NSView,
+        generation: UInt64,
+        folderID: UUID,
+        started: CFTimeInterval,
+        duration: TimeInterval
+    ) {
+        stop()
+        self.generation = generation
+        self.folderID = folderID
+        self.started = started
+        self.duration = duration
+        let link = view.displayLink(target: self, selector: #selector(step(_:)))
+        link.add(to: .main, forMode: .common)
+        self.link = link
+    }
+
+    func stop() {
+        link?.invalidate()
+        link = nil
+    }
+
+    @objc nonisolated private func step(_ link: CADisplayLink) {
+        let now = link.targetTimestamp
+        let token = ObjectIdentifier(link)
+        MainActor.assumeIsolated {
+            guard let current = self.link, ObjectIdentifier(current) == token else { return }
+            guard let folderID = self.folderID else {
+                self.stop()
+                return
+            }
+            let finished = self.owner?.receivePreviewPlateFrame(
+                at: now,
+                generation: self.generation,
+                folderID: folderID,
+                started: self.started,
+                duration: self.duration
+            ) ?? true
+            if finished { self.stop() }
+        }
+    }
+}
+
+/// Display link for the page dots. The link retains this object, and this
+/// object retains the link, so `owner` stays weak. `stop` breaks that pair.
+/// The view's link follows the display that view is on. Weights live on the
+/// indicator, so the callback hops to the main actor the same way the old
+/// timer did. A callback whose link was already replaced does not stop the
+/// new one.
+@MainActor
+private final class PageWeightDriver: NSObject {
+    weak var owner: PageIndicatorView?
+    private var link: CADisplayLink?
+    private var generation = 0
+
+    func start(on view: NSView, generation: Int) {
+        stop()
+        self.generation = generation
+        // The class method is unavailable on macOS. The view's link stays on
+        // the display that view is actually on, which is the page's clock.
+        let link = view.displayLink(target: self, selector: #selector(step(_:)))
+        link.add(to: .main, forMode: .common)
+        self.link = link
+    }
+
+    func stop() {
+        link?.invalidate()
+        link = nil
+    }
+
+    @objc nonisolated private func step(_ link: CADisplayLink) {
+        let now = link.targetTimestamp
+        let token = ObjectIdentifier(link)
+        MainActor.assumeIsolated {
+            guard let current = self.link, ObjectIdentifier(current) == token else { return }
+            let finished = self.owner?.receivePageWeightFrame(at: now, generation: self.generation) ?? true
+            if finished { self.stop() }
+        }
     }
 }
 
@@ -7003,6 +10067,11 @@ private final class AppGridItem: NSCollectionViewItem {
             onHideApplication: onHideApplication
         )
     }
+
+    /// Click-stack safe: flip「正在启动…」without collection reload.
+    func applyLaunchHighlightState(pendingKey: String?) {
+        (view as? AppGridTileView)?.applyLaunchHighlightState(pendingKey: pendingKey)
+    }
 }
 
 private final class AppGridTileView: NSView {
@@ -7044,33 +10113,17 @@ private final class AppGridTileView: NSView {
 
     override var acceptsFirstResponder: Bool { true }
 
-    override var focusRingMaskBounds: NSRect { focusRingRect }
-
-    private var focusRingRect: NSRect {
-        guard !iconView.frame.isEmpty, !titleLabel.frame.isEmpty else {
-            return bounds.insetBy(dx: 3, dy: 3)
-        }
-        let titleWidth = min(
-            max(titleLabel.intrinsicContentSize.width, iconView.frame.width),
-            max(iconView.frame.width, bounds.width - 24)
-        )
-        let width = min(bounds.width - 8, titleWidth + 16)
-        let minY = max(2, min(iconView.frame.minY, titleLabel.frame.minY) - 7)
-        let maxY = min(bounds.height - 2, max(iconView.frame.maxY, titleLabel.frame.maxY) + 6)
-        return NSRect(
-            x: (bounds.width - width) / 2,
-            y: minY,
-            width: width,
-            height: max(maxY - minY, 44)
-        )
-    }
-
     var isLaunching = false {
         didSet {
             updateAppearance()
             if isLaunching, !oldValue { playLaunchFeedback() }
         }
     }
+
+    /// Dedup key for in-place「正在启动…」updates (nil for folders).
+    private var launchHighlightKey: String?
+    /// Title restored when launch pending clears.
+    private var restingTitle = ""
 
     var isDropTarget = false {
         didSet {
@@ -7083,11 +10136,12 @@ private final class AppGridTileView: NSView {
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
+        reorderClock.owner = self
         wantsLayer = true
         layer?.cornerRadius = 12
         layer?.masksToBounds = true
         clipsToBounds = true
-        focusRingType = .default
+        focusRingType = .none
         setAccessibilityElement(true)
         setAccessibilityRole(.button)
         setAccessibilityEnabled(true)
@@ -7126,7 +10180,10 @@ private final class AppGridTileView: NSView {
         titleTrailingConstraint.priority = .init(999)
         NSLayoutConstraint.activate([
             iconView.centerXAnchor.constraint(equalTo: reorderSlideHost.centerXAnchor),
-            iconView.centerYAnchor.constraint(equalTo: reorderSlideHost.centerYAnchor, constant: -14),
+            iconView.centerYAnchor.constraint(
+                equalTo: reorderSlideHost.centerYAnchor,
+                constant: -LauncherLayout.iconCenterLift
+            ),
             iconWidthConstraint,
             iconHeightConstraint,
             titleLabel.leadingAnchor.constraint(equalTo: reorderSlideHost.leadingAnchor, constant: 6),
@@ -7150,6 +10207,13 @@ private final class AppGridTileView: NSView {
     ) {
         self.reducesMotion = reducesMotion
         self.isFolder = isFolder
+        iconView.alphaValue = 1
+        titleLabel.alphaValue = 1
+        openFlightHidesPreviewGlyphs = false
+        openFlightHidesPlate = false
+        chromeHidesPlate = false
+        previewPlateOpacity = 1
+        previewGlyphDrawLimit = nil
         self.onActivate = onActivate
         self.onDragStart = onDragStart
         self.onRenameAlias = onRenameAlias
@@ -7161,6 +10225,8 @@ private final class AppGridTileView: NSView {
         deferredIconImage = nil
         deferredPreviewImages = nil
         loadedIconWaitsForLauncher = false
+        launchHighlightKey = isFolder ? nil : candidate.id
+        restingTitle = displayName
         titleLabel.stringValue = isLaunching ? L("正在启动…") : displayName
         toolTip = displayName
         setAccessibilityLabel(isFolder ? String(format: L("文件夹 %@"), displayName) : displayName)
@@ -7238,6 +10304,14 @@ private final class AppGridTileView: NSView {
         }
     }
 
+    /// In-place「正在启动…」without reconfigure / reloadItems.
+    func applyLaunchHighlightState(pendingKey: String?) {
+        guard let launchHighlightKey, !isFolder else { return }
+        let launching = pendingKey == launchHighlightKey
+        titleLabel.stringValue = launching ? L("正在启动…") : restingTitle
+        isLaunching = launching
+    }
+
     func resetForReuse() {
         iconLoadTask?.cancel()
         iconLoadTask = nil
@@ -7246,10 +10320,18 @@ private final class AppGridTileView: NSView {
         deferredPreviewImages = nil
         loadedIconWaitsForLauncher = false
         launcherIsDismissing = { false }
+        launchHighlightKey = nil
+        restingTitle = ""
+        isLaunching = false
         titleLabel.stringValue = ""
         iconView.image = nil
         previewCandidates = []
         previewImages = []
+        previewGlyphDrawLimit = nil
+        openFlightHidesPreviewGlyphs = false
+        openFlightHidesPlate = false
+        chromeHidesPlate = false
+        previewPlateOpacity = 1
         isFolder = false
         onActivate = nil
         onFocus = nil
@@ -7268,12 +10350,12 @@ private final class AppGridTileView: NSView {
         isDropTarget = false
         alphaValue = 1
         layer?.opacity = 1
-        reorderTicker?.invalidate()
-        reorderTicker = nil
+        reorderClock.stop()
         reorderGeneration += 1
         reorderSlideHeld = false
         reorderTarget = .zero
         reorderPresented = .zero
+        reorderVelocity = .zero
         layer?.transform = CATransform3DIdentity
         reorderSlideHost.frame = bounds
         clipsToBounds = true
@@ -7282,16 +10364,18 @@ private final class AppGridTileView: NSView {
 
     private var reorderTarget: CGSize = .zero
     private var reorderPresented: CGSize = .zero
-    private var reorderTicker: Timer?
+    private var reorderVelocity: CGSize = .zero
+    private var reorderLastTick: CFTimeInterval = 0
+    private let reorderClock = ReorderSlideClock()
     private var reorderGeneration = 0
-    /// The fade stopped an ease before it reached the gap. Release jumps to
+    /// The fade stopped a slide before it reached the gap. Release jumps to
     /// that gap only while the drag is still down. Clearing the highlight
     /// sends the icon home instead.
     private var reorderSlideHeld = false
 
     /// Slides the icon and title inside the cell. AppKit resets the item
     /// layer's transform while it keeps that cell's frame fixed during a drag.
-    /// A fade that is still on screen does not start this ease and does not
+    /// A fade that is still on screen does not start this slide and does not
     /// snap the icon to the new gap. The picture stays on the frame it has.
     func setReorderTranslation(_ translation: CGSize, animated: Bool) {
         if LauncherLayout.shouldHoldReorderSlide(
@@ -7304,67 +10388,65 @@ private final class AppGridTileView: NSView {
             pinReorderSlideForDismissal()
             return
         }
-        guard translation != reorderTarget else { return }
-        let from = reorderPresented
+        guard translation != reorderTarget
+            || ((!animated || reducesMotion) && reorderPresented != translation) else { return }
         reorderTarget = translation
-        reorderTicker?.invalidate()
-        reorderTicker = nil
-        reorderGeneration += 1
         reorderSlideHeld = false
         layer?.transform = CATransform3DIdentity
-        guard animated, !reducesMotion, translation != from else {
+        guard animated, !reducesMotion,
+              translation != reorderPresented || reorderVelocity != .zero else {
+            reorderClock.stop()
+            reorderGeneration += 1
             reorderPresented = translation
+            reorderVelocity = .zero
             applyReorderSlidePresentation()
             return
         }
-        let started = CACurrentMediaTime()
-        let duration = LauncherLayout.reorderSlideDuration
-        let generation = reorderGeneration
-        let ticker = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] timer in
-            guard let self else {
-                timer.invalidate()
-                return
-            }
-            let finished = MainActor.assumeIsolated {
-                self.advanceReorderSlide(
-                    from: from, to: translation, started: started,
-                    duration: duration, generation: generation
-                )
-            }
-            if finished { timer.invalidate() }
-        }
-        RunLoop.main.add(ticker, forMode: .common)
-        reorderTicker = ticker
-        applyReorderSlidePresentation()
+        guard !reorderClock.isRunning else { return }
+        reorderLastTick = CACurrentMediaTime()
+        reorderGeneration += 1
+        reorderClock.start(on: self, generation: reorderGeneration)
     }
 
-    private func advanceReorderSlide(
-        from: CGSize, to: CGSize, started: CFTimeInterval,
-        duration: CFTimeInterval, generation: Int
-    ) -> Bool {
+    /// Called on the frame that is about to draw. `generation` is the one
+    /// captured when that link started. Returns true when the link should stop.
+    fileprivate func receiveReorderSlideFrame(at now: CFTimeInterval, generation: Int) -> Bool {
+        advanceReorderSlide(generation: generation, now: now)
+    }
+
+    private func advanceReorderSlide(generation: Int, now: CFTimeInterval) -> Bool {
         guard reorderGeneration == generation else { return true }
-        let raw = duration > 0 ? (CACurrentMediaTime() - started) / duration : 1
-        let progress = min(1, max(0, raw))
-        let eased = Self.reorderEase(progress)
-        reorderPresented = CGSize(
-            width: from.width + (to.width - from.width) * eased,
-            height: from.height + (to.height - from.height) * eased
+        let step = LauncherLayout.reorderSlideElapsed(now: now, lastTick: reorderLastTick)
+        // A clock behind the last frame integrates nothing. Leave the mark
+        // where it is so the next frame still covers the whole gap.
+        guard step > 0 else { return false }
+        reorderLastTick = now
+        let motion = LauncherLayout.reorderSpringStep(
+            position: reorderPresented, velocity: reorderVelocity,
+            target: reorderTarget, elapsed: step
         )
-        applyReorderSlidePresentation()
-        if progress >= 1 {
-            reorderTicker = nil
+        reorderPresented = motion.position
+        reorderVelocity = motion.velocity
+        let finished = abs(reorderPresented.width - reorderTarget.width) < 0.5
+            && abs(reorderPresented.height - reorderTarget.height) < 0.5
+            && abs(reorderVelocity.width) < 12
+            && abs(reorderVelocity.height) < 12
+        if finished {
+            reorderPresented = reorderTarget
+            reorderVelocity = .zero
             reorderSlideHeld = false
         }
-        return progress >= 1
+        applyReorderSlidePresentation()
+        return finished
     }
 
-    /// Stop the ease on the frame already drawn. The target gap stays put
-    /// so a later release can jump there without replaying the timer.
+    /// Stop the slide on the frame already drawn. The target gap stays put
+    /// so a later release can jump there without replaying the slide.
     func pinReorderSlideForDismissal() {
-        let inFlight = reorderTicker != nil || reorderPresented != reorderTarget
-        reorderTicker?.invalidate()
-        reorderTicker = nil
+        let inFlight = reorderClock.isRunning || reorderPresented != reorderTarget
+        reorderClock.stop()
         reorderGeneration += 1
+        reorderVelocity = .zero
         if inFlight {
             reorderSlideHeld = true
         }
@@ -7375,9 +10457,9 @@ private final class AppGridTileView: NSView {
     func releaseHeldReorderSlide(jumpToTarget: Bool) {
         guard reorderSlideHeld else { return }
         reorderSlideHeld = false
-        reorderTicker?.invalidate()
-        reorderTicker = nil
+        reorderClock.stop()
         reorderGeneration += 1
+        reorderVelocity = .zero
         guard jumpToTarget, reorderPresented != reorderTarget else { return }
         reorderPresented = reorderTarget
         applyReorderSlidePresentation()
@@ -7418,29 +10500,6 @@ private final class AppGridTileView: NSView {
             if current.layer?.masksToBounds != false { current.layer?.masksToBounds = false }
             ancestor = current.superview
         }
-    }
-
-    /// Samples `cubic-bezier(0.23, 1, 0.32, 1)`, the reorder ease-out.
-    private static func reorderEase(_ time: CGFloat) -> CGFloat {
-        let clamped = min(1, max(0, time))
-        var parameter = clamped
-        for _ in 0..<6 {
-            let x = reorderBezier(parameter, 0.23, 0.32)
-            let slope = reorderBezierSlope(parameter, 0.23, 0.32)
-            guard abs(slope) > 0.0001 else { break }
-            parameter = min(1, max(0, parameter - (x - clamped) / slope))
-        }
-        return reorderBezier(parameter, 1, 1)
-    }
-
-    private static func reorderBezier(_ t: CGFloat, _ c1: CGFloat, _ c2: CGFloat) -> CGFloat {
-        let inverse = 1 - t
-        return 3 * inverse * inverse * t * c1 + 3 * inverse * t * t * c2 + t * t * t
-    }
-
-    private static func reorderBezierSlope(_ t: CGFloat, _ c1: CGFloat, _ c2: CGFloat) -> CGFloat {
-        let inverse = 1 - t
-        return 3 * inverse * inverse * c1 + 6 * inverse * t * (c2 - c1) + 3 * t * t * (1 - c2)
     }
 
     override func accessibilityPerformPress() -> Bool {
@@ -7556,6 +10615,7 @@ private final class AppGridTileView: NSView {
         let accepted = super.becomeFirstResponder()
         if accepted {
             onFocus?()
+            updateDropTargetAppearance(focused: true)
             needsDisplay = true
         }
         return accepted
@@ -7563,7 +10623,10 @@ private final class AppGridTileView: NSView {
 
     override func resignFirstResponder() -> Bool {
         let resigned = super.resignFirstResponder()
-        if resigned { needsDisplay = true }
+        if resigned {
+            updateDropTargetAppearance(focused: false)
+            needsDisplay = true
+        }
         return resigned
     }
 
@@ -7600,45 +10663,142 @@ private final class AppGridTileView: NSView {
         super.insertBacktab(sender)
     }
 
-    override func drawFocusRingMask() {
-        NSColor.black.setFill()
-        NSBezierPath(
-            roundedRect: focusRingRect,
-            xRadius: 12,
-            yRadius: 12
-        ).fill()
-    }
-
     func setAccessibilitySuppressed(_ suppressed: Bool) {
         setAccessibilityHidden(suppressed)
     }
 
-    override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-        guard isFolder else { return }
+    /// True while this plate's mini icons are flying to or from the open folder.
+    /// The plate stays; a second copy of the glyphs would sit under the flyers.
+    var openFlightHidesPreviewGlyphs = false {
+        didSet {
+            if openFlightHidesPreviewGlyphs != oldValue { needsDisplay = true }
+        }
+    }
+
+    /// True while a dropped icon's picture is flying onto this cell.
+    /// The plate would otherwise sit under that picture. The cell still hits.
+    var openFlightHidesPlate = false {
+        didSet {
+            if openFlightHidesPlate != oldValue { needsDisplay = true }
+        }
+    }
+
+    /// True while the open-folder panel is this plate, grown up. The plate
+    /// and its mini icons stay off until the close starts dissolving into
+    /// them. The cell still hits. The title stays.
+    var chromeHidesPlate = false {
+        didSet {
+            if chromeHidesPlate != oldValue { needsDisplay = true }
+        }
+    }
+
+    /// 1 is the resting plate. A close ramps this from 0 to 1 on the same
+    /// late dissolve as the panel, so the panel fades into the plate. The
+    /// fill stays in `draw` — a sublayer would sit above the glyphs.
+    var previewPlateOpacity: CGFloat = 1 {
+        didSet {
+            if previewPlateOpacity != oldValue { needsDisplay = true }
+        }
+    }
+
+    /// Glyphs at this index and after stay off the plate. Earlier ones stay.
+    /// Nil draws every glyph. A flyer is carrying the new icon into that slot.
+    var previewGlyphDrawLimit: Int? {
+        didSet {
+            if previewGlyphDrawLimit != oldValue { needsDisplay = true }
+        }
+    }
+
+    /// Hide the icon and its title while a flyer carries the icon into the
+    /// folder. The cell stays in place so the flyer can land on it.
+    func setOpenFlightContentHidden(_ hidden: Bool) {
+        let alpha: CGFloat = hidden ? 0 : 1
+        for view in [iconView, titleLabel] {
+            view.wantsLayer = true
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            view.layer?.removeAllAnimations()
+            view.alphaValue = alpha
+            CATransaction.commit()
+        }
+    }
+
+    /// The app icon, in `view`'s coordinates. Folder tiles hide this view and
+    /// draw the preview on top of the same rect.
+    func iconFrame(in view: NSView) -> CGRect? {
+        layoutSubtreeIfNeeded()
+        guard iconView.bounds.width >= 1, iconView.bounds.height >= 1 else { return nil }
+        let frame = iconView.convert(iconView.bounds, to: view)
+        guard frame.width >= 1, frame.height >= 1,
+              frame.origin.x.isFinite, frame.origin.y.isFinite else { return nil }
+        return frame
+    }
+
+    /// The rounded preview the panel grows out of, in `view`'s coordinates.
+    func folderPreviewWellFrame(in view: NSView) -> CGRect? {
+        guard let well = folderPreviewWellFrame() else { return nil }
+        let converted = convert(well, to: view)
+        guard converted.width >= 1, converted.height >= 1,
+              converted.origin.x.isFinite, converted.origin.y.isFinite else { return nil }
+        return converted
+    }
+
+    /// The rounded preview the panel grows out of. Same rect `draw` fills.
+    func folderPreviewWellFrame() -> CGRect? {
+        guard isFolder else { return nil }
         let iconSize = LauncherLayout.iconPointSize(in: bounds.size)
+        guard iconSize >= 1, bounds.width >= 1, bounds.height >= 1 else { return nil }
         let iconFrame = iconView.convert(iconView.bounds, to: self)
-        let well = NSRect(
+        guard iconFrame.width >= 1, iconFrame.height >= 1,
+              iconFrame.origin.x.isFinite, iconFrame.origin.y.isFinite else { return nil }
+        return NSRect(
             x: iconFrame.midX - iconSize / 2,
             y: iconFrame.midY - iconSize / 2,
             width: iconSize,
             height: iconSize
         )
-        NSColor.controlBackgroundColor.withAlphaComponent(0.7).setFill()
-        let cornerRadius = iconSize * 0.24
+    }
+
+    /// Preview glyphs, in `view`'s coordinates. Same rects `draw` fills.
+    func folderPreviewGlyphFrames(in view: NSView) -> [CGRect] {
+        guard let well = folderPreviewWellFrame() else { return [] }
+        let frames = LauncherLayout.folderPreviewGlyphFrames(well: well, count: previewImages.count)
+        guard !frames.isEmpty else { return [] }
+        let converted = frames.map { convert($0, to: view) }
+        guard converted.allSatisfy({
+            $0.width >= 1 && $0.height >= 1 && $0.origin.x.isFinite && $0.origin.y.isFinite
+        }) else { return [] }
+        return converted
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard !openFlightHidesPlate, !chromeHidesPlate else { return }
+        guard let well = folderPreviewWellFrame() else { return }
+        let plateOpacity = min(max(previewPlateOpacity, 0), 1)
+        guard plateOpacity > 0.001 else { return }
+        let iconSize = well.width
+        NSColor.controlBackgroundColor.withAlphaComponent(0.7 * plateOpacity).setFill()
+        let cornerRadius = iconSize * LauncherLayout.folderPreviewPlateCornerFraction
         NSBezierPath(roundedRect: well, xRadius: cornerRadius, yRadius: cornerRadius).fill()
-        let inset: CGFloat = 5
-        let gap: CGFloat = 2
-        let tile = floor((iconSize - inset * 2 - gap * 2) / 3)
-        for (index, icon) in previewImages.prefix(9).enumerated() {
-            let column = index % 3
-            let row = index / 3
-            let origin = NSPoint(
-                x: well.minX + inset + CGFloat(column) * (tile + gap),
-                y: well.maxY - inset - tile - CGFloat(row) * (tile + gap)
+        guard !openFlightHidesPreviewGlyphs else { return }
+        let frames = LauncherLayout.folderPreviewGlyphFrames(well: well, count: previewImages.count)
+        let shown = min(previewGlyphDrawLimit ?? previewImages.count, frames.count, previewImages.count)
+        guard shown > 0 else { return }
+        for index in 0..<shown {
+            previewImages[index].draw(
+                in: frames[index],
+                from: .zero,
+                operation: .sourceOver,
+                fraction: plateOpacity
             )
-            icon.draw(in: NSRect(origin: origin, size: NSSize(width: tile, height: tile)))
         }
+    }
+
+    /// The slide link retains its driver. Releasing this cell has to
+    /// invalidate it, or a cell that leaves the screen never fires again.
+    isolated deinit {
+        reorderClock.stop()
     }
 
     @available(*, unavailable)
@@ -7676,20 +10836,25 @@ private final class AppGridTileView: NSView {
     }
 
     private func updateAppearance() {
-        layer?.backgroundColor = isLaunching ? NSColor.selectedContentBackgroundColor.withAlphaComponent(0.35).cgColor : .clear
         iconView.isHidden = isFolder
         updateDropTargetAppearance()
     }
 
-    private func updateDropTargetAppearance() {
+    private func updateDropTargetAppearance(focused: Bool? = nil) {
+        if let layer {
+            let focused = focused ?? (window?.firstResponder === self)
+            let opacity: CGFloat = isLaunching ? 0.35 : (isDropTarget ? 0.12 : (focused ? 0.08 : 0))
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.borderWidth = 0
+            layer.borderColor = nil
+            layer.backgroundColor = NSColor.white.withAlphaComponent(opacity).cgColor
+            CATransaction.commit()
+        }
         if isDropTarget {
-            layer?.borderWidth = 2
-            layer?.borderColor = NSColor.controlAccentColor.cgColor
             setAccessibilitySelected(true)
             setAccessibilityHelp(isFolder ? L("拖放到此文件夹") : L("拖放到此以合并"))
         } else {
-            layer?.borderWidth = 0
-            layer?.borderColor = nil
             setAccessibilitySelected(false)
             if !baseAccessibilityHelp.isEmpty {
                 setAccessibilityHelp(baseAccessibilityHelp)
@@ -7702,13 +10867,24 @@ private final class AppGridTileView: NSView {
             isDismissing: launcherIsDismissing(),
             reducesMotion: reducesMotion
         ) else { return }
-        let animation = CABasicAnimation(keyPath: "transform.scale")
-        animation.fromValue = 1.0
-        animation.toValue = 0.93
-        animation.duration = 0.045
+        guard let layer else { return }
+        // `transform.scale` shrinks toward the origin anchor, so the icon
+        // jumps toward the corner. Scale, then shift, and the icon stays.
+        let iconCenter = iconFrame(in: self).map { CGPoint(x: $0.midX, y: $0.midY) }
+            ?? CGPoint(x: bounds.midX, y: bounds.midY + LauncherLayout.iconCenterLift)
+        let scale = LauncherLayout.launchPressScale
+        let shift = LauncherLayout.originPinnedScaleTranslation(point: iconCenter, scale: scale)
+        let pressed = CATransform3DConcat(
+            CATransform3DMakeScale(scale, scale, 1),
+            CATransform3DMakeTranslation(shift.x, shift.y, 0)
+        )
+        let animation = CABasicAnimation(keyPath: "transform")
+        animation.fromValue = NSValue(caTransform3D: CATransform3DIdentity)
+        animation.toValue = NSValue(caTransform3D: pressed)
+        animation.duration = LauncherLayout.launchPressHalfDuration
         animation.autoreverses = true
         animation.timingFunction = CAMediaTimingFunction(name: .easeOut)
-        layer?.add(animation, forKey: "launch-feedback")
+        layer.add(animation, forKey: "launch-feedback")
     }
 
     /// The preference changed. The pulse returns to the normal scale instead
@@ -7904,6 +11080,9 @@ private final class PagingArrowButton: NSButton {
         toolTip = accessibilityLabel
         wantsLayer = true
         layer?.cornerRadius = 22
+        layer?.backgroundColor = NSColor.black.withAlphaComponent(
+            LauncherLayout.pageButtonHoverPlateAlpha
+        ).cgColor
         alphaValue = 0
         registerForDraggedTypes([layoutItemPasteboardType])
     }
@@ -7944,7 +11123,8 @@ private final class PagingArrowButton: NSButton {
         }
         if !isDragHovering {
             isDragHovering = true
-            scheduleDragHover(after: 0.5)
+            updateVisibility(animated: true)
+            scheduleDragHover(after: LauncherLayout.pageButtonDragHoverDelay)
         }
         return .move
     }
@@ -7953,7 +11133,9 @@ private final class PagingArrowButton: NSButton {
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.isDragHovering, !self.isHidden else { return }
             self.onDragHover?()
-            self.scheduleDragHover(after: 0.5 + LauncherLayout.pageAnimationDuration)
+            self.scheduleDragHover(
+                after: LauncherLayout.pageButtonDragHoverDelay + LauncherLayout.pageAnimationDuration
+            )
         }
         dragHoverWorkItem = work
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
@@ -7971,7 +11153,18 @@ private final class PagingArrowButton: NSButton {
     func cancelDragHover() {
         dragHoverWorkItem?.cancel()
         dragHoverWorkItem = nil
+        let wasDragging = isDragHovering
         isDragHovering = false
+        guard wasDragging else { return }
+        // A drop can end with the pointer still over the arrow. Mouse-entered
+        // does not fire again until the pointer leaves, so keep the plate up.
+        if let window, window.isVisible {
+            let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+            if bounds.contains(point) {
+                isHovering = true
+            }
+        }
+        updateVisibility(animated: true)
     }
 
     override func keyDown(with event: NSEvent) {
@@ -8018,7 +11211,10 @@ private final class PagingArrowButton: NSButton {
         guard !holdingHoverFade else { return }
         if window?.isVisible != true {
             isHovering = false
-            layer?.backgroundColor = .clear
+            isDragHovering = false
+            dragHoverWorkItem?.cancel()
+            dragHoverWorkItem = nil
+            installHoverPlate()
             setAlphaWithoutAnimation(0)
             return
         }
@@ -8037,18 +11233,72 @@ private final class PagingArrowButton: NSButton {
             pinHoverFade()
             return
         }
-        let shown = isHovering || window?.firstResponder === self
-        layer?.backgroundColor = shown ? NSColor.black.withAlphaComponent(0.22).cgColor : .clear
-        let alpha: CGFloat = shown ? 0.9 : 0
+        let shown = LauncherLayout.pageButtonHoverShown(
+            pointerInside: isHovering,
+            dragInside: isDragHovering,
+            focused: window?.firstResponder === self
+        )
+        let fade = LauncherLayout.pageButtonHoverFade(shown: shown)
+        installHoverPlate()
         if animated, LauncherLayout.shouldAnimatePageButtonHover(
             isDismissing: launcherIsDismissing(),
             isVisible: window?.isVisible == true,
             reducesMotion: reducesMotion()
         ) {
-            animator().alphaValue = alpha
+            animateHoverOpacity(to: fade.opacity, duration: fade.duration)
         } else {
-            setAlphaWithoutAnimation(alpha)
+            setAlphaWithoutAnimation(fade.opacity)
         }
+    }
+
+    /// The plate stays painted. Control opacity is what shows and hides it,
+    /// so a fade-out cannot clear the well while the arrow is still moving.
+    private func installHoverPlate() {
+        wantsLayer = true
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer?.backgroundColor = NSColor.black.withAlphaComponent(
+            LauncherLayout.pageButtonHoverPlateAlpha
+        ).cgColor
+        CATransaction.commit()
+    }
+
+    /// Ease-out from the opacity already on screen. The system animator
+    /// eased in, so the arrow sat still and then caught up.
+    private func animateHoverOpacity(to alpha: CGFloat, duration: TimeInterval) {
+        wantsLayer = true
+        guard let layer else {
+            alphaValue = alpha
+            return
+        }
+        let from = layer.presentation()?.opacity ?? layer.opacity
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.removeAnimation(forKey: "pageButtonHover")
+        guard abs(CGFloat(from) - alpha) > 0.004 else {
+            alphaValue = alpha
+            layer.opacity = Float(alpha)
+            CATransaction.commit()
+            return
+        }
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = from
+        fade.toValue = Float(alpha)
+        fade.duration = duration
+        fade.timingFunction = CAMediaTimingFunction(
+            controlPoints: Float(LauncherLayout.pageTurnCurveX1),
+            Float(LauncherLayout.pageTurnCurveY1),
+            Float(LauncherLayout.pageTurnCurveX2),
+            Float(LauncherLayout.pageTurnCurveY2)
+        )
+        // The model below is already the end opacity. Hold the opacity on
+        // screen until this animation is attached, or the commit frame
+        // flashes the arrow full or gone.
+        fade.fillMode = .backwards
+        alphaValue = alpha
+        layer.opacity = Float(alpha)
+        layer.add(fade, forKey: "pageButtonHover")
+        CATransaction.commit()
     }
 
     /// `animator().alphaValue` writes the destination immediately. The
@@ -8133,6 +11383,15 @@ private final class AliasNameField: NSTextField, NSTextFieldDelegate {
 
 @MainActor
 private final class FolderTitleField: NSTextField {
+    var pointerEditingAvailable: () -> Bool = { true }
+
+    override func isAccessibilityHidden() -> Bool {
+        // The panel's hit test suppresses pointer editing while it travels.
+        // Keep a keyboard editor exposed, but do not advertise a clickable
+        // title at its resting frame before the panel has arrived.
+        super.isAccessibilityHidden() || (currentEditor() == nil && !pointerEditingAvailable())
+    }
+
     var onBacktab: (() -> Bool)?
 
     override func insertBacktab(_ sender: Any?) {
@@ -8145,12 +11404,17 @@ private final class FolderTitleField: NSTextField {
 private final class FolderOverlayView: NSView, NSTextFieldDelegate {
     let collectionView = PagingCollectionView()
     var onClose: (() -> Void)?
+    /// The close animation landed, or an immediate close removed the panel.
+    /// A completion that lost the generation does not call this. The grid
+    /// draws the preview plate again here.
+    var onChromeCloseLanded: (() -> Void)?
     var onActivateApp: ((AppCandidate) -> Void)?
     /// False while the launcher is fading or already ordered out. Releasing
     /// the close button or the dimmer must not close the folder or save the
     /// title.
     var acceptsPointerActivation: () -> Bool = { true }
-    var onDrop: ((LayoutDrop) -> Bool)?
+    /// `pointInOverlay` is where the pointer let go, in this overlay.
+    var onDrop: ((LayoutDrop, CGPoint) -> Bool)?
     /// False while the launcher is fading out. Dragging out of a folder then
     /// must not extract the icon.
     var acceptsDrop: () -> Bool = { true }
@@ -8169,6 +11433,9 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
     private var isStrippingMarkedTitle = false
     private let closeButton = LauncherChromeButton(title: L("关闭"), target: nil, action: nil)
     private let folderScrollView = LauncherScrollView()
+    #if DEBUG
+    var testContentScrollElasticityIsNone: Bool { folderScrollView.verticalScrollElasticity == .none }
+    #endif
     private var preferredPanelWidth: NSLayoutConstraint!
     private var preferredPanelHeight: NSLayoutConstraint!
     private var animationGeneration: UInt64 = 0
@@ -8189,7 +11456,10 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
         panel.blendingMode = .withinWindow
         panel.state = .active
         panel.wantsLayer = true
-        panel.layer?.cornerRadius = 22
+        panel.layer?.cornerRadius = LauncherLayout.folderPanelCornerRadius
+        // The radius has to clip the material. Otherwise the corner animation
+        // only moves the hairline border, and the panel stays square.
+        panel.layer?.masksToBounds = true
         panel.layer?.borderWidth = 0.5
         panel.layer?.borderColor = NSColor.white.withAlphaComponent(0.16).cgColor
         panel.setAccessibilityElement(true)
@@ -8210,6 +11480,10 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
         titleField.setAccessibilityLabel(L("文件夹名称"))
         titleField.delegate = self
         titleField.onBacktab = { [weak self] in self?.onBacktabFromTitle?() ?? false }
+        titleField.pointerEditingAvailable = { [weak self] in
+            guard let self else { return false }
+            return !self.isAnimatingClose && !self.panelTransformInFlight
+        }
         titleField.translatesAutoresizingMaskIntoConstraints = false
         panel.addSubview(titleField)
 
@@ -8240,7 +11514,8 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
         collectionView.setAccessibilityLabel(L("文件夹中的应用"))
 
         preferredPanelWidth = panel.widthAnchor.constraint(equalToConstant: 820)
-        preferredPanelWidth.priority = .defaultHigh
+        // Keep the preferred width below fitting-size compression so it cannot enlarge the window.
+        preferredPanelWidth.priority = NSLayoutConstraint.Priority(249)
         preferredPanelHeight = panel.heightAnchor.constraint(equalToConstant: 620)
         preferredPanelHeight.priority = .defaultLow
 
@@ -8273,8 +11548,39 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
     required init?(coder: NSCoder) { nil }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
-        guard isAnimatingClose else { return super.hitTest(point) }
-        return self
+        guard !isAnimatingClose else { return self }
+        // While the panel is still flying, its layout frame is the resting
+        // place and its pixels are somewhere else. Ignore the resting frame
+        // so a click does not open an icon that has not arrived, and accept
+        // the pixels so a click on the traveling panel does not dismiss it.
+        guard panelTransformInFlight else { return super.hitTest(point) }
+        if presentedPanelContains(point) { return panel }
+        let hit = super.hitTest(point)
+        if hit === panel || hit?.isDescendant(of: panel) == true { return panel }
+        return hit
+    }
+
+    private var panelTransformInFlight: Bool {
+        let keys = panel.layer?.animationKeys() ?? []
+        return keys.contains("folderOpenScale") || keys.contains("folderCloseScale")
+    }
+
+    /// Layer anchor is the view origin. `m41`/`m42` are the origin offset
+    /// after scale, not the center offset.
+    private func presentedPanelContains(_ point: CGPoint) -> Bool {
+        guard let layer = panel.layer else { return panel.frame.contains(point) }
+        let transform = layer.presentation()?.transform ?? layer.transform
+        let scale = CGFloat(transform.m11)
+        guard scale > 0.001, scale.isFinite,
+              transform.m41.isFinite, transform.m42.isFinite else { return false }
+        let visual = CGRect(
+            x: panel.frame.minX + CGFloat(transform.m41),
+            y: panel.frame.minY + CGFloat(transform.m42),
+            width: panel.frame.width * scale,
+            height: panel.frame.height * scale
+        )
+        guard visual.width >= 1, visual.height >= 1 else { return false }
+        return visual.contains(point)
     }
 
     private var isSizingGrid = false
@@ -8367,8 +11673,10 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
         let dimmerKeys = dimmer.layer?.animationKeys() ?? []
         let panelAnimating = panelKeys.contains("folderOpenFade")
             || panelKeys.contains("folderOpenScale")
+            || panelKeys.contains("folderOpenCorner")
             || panelKeys.contains("folderCloseFade")
             || panelKeys.contains("folderCloseScale")
+            || panelKeys.contains("folderCloseCorner")
         let dimmerAnimating = dimmerKeys.contains("folderOpenFade")
             || dimmerKeys.contains("folderCloseFade")
         guard panelAnimating || dimmerAnimating || isAnimatingClose else { return false }
@@ -8377,21 +11685,30 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
         pinLayerToPresentedFrame(panel.layer, removing: [
             "folderOpenFade", "folderOpenScale", "folderCloseFade", "folderCloseScale"
         ])
+        pinPresentedPanelCorner()
         pinLayerToPresentedFrame(dimmer.layer, removing: ["folderOpenFade", "folderCloseFade"])
         return true
     }
 
-    /// Reduced motion does not scale the panel. Drop a scale that is already
-    /// running. A preference change snaps the opacity fade on its own; this
-    /// only clears scale. The model scale of an opening panel is already
-    /// identity; a closing panel had written 0.92.
+    /// Layout frame of the folder panel, in this overlay. The open and close
+    /// poses are measured against it.
+    var panelFrame: CGRect { panel.frame }
+
+    /// Reduced motion does not scale the panel. Drop a transform that is
+    /// already running. A preference change snaps the opacity fade on its
+    /// own; this only clears the transform. The model transform of an opening
+    /// panel is already identity; a closing panel had written the collapsed
+    /// pose (toward the icon, or a centered 0.92).
     func dropScaleForReducedMotion() {
         guard let panelLayer = panel.layer else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         panelLayer.removeAnimation(forKey: "folderOpenScale")
         panelLayer.removeAnimation(forKey: "folderCloseScale")
+        panelLayer.removeAnimation(forKey: "folderOpenCorner")
+        panelLayer.removeAnimation(forKey: "folderCloseCorner")
         panelLayer.transform = CATransform3DIdentity
+        panelLayer.cornerRadius = LauncherLayout.folderPanelCornerRadius
         CATransaction.commit()
     }
 
@@ -8405,9 +11722,11 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
         let closing = isAnimatingClose
             || panelKeys.contains("folderCloseFade")
             || panelKeys.contains("folderCloseScale")
+            || panelKeys.contains("folderCloseCorner")
             || dimmerKeys.contains("folderCloseFade")
         let opening = panelKeys.contains("folderOpenFade")
             || panelKeys.contains("folderOpenScale")
+            || panelKeys.contains("folderOpenCorner")
             || dimmerKeys.contains("folderOpenFade")
         guard closing || opening else { return false }
         if closing {
@@ -8420,6 +11739,7 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
         panel.layer?.removeAllAnimations()
         panel.layer?.opacity = 1
         panel.layer?.transform = CATransform3DIdentity
+        panel.layer?.cornerRadius = LauncherLayout.folderPanelCornerRadius
         dimmer.layer?.removeAllAnimations()
         dimmer.layer?.opacity = 1
         CATransaction.commit()
@@ -8439,55 +11759,107 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
         panel.layer?.removeAllAnimations()
         panel.layer?.opacity = 1
         panel.layer?.transform = CATransform3DIdentity
+        panel.layer?.cornerRadius = LauncherLayout.folderPanelCornerRadius
         dimmer.layer?.removeAllAnimations()
         dimmer.layer?.opacity = 1
         CATransaction.commit()
     }
 
-    func animateOpen(reducesMotion: Bool) {
+    /// Stop the corner on the radius already on screen. The model value is
+    /// the end of the flight, which would square the panel or balloon it.
+    private func pinPresentedPanelCorner() {
+        guard let layer = panel.layer else { return }
+        let radius = layer.presentation()?.cornerRadius ?? layer.cornerRadius
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.removeAnimation(forKey: "folderOpenCorner")
+        layer.removeAnimation(forKey: "folderCloseCorner")
+        layer.cornerRadius = radius
+        CATransaction.commit()
+    }
+
+    func animateOpen(collapse: LauncherLayout.FolderChromeCollapse) {
         let wasClosing = isAnimatingClose
         let panelLayer = panel.layer
         let dimmerLayer = dimmer.layer
-        let currentPanelOpacity = wasClosing ? panelLayer?.presentation()?.opacity ?? 0 : 0
-        let currentDimmerOpacity = wasClosing ? dimmerLayer?.presentation()?.opacity ?? 0 : 0
-        let currentPanelScale = wasClosing ? panelLayer?.presentation()?.transform.m11 ?? 0.92 : 0.92
+        let presentedPanel = wasClosing ? panelLayer?.presentation() : nil
+        let presentedDimmer = wasClosing ? dimmerLayer?.presentation() : nil
+        let fromOpacity = presentedPanel?.opacity ?? Float(collapse.panelOpacity)
+        let fromDimmerOpacity = presentedDimmer?.opacity ?? 0
+        let fromTransform = wasClosing
+            ? (presentedPanel?.transform ?? collapsedPanelTransform(collapse))
+            : collapsedPanelTransform(collapse)
+        let restingRadius = LauncherLayout.folderPanelCornerRadius
+        let fromRadius = wasClosing
+            ? (presentedPanel?.cornerRadius ?? collapse.collapsedCornerRadius)
+            : collapse.collapsedCornerRadius
         animationGeneration &+= 1
         isAnimatingClose = false
+        let duration = collapse.duration
+        let timing = folderChromeTiming(tracksIcon: collapse.tracksIcon)
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         panelLayer?.removeAnimation(forKey: "folderOpenScale")
         panelLayer?.removeAnimation(forKey: "folderOpenFade")
+        panelLayer?.removeAnimation(forKey: "folderOpenCorner")
         panelLayer?.removeAnimation(forKey: "folderCloseScale")
         panelLayer?.removeAnimation(forKey: "folderCloseFade")
+        panelLayer?.removeAnimation(forKey: "folderCloseCorner")
         dimmerLayer?.removeAnimation(forKey: "folderOpenFade")
         dimmerLayer?.removeAnimation(forKey: "folderCloseFade")
-        panel.layer?.opacity = 1
-        panel.layer?.transform = CATransform3DIdentity
-        dimmer.layer?.opacity = 1
-
-        let duration = reducesMotion ? 0.12 : 0.22
-        let timing = CAMediaTimingFunction(controlPoints: 0.2, 0.8, 0.2, 1.0)
-        let fade = CABasicAnimation(keyPath: "opacity")
-        fade.fromValue = currentPanelOpacity
-        fade.toValue = 1
-        fade.duration = duration
-        fade.timingFunction = timing
-        panelLayer?.add(fade, forKey: "folderOpenFade")
+        panelLayer?.opacity = 1
+        panelLayer?.transform = CATransform3DIdentity
+        panelLayer?.cornerRadius = restingRadius
+        dimmerLayer?.opacity = 1
+        if fromOpacity < 0.999 {
+            let fade = CABasicAnimation(keyPath: "opacity")
+            fade.fromValue = fromOpacity
+            fade.toValue = 1
+            fade.duration = duration
+            fade.timingFunction = timing
+            // The model is already the open panel. Hold the picture on screen
+            // until this animation is attached, or the commit frame flashes full size.
+            fade.fillMode = .backwards
+            panelLayer?.add(fade, forKey: "folderOpenFade")
+        }
         let dimmerFade = CABasicAnimation(keyPath: "opacity")
-        dimmerFade.fromValue = currentDimmerOpacity
+        dimmerFade.fromValue = fromDimmerOpacity
         dimmerFade.toValue = 1
         dimmerFade.duration = duration
         dimmerFade.timingFunction = timing
+        dimmerFade.fillMode = .backwards
         dimmerLayer?.add(dimmerFade, forKey: "folderOpenFade")
-
-        guard !reducesMotion else { return }
-        let scale = CABasicAnimation(keyPath: "transform.scale")
-        scale.fromValue = currentPanelScale
-        scale.toValue = 1
-        scale.duration = duration
-        scale.timingFunction = timing
-        panelLayer?.add(scale, forKey: "folderOpenScale")
+        // Reduced motion never scales, including when a close is reversed.
+        // The transform above is already identity, so the fade is the whole open.
+        if collapse.animatesTransform {
+            let move = CABasicAnimation(keyPath: "transform")
+            move.fromValue = NSValue(caTransform3D: fromTransform)
+            move.toValue = NSValue(caTransform3D: CATransform3DIdentity)
+            move.duration = duration
+            move.timingFunction = timing
+            move.fillMode = .backwards
+            panelLayer?.add(move, forKey: "folderOpenScale")
+            // The layer radius scales with the panel. Start where the plate's
+            // corner is, and settle on the full-size 22. Same clock as the grow.
+            if abs(fromRadius - restingRadius) > 0.5 {
+                let corner = CABasicAnimation(keyPath: "cornerRadius")
+                corner.fromValue = fromRadius
+                corner.toValue = restingRadius
+                corner.duration = duration
+                corner.timingFunction = timing
+                corner.fillMode = .backwards
+                panelLayer?.add(corner, forKey: "folderOpenCorner")
+            }
+        }
+        CATransaction.commit()
     }
 
-    func animateClose(reducesMotion: Bool, immediately: Bool = false) {
+    func animateClose(
+        reducesMotion: Bool,
+        immediately: Bool = false,
+        collapse: LauncherLayout.FolderChromeCollapse? = nil
+    ) {
         if immediately {
             animationGeneration &+= 1
             isAnimatingClose = false
@@ -8495,30 +11867,43 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
             panel.layer?.removeAllAnimations()
             panel.layer?.opacity = 1
             panel.layer?.transform = CATransform3DIdentity
+            panel.layer?.cornerRadius = LauncherLayout.folderPanelCornerRadius
             dimmer.layer?.removeAllAnimations()
             dimmer.layer?.opacity = 1
             isHidden = true
+            onChromeCloseLanded?()
             return
         }
+        let collapse = collapse ?? LauncherLayout.folderChromeCollapse(
+            panelFrame: panel.frame,
+            iconFrame: nil,
+            reducesMotion: reducesMotion
+        )
         let panelLayer = panel.layer
         let dimmerLayer = dimmer.layer
         let currentPanelOpacity = panelLayer?.presentation()?.opacity ?? panelLayer?.opacity ?? 1
         let currentDimmerOpacity = dimmerLayer?.presentation()?.opacity ?? dimmerLayer?.opacity ?? 1
-        let currentPanelScale = panelLayer?.presentation()?.transform.m11 ?? panelLayer?.transform.m11 ?? 1
+        let fromTransform = panelLayer?.presentation()?.transform ?? panelLayer?.transform ?? CATransform3DIdentity
+        let fromRadius = panelLayer?.presentation()?.cornerRadius ?? panelLayer?.cornerRadius ?? LauncherLayout.folderPanelCornerRadius
         animationGeneration &+= 1
         let generation = animationGeneration
         isAnimatingClose = true
         setAccessibilityHidden(true)
 
-        let duration = reducesMotion ? 0.12 : 0.22
-        let timing = CAMediaTimingFunction(controlPoints: 0.2, 0.8, 0.2, 1.0)
-        panelLayer?.removeAnimation(forKey: "folderOpenScale")
-        panelLayer?.removeAnimation(forKey: "folderOpenFade")
-        dimmerLayer?.removeAnimation(forKey: "folderOpenFade")
+        let duration = collapse.duration
+        let timing = folderChromeTiming(tracksIcon: collapse.tracksIcon)
+        let opacityTiming = folderCloseOpacityTiming(tracksIcon: collapse.tracksIcon)
+        let toTransform = collapse.animatesTransform
+            ? collapsedPanelTransform(collapse)
+            : CATransform3DIdentity
+        let toRadius = collapse.animatesTransform
+            ? collapse.collapsedCornerRadius
+            : LauncherLayout.folderPanelCornerRadius
 
         guard let panelLayer, let dimmerLayer else {
             isAnimatingClose = false
             isHidden = true
+            onChromeCloseLanded?()
             return
         }
 
@@ -8526,43 +11911,87 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
         panelFade.fromValue = currentPanelOpacity
         panelFade.toValue = 0
         panelFade.duration = duration
-        panelFade.timingFunction = timing
-        panelLayer.opacity = 0
+        panelFade.timingFunction = opacityTiming
+        // The model below is already the collapsed panel. Hold the picture
+        // on screen until the animation is attached, or the commit frame
+        // flashes shut.
+        panelFade.fillMode = .backwards
 
         let dimmerFade = CABasicAnimation(keyPath: "opacity")
         dimmerFade.fromValue = currentDimmerOpacity
         dimmerFade.toValue = 0
         dimmerFade.duration = duration
-        dimmerFade.timingFunction = timing
-        dimmerLayer.opacity = 0
+        dimmerFade.timingFunction = folderCloseVeilTiming(
+            tracksIcon: collapse.tracksIcon,
+            closing: true
+        )
+        dimmerFade.fillMode = .backwards
 
         CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        panelLayer.removeAnimation(forKey: "folderOpenScale")
+        panelLayer.removeAnimation(forKey: "folderOpenFade")
+        panelLayer.removeAnimation(forKey: "folderOpenCorner")
+        dimmerLayer.removeAnimation(forKey: "folderOpenFade")
+        panelLayer.opacity = 0
+        dimmerLayer.opacity = 0
+        panelLayer.transform = toTransform
+        panelLayer.cornerRadius = toRadius
         CATransaction.setCompletionBlock { [weak self] in
-            Task { @MainActor [weak self] in
+            // Already on the main thread. A Task would leave the collapsed
+            // panel up for another turn, and the preview plate would wait.
+            finishFlightOnLandingTurn { [weak self] in
                 guard let self, self.animationGeneration == generation else { return }
                 self.isHidden = true
                 self.isAnimatingClose = false
                 panelLayer.removeAllAnimations()
                 panelLayer.opacity = 1
                 panelLayer.transform = CATransform3DIdentity
+                panelLayer.cornerRadius = LauncherLayout.folderPanelCornerRadius
                 dimmerLayer.removeAllAnimations()
                 dimmerLayer.opacity = 1
+                self.onChromeCloseLanded?()
             }
         }
         panelLayer.add(panelFade, forKey: "folderCloseFade")
         dimmerLayer.add(dimmerFade, forKey: "folderCloseFade")
-        if !reducesMotion {
-            let scale = CABasicAnimation(keyPath: "transform.scale")
-            scale.fromValue = currentPanelScale
-            scale.toValue = 0.92
-            scale.duration = duration
-            scale.timingFunction = timing
-            panelLayer.transform = CATransform3DMakeScale(0.92, 0.92, 1)
-            panelLayer.add(scale, forKey: "folderCloseScale")
-        } else {
-            panelLayer.transform = CATransform3DIdentity
+        if collapse.animatesTransform {
+            let move = CABasicAnimation(keyPath: "transform")
+            move.fromValue = NSValue(caTransform3D: fromTransform)
+            move.toValue = NSValue(caTransform3D: toTransform)
+            move.duration = duration
+            move.timingFunction = timing
+            move.fillMode = .backwards
+            panelLayer.add(move, forKey: "folderCloseScale")
+            if abs(fromRadius - toRadius) > 0.5 {
+                let corner = CABasicAnimation(keyPath: "cornerRadius")
+                corner.fromValue = fromRadius
+                corner.toValue = toRadius
+                corner.duration = duration
+                corner.timingFunction = timing
+                corner.fillMode = .backwards
+                panelLayer.add(corner, forKey: "folderCloseCorner")
+            }
         }
         CATransaction.commit()
+    }
+
+    /// `FolderChromeCollapse` moves the panel center. AppKit's layer anchor
+    /// is the view origin, so a bare scale would pin that corner. Scale
+    /// first, then the shift: `m41` stays the full shift. The other order
+    /// stores `scale * shift`, and the panel misses the icon.
+    private func collapsedPanelTransform(_ collapse: LauncherLayout.FolderChromeCollapse) -> CATransform3D {
+        let scale = collapse.scale
+        let shift = LauncherLayout.folderPanelCollapseShift(
+            scale: scale,
+            translationX: collapse.translationX,
+            translationY: collapse.translationY,
+            panelBounds: panel.bounds
+        )
+        return CATransform3DConcat(
+            CATransform3DMakeScale(scale, scale, 1),
+            CATransform3DMakeTranslation(shift.x, shift.y, 0)
+        )
     }
 
     var keyViews: [NSView] {
@@ -8673,10 +12102,11 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
               let data = sender.draggingPasteboard.data(forType: layoutItemPasteboardType),
               let payload = try? JSONDecoder().decode(DraggedLayoutItem.self, from: data),
               let folderID = payload.folderID else { return false }
+        let point = convert(sender.draggingLocation, from: nil)
         return onDrop?(LayoutDrop(
             source: .folderMember(folderID: folderID, itemID: payload.itemID),
             destination: .topLevelIndex(Int.max)
-        )) ?? false
+        ), point) ?? false
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -8757,6 +12187,9 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
         let restored = titleBeforeEdit
         isDiscardingTitleEdit = true
         titleField.stringValue = restored
+        #if DEBUG
+        auditTitleFieldEditor(stage: "before-abort")
+        #endif
         titleField.abortEditing()
         isDiscardingTitleEdit = false
         return true
@@ -8764,9 +12197,15 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
 
     func controlTextDidBeginEditing(_ obj: Notification) {
         titleBeforeEdit = titleField.stringValue
+        #if DEBUG
+        auditTitleFieldEditor(stage: "begin")
+        #endif
     }
 
     func controlTextDidEndEditing(_ obj: Notification) {
+        #if DEBUG
+        auditTitleFieldEditor(stage: "end")
+        #endif
         guard !isDiscardingTitleEdit else {
             titleField.isEditable = titleEditingEnabled
             return
@@ -8787,6 +12226,17 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
             }
         }
     }
+
+    #if DEBUG
+    private func auditTitleFieldEditor(stage: String) {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["LAUNCHICON_TEST_FIELD_EDITOR_AUDIT"] == "1",
+              environment["LAUNCHICON_TEST_SCAN_ROOT"] != nil,
+              let editor = titleField.currentEditor() as? NSTextView else { return }
+        let logger = Logger(subsystem: "com.sunzheng.LaunchIcon", category: "FieldEditorAudit")
+        logger.info("title stage=\(stage, privacy: .public) fieldEditor=\(editor.isFieldEditor, privacy: .public) spelling=\(editor.isContinuousSpellCheckingEnabled, privacy: .public) grammar=\(editor.isGrammarCheckingEnabled, privacy: .public) correction=\(editor.isAutomaticSpellingCorrectionEnabled, privacy: .public) replacement=\(editor.isAutomaticTextReplacementEnabled, privacy: .public) dataDetection=\(editor.isAutomaticDataDetectionEnabled, privacy: .public) checkingTypes=\(editor.enabledTextCheckingTypes, privacy: .public) sharedEditor=\(editor === self.window?.fieldEditor(false, for: nil), privacy: .public) marked=\(editor.hasMarkedText(), privacy: .public)")
+    }
+    #endif
 
     @objc private func close() {
         guard acceptsPointerActivation() else { return }

@@ -1,5 +1,6 @@
 import AppKit
 import Carbon.HIToolbox
+import Darwin
 import UniformTypeIdentifiers
 
 public protocol AppIconProviding: Sendable {
@@ -408,11 +409,15 @@ public final class WorkspaceIconCache: @unchecked Sendable {
 }
 
 public protocol AppLaunching: Sendable {
+    /// Finder-style open. Must not wait for the target app to finish launching.
+    func openImmediately(_ applicationURL: URL) throws -> WorkspaceAppLauncher.ImmediateOpenResult
     func launch(_ applicationURL: URL) async throws
 }
 
 public enum WorkspaceLaunchError: LocalizedError, Equatable, Sendable {
     case requestRejected(URL)
+    /// Kept for callers that still surface a late Launch Services failure.
+    /// The Finder-style path no longer uses a fixed wall-clock timeout.
     case timedOut(URL)
 
     public var errorDescription: String? {
@@ -420,49 +425,293 @@ public enum WorkspaceLaunchError: LocalizedError, Equatable, Sendable {
         case .requestRejected:
             return "系统未接受打开应用的请求。"
         case .timedOut:
-            return "系统未在 10 秒内回应启动请求；应用可能仍在启动。"
+            return "系统未能完成启动请求；应用可能仍在启动或已被拒绝。"
         }
-    }
-}
-
-private final class WorkspaceLaunchFlight: @unchecked Sendable {
-    private let lock = NSLock()
-    private var continuation: CheckedContinuation<Void, any Error>?
-
-    init(_ continuation: CheckedContinuation<Void, any Error>) {
-        self.continuation = continuation
-    }
-
-    func finish(_ result: Result<Void, any Error>) {
-        lock.lock()
-        let continuation = self.continuation
-        self.continuation = nil
-        lock.unlock()
-        continuation?.resume(with: result)
     }
 }
 
 public struct WorkspaceAppLauncher: AppLaunching {
-    public init() {}
+    public enum ImmediateOpenResult: Equatable, Sendable {
+        case activated
+        case opened
+    }
+
+    /// Invoked off the caller thread after `/usr/bin/open` exits. Status 0 is
+    /// success; any other status means Launch Services rejected the request
+    /// after spawn returned.
+    public typealias OpenProcessFinishedHandler = @Sendable (URL, Int32) -> Void
+
+    private let immediateOpen: @Sendable (URL) throws -> ImmediateOpenResult
+
+    public init(onOpenProcessFinished: OpenProcessFinishedHandler? = nil) {
+        self.init(immediateOpen: { url in
+            try Self.systemImmediateOpen(url, onOpenProcessFinished: onOpenProcessFinished)
+        })
+    }
+
+    init(immediateOpen: @escaping @Sendable (URL) throws -> ImmediateOpenResult) {
+        self.immediateOpen = immediateOpen
+    }
+
+    /// Opens via `/usr/bin/open` (same as Finder / shell). Spawns `open` and
+    /// returns after `run()` — does **not** `waitUntilExit` on the caller
+    /// thread. Waiting on the main runloop deadlocks Launch Services for some
+    /// apps (Devin). Must not call `Bundle(url:)` or `NSWorkspace.open` /
+    /// `openApplication` on this hot path — those AppKit/LaunchServices entry
+    /// points can raise ObjC exceptions that HIServices swallows, aborting the
+    /// Swift opener after "Launch requested" with no catch, no pending clear,
+    /// and no target process (seen with Devin / Windsurf on preview.73–74).
+    /// A non-zero `open` exit is reported later via `onOpenProcessFinished`.
+    public func openImmediately(_ applicationURL: URL) throws -> ImmediateOpenResult {
+        try immediateOpen(applicationURL)
+    }
 
     public func launch(_ applicationURL: URL) async throws {
-        try await withCheckedThrowingContinuation { continuation in
-            let flight = WorkspaceLaunchFlight(continuation)
-            DispatchQueue.global().asyncAfter(deadline: .now() + 10) {
-                flight.finish(.failure(WorkspaceLaunchError.timedOut(applicationURL)))
-            }
-            DispatchQueue.global(qos: .userInitiated).async {
-                let fileManager = FileManager.default
-                guard fileManager.fileExists(atPath: applicationURL.path),
-                      let executableURL = Bundle(url: applicationURL)?.executableURL,
-                      fileManager.isExecutableFile(atPath: executableURL.path),
-                      NSWorkspace.shared.open(applicationURL) else {
-                    flight.finish(.failure(WorkspaceLaunchError.requestRejected(applicationURL)))
-                    return
-                }
-                flight.finish(.success(()))
-            }
+        _ = try openImmediately(applicationURL)
+    }
+
+    private static func systemImmediateOpen(
+        _ applicationURL: URL,
+        onOpenProcessFinished: OpenProcessFinishedHandler?
+    ) throws -> ImmediateOpenResult {
+        // Absolute file URL only — do not touch Bundle or NSWorkspace here.
+        guard applicationURL.isFileURL else {
+            throw WorkspaceLaunchError.requestRejected(applicationURL)
         }
+        let url = applicationURL.standardizedFileURL
+        let path = url.path
+        guard !path.isEmpty, path.hasPrefix("/"), FileManager.default.fileExists(atPath: path) else {
+            throw WorkspaceLaunchError.requestRejected(applicationURL)
+        }
+        // Fixture-style bundles and other Mac apps that cannot run make
+        // `/usr/bin/open` exit 1 ("executable is missing" or "incorrect
+        // executable format"). A fifo with the execute bit is worse: `open`
+        // does not return, including when the plist is missing or unreadable
+        // and the bundle filename is that fifo. Rejecting here keeps the
+        // click on the synchronous failure path (toast, no hide). A runnable
+        // file under `Contents/MacOS`, `Contents`, or the bundle root, and
+        // real apps with no Contents/Info.plist, still spawn.
+        if LauncherLayout.shouldRejectOpenBeforeSpawn(executable: openBundleExecutable(at: url)) {
+            throw WorkspaceLaunchError.requestRejected(applicationURL)
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        process.arguments = [path]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        // `Process` is not thread-safe, so do not `waitUntilExit` on another
+        // queue. The termination handler is the supported exit callback, and
+        // it runs off the caller. Retain until that handler: dropping `Process`
+        // immediately (Store spike passes no callback) can reap `/usr/bin/open`
+        // before Launch Services accepts the request.
+        let callback = onOpenProcessFinished
+        let lifetime = OpenProcessLifetime(process)
+        process.terminationHandler = { finished in
+            let status = finished.terminationStatus
+            callback?(url, status)
+            lifetime.release()
+        }
+        do {
+            try process.run()
+            return .opened
+        } catch {
+            process.terminationHandler = nil
+            lifetime.release()
+            throw WorkspaceLaunchError.requestRejected(applicationURL)
+        }
+    }
+
+    /// Reads `Contents/Info.plist` with `NSDictionary` only. `Bundle(url:)` is
+    /// intentionally not used; see `LauncherLayout.OpenBundleExecutable`.
+    public static func openBundleExecutable(at url: URL) -> LauncherLayout.OpenBundleExecutable {
+        let infoURL = url.appendingPathComponent("Contents/Info.plist")
+        let infoPath = infoURL.path
+        // No node at all, including a dangling symlink. `open` still receives
+        // the bundle. The one exception is a bundle-name fifo (or socket or
+        // device): Launch Services blocks in `open()` while recording the
+        // executable format, and killing the client does not unblock it.
+        guard FileManager.default.fileExists(atPath: infoPath) else {
+            if case .named(.notRegularFile) = bundleNameFallback(at: url) {
+                return .named(.notRegularFile)
+            }
+            return .notMacInfoPlist
+        }
+        // Present, but not a property list `open` can read: an empty file, a
+        // corrupt file, a directory, a fifo, a socket, or a device. `open`
+        // then uses the bundle filename and the same three-directory search.
+        // Stat first. `NSDictionary` happens to return nil for a fifo, but
+        // the file open must not be how that fact is learned.
+        if regularFileSize(at: infoPath) == nil {
+            return bundleNameFallback(at: url)
+        }
+        guard let info = NSDictionary(contentsOf: infoURL) as? [String: Any] else {
+            return bundleNameFallback(at: url)
+        }
+        if let raw = info["CFBundleExecutable"] {
+            if let name = nonEmptyExecutableString(raw) {
+                // `/usr/bin/open` uses this string as the filename and does not
+                // trim. A name of spaces is launchable when that file exists.
+                // `""` is not a filename. A non-string is not either. Neither
+                // consults `NSExecutable`; both use the bundle filename.
+                // An explicit different string does not fall back when missing.
+                return resolvedExecutable(named: name, in: url)
+            }
+            return bundleNameFallback(at: url)
+        }
+        // The key itself is absent. A non-empty `NSExecutable` is the filename
+        // and does not fall through to the bundle name when that file is gone.
+        // An empty or non-string `NSExecutable` is ignored.
+        if let legacy = nonEmptyExecutableString(info["NSExecutable"]) {
+            return resolvedExecutable(named: legacy, in: url)
+        }
+        return bundleNameFallback(at: url)
+    }
+
+    /// `/usr/bin/open` uses the bundle filename when the plist has no
+    /// executable name, and also when a plist node exists but is not a
+    /// property list. The filename drops only the last extension:
+    /// `Foo.bar.app` loads `Foo.bar`, `My App.app` loads `My App`.
+    /// `CFBundleName` is not the fallback. A non-regular file is returned
+    /// as itself so the caller does not spawn `open` onto a fifo. Anything
+    /// else that cannot run is `.absent`.
+    private static func bundleNameFallback(at url: URL) -> LauncherLayout.OpenBundleExecutable {
+        let bundleName = url.deletingPathExtension().lastPathComponent
+        guard !bundleName.isEmpty else { return .absent }
+        let resolved = resolvedExecutable(named: bundleName, in: url)
+        switch resolved {
+        case .named(.executableFile), .named(.notRegularFile):
+            return resolved
+        default:
+            return .absent
+        }
+    }
+
+    private static func nonEmptyExecutableString(_ raw: Any?) -> String? {
+        guard let text = raw as? String, !text.isEmpty else { return nil }
+        return text
+    }
+
+    /// Search order proved against `/usr/bin/open`: `Contents/MacOS/<name>`,
+    /// then `Contents/<name>`, then `<bundle>/<name>`. `.` and `..` and empty
+    /// slash components are normalized. The first path that exists wins, so a
+    /// bad file in `MacOS` hides a good file at the bundle root. An absolute
+    /// name ignores those directories. A lexical path outside the bundle is
+    /// not launched, even when the file is runnable. `fstatat` follows the
+    /// final symlink and does not open it, so a fifo cannot block this check.
+    private static func resolvedExecutable(
+        named name: String,
+        in bundle: URL
+    ) -> LauncherLayout.OpenBundleExecutable {
+        let bundleURL = bundle.standardizedFileURL
+        var bundlePath = bundleURL.path
+        if bundlePath.count > 1, bundlePath.hasSuffix("/") {
+            bundlePath.removeLast()
+        }
+        if name.hasPrefix("/") {
+            let path = lexicalExecutablePath(base: "/", name: name)
+            guard namedMacOSExecutable(at: path) != .missing else { return .named(.missing) }
+            return .absolute
+        }
+        let bases = [
+            bundleURL
+                .appendingPathComponent("Contents", isDirectory: true)
+                .appendingPathComponent("MacOS", isDirectory: true)
+                .path,
+            bundleURL.appendingPathComponent("Contents", isDirectory: true).path,
+            bundlePath
+        ]
+        for base in bases {
+            let path = lexicalExecutablePath(base: base, name: name)
+            let kind = namedMacOSExecutable(at: path)
+            guard kind != .missing else { continue }
+            guard pathStaysInBundle(candidate: path, bundlePath: bundlePath) else {
+                return .outsideBundle
+            }
+            return .named(kind)
+        }
+        return .named(.missing)
+    }
+
+    /// POSIX lexical join. Does not touch the filesystem and does not resolve
+    /// symlinks: `open` follows a symlink stored inside the bundle, and the
+    /// path it starts from is this string.
+    private static func lexicalExecutablePath(base: String, name: String) -> String {
+        var parts: [String] = []
+        if !name.hasPrefix("/") {
+            parts = base.split(separator: "/").map(String.init)
+        }
+        for component in name.split(separator: "/", omittingEmptySubsequences: false) {
+            if component.isEmpty || component == "." { continue }
+            if component == ".." {
+                if !parts.isEmpty { parts.removeLast() }
+                continue
+            }
+            parts.append(String(component))
+        }
+        return "/" + parts.joined(separator: "/")
+    }
+
+    private static func pathStaysInBundle(candidate: String, bundlePath: String) -> Bool {
+        if bundlePath == "/" { return candidate.hasPrefix("/") }
+        if candidate == bundlePath { return true }
+        return candidate.hasPrefix(bundlePath + "/")
+    }
+
+    /// `fileExists` alone treats a directory, a mode-644 placeholder, an empty
+    /// file, and a fifo as launchable. The first two make `/usr/bin/open` exit
+    /// 1. An empty file does too ("incorrect executable format"). A fifo with
+    /// the execute bit does not return. Follow symlinks the same way Launch
+    /// Services does. Do not call `Bundle`, and do not open the file: opening
+    /// a fifo blocks.
+    private static func namedMacOSExecutable(at path: String) -> LauncherLayout.OpenBundleExecutable.NamedFile {
+        var isDirectory = ObjCBool(false)
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) else {
+            return .missing
+        }
+        if isDirectory.boolValue {
+            return .directory
+        }
+        // A directory is "executable" in the POSIX sense. That check is only
+        // meaningful after the directory case above.
+        guard FileManager.default.isExecutableFile(atPath: path) else {
+            return .notExecutable
+        }
+        switch regularFileSize(at: path) {
+        case let size? where size > 0:
+            return .executableFile
+        case .some:
+            return .emptyFile
+        case .none:
+            return .notRegularFile
+        }
+    }
+
+    /// Size of a regular file, following symlinks. `nil` when the path is not
+    /// a regular file. `fstatat` does not open the file, so a fifo cannot block.
+    /// The C `stat` function is not used: Swift's `stat` struct hides it.
+    private static func regularFileSize(at path: String) -> Int64? {
+        var followed = Darwin.stat()
+        let result = path.withCString { fstatat(AT_FDCWD, $0, &followed, 0) }
+        guard result == 0, (followed.st_mode & S_IFMT) == S_IFREG else { return nil }
+        return Int64(followed.st_size)
+    }
+}
+
+/// Keeps one `/usr/bin/open` `Process` alive until its termination handler runs.
+private final class OpenProcessLifetime: @unchecked Sendable {
+    private let lock = NSLock()
+    private var process: Process?
+
+    init(_ process: Process) {
+        self.process = process
+    }
+
+    func release() {
+        lock.lock()
+        process = nil
+        lock.unlock()
     }
 }
 
