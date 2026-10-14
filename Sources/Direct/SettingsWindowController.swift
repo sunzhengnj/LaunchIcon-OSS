@@ -66,7 +66,7 @@ final class SettingsWindowController: NSWindowController {
         guard shortcutRegistrationError == nil else { return }
         messageLabel.stringValue = canEditLayout
             ? L("重新扫描完成")
-            : L("扫描仍不完整，暂时无法整理")
+            : L("暂时无法整理，请查看主界面提示")
     }
 
     private func buildContent(in window: NSWindow) {

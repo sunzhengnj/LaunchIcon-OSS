@@ -32,6 +32,12 @@ jobs:
       - name: Guard against explicit network APIs
         run: ./script/check_no_network_apis.sh
 
+      - name: Check animation method contracts without a window
+        run: |
+          python3 script/test_folder_landing_timing.py
+          python3 script/test_folder_flight_cleanup.py
+          python3 script/test_folder_title_readiness.py
+
       - name: Run Core tests
         env:
           TMPDIR: ${{ runner.temp }}

@@ -13,6 +13,7 @@ public actor CatalogSnapshotStore {
     }
 
     public func load() throws -> [AppCandidate]? {
+        try Task.checkCancellation()
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
         let snapshot = try JSONDecoder().decode(Snapshot.self, from: Data(contentsOf: fileURL))
         guard snapshot.schemaVersion == 1,
@@ -22,6 +23,7 @@ public actor CatalogSnapshotStore {
     }
 
     public func save(_ report: CatalogScanReport) throws {
+        try Task.checkCancellation()
         guard report.canPersistReconciledLayout else { return }
         try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         let snapshot = Snapshot(schemaVersion: 1, candidates: report.candidates)

@@ -6,6 +6,9 @@ DERIVED_DATA="$(mktemp -d /private/tmp/LaunchIcon-BackgroundValidation.XXXXXX)"
 trap 'rm -rf "$DERIVED_DATA"' EXIT
 
 "$ROOT_DIR/script/check_no_network_apis.sh"
+python3 "$ROOT_DIR/script/test_folder_landing_timing.py"
+python3 "$ROOT_DIR/script/test_folder_flight_cleanup.py"
+python3 "$ROOT_DIR/script/test_folder_title_readiness.py"
 TMPDIR=/private/tmp "$ROOT_DIR/script/test_core.sh"
 
 for scheme in LaunchIconDirect LaunchIconStoreSpike; do
