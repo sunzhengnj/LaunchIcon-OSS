@@ -17,3 +17,5 @@ Previous development evidence: Core194/194, windowless cleanup33/33; the last fu
 历史开发证据：Core194/194、无窗口清理33/33；最近完整UI为55通过/1失败/2跳过，保留56条主线程警告。重启后别名搜索间歇失败尚未定位，新合并结束态UI断言只编译未运行，78未有新的冷启动/UI运行。不将历史证据描述成新的公开UI通过。
 
 The current public checkout's background gate and CI results are recorded in TEST_MATRIX. Continuous rendered motion, physical input/IME, VoiceOver, multiple displays, Store distribution and notarization remain open. No visible tests are launched by this synchronization.
+
+The public repository’s directory-watcher noise-test timing/cleanup fix is retained; it is a test-only difference from the development snapshot. / 保留公开仓目录监听噪声测试的时序与进程清理修复，该差异仅涉及测试。
