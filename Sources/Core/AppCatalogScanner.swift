@@ -20,10 +20,17 @@ public actor AppCatalogScanner: AppCataloging {
     }
 
     public func scan(roots: [URL] = AppCatalogScanner.standardRoots) async -> CatalogScanReport {
-        Self.scanSynchronously(roots: roots, fileManager: fileManager)
+        Self.scanSynchronously(roots: roots, fileManager: fileManager, includeHiddenApplications: false)
     }
 
-    private nonisolated static func scanSynchronously(roots: [URL], fileManager: FileManager) -> CatalogScanReport {
+    /// Uninstall safety must see copies in hidden directories that the grid omits.
+    public func scanIncludingHiddenApplications(roots: [URL]) async -> CatalogScanReport {
+        Self.scanSynchronously(roots: roots, fileManager: fileManager, includeHiddenApplications: true)
+    }
+
+    private nonisolated static func scanSynchronously(
+        roots: [URL], fileManager: FileManager, includeHiddenApplications: Bool
+    ) -> CatalogScanReport {
         var candidates: [AppCandidate] = []
         var skippedPaths: [URL] = []
         var unreadableMetadataPaths: [URL] = []
@@ -43,7 +50,7 @@ public actor AppCatalogScanner: AppCataloging {
             guard let enumerator = fileManager.enumerator(
                 at: root.resolvingSymlinksInPath(),
                 includingPropertiesForKeys: [.isDirectoryKey, .isPackageKey, .isSymbolicLinkKey, .isHiddenKey, .contentModificationDateKey],
-                options: [.skipsHiddenFiles, .skipsPackageDescendants],
+                options: includeHiddenApplications ? [.skipsPackageDescendants] : [.skipsHiddenFiles, .skipsPackageDescendants],
                 errorHandler: { url, _ in
                     skippedPaths.append(url)
                     return true
@@ -55,11 +62,14 @@ public actor AppCatalogScanner: AppCataloging {
 
             for case let url as URL in enumerator {
                 guard !Task.isCancelled else {
+                    let selected = deduplicate(candidates)
+                    let selectedURLs = Set(selected.map(\.canonicalURL))
                     return CatalogScanReport(
-                        candidates: disambiguateDisplayNames(deduplicate(candidates)),
+                        candidates: disambiguateDisplayNames(selected),
                         skippedPaths: skippedPaths,
                         unreadableMetadataPaths: unreadableMetadataPaths,
                         unlaunchablePaths: unlaunchablePaths,
+                        duplicateCandidates: candidates.filter { !selectedURLs.contains($0.canonicalURL) },
                         wasCancelled: true
                     )
                 }
@@ -74,10 +84,9 @@ public actor AppCatalogScanner: AppCataloging {
                     let resolvedValues = try resolvedURL.resourceValues(
                         forKeys: [.isDirectoryKey, .isSymbolicLinkKey, .isHiddenKey, .contentModificationDateKey]
                     )
-                    guard values.isHidden != true,
-                          resolvedValues.isDirectory == true,
+                    guard resolvedValues.isDirectory == true,
                           resolvedValues.isSymbolicLink != true,
-                          resolvedValues.isHidden != true else {
+                          (includeHiddenApplications || (values.isHidden != true && resolvedValues.isHidden != true)) else {
                         skippedPaths.append(url)
                         continue
                     }
@@ -101,11 +110,14 @@ public actor AppCatalogScanner: AppCataloging {
             }
         }
 
+        let selected = deduplicate(candidates)
+        let selectedURLs = Set(selected.map(\.canonicalURL))
         return CatalogScanReport(
-            candidates: disambiguateDisplayNames(deduplicate(candidates)),
+            candidates: disambiguateDisplayNames(selected),
             skippedPaths: skippedPaths,
             unreadableMetadataPaths: unreadableMetadataPaths,
             unlaunchablePaths: unlaunchablePaths,
+            duplicateCandidates: candidates.filter { !selectedURLs.contains($0.canonicalURL) },
             wasCancelled: Task.isCancelled
         )
     }

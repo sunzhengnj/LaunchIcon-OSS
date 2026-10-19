@@ -28,6 +28,130 @@ public enum LayoutMutationError: Error, Equatable, Sendable {
     case cannotDropOnSelf
 }
 
+
+/// Multi-select foundation for ⌘-click / Shift-click chrome. Plain click
+/// replaces; Command toggles; Shift selects a contiguous range in the
+/// *presented* order (current page / list only — never pages). Marquee and
+/// multi-drag are later. Does not own paging, focus, or reorder.
+public struct LauncherItemSelection: Equatable, Sendable {
+    public private(set) var orderedIDs: [UUID]
+    /// Anchor for Shift-click ranges. Updated by replace/toggle; preserved
+    /// across successive Shift-clicks so the range grows from the same end.
+    public private(set) var rangeAnchorID: UUID?
+
+    public init(orderedIDs: [UUID] = [], rangeAnchorID: UUID? = nil) {
+        var seen = Set<UUID>()
+        var unique: [UUID] = []
+        unique.reserveCapacity(orderedIDs.count)
+        for id in orderedIDs where seen.insert(id).inserted {
+            unique.append(id)
+        }
+        self.orderedIDs = unique
+        if let rangeAnchorID, unique.contains(rangeAnchorID) {
+            self.rangeAnchorID = rangeAnchorID
+        } else {
+            self.rangeAnchorID = unique.last
+        }
+    }
+
+    public static let empty = LauncherItemSelection()
+
+    public var isEmpty: Bool { orderedIDs.isEmpty }
+    public var count: Int { orderedIDs.count }
+
+    public func contains(_ id: UUID) -> Bool {
+        orderedIDs.contains(id)
+    }
+
+    public mutating func clear() {
+        orderedIDs.removeAll(keepingCapacity: false)
+        rangeAnchorID = nil
+    }
+
+    public mutating func selectOnly(_ id: UUID) {
+        orderedIDs = [id]
+        rangeAnchorID = id
+    }
+
+    public mutating func toggle(_ id: UUID) {
+        if let index = orderedIDs.firstIndex(of: id) {
+            orderedIDs.remove(at: index)
+        } else {
+            orderedIDs.append(id)
+        }
+        rangeAnchorID = id
+    }
+
+    public mutating func remove(_ id: UUID) {
+        orderedIDs.removeAll { $0 == id }
+        if rangeAnchorID == id {
+            rangeAnchorID = orderedIDs.last
+        }
+    }
+
+    /// Drop IDs that left the layout (hide, uninstall, reconcile, folder dissolve).
+    public mutating func removeAbsent(from presentIDs: Set<UUID>) {
+        orderedIDs.removeAll { !presentIDs.contains($0) }
+        if let anchor = rangeAnchorID, !presentIDs.contains(anchor) {
+            rangeAnchorID = orderedIDs.last
+        }
+    }
+
+    public func pruningAbsent(from presentIDs: Set<UUID>) -> LauncherItemSelection {
+        var next = self
+        next.removeAbsent(from: presentIDs)
+        return next
+    }
+
+    public enum ClickKind: Equatable, Sendable {
+        /// Plain click — selection becomes only this item.
+        case replace
+        /// ⌘-click — toggle membership without clearing others.
+        case toggle
+    }
+
+    public static func applying(
+        kind: ClickKind,
+        itemID: UUID,
+        to current: LauncherItemSelection
+    ) -> LauncherItemSelection {
+        var next = current
+        switch kind {
+        case .replace:
+            next.selectOnly(itemID)
+        case .toggle:
+            next.toggle(itemID)
+        }
+        return next
+    }
+
+    /// ⌘A: replace selection with every id on the current presented page
+    /// (order preserved). Empty `ids` yields an empty selection.
+    public static func selectingAll(ids: [UUID]) -> LauncherItemSelection {
+        LauncherItemSelection(orderedIDs: ids, rangeAnchorID: ids.first)
+    }
+
+    /// Shift-click: select contiguous ids from the range anchor through `itemID`
+    /// in `presentedOrder` only. Does not invent off-list / other-page ids.
+    public static func applyingRange(
+        to itemID: UUID,
+        presentedOrder: [UUID],
+        current: LauncherItemSelection
+    ) -> LauncherItemSelection {
+        let anchor = current.rangeAnchorID
+            ?? current.orderedIDs.last
+            ?? itemID
+        guard let i = presentedOrder.firstIndex(of: anchor),
+              let j = presentedOrder.firstIndex(of: itemID) else {
+            return applying(kind: .replace, itemID: itemID, to: current)
+        }
+        let lo = min(i, j)
+        let hi = max(i, j)
+        let slice = Array(presentedOrder[lo...hi])
+        return LauncherItemSelection(orderedIDs: slice, rangeAnchorID: anchor)
+    }
+}
+
 public enum LauncherLayout {
     public enum PageIndicatorSlot: Equatable, Sendable {
         case page(Int)
@@ -42,26 +166,67 @@ public enum LauncherLayout {
     public static let pageIndicatorLimit = 7
     public static let pageAnimationDuration: TimeInterval = 0.28
     /// Cubic control points of the page slide. Dots sample the same curve.
-    public static let pageTurnCurveX1: CGFloat = 0.2
-    public static let pageTurnCurveY1: CGFloat = 0.8
-    public static let pageTurnCurveX2: CGFloat = 0.2
+    // Leave visible travel through the middle of the turn. The previous
+    // curve spent almost all its distance in the first half and then coasted.
+    public static let pageTurnCurveX1: CGFloat = 0.25
+    public static let pageTurnCurveY1: CGFloat = 0.55
+    public static let pageTurnCurveX2: CGFloat = 0.45
     public static let pageTurnCurveY2: CGFloat = 1
     /// How far a finger must travel, as a fraction of the page, before the
     /// page turns. A fast flick can still turn below this. This is not how
     /// far the pages slide.
     public static let pageTurnDistanceFraction: CGFloat = 0.18
-    /// How far the pages follow a finger, as a fraction of the page width at
-    /// a full-width drag. A full pull still docks the incoming page. Arrow
-    /// and keyboard turns do not use this.
-    public static let pageDragSlideFraction: CGFloat = 0.18
-    /// Arrow, keyboard, and page-dot turns. The old jump used the drag
-    /// fraction, so the fade finished before the page had moved enough to
-    /// read as a turn. Same ease-out as the drag. The drag-to-turn threshold
-    /// stays `pageTurnDistanceFraction`.
-    public static let discretePageSlideFraction: CGFloat = 0.36
+    /// Keep the two page hosts adjacent while a finger drags. A shorter
+    /// travel makes their grids overlap and appear to drift through each other.
+    public static let pageDragSlideFraction: CGFloat = 1
+    /// Arrow, keyboard, and page-dot turns use the same adjacent-page travel.
+    /// The drag-to-turn threshold stays `pageTurnDistanceFraction`.
+    public static let discretePageSlideFraction: CGFloat = 1
     public static let discretePageTurnThreshold: CGFloat = 3
     public static let dragLiftScale: CGFloat = 1.06
     public static let dragLiftShadowOpacity: CGFloat = 0.18
+    /// Cell chrome fill alphas for `AppGridTileView` (neutral white over wallpaper).
+    /// Idle/resting tiles stay fully transparent — no permanent gray plate.
+    public static let tileChromeIdleAlpha: CGFloat = 0
+    /// Keyboard focus affordance only (not resting, not mouse-idle).
+    public static let tileChromeFocusAlpha: CGFloat = 0.08
+    /// ⌘-click multi-select fill (between keyboard focus and drop-target).
+    public static let tileChromeSelectionAlpha: CGFloat = 0.10
+    /// Active merge/drop-target highlight while the pointer is targeting a tile.
+    public static let tileChromeDropTargetAlpha: CGFloat = 0.12
+    /// In-place「正在启动…」highlight.
+    public static let tileChromeLaunchingAlpha: CGFloat = 0.35
+
+    /// Fill alpha for tile cell chrome. Idle stays 0 (fully clear — use `nil`
+    /// background, not white@0). Drag-lift snapshots must call
+    /// `tileChromeFillAlphaForDragLiftSnapshot` so focus/drop/launch fills
+    /// are never baked into the flying image.
+    public static func tileChromeFillAlpha(
+        isLaunching: Bool,
+        isDropTarget: Bool,
+        focused: Bool,
+        selected: Bool = false,
+        folderPanelChromeInFlight: Bool = false
+    ) -> CGFloat {
+        if isLaunching { return tileChromeLaunchingAlpha }
+        if isDropTarget { return tileChromeDropTargetAlpha }
+        // Folder members: suppress focus/selection fills while open/close chrome
+        // is still traveling (same keys as title pointer/AX). Drop/launch stay.
+        if !folderPanelChromeInFlight {
+            if selected { return tileChromeSelectionAlpha }
+            if focused { return tileChromeFocusAlpha }
+        }
+        return tileChromeIdleAlpha
+    }
+
+    /// Drag-lift pictures always use idle chrome (fully clear).
+    public static func tileChromeFillAlphaForDragLiftSnapshot() -> CGFloat {
+        tileChromeIdleAlpha
+    }
+
+    /// Keyboard focus fill (idle ↔ 8%) retargets from presentation.
+    public static let tileChromeFillFadeAnimationKey = "tile-chrome-fill"
+
     public static let reorderSlideDuration: TimeInterval = 0.18
     /// Time to feed `reorderSpringStep`, measured to the frame about to draw.
     /// A timer that waits a full interval first holds the icon, then jumps.
@@ -104,6 +269,14 @@ public enum LauncherLayout {
         let width = max(pageWidth, 0)
         let fraction = discrete ? discretePageSlideFraction : pageDragSlideFraction
         return width * fraction
+    }
+
+    /// A full pull has already drawn the destination and can land now. Small
+    /// remaining distances should not sit in the old 120 ms minimum tail.
+    public static func pageSlideCompletionDuration(remainingFraction: CGFloat) -> TimeInterval {
+        let fraction = min(max(remainingFraction, 0), 1)
+        guard fraction > 0 else { return 0 }
+        return max(0.06, pageAnimationDuration * pow(Double(fraction), 0.55))
     }
 
     /// Offsets while a finger is down. `distance` is the finger travel in
@@ -192,6 +365,31 @@ public enum LauncherLayout {
     public static let folderBackdropOpenScale: CGFloat = 0.96
     /// PRD `motion.fast`: search results appear or the grid returns.
     public static let searchTransitionDuration: TimeInterval = 0.12
+    /// Same clock as search chrome: idle ↔ focus fill crossfade.
+    public static let tileChromeFillFadeDuration: TimeInterval = searchTransitionDuration
+
+    public static func shouldAnimateTileChromeFocusFill(
+        fromAlpha: CGFloat,
+        toAlpha: CGFloat,
+        reducesMotion: Bool
+    ) -> Bool {
+        guard !reducesMotion else { return false }
+        func inFocusBand(_ alpha: CGFloat) -> Bool {
+            abs(alpha - tileChromeIdleAlpha) < 0.001
+                || abs(alpha - tileChromeFocusAlpha) < 0.001
+        }
+        guard inFocusBand(fromAlpha), inFocusBand(toAlpha) else { return false }
+        return abs(fromAlpha - toAlpha) > 0.004
+    }
+
+
+    /// Reduced motion: search↔grid presence snaps (no 0.12s opacity half-fade).
+    /// Full motion still crossfades with `searchTransitionDuration`.
+    public static func shouldSnapSearchChromeForReducedMotion(
+        reducesMotion: Bool
+    ) -> Bool {
+        reducesMotion
+    }
 
     /// Search and the grid trade places. The outgoing surface stays drawn and
     /// fades out with the incoming one, so the page does not vanish first.
@@ -223,7 +421,10 @@ public enum LauncherLayout {
         incomingIsFolderBackdrop: Bool
     ) -> SearchChromeFade {
         let incoming = incomingIsFolderBackdrop ? folderBackdropOpenOpacity : 1
-        let crossfade = !reducesMotion && !holdsForLauncherFade && !incomingIsFolderBackdrop
+        let snapReduced = shouldSnapSearchChromeForReducedMotion(
+            reducesMotion: reducesMotion
+        )
+        let crossfade = !snapReduced && !holdsForLauncherFade && !incomingIsFolderBackdrop
         return SearchChromeFade(
             incomingOpacity: incoming,
             outgoingOpacity: crossfade ? 0 : 1,
@@ -235,7 +436,272 @@ public enum LauncherLayout {
     public static func searchChromeOutgoingAcceptsClicks(fadingOut: Bool) -> Bool {
         !fadingOut
     }
+
+    /// CAAnimation keys for Direct opacity fades that must hold presentation
+    /// with `fillMode = .backwards` (avoid animator() commit-frame flashes).
+    public static let searchChromeFadeAnimationKey = "search-chrome-fade"
+    public static let pageIndicatorFadeAnimationKey = "page-indicator-fade"
+    public static let pageArrowPresenceAnimationKey = "page-arrow-presence"
+    public static let footerHintFadeAnimationKey = "footer-hint-fade"
+
+    /// Hidden navigation hint must not unhide at opacity 1 before a text-swap
+    /// fade — that flashes the previous (or empty) line solid for a frame.
+    public static func footerNavigationShouldClearOpacityBeforeUnhide(
+        isHidden: Bool,
+        textChanging: Bool
+    ) -> Bool {
+        isHidden && textChanging
+    }
+
+    /// A text-swap fade-out was cut off (quick type → clear): the label is still
+    /// the old string but its model opacity is already 0. Same text again must
+    /// fade back in, not stay invisible.
+    public static func footerNavigationShouldRestoreOpacityWhenTextUnchanged(
+        isHidden: Bool,
+        textChanging: Bool,
+        currentOpacity: CGFloat
+    ) -> Bool {
+        !isHidden && !textChanging && currentOpacity < 0.99
+    }
+
+    /// Hidden navigation hint with unchanged text can snap visible at full
+    /// opacity (no swap animation).
+    public static func footerNavigationShouldSnapUnhide(
+        isHidden: Bool,
+        textChanging: Bool
+    ) -> Bool {
+        isHidden && !textChanging
+    }
+    /// Catalog message / empty / skeleton / read-only status presence fades.
+    public static let statusChromeFadeAnimationKey = "status-chrome-fade"
+
+    /// Hidden empty / recovery / skeleton chrome must clear opacity before
+    /// unhide — hide completion parks alpha at 1 while hidden, so revealing
+    /// first would flash solid for a frame (same class as settings message).
+    public static func statusChromeShouldClearOpacityBeforeUnhide(
+        willShow: Bool,
+        currentlyHidden: Bool
+    ) -> Bool {
+        willShow && currentlyHidden
+    }
+
+    /// A hide fade was interrupted (generation bump / rescan toggle): the view
+    /// is still unhidden but presentation opacity is near 0. Another "show"
+    /// must fade back up, not early-out and leave the chrome invisible.
+    public static func statusChromeShouldRestoreOpacityWhenAlreadyShown(
+        currentlyHidden: Bool,
+        currentOpacity: CGFloat
+    ) -> Bool {
+        !currentlyHidden && currentOpacity < 0.99
+    }
+
+    /// Catalog status / read-only lines already on screen must crossfade when
+    /// the copy changes (loading → search empty), not snap the new string.
+    /// `animated` false (reduced motion / dismiss / snappy restore) snaps copy.
+    public static func statusChromeShouldCrossfadeText(
+        willShow: Bool,
+        currentlyHidden: Bool,
+        textChanging: Bool,
+        animated: Bool = true
+    ) -> Bool {
+        animated && willShow && !currentlyHidden && textChanging
+    }
+
+    /// Read-only explanation is shown only when there is real copy to display.
+    public static func statusChromeLabeledTextToShow(
+        show: Bool,
+        text: String
+    ) -> String? {
+        guard show else { return nil }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// Settings panel feedback line (rescan / apply / login). Same clock as
+    /// status chrome; reveal clears opacity before unhide.
+    public static let settingsMessageFadeDuration: TimeInterval = searchTransitionDuration
+    public static let settingsMessageFadeAnimationKey = "settings-message-fade"
+
+    public static func settingsMessageShouldShow(text: String) -> Bool {
+        !text.isEmpty
+    }
+
+    /// VoiceOver should hear new feedback lines (rescan done, restored, errors)
+    /// once; clearing or repeating the same line stays silent.
+    public static func settingsMessageShouldAnnounce(text: String, previous: String) -> Bool {
+        !text.isEmpty && text != previous
+    }
+
+    /// VoiceOver name for the settings feedback row (navigable static text).
+    public static let settingsFeedbackAccessibilityLabelKey = "设置反馈"
+
+    /// VoiceOver name for the incomplete-scan / read-only status line.
+    public static let readOnlyStatusAccessibilityLabelKey = "整理状态"
+
+    /// Tile accessibility help when open still works but drag/organize (and
+    /// typically uninstall) is blocked by an incomplete or loading scan.
+    public static func tileAccessibilityHelp(
+        isFolder: Bool,
+        layoutEditingEnabled: Bool,
+        layoutEditingExplanation: String?
+    ) -> String {
+        let openHelp = isFolder ? "按下以打开文件夹" : "按下以打开应用"
+        guard !layoutEditingEnabled else { return openHelp }
+        let reason = (layoutEditingExplanation ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !reason.isEmpty else {
+            return "\(openHelp)。暂时无法拖动整理或卸载，请先完成扫描"
+        }
+        return "\(openHelp)。\(reason)"
+    }
+
+    /// Grid / folder collection accessibility help while editing is blocked.
+    public static func layoutCollectionAccessibilityHelp(
+        layoutEditingEnabled: Bool,
+        layoutEditingExplanation: String?,
+        editableHelp: String
+    ) -> String {
+        if layoutEditingEnabled { return editableHelp }
+        let reason = (layoutEditingExplanation ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return reason.isEmpty ? "暂时无法拖动整理，请先完成扫描" : reason
+    }
+
+    /// After the last hidden app is restored the popup and Restore button
+    /// disable. Keyboard focus must move on, not vanish with them.
+    public static func settingsShouldMoveFocusAfterRestore(remainingHidden: Int) -> Bool {
+        remainingHidden == 0
+    }
+
+    /// Escape closes the settings window (standard preferences behavior).
+    public static let settingsEscapeClosesWindow = true
+
+    /// Settings window presence (show/hide). Same clock as status/toast;
+    /// park opacity before `orderFront`; restore interrupted hide from presentation.
+    public static let settingsPresenceFadeDuration: TimeInterval = searchTransitionDuration
+    public static let settingsPresenceFadeAnimationKey = "settings-presence-fade"
+
+    public static func settingsPresenceShouldClearOpacityBeforeUnhide(
+        willShow: Bool,
+        currentlyVisible: Bool
+    ) -> Bool {
+        willShow && !currentlyVisible
+    }
+
+    public static func settingsPresenceShouldRestoreOpacityWhenAlreadyShown(
+        currentlyVisible: Bool,
+        currentOpacity: CGFloat
+    ) -> Bool {
+        currentlyVisible && currentOpacity < 0.99
+    }
+
+    /// Fresh appear starts at 0 (caller parks before orderFront). Interrupted
+    /// hide/show continues from on-screen presentation.
+    public static func settingsPresenceFadeFromOpacity(
+        appearing: Bool,
+        presentedOpacity: Float?,
+        modelOpacity: Float
+    ) -> Float {
+        if appearing { return 0 }
+        return presentedOpacity ?? modelOpacity
+    }
+
+    /// Re-show / opacity restore on an already-key settings window must not
+    /// re-activate (would steal first responder / yank focus from launcher
+    /// if both were somehow up). Fresh open or non-key window still takes key.
+    public static func settingsPresenceShouldBecomeKeyOnShow(
+        currentlyVisible: Bool,
+        isKeyWindow: Bool
+    ) -> Bool {
+        !(currentlyVisible && isKeyWindow)
+    }
+
+
+    /// Hidden empty label must clear opacity before unhide, or the first
+    /// feedback line flashes solid for a frame.
+    public static func settingsMessageShouldClearOpacityBeforeUnhide(
+        willShow: Bool,
+        currentlyHidden: Bool
+    ) -> Bool {
+        willShow && currentlyHidden
+    }
+
+    /// A hide/crossfade was interrupted: the feedback row is still unhidden
+    /// but presentation opacity is near 0. Repeating the same line must fade
+    /// back up (parity with statusChromeShouldRestoreOpacityWhenAlreadyShown /
+    /// footer restoreInterruptedFooterFade), not early-out and stay invisible.
+    public static func settingsMessageShouldRestoreOpacityWhenAlreadyShown(
+        currentlyHidden: Bool,
+        currentOpacity: CGFloat
+    ) -> Bool {
+        !currentlyHidden && currentOpacity < 0.99
+    }
+
+
+    /// Completions from an older fade must not clear or swap a newer line
+    /// (rapid rescan / login / restore races).
+    public static func settingsMessageFadeShouldApply(
+        generation: UInt64,
+        expected: UInt64
+    ) -> Bool {
+        generation == expected
+    }
+    public static let pageHostFadeAnimationKey = "page-host-fade"
+    public static let pageHostSlideAnimationKey = "page-host-slide"
+    public static let flyerSlideAnimationKey = "flyer-slide"
+    public static let dissolvedGridFadeAnimationKey = "dissolved-grid-fade"
     public static let searchFieldWidth: CGFloat = 400
+
+    /// Search top chrome (field pill + count + settings) stays quiet while
+    /// folder chrome is open or still dissolving closed.
+    public static func searchAdjacentChromeShouldShow(
+        folderOpen: Bool,
+        folderClosing: Bool
+    ) -> Bool {
+        !folderOpen && !folderClosing
+    }
+
+    /// Search-adjacent row (pill + count + settings). Own fade key so status /
+    /// empty chrome generation bumps cannot cancel an interrupted adjacent hide
+    /// (parity with footer restoreInterruptedFooterFade / status restore).
+    public static let searchAdjacentChromeFadeAnimationKey = "search-adjacent-chrome-fade"
+
+    public static func searchAdjacentChromeShouldClearOpacityBeforeUnhide(
+        willShow: Bool,
+        currentlyHidden: Bool
+    ) -> Bool {
+        statusChromeShouldClearOpacityBeforeUnhide(
+            willShow: willShow,
+            currentlyHidden: currentlyHidden
+        )
+    }
+
+    public static func searchAdjacentChromeShouldRestoreOpacityWhenAlreadyShown(
+        currentlyHidden: Bool,
+        currentOpacity: CGFloat
+    ) -> Bool {
+        statusChromeShouldRestoreOpacityWhenAlreadyShown(
+            currentlyHidden: currentlyHidden,
+            currentOpacity: currentOpacity
+        )
+    }
+
+
+    /// Beside the search field: result count while searching, grid item count when idle.
+    public enum SearchCountLabelKind: Equatable, Sendable {
+        case results
+        case items
+    }
+
+    public static func searchCountLabelKind(
+        isSearching: Bool,
+        folderOpen: Bool,
+        folderClosing: Bool
+    ) -> SearchCountLabelKind? {
+        guard searchAdjacentChromeShouldShow(
+            folderOpen: folderOpen,
+            folderClosing: folderClosing
+        ) else { return nil }
+        return isSearching ? .results : .items
+    }
     public static let searchFieldHeight: CGFloat = 42
     public static let searchFieldCornerRadius: CGFloat = 21
 
@@ -264,6 +730,13 @@ public enum LauncherLayout {
         }
     }
 
+    /// Reduced motion: drag-lift snaps to the cell image (no scale / shadow travel).
+    public static func shouldSnapDragLiftForReducedMotion(
+        reducesMotion: Bool
+    ) -> Bool {
+        reducesMotion
+    }
+
     /// Reduced motion keeps the original cell image. The lift is scale plus shadow.
     public static func dragLiftPresentation(for sourceSize: CGSize, reducesMotion: Bool) -> DragLiftPresentation {
         let identity = DragLiftPresentation(
@@ -274,7 +747,10 @@ public enum LauncherLayout {
             contentSize: sourceSize,
             canvasSize: sourceSize
         )
-        guard !reducesMotion, sourceSize.width > 0, sourceSize.height > 0 else { return identity }
+        if shouldSnapDragLiftForReducedMotion(reducesMotion: reducesMotion) {
+            return identity
+        }
+        guard sourceSize.width > 0, sourceSize.height > 0 else { return identity }
         let shadowRadius: CGFloat = 14
         let shadowOffset = CGSize(width: 0, height: -4)
         let contentSize = CGSize(
@@ -393,6 +869,25 @@ public enum LauncherLayout {
         let previous = index - 1
         guard currentEntries.indices.contains(previous) else { return nil }
         return currentEntries[previous].id
+    }
+
+    /// Grid focus after folder chrome closes (Esc / dimmer / dissolve). Prefer
+    /// the folder tile while it still exists; if it dissolved, the neighbor that
+    /// took its slot (or the previous item when the folder was last). Nil only
+    /// when the grid is empty.
+    public static func folderCloseGridFocusID(
+        pendingFolderID: UUID,
+        previousEntries: [LauncherEntry],
+        currentEntries: [LauncherEntry]
+    ) -> UUID? {
+        if let id = entryReplacingDissolvedFolder(
+            folderID: pendingFolderID,
+            previousEntries: previousEntries,
+            currentEntries: currentEntries
+        ) {
+            return id
+        }
+        return currentEntries.first?.id
     }
 
     /// Apps that should fly out of an open folder when it breaks apart.
@@ -760,6 +1255,269 @@ public enum LauncherLayout {
     /// an unfinished search. A launcher that is appearing, or that already
     /// gave up key, starts on the grid. The caller has to read key status
     /// before `NSApp.activate`, which makes the window key again.
+    /// Opening settings from a visible launcher dismisses the grid so the
+    /// settings window is not buried. Closing settings should bring that
+    /// grid back only when we were the ones who hid it.
+    public static func shouldHideLauncherToShowSettings(launcherVisible: Bool) -> Bool {
+        launcherVisible
+    }
+
+    public static func shouldRestoreLauncherWhenSettingsCloses(
+        didHideLauncherToShowSettings: Bool
+    ) -> Bool {
+        didHideLauncherToShowSettings
+    }
+
+    /// User brought the launcher back (hotkey/menu) while settings stayed open.
+    /// Drop the restore flag so closing settings does not show() again.
+    public static func shouldClearSettingsLauncherRestoreFlag(
+        didHideLauncherToShowSettings: Bool,
+        launcherVisible: Bool
+    ) -> Bool {
+        didHideLauncherToShowSettings && launcherVisible
+    }
+
+    /// Opening settings should not wait on the launcher dismiss fade — hand off
+    /// with an immediate orderOut so the settings window can appear on this turn.
+    public static func shouldAnimateLauncherHideForSettingsHandoff() -> Bool {
+        false
+    }
+
+    /// Closing settings restores a launcher that was instant-hidden — skip the
+    /// full appear fade/rise so gear → settings → close stays symmetric.
+    public static func shouldAnimateLauncherShowForSettingsHandoff() -> Bool {
+        false
+    }
+
+    /// Settings handoff restore must keep the in-progress search query. A
+    /// normal hotkey/menu appear still clears it in prepareForPresentation.
+    public static func shouldClearSearchQueryWhenPreparingPresentation(
+        preservesQueryAcrossHandoff: Bool
+    ) -> Bool {
+        !preservesQueryAcrossHandoff
+    }
+
+    /// Instant hide for settings: remember if the search field held the keyboard
+    /// so snappy restore can put typing focus back.
+    public static func shouldParkSearchFocusForSettingsHandoff(
+        searchHoldsKeyboardFocus: Bool
+    ) -> Bool {
+        searchHoldsKeyboardFocus
+    }
+
+    public static func shouldRestoreSearchFocusAfterSettingsHandoff(
+        isSettingsHandoffRestore: Bool,
+        searchHeldFocusBeforeHandoff: Bool
+    ) -> Bool {
+        isSettingsHandoffRestore && searchHeldFocusBeforeHandoff
+    }
+
+    /// Instant hide for settings: remember a non-empty query so snappy restore
+    /// can keep the search-results host up (no grid flash before hits).
+    public static func shouldParkSearchResultsChromeForSettingsHandoff(
+        queryIsNonEmpty: Bool
+    ) -> Bool {
+        queryIsNonEmpty
+    }
+
+    public static func shouldRestoreSearchResultsChromeAfterSettingsHandoff(
+        isSettingsHandoffRestore: Bool,
+        hadNonEmptyQueryBeforeHandoff: Bool
+    ) -> Bool {
+        isSettingsHandoffRestore && hadNonEmptyQueryBeforeHandoff
+    }
+
+    /// prepareForPresentation keeping the query: land results chrome before
+    /// the first restored frame.
+    public static func shouldEnsureSearchResultsChromeWhenPreservingQuery(
+        queryIsNonEmpty: Bool
+    ) -> Bool {
+        queryIsNonEmpty
+    }
+
+    /// Snappy settings restore with a parked non-empty query: page dots stay
+    /// off (search passes pageCount 0) so grid dots do not flash under results.
+    public static func shouldSuppressPageIndicatorAfterSettingsHandoff(
+        isSettingsHandoffRestore: Bool,
+        hadNonEmptyQueryBeforeHandoff: Bool
+    ) -> Bool {
+        isSettingsHandoffRestore && hadNonEmptyQueryBeforeHandoff
+    }
+
+    /// prepareForPresentation keeping a non-empty query: snap dots suppressed
+    /// before the first restored frame.
+    public static func shouldEnsurePageIndicatorSuppressedWhenPreservingQuery(
+        queryIsNonEmpty: Bool
+    ) -> Bool {
+        queryIsNonEmpty
+    }
+
+    /// Snappy settings restore with a parked non-empty query: prev/next page
+    /// arrows stay off so grid arrows do not flash under search results.
+    public static func shouldSuppressPageArrowsAfterSettingsHandoff(
+        isSettingsHandoffRestore: Bool,
+        hadNonEmptyQueryBeforeHandoff: Bool
+    ) -> Bool {
+        isSettingsHandoffRestore && hadNonEmptyQueryBeforeHandoff
+    }
+
+    /// prepareForPresentation keeping a non-empty query: snap arrows off
+    /// before the first restored frame.
+    public static func shouldEnsurePageArrowsSuppressedWhenPreservingQuery(
+        queryIsNonEmpty: Bool
+    ) -> Bool {
+        queryIsNonEmpty
+    }
+
+    /// Snappy settings restore with a parked non-empty query: footer shows
+    /// search chrome (no drag / grid nav hint flash under results).
+    public static func shouldSnapSearchFooterChromeAfterSettingsHandoff(
+        isSettingsHandoffRestore: Bool,
+        hadNonEmptyQueryBeforeHandoff: Bool
+    ) -> Bool {
+        isSettingsHandoffRestore && hadNonEmptyQueryBeforeHandoff
+    }
+
+    /// prepareForPresentation keeping a non-empty query: land search footer
+    /// chrome before the first restored frame.
+    public static func shouldEnsureSearchFooterChromeWhenPreservingQuery(
+        queryIsNonEmpty: Bool
+    ) -> Bool {
+        queryIsNonEmpty
+    }
+
+    /// Snappy settings restore with a parked non-empty query: count + settings
+    /// stay search-visible (results count, not idle grid item count).
+    public static func shouldSnapSearchAdjacentChromeAfterSettingsHandoff(
+        isSettingsHandoffRestore: Bool,
+        hadNonEmptyQueryBeforeHandoff: Bool
+    ) -> Bool {
+        isSettingsHandoffRestore && hadNonEmptyQueryBeforeHandoff
+    }
+
+    /// prepareForPresentation keeping a non-empty query: land search-adjacent
+    /// chrome before the first restored frame.
+    public static func shouldEnsureSearchAdjacentChromeWhenPreservingQuery(
+        queryIsNonEmpty: Bool
+    ) -> Bool {
+        queryIsNonEmpty
+    }
+
+    /// Esc cleared a search that had a focused result: put the keyboard on
+    /// that same entry in the grid instead of the blank root view.
+    public static func shouldRestoreGridFocusAfterClearingSearch(
+        hadFocusedSearchResult: Bool
+    ) -> Bool {
+        hadFocusedSearchResult
+    }
+
+    /// Esc cleared a search while the field (not a result) held focus: land on
+    /// the first tile of the current grid page instead of the blank root.
+    public static func shouldFocusFirstGridItemAfterClearingSearch(
+        hadFocusedSearchResult: Bool
+    ) -> Bool {
+        !hadFocusedSearchResult
+    }
+
+    /// Search field emptied (built-in clear / delete-all) while a query was
+    /// active: leave the empty field and land on the current page's first tile.
+    public static func shouldFocusFirstGridItemAfterSearchQueryEmptied(
+        wasSearching: Bool,
+        isSearchingNow: Bool
+    ) -> Bool {
+        wasSearching && !isSearchingNow
+    }
+
+    /// System NSSearchField cancel ended searching (custom clearButton removed).
+    /// If the field still holds focus and the grid is showing, land on the
+    /// first tile — covers cancel when text-change already emptied the query.
+    public static func shouldFocusFirstGridItemAfterSearchFieldDidEndSearching(
+        isSearching: Bool,
+        searchHoldsKeyboardFocus: Bool
+    ) -> Bool {
+        !isSearching && searchHoldsKeyboardFocus
+    }
+
+    /// After a non-empty query yields hits, the first hit is the keyboard-open
+    /// target while the search field keeps first responder (typing uninterrupted).
+    /// Not searching / no hits clears. When `previousHighlightID` is still in
+    /// the list it is kept (arrow navigation); pass nil after a query edit to
+    /// pin the first hit.
+    public static func searchKeyboardHighlightID(
+        isSearching: Bool,
+        presentedIDs: [UUID],
+        previousHighlightID: UUID?
+    ) -> UUID? {
+        guard isSearching, !presentedIDs.isEmpty else { return nil }
+        if let previousHighlightID, presentedIDs.contains(previousHighlightID) {
+            return previousHighlightID
+        }
+        return presentedIDs.first
+    }
+
+    /// Arrow-down / arrow-up while the search field stays first responder.
+    /// Moves the keyboard-open highlight within presented hits; does not page.
+    public static func searchKeyboardHighlightIDMoving(
+        from current: UUID?,
+        in presentedIDs: [UUID],
+        by delta: Int
+    ) -> UUID? {
+        guard !presentedIDs.isEmpty else { return nil }
+        if delta == 0 {
+            return searchKeyboardHighlightID(
+                isSearching: true,
+                presentedIDs: presentedIDs,
+                previousHighlightID: current
+            )
+        }
+        if let current, let idx = presentedIDs.firstIndex(of: current) {
+            let next = min(max(idx + delta, 0), presentedIDs.count - 1)
+            return presentedIDs[next]
+        }
+        // No highlight yet: Down → first, Up → last.
+        return delta > 0 ? presentedIDs.first : presentedIDs.last
+    }
+
+    /// Focus-fill chrome when the tile is first responder or the search
+    /// keyboard-open highlight (field still holds the caret).
+    public static func tileShowsKeyboardFocusChrome(
+        isFirstResponder: Bool,
+        isSearchKeyboardHighlighted: Bool
+    ) -> Bool {
+        isFirstResponder || isSearchKeyboardHighlighted
+    }
+
+    /// Deliberate Tab from the search field: hand real first responder to the
+    /// keyboard-open highlight (or first hit). Marked IME text must not move FR.
+    public static func shouldHandOffSearchFieldTabToHit(
+        isSearching: Bool,
+        hasHits: Bool,
+        hasMarkedText: Bool
+    ) -> Bool {
+        isSearching && hasHits && !hasMarkedText
+    }
+
+    /// Target id for Tab handoff from the search field.
+    public static func searchFieldTabHandoffTargetID(
+        highlightID: UUID?,
+        presentedIDs: [UUID]
+    ) -> UUID? {
+        guard !presentedIDs.isEmpty else { return nil }
+        if let highlightID, presentedIDs.contains(highlightID) {
+            return highlightID
+        }
+        return presentedIDs.first
+    }
+
+    /// Shift-Tab from the first search hit returns to the field (natural reverse
+    /// of Tab handoff). Other collections keep their own leave-list policy.
+    public static func shouldReturnSearchHitBacktabToField(
+        isSearchCollection: Bool,
+        tabDirection: Int
+    ) -> Bool {
+        isSearchCollection && tabDirection < 0
+    }
+
     public static func shouldKeepLauncherFocusWhenShown(isAppearing: Bool, isKey: Bool) -> Bool {
         !isAppearing && isKey
     }
@@ -778,6 +1536,73 @@ public enum LauncherLayout {
         return .hide
     }
 
+    /// Pixel inset from a screen edge that counts as a hot-corner hit.
+    /// Slightly larger than a single pixel for usability; still conflicts with
+    /// a system Mission Control corner on the same display corner.
+    public static let hotCornerHitThreshold: CGFloat = 5
+
+    /// Which configured corner (if any) contains `point` in Cocoa global coords
+    /// (origin bottom-left, same as `NSEvent.mouseLocation` / `NSScreen.frame`).
+    public static func hotCorner(
+        at point: CGPoint,
+        screenFrame: CGRect,
+        threshold: CGFloat = hotCornerHitThreshold
+    ) -> LauncherHotCorner? {
+        guard threshold >= 0, screenFrame.width > 0, screenFrame.height > 0 else { return nil }
+        let inLeft = point.x <= screenFrame.minX + threshold
+        let inRight = point.x >= screenFrame.maxX - threshold
+        let inBottom = point.y <= screenFrame.minY + threshold
+        let inTop = point.y >= screenFrame.maxY - threshold
+        if inLeft && inTop { return .topLeft }
+        if inRight && inTop { return .topRight }
+        if inLeft && inBottom { return .bottomLeft }
+        if inRight && inBottom { return .bottomRight }
+        return nil
+    }
+
+    /// First matching corner across displays (mouse may sit on any screen).
+    public static func hotCorner(
+        at point: CGPoint,
+        screenFrames: [CGRect],
+        threshold: CGFloat = hotCornerHitThreshold
+    ) -> LauncherHotCorner? {
+        for frame in screenFrames {
+            if let hit = hotCorner(at: point, screenFrame: frame, threshold: threshold) {
+                return hit
+            }
+        }
+        return nil
+    }
+
+    /// Edge-trigger: fire only when the pointer newly enters `configured`.
+    /// Seeding `previousHit` to the current hit on monitor start avoids a
+    /// spurious toggle if the cursor is already in that corner.
+    public static func shouldFireHotCorner(
+        configured: LauncherHotCorner,
+        previousHit: LauncherHotCorner?,
+        currentHit: LauncherHotCorner?
+    ) -> Bool {
+        guard configured.isEnabled else { return false }
+        guard currentHit == configured else { return false }
+        return previousHit != configured
+    }
+
+
+    /// Hot-corner show/hide must use the same animated launcher presence fade
+    /// as the hotkey (`park` + `animateLauncherPresence` from presentation).
+    /// Never the settings-handoff snappy path (animated: false), and never
+    /// retune page indicator/arrows as a side effect of the corner trigger.
+    public static func shouldAnimateLauncherPresenceForHotCorner() -> Bool {
+        true
+    }
+
+    /// Hot corner must not snap paging chrome (indicator/arrows/footer) the way
+    /// settings handoff does — that is a paging-adjacent risk and unrelated.
+    public static func shouldSnapPagingChromeForHotCornerTrigger() -> Bool {
+        false
+    }
+
+
     /// Menu-bar title for that same choice. The menu writes it when it opens
     /// and must write it again if show or hide happens while the menu is up.
     /// A stale「隐藏」during the fade would bring the launcher back.
@@ -789,6 +1614,21 @@ public enum LauncherLayout {
             return "隐藏 LaunchIcon"
         }
     }
+
+
+    /// Arming dismiss (fade still on screen) must refresh the status-menu
+    /// toggle immediately — an already-open menu can still show「隐藏」until
+    /// the next `menuWillOpen`. Same for cancelling dismiss mid-fade.
+    public static func shouldRefreshStatusItemToggleTitleOnDismissArm() -> Bool {
+        true
+    }
+
+    public static func shouldRefreshStatusItemToggleTitleOnDismissCancel(
+        wasDismissing: Bool
+    ) -> Bool {
+        wasDismissing
+    }
+
 
     /// The dismiss animation leaves the window on screen. Keys during that
     /// wait must not page, search, or edit. The global hotkey is not a window
@@ -950,21 +1790,53 @@ public enum LauncherLayout {
         isVisible && !shouldHoldMergeFlight(isDismissing: isDismissing, isVisible: isVisible)
     }
 
+    /// Reduced motion: merge flyer snaps off (no 0.12s opacity half-fade).
+    /// Full motion still dissolves over the merge flight clock.
+    public static func shouldSnapMergeFlyerForReducedMotion(
+        reducesMotion: Bool
+    ) -> Bool {
+        reducesMotion
+    }
+
+    /// Duration of the reduced-motion merge flyer dismiss. Zero so Direct
+    /// removes the flyer at once instead of half-fading.
+    public static func mergeReducedFadeDuration(reducesMotion: Bool) -> TimeInterval {
+        if shouldSnapMergeFlyerForReducedMotion(reducesMotion: reducesMotion) {
+            return 0
+        }
+        return 0.12
+    }
+
     /// Changing reduced motion snaps a merge flight that is already running.
-    /// Reduced motion is a short fade, and turning motion back on does not
-    /// finish the old flight either. Both end by removing the image. A
-    /// launcher fade that is still on screen is holding the frame already
-    /// drawn, so this snap waits. Same hold as the flight. A flight that has
-    /// not started is left alone.
+    /// Reduced motion has no flyer fade (snap remove), and turning motion
+    /// back on does not finish the old flight either. Both end by removing
+    /// the image. A launcher fade that is still on screen is holding the
+    /// frame already drawn, so this snap waits. Same hold as the flight. A
+    /// flight that has not started is left alone.
     public static func shouldSnapInFlightMergeFlight(isDismissing: Bool, isVisible: Bool) -> Bool {
         !shouldHoldMergeFlight(isDismissing: isDismissing, isVisible: isVisible)
     }
 
-    /// Reduced motion fades a new folder in over 0.12s instead of springing.
-    /// The model opacity is already 1, so the landing hold used to miss it
-    /// and the fade kept running under the launcher fade. Play that fade only
-    /// while the launcher is up. A hidden window, or a cancelled fade, shows
-    /// the folder at full opacity. Same condition as starting a merge flight.
+    /// Reduced motion: new-folder landing snaps (no 0.12s opacity half-fade).
+    public static func shouldSnapFolderCreatedForReducedMotion(
+        reducesMotion: Bool
+    ) -> Bool {
+        reducesMotion
+    }
+
+    /// Duration of the reduced-motion new-folder reveal. Zero so Direct snaps
+    /// instead of half-fading; full motion uses spring / dissolve clocks.
+    public static func folderCreatedFadeDuration(reducesMotion: Bool) -> TimeInterval {
+        if shouldSnapFolderCreatedForReducedMotion(reducesMotion: reducesMotion) {
+            return 0
+        }
+        return 0.12
+    }
+
+    /// Reduced motion used to fade a new folder in over 0.12s instead of
+    /// springing. That reveal now snaps when allowed. Reveal only while the
+    /// launcher is up. A hidden window, or a cancelled reveal, shows the
+    /// folder at full opacity. Same condition as starting a merge flight.
     public static func shouldAnimateReducedMotionFolderLanding(
         isDismissing: Bool,
         isVisible: Bool
@@ -989,7 +1861,7 @@ public enum LauncherLayout {
     }
 
     /// Changing reduced motion snaps a folder landing that is already running.
-    /// Reduced motion is a short fade, and turning motion back on does not
+    /// Reduced motion has no fade (snap), and turning motion back on does not
     /// finish the old spring either. Both land on full opacity and scale.
     /// A launcher fade that is still on screen is holding the frame already
     /// drawn, so this snap waits. Same commit as the landing. A tile that is
@@ -1004,6 +1876,48 @@ public enum LauncherLayout {
     /// While the dismiss is still on screen, keep the frame already drawn
     /// instead of jumping to the end or playing the rest. A hidden window,
     /// or a launcher that is up, snaps. Same condition as holding a toast.
+    /// Layer keys for the launcher window fade / card rise (Direct).
+    public static let launcherPresenceFadeAnimationKey = "launcherFade"
+    public static let launcherPresenceRiseAnimationKey = "launcherRise"
+    /// Fresh appear rises from this translation (points); hide settles slightly below.
+    public static let launcherPresenceAppearRiseOffset: CGFloat = -8
+    public static let launcherPresenceHideRiseOffset: CGFloat = -4
+
+    /// Opacity the presence fade should hold with `fillMode.backwards`.
+    /// Fresh appear always starts at 0 (caller parks before `orderFront`).
+    /// Cancelled dismiss / hide continues from the on-screen presentation.
+    public static func launcherPresenceFadeFromOpacity(
+        visible: Bool,
+        appearing: Bool,
+        presentedOpacity: Float?,
+        modelOpacity: Float
+    ) -> Float {
+        if visible && appearing { return 0 }
+        return presentedOpacity ?? modelOpacity
+    }
+
+
+    /// Reduced motion: launcher show/hide/hotkey/hot-corner presence snaps
+    /// (opacity + resting card transform) — no opacity half-fade and no rise.
+    public static func shouldSnapLauncherPresenceForReducedMotion(
+        reducesMotion: Bool
+    ) -> Bool {
+        reducesMotion
+    }
+
+    /// Duration of the presence opacity/rise flight. Zero when reduced motion
+    /// snaps so dismiss `Task.sleep` does not wait on a half-fade.
+    public static func launcherPresenceFadeDuration(
+        visible: Bool,
+        reducesMotion: Bool
+    ) -> TimeInterval {
+        if shouldSnapLauncherPresenceForReducedMotion(reducesMotion: reducesMotion) {
+            return 0
+        }
+        return visible ? 0.22 : 0.15
+    }
+
+
     public static func shouldHoldInFlightLauncherPresence(isDismissing: Bool, isVisible: Bool) -> Bool {
         shouldHoldInFlightToastFade(isDismissing: isDismissing, isVisible: isVisible)
     }
@@ -1029,10 +1943,11 @@ public enum LauncherLayout {
         isVisible: Bool,
         reducesMotion: Bool
     ) -> Bool {
-        reducesMotion && shouldSnapInFlightLauncherPresence(
-            isDismissing: isDismissing,
-            isVisible: isVisible
-        )
+        shouldSnapDragLiftForReducedMotion(reducesMotion: reducesMotion)
+            && shouldSnapInFlightLauncherPresence(
+                isDismissing: isDismissing,
+                isVisible: isVisible
+            )
     }
 
     /// The folder panel fades and scales as it opens or closes. The grid
@@ -1069,6 +1984,27 @@ public enum LauncherLayout {
     /// them. An open, reduced motion, and a centered pop keep one curve.
     public static func folderCloseVeilUsesLateDissolve(tracksIcon: Bool, closing: Bool) -> Bool {
         tracksIcon && closing
+    }
+
+    /// Reduced motion: folder backdrop (grid veil) open/close snaps — no
+    /// 0.12s opacity half-fade. Full motion still fades with scale/blur.
+    public static func shouldSnapFolderBackdropForReducedMotion(
+        reducesMotion: Bool
+    ) -> Bool {
+        reducesMotion
+    }
+
+    /// Duration of the backdrop opacity/scale/blur flight. Zero when reduced
+    /// motion snaps. Otherwise prefers a tracked panel motion duration, else
+    /// the fallback chrome clock.
+    public static func folderBackdropFadeDuration(
+        reducesMotion: Bool,
+        motionDuration: TimeInterval?
+    ) -> TimeInterval {
+        if shouldSnapFolderBackdropForReducedMotion(reducesMotion: reducesMotion) {
+            return 0
+        }
+        return motionDuration ?? folderChromeFallbackDuration
     }
 
     public static func folderBackdropStyle(open: Bool, reducesMotion: Bool) -> FolderBackdropStyle {
@@ -1188,24 +2124,42 @@ public enum LauncherLayout {
     public static let folderChromeTravelX2: CGFloat = 0.3
     public static let folderChromeTravelY2: CGFloat = 1
     public static let folderChromeFallbackDuration: TimeInterval = 0.22
-    public static let folderChromeReducedDuration: TimeInterval = 0.12
+    /// Reduced motion snaps panel open/close (no opacity half-fade). Kept as a
+    /// named token so collapse/dissolve helpers share one duration policy.
+    public static let folderChromeReducedDuration: TimeInterval = 0
     public static let folderChromeFallbackScale: CGFloat = 0.92
     public static let folderChromeMinimumScale: CGFloat = 0.12
     public static let folderChromeMaximumScale: CGFloat = 0.86
+
+    /// Reduced motion: folder panel open/close snaps (no 0.12s opacity half-fade).
+    public static func shouldSnapFolderChromeForReducedMotion(
+        reducesMotion: Bool
+    ) -> Bool {
+        reducesMotion
+    }
+
+    /// Duration carried on reduced-motion chrome collapse / dissolve. Zero so
+    /// Direct parks then snaps instead of half-fading.
+    public static func folderChromeFadeDuration(reducesMotion: Bool) -> TimeInterval {
+        if shouldSnapFolderChromeForReducedMotion(reducesMotion: reducesMotion) {
+            return folderChromeReducedDuration
+        }
+        return folderChromeFallbackDuration
+    }
 
     public static func folderChromeCollapse(
         panelFrame: CGRect,
         iconFrame: CGRect?,
         reducesMotion: Bool
     ) -> FolderChromeCollapse {
-        if reducesMotion {
+        if shouldSnapFolderChromeForReducedMotion(reducesMotion: reducesMotion) {
             return FolderChromeCollapse(
                 scale: 1,
                 translationX: 0,
                 translationY: 0,
                 animatesTransform: false,
                 panelOpacity: 0,
-                duration: folderChromeReducedDuration,
+                duration: folderChromeFadeDuration(reducesMotion: true),
                 tracksIcon: false,
                 collapsedCornerRadius: folderPanelCornerRadius
             )
@@ -1405,6 +2359,21 @@ public enum LauncherLayout {
 
     public static let folderDissolveFlightDuration: TimeInterval = folderChromeTravelDuration
 
+    /// Reduced motion: folder-dissolve icon scatter snaps (no flyer travel).
+    public static func shouldSnapDissolveScatterForReducedMotion(
+        reducesMotion: Bool
+    ) -> Bool {
+        reducesMotion
+    }
+
+    /// Scatter flight duration. Zero when reduced motion snaps.
+    public static func dissolveScatterTravelDuration(reducesMotion: Bool) -> TimeInterval {
+        if shouldSnapDissolveScatterForReducedMotion(reducesMotion: reducesMotion) {
+            return 0
+        }
+        return folderDissolveFlightDuration
+    }
+
     /// Fly leftover icons from the open folder back onto the grid. Reduced
     /// motion does not travel. An unusable frame, a repeated id, or a hop
     /// shorter than a point stays put, so an icon that is already home does
@@ -1413,7 +2382,9 @@ public enum LauncherLayout {
         placements: [FolderDissolveIconPlacement],
         reducesMotion: Bool
     ) -> [FolderDissolveFlight] {
-        guard !reducesMotion else { return [] }
+        guard !shouldSnapDissolveScatterForReducedMotion(reducesMotion: reducesMotion) else {
+            return []
+        }
         var seen = Set<UUID>()
         var flights: [FolderDissolveFlight] = []
         for placement in placements {
@@ -1424,7 +2395,7 @@ public enum LauncherLayout {
                 itemID: placement.itemID,
                 source: placement.source,
                 destination: placement.destination,
-                duration: folderDissolveFlightDuration
+                duration: dissolveScatterTravelDuration(reducesMotion: false)
             ))
         }
         return flights
@@ -1435,14 +2406,14 @@ public enum LauncherLayout {
     /// the leftover icon flies to its cell. Same length as that flight.
     /// Reduced motion is the short fade with no scale.
     public static func folderDissolveChrome(reducesMotion: Bool) -> FolderChromeCollapse {
-        if reducesMotion {
+        if shouldSnapFolderChromeForReducedMotion(reducesMotion: reducesMotion) {
             return FolderChromeCollapse(
                 scale: 1,
                 translationX: 0,
                 translationY: 0,
                 animatesTransform: false,
                 panelOpacity: 0,
-                duration: folderChromeReducedDuration,
+                duration: folderChromeFadeDuration(reducesMotion: true),
                 tracksIcon: false,
                 collapsedCornerRadius: folderPanelCornerRadius
             )
@@ -1467,7 +2438,9 @@ public enum LauncherLayout {
         isDismissing: Bool,
         isVisible: Bool
     ) -> Bool {
-        !reducesMotion && isVisible && !isDismissing
+        !shouldSnapDissolveScatterForReducedMotion(reducesMotion: reducesMotion)
+            && isVisible
+            && !isDismissing
     }
 
     /// A flight completion is already on the main thread. Hopping to the next
@@ -1544,6 +2517,21 @@ public enum LauncherLayout {
 
     public static let folderPreviewGlyphFlightDuration: TimeInterval = folderChromeTravelDuration
 
+    /// Reduced motion: folder-preview glyph fly-in/return snaps (no flyer travel).
+    public static func shouldSnapFolderPreviewGlyphForReducedMotion(
+        reducesMotion: Bool
+    ) -> Bool {
+        reducesMotion
+    }
+
+    /// Glyph flight duration. Zero when reduced motion snaps.
+    public static func folderPreviewGlyphTravelDuration(reducesMotion: Bool) -> TimeInterval {
+        if shouldSnapFolderPreviewGlyphForReducedMotion(reducesMotion: reducesMotion) {
+            return 0
+        }
+        return folderPreviewGlyphFlightDuration
+    }
+
     /// Fly the preview glyphs into the open folder. Reduced motion does not
     /// travel. An unusable frame, a repeated id, or a hop shorter than a
     /// point stays put. Icons start together; a stagger would break the one gesture.
@@ -1551,7 +2539,9 @@ public enum LauncherLayout {
         placements: [FolderPreviewGlyphPlacement],
         reducesMotion: Bool
     ) -> [FolderPreviewGlyphFlight] {
-        guard !reducesMotion else { return [] }
+        guard !shouldSnapFolderPreviewGlyphForReducedMotion(reducesMotion: reducesMotion) else {
+            return []
+        }
         var seen = Set<UUID>()
         var flights: [FolderPreviewGlyphFlight] = []
         for placement in placements {
@@ -1562,7 +2552,7 @@ public enum LauncherLayout {
                 itemID: placement.itemID,
                 source: placement.source,
                 destination: placement.destination,
-                duration: folderPreviewGlyphFlightDuration
+                duration: folderPreviewGlyphTravelDuration(reducesMotion: false)
             ))
         }
         return flights
@@ -1570,14 +2560,17 @@ public enum LauncherLayout {
 
     /// Glyphs fly only when the panel itself is growing out of the preview.
     /// A centered pop has no plate to leave. The launcher fade must not grow
-    /// a new flight underneath it.
+    /// a new flight underneath it. Reduced motion snaps (no flyers).
     public static func shouldPlayFolderPreviewGlyphFlight(
         reducesMotion: Bool,
         isDismissing: Bool,
         isVisible: Bool,
         tracksIcon: Bool
     ) -> Bool {
-        tracksIcon && !reducesMotion && isVisible && !isDismissing
+        tracksIcon
+            && !shouldSnapFolderPreviewGlyphForReducedMotion(reducesMotion: reducesMotion)
+            && isVisible
+            && !isDismissing
     }
 
     /// Fly the open folder's icons back onto the preview plate. `source` is
@@ -1634,6 +2627,9 @@ public enum LauncherLayout {
         opening
     }
 
+    /// CAAnimation key for Direct's overflow open fade (icon + title).
+    public static let folderOverflowOpenFadeAnimationKey = "overflow-open-fade"
+
     /// Two app icons becoming a folder. The icon that was already on the grid
     /// lands in `destinations[0]`, the one that was dropped in `destinations[1]`.
     /// Those rects are the preview plate's first two glyphs. The clock matches
@@ -1654,24 +2650,41 @@ public enum LauncherLayout {
         }
     }
 
+    /// Reduced motion: folder-merge preview landings snap (no flyer travel).
+    public static func shouldSnapFolderMergePreviewForReducedMotion(
+        reducesMotion: Bool
+    ) -> Bool {
+        reducesMotion
+    }
+
+    /// Merge-preview landing duration. Zero when reduced motion snaps.
+    public static func folderMergePreviewTravelDuration(reducesMotion: Bool) -> TimeInterval {
+        if shouldSnapFolderMergePreviewForReducedMotion(reducesMotion: reducesMotion) {
+            return 0
+        }
+        return folderChromeTravelDuration
+    }
+
     public static func folderMergePreviewLandings(
         resident: CGRect,
         incoming: CGRect,
         destinations: [CGRect],
         reducesMotion: Bool
     ) -> [FolderMergePreviewLanding] {
-        guard !reducesMotion, destinations.count >= 2 else { return [] }
+        guard !shouldSnapFolderMergePreviewForReducedMotion(reducesMotion: reducesMotion),
+              destinations.count >= 2 else { return [] }
         let pairs = [(resident, destinations[0]), (incoming, destinations[1])]
         guard pairs.allSatisfy({ source, destination in
             usableChromeFrame(source)
                 && usableChromeFrame(destination)
                 && !framesNearlyEqual(source, destination)
         }) else { return [] }
+        let duration = folderMergePreviewTravelDuration(reducesMotion: false)
         return pairs.map { source, destination in
             FolderMergePreviewLanding(
                 source: source,
                 destination: destination,
-                duration: folderChromeTravelDuration
+                duration: duration
             )
         }
     }
@@ -1746,6 +2759,21 @@ public enum LauncherLayout {
         return glyphsBefore
     }
 
+    /// Reduced motion: folder incoming-preview slot/center landings snap (no flyer travel).
+    public static func shouldSnapFolderIncomingPreviewForReducedMotion(
+        reducesMotion: Bool
+    ) -> Bool {
+        reducesMotion
+    }
+
+    /// Incoming-preview landing duration. Zero when reduced motion snaps.
+    public static func folderIncomingPreviewTravelDuration(reducesMotion: Bool) -> TimeInterval {
+        if shouldSnapFolderIncomingPreviewForReducedMotion(reducesMotion: reducesMotion) {
+            return 0
+        }
+        return folderChromeTravelDuration
+    }
+
     /// The dropped icon flies into that empty preview slot. The clock matches
     /// the other folder flights. Reduced motion does not travel. A short hop
     /// or a bad frame lands nowhere, and the caller keeps the older flight
@@ -1755,14 +2783,16 @@ public enum LauncherLayout {
         destination: CGRect,
         reducesMotion: Bool
     ) -> FolderMergePreviewLanding? {
-        guard !reducesMotion else { return nil }
+        guard !shouldSnapFolderIncomingPreviewForReducedMotion(reducesMotion: reducesMotion) else {
+            return nil
+        }
         guard usableChromeFrame(incoming),
               usableChromeFrame(destination),
               !framesNearlyEqual(incoming, destination) else { return nil }
         return FolderMergePreviewLanding(
             source: incoming,
             destination: destination,
-            duration: folderChromeTravelDuration
+            duration: folderIncomingPreviewTravelDuration(reducesMotion: false)
         )
     }
 
@@ -1795,14 +2825,14 @@ public enum LauncherLayout {
         well: CGRect,
         reducesMotion: Bool
     ) -> FolderMergePreviewLanding? {
-        guard !reducesMotion,
+        guard !shouldSnapFolderIncomingPreviewForReducedMotion(reducesMotion: reducesMotion),
               let destination = folderPreviewPlateCenterFrame(well: well),
               usableChromeFrame(incoming),
               !framesNearlyEqual(incoming, destination) else { return nil }
         return FolderMergePreviewLanding(
             source: incoming,
             destination: destination,
-            duration: folderChromeTravelDuration
+            duration: folderIncomingPreviewTravelDuration(reducesMotion: false)
         )
     }
 
@@ -1917,6 +2947,22 @@ public enum LauncherLayout {
         )
     }
 
+    /// Reduced motion: drop-landing start/flight snaps (no travel from lift).
+    public static func shouldSnapDropLandingForReducedMotion(
+        reducesMotion: Bool
+    ) -> Bool {
+        reducesMotion
+    }
+
+    /// Flight duration. Zero when reduced motion snaps so Direct commits
+    /// the cell immediately instead of running a flyer.
+    public static func dropLandingTravelDuration(reducesMotion: Bool) -> TimeInterval {
+        if shouldSnapDropLandingForReducedMotion(reducesMotion: reducesMotion) {
+            return 0
+        }
+        return dropLandingFlightDuration
+    }
+
     /// Where the released drag picture already is. The drag image is the cell
     /// plus the lift (scale and shadow). The flight has to leave from that
     /// picture, not from the smaller cell, or the icon pops when the drag
@@ -1924,7 +2970,10 @@ public enum LauncherLayout {
     /// A cell that cannot be measured is returned unchanged.
     public static func dropLandingStartFrame(cell: CGRect, reducesMotion: Bool) -> CGRect {
         guard usableChromeFrame(cell) else { return cell }
-        let presentation = dragLiftPresentation(for: cell.size, reducesMotion: reducesMotion)
+        let presentation = dragLiftPresentation(
+            for: cell.size,
+            reducesMotion: shouldSnapDropLandingForReducedMotion(reducesMotion: reducesMotion)
+        )
         let canvas = presentation.canvasFrame(centering: cell)
         return CGRect(
             origin: CGPoint(
@@ -2029,29 +3078,31 @@ public enum LauncherLayout {
         to destination: CGRect,
         reducesMotion: Bool
     ) -> DropLandingFlight? {
-        guard !reducesMotion,
+        guard !shouldSnapDropLandingForReducedMotion(reducesMotion: reducesMotion),
               usableChromeFrame(source),
               usableChromeFrame(destination),
               !framesNearlyEqual(source, destination) else { return nil }
         return DropLandingFlight(
             source: source,
             destination: destination,
-            duration: dropLandingFlightDuration
+            duration: dropLandingTravelDuration(reducesMotion: false)
         )
     }
 
     /// A reorder flight only while the launcher is up. The fade must not
     /// grow a new one underneath it. A hidden window shows the cell in place.
+    /// Reduced motion snaps (no flyer).
     public static func shouldPlayDropLanding(
         reducesMotion: Bool,
         isDismissing: Bool,
         isVisible: Bool
     ) -> Bool {
-        shouldPlayFolderDissolveScatter(
-            reducesMotion: reducesMotion,
-            isDismissing: isDismissing,
-            isVisible: isVisible
-        )
+        !shouldSnapDropLandingForReducedMotion(reducesMotion: reducesMotion)
+            && shouldPlayFolderDissolveScatter(
+                reducesMotion: false,
+                isDismissing: isDismissing,
+                isVisible: isVisible
+            )
     }
 
     /// Same hold as the merge flight. The drag session can end during the
@@ -2116,11 +3167,28 @@ public enum LauncherLayout {
         shouldHoldSearchChromeAnimation(isDismissing: isDismissing, isVisible: isVisible)
     }
 
+    /// Reduced motion: dissolved-folder grid fade-in snaps (no 0.12s half-fade).
+    /// Full motion still fades the grid back in over `dissolvedGridFadeDuration`.
+    public static func shouldSnapDissolvedGridFadeForReducedMotion(
+        reducesMotion: Bool
+    ) -> Bool {
+        reducesMotion
+    }
+
+    /// Duration of the grid fade-in after a folder dissolves. Zero when
+    /// reduced motion snaps so the tiles appear at once.
+    public static func dissolvedGridFadeDuration(reducesMotion: Bool) -> TimeInterval {
+        if shouldSnapDissolvedGridFadeForReducedMotion(reducesMotion: reducesMotion) {
+            return 0
+        }
+        return 0.22
+    }
+
     /// Changing reduced motion snaps a dissolved-folder fade that is already
-    /// running. Reduced motion uses a shorter fade, and turning motion back
-    /// on does not finish the old one either. Both land on a fully opaque
-    /// grid. A launcher fade that is still on screen is holding the frame
-    /// already drawn, so this snap waits. Same hold as the fade.
+    /// running. Reduced motion has no fade, and turning motion back on does
+    /// not finish the old one either. Both land on a fully opaque grid. A
+    /// launcher fade that is still on screen is holding the frame already
+    /// drawn, so this snap waits. Same hold as the fade.
     public static func shouldSnapInFlightDissolvedGridFade(isDismissing: Bool, isVisible: Bool) -> Bool {
         !shouldHoldDissolvedGridFade(isDismissing: isDismissing, isVisible: isVisible)
     }
@@ -2305,18 +3373,37 @@ public enum LauncherLayout {
         shouldHoldPageSlide(isDismissing: isDismissing, isVisible: isVisible)
     }
 
-    /// Do not start that pulse during the fade. Reduced motion has none.
-    /// The "正在启动…" label is separate and is not a scale.
+    /// Do not start that pulse during the fade. Reduced motion snaps (no
+    /// scale travel). The "正在启动…" label is separate and is not a scale.
     /// The scale is 1 → `launchPressScale` → 1. Each half is
     /// `launchPressHalfDuration`, so the whole press is about 0.09s.
     /// The layer anchor is the view origin. Pair the scale with
     /// `originPinnedScaleTranslation` or the icon slides toward that corner.
     public static let launchPressScale: CGFloat = 0.93
     public static let launchPressHalfDuration: TimeInterval = 0.045
+    /// CAAnimation key for Direct's tile launch-press pulse.
+    public static let launchFeedbackAnimationKey = "launch-feedback"
 
-    /// Do not start that pulse during the fade. Reduced motion has none.
+    /// Reduced motion: launch-press scale feedback snaps to resting identity
+    /// (no 1→0.93→1 pulse / half-fade travel).
+    public static func shouldSnapLaunchPressForReducedMotion(
+        reducesMotion: Bool
+    ) -> Bool {
+        reducesMotion
+    }
+
+    /// Half-duration of the press pulse. Zero when reduced motion snaps so
+    /// Direct does not schedule a scale flight.
+    public static func launchPressPulseHalfDuration(reducesMotion: Bool) -> TimeInterval {
+        if shouldSnapLaunchPressForReducedMotion(reducesMotion: reducesMotion) {
+            return 0
+        }
+        return launchPressHalfDuration
+    }
+
+    /// Do not start that pulse during the fade. Reduced motion snaps instead.
     public static func shouldPlayLaunchFeedback(isDismissing: Bool, reducesMotion: Bool) -> Bool {
-        !isDismissing && !reducesMotion
+        !isDismissing && !shouldSnapLaunchPressForReducedMotion(reducesMotion: reducesMotion)
     }
 
     /// Changing reduced motion snaps a press pulse that is already running.
@@ -2340,13 +3427,51 @@ public enum LauncherLayout {
         shouldHoldLaunchFeedback(isDismissing: isDismissing, isVisible: isVisible)
     }
 
-    /// Do not start that slide during the fade. Reduced motion never slides.
+    /// Reduced motion: neighbor reorder slide snaps to the gap (no 0.18s spring).
+    public static func shouldSnapReorderSlideForReducedMotion(
+        reducesMotion: Bool
+    ) -> Bool {
+        reducesMotion
+    }
+
+    /// Duration policy for the reorder spring. Zero when reduced motion snaps.
+    public static func reorderSlideSpringDuration(reducesMotion: Bool) -> TimeInterval {
+        if shouldSnapReorderSlideForReducedMotion(reducesMotion: reducesMotion) {
+            return 0
+        }
+        return reorderSlideDuration
+    }
+
+    /// Do not start that slide during the fade. Reduced motion snaps instead.
     public static func shouldAnimateReorderSlide(
         isDismissing: Bool,
         isVisible: Bool,
         reducesMotion: Bool
     ) -> Bool {
-        !reducesMotion && !shouldHoldReorderSlide(isDismissing: isDismissing, isVisible: isVisible)
+        !shouldSnapReorderSlideForReducedMotion(reducesMotion: reducesMotion)
+            && !shouldHoldReorderSlide(isDismissing: isDismissing, isVisible: isVisible)
+    }
+
+    /// Drag-reorder layout frames can be empty for a turn. Snapping neighbors
+    /// to that provisional gap and then easing on the next turn flashes them.
+    /// Hold the translation already presented until frames are usable.
+    public static func shouldHoldReorderPresentationUntilFramesReady(
+        animated: Bool,
+        framesUsable: Bool
+    ) -> Bool {
+        animated && !framesUsable
+    }
+
+    public static func reorderFramesUsable(
+        slot: Int,
+        itemIndex: Int,
+        fromFrame: CGRect,
+        toFrame: CGRect
+    ) -> Bool {
+        if slot == itemIndex { return true }
+        guard fromFrame.size.width > 0, fromFrame.size.height > 0,
+              toFrame.size.width > 0, toFrame.size.height > 0 else { return false }
+        return fromFrame != toFrame
     }
 
     /// Changing reduced motion snaps a reorder slide that is already running.
@@ -2367,28 +3492,52 @@ public enum LauncherLayout {
         shouldHoldReorderSlide(isDismissing: isDismissing, isVisible: isVisible)
     }
 
+    /// Reduced motion: page-arrow hover opacity snaps (no 0.2s half-fade).
+    /// Does not retune page-turn, swipe, or indicator transitions.
+    public static func shouldSnapPageButtonHoverForReducedMotion(
+        reducesMotion: Bool
+    ) -> Bool {
+        reducesMotion
+    }
+
     /// Do not start that fade during the launcher fade, while the window is
     /// already hidden, or when the user asked for less motion. Reduced motion
-    /// snaps to hover or focus. The unreduced fade is the page-turn ease-out
-    /// below, not the system ease-in.
+    /// snaps to hover or focus. The unreduced fade is hover ease-out only —
+    /// not the page slide.
     public static func shouldAnimatePageButtonHover(
         isDismissing: Bool,
         isVisible: Bool,
         reducesMotion: Bool
     ) -> Bool {
-        !reducesMotion
+        !shouldSnapPageButtonHoverForReducedMotion(reducesMotion: reducesMotion)
             && isVisible
             && !shouldHoldPageButtonHover(isDismissing: isDismissing, isVisible: isVisible)
     }
 
     /// Hover on a page arrow. The old fade was the system default: it eased
     /// in, so the first moments barely moved, and the plate was cleared in
-    /// the same turn the arrow started leaving. This one uses the page-turn
-    /// ease-out (`pageTurnCurveProgress`) and keeps the plate painted. The
+    /// the same turn the arrow started leaving. Keep its prompt ease-out
+    /// separate from the longer page slide, and keep the plate painted. The
     /// control opacity carries the plate, so the two leave together.
     public static let pageButtonHoverFadeDuration: TimeInterval = 0.2
+
+    /// Hover opacity flight only. Zero when reduced motion snaps; full motion
+    /// keeps `pageButtonHoverFadeDuration`. Not used by page-turn / presence.
+    public static func pageButtonHoverOpacityFadeDuration(
+        reducesMotion: Bool
+    ) -> TimeInterval {
+        if shouldSnapPageButtonHoverForReducedMotion(reducesMotion: reducesMotion) {
+            return 0
+        }
+        return pageButtonHoverFadeDuration
+    }
+
     public static let pageButtonHoverShownOpacity: CGFloat = 0.9
     public static let pageButtonHoverPlateAlpha: CGFloat = 0.22
+    public static let pageButtonHoverCurveX1: CGFloat = 0.2
+    public static let pageButtonHoverCurveY1: CGFloat = 0.8
+    public static let pageButtonHoverCurveX2: CGFloat = 0.2
+    public static let pageButtonHoverCurveY2: CGFloat = 1
 
     public struct PageButtonHoverFade: Equatable, Sendable {
         public var opacity: CGFloat
@@ -2426,13 +3575,19 @@ public enum LauncherLayout {
 
     /// Clock time 0...1 along a hover fade. Appearing goes hidden to shown.
     /// Leaving goes shown to hidden. The plate alpha stays painted for the
-    /// whole fade; only the control opacity hides it. Sampling the page-turn
-    /// curve means the first slice of the clock already moves.
+    /// whole fade; only the control opacity hides it. The first slice of the
+    /// hover clock must already move, independent of the page slide's pace.
     public static func pageButtonHoverSample(
         appearing: Bool,
         time: CGFloat
     ) -> (controlOpacity: CGFloat, plateAlpha: CGFloat) {
-        let progress = pageTurnCurveProgress(time)
+        let bounded = min(max(time, 0), 1)
+        let parameter = unitBezierParameter(
+            forX: bounded, x1: pageButtonHoverCurveX1, x2: pageButtonHoverCurveX2
+        )
+        let progress = unitBezierComponent(
+            parameter, c1: pageButtonHoverCurveY1, c2: pageButtonHoverCurveY2
+        )
         let control = appearing
             ? pageButtonHoverShownOpacity * progress
             : pageButtonHoverShownOpacity * (1 - progress)
@@ -2455,6 +3610,159 @@ public enum LauncherLayout {
     /// `show()` during the fade does not resign key, so that draft stays.
     public static func shouldAbandonFolderRenameOnResignKey(isEditingTitle: Bool) -> Bool {
         isEditingTitle
+    }
+
+    /// Open/close chrome keys that mean the panel is still traveling or
+    /// fading. Reduced motion skips scale but keeps the fade — the title must
+    /// stay non-clickable and AX-hidden until that fade lands.
+    public static let folderTitleBlockingChromeAnimationKeys: Set<String> = [
+        "folderOpenScale",
+        "folderCloseScale",
+        "folderOpenFade",
+        "folderCloseFade"
+    ]
+
+    /// Open/close chrome still traveling or fading (scale and/or fade).
+    /// Shared by title pointer/AX and folder-member focus fill.
+    public static func folderPanelChromeInFlight(
+        isAnimatingClose: Bool,
+        panelAnimationKeys: [String]
+    ) -> Bool {
+        if isAnimatingClose { return true }
+        return panelAnimationKeys.contains {
+            folderTitleBlockingChromeAnimationKeys.contains($0)
+        }
+    }
+
+    /// Focused folder-member keyboard fill vs panel chrome flight.
+    /// In flight → idle (0), matching title pointer/AX gates; after land → 8%.
+    public static func folderMemberFocusFillAlpha(
+        focused: Bool,
+        panelChromeInFlight: Bool
+    ) -> CGFloat {
+        tileChromeFillAlpha(
+            isLaunching: false,
+            isDropTarget: false,
+            focused: focused,
+            selected: false,
+            folderPanelChromeInFlight: panelChromeInFlight
+        )
+    }
+
+
+    /// Pointer editing (and AX advertisement without an editor) wait until
+    /// open/close chrome has landed. A keyboard field editor already up stays
+    /// exposed through `folderTitleAccessibilityHidden`.
+    /// Who holds the keyboard when folder open chrome lands.
+    public enum FolderOpenFocusOwner: Equatable, Sendable {
+        /// Grid / search / window — not inside the folder overlay.
+        case outsideOverlay
+        /// A folder member tile (or its descendant).
+        case memberTile
+        /// Title field / field editor / close button.
+        case titleOrClose
+        /// Overlay chrome that is not a deliberate control (collection, panel).
+        case otherOverlayChrome
+    }
+
+    /// What to do with keyboard focus after open chrome lands.
+    public enum FolderOpenFocusHandoff: Equatable, Sendable {
+        /// Move focus to the first member tile.
+        case focusFirstMember
+        /// Keep the focused member; re-apply focus fill now that chrome is idle.
+        case refreshMemberChrome
+        /// Leave title / close alone.
+        case preserveControl
+    }
+
+    /// Title and close keep the keyboard; stray overlay chrome does not steal
+    /// the first-member handoff. A member already focused only needs a chrome refresh.
+    public static func folderOpenFocusHandoff(
+        owner: FolderOpenFocusOwner
+    ) -> FolderOpenFocusHandoff {
+        switch owner {
+        case .outsideOverlay, .otherOverlayChrome:
+            return .focusFirstMember
+        case .memberTile:
+            return .refreshMemberChrome
+        case .titleOrClose:
+            return .preserveControl
+        }
+    }
+
+    /// Grid focus after close waits for close chrome to land (mirror open).
+    /// Snap/immediate close still goes through the land callback on the same turn.
+    public static func folderCloseShouldRestoreGridFocusOnChromeLand(
+        restoreFocusRequested: Bool
+    ) -> Bool {
+        restoreFocusRequested
+    }
+
+    /// Open chrome landed and the folder has no members: put the keyboard on
+    /// the title (rename / VoiceOver) instead of leaving focus nowhere or on
+    /// an empty collection view. Non-empty folders keep first-member-only.
+    public static func folderOpenEmptyFocusesTitle(memberCount: Int) -> Bool {
+        memberCount == 0
+    }
+
+    /// After title edit ends: first member when present; empty folders prefer
+    /// the title over an empty collection view (then close as last resort).
+    public enum FolderTitleEndFocusTarget: Equatable, Sendable {
+        case firstMember
+        case title
+        case close
+    }
+
+    public static func folderTitleEndFocusTarget(memberCount: Int) -> FolderTitleEndFocusTarget {
+        memberCount > 0 ? .firstMember : .title
+    }
+
+    /// Folder overlay members and close refuse new Tab/keyboard focus while
+    /// open/close chrome travels — same window as the title keyboard gate —
+    /// so Tab cannot land on members before first-member handoff (or after
+    /// close starts, before grid restore lands).
+    public static func folderOverlayKeyboardFocusAvailable(
+        panelChromeInFlight: Bool
+    ) -> Bool {
+        !panelChromeInFlight
+    }
+
+    /// Key-view *list* omits overlay controls only while closing (grid loop
+    /// owns Tab). During open the list stays so the loop is ready when chrome
+    /// lands and members begin accepting focus again.
+    public static func folderOverlayKeyViewsShouldIncludeControls(
+        isAnimatingClose: Bool
+    ) -> Bool {
+        !isAnimatingClose
+    }
+
+    public static func folderTitlePointerEditingAvailable(
+        isAnimatingClose: Bool,
+        panelAnimationKeys: [String]
+    ) -> Bool {
+        !folderPanelChromeInFlight(
+            isAnimatingClose: isAnimatingClose,
+            panelAnimationKeys: panelAnimationKeys
+        )
+    }
+
+    /// Match hit-testing: advertise the title only when a click could begin
+    /// editing, or when a keyboard editor is already active.
+    public static func folderTitleAccessibilityHidden(
+        baseHidden: Bool,
+        hasFieldEditor: Bool,
+        pointerEditingAvailable: Bool
+    ) -> Bool {
+        baseHidden || (!hasFieldEditor && !pointerEditingAvailable)
+    }
+
+    /// Tab/keyboard focus waits for the same chrome landing as pointer edits.
+    /// An editor already up stays focusable so Escape/Return still work mid-close.
+    public static func folderTitleKeyboardFocusAvailable(
+        hasFieldEditor: Bool,
+        pointerEditingAvailable: Bool
+    ) -> Bool {
+        hasFieldEditor || pointerEditingAvailable
     }
 
     /// Losing key ends the search field editor. Unfinished pinyin is dropped
@@ -2588,6 +3896,65 @@ public enum LauncherLayout {
         !shouldHoldInFlightToastFade(isDismissing: isDismissing, isVisible: isVisible)
     }
 
+    /// Toast show/hide opacity travel. Matches the former animator() duration.
+    public static let toastFadeDuration: TimeInterval = 0.12
+    /// CAAnimation key for Direct toast opacity fades (presentation-backed).
+    public static let toastFadeAnimationKey = "toast-fade"
+
+    /// Hidden toast must clear opacity before unhide (parity with status /
+    /// settings feedback / footer), or the first frame flashes solid.
+    public static func toastShouldClearOpacityBeforeUnhide(
+        willShow: Bool,
+        currentlyHidden: Bool
+    ) -> Bool {
+        willShow && currentlyHidden
+    }
+
+    /// Hide fade interrupted (newer toast / generation bump): still unhidden
+    /// but near-transparent. Fade back from presentation — do not snap to 0
+    /// then up (blink), matching status/footer/settings restore.
+    public static func toastShouldRestoreOpacityWhenAlreadyShown(
+        currentlyHidden: Bool,
+        currentOpacity: CGFloat
+    ) -> Bool {
+        !currentlyHidden && currentOpacity < 0.99
+    }
+
+
+    /// VoiceOver: announce a toast once per distinct message. Repeating the
+    /// same progress line (or re-presenting it while still visible) stays quiet.
+    public static func toastShouldAnnounce(
+        message: String,
+        previousAnnounced: String,
+        toastWasHidden: Bool
+    ) -> Bool {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        if toastWasHidden { return true }
+        return trimmed != previousAnnounced
+    }
+
+    /// Progress / sticky toasts use medium; fleeting errors stay high.
+    public static func toastAnnouncementPriority(autoDismiss: Bool) -> Bool {
+        // true → high; false (progress) → medium. Mapped at the call site.
+        autoDismiss
+    }
+
+    /// An open folder is modal and owns the card. A toast already on screen
+    /// would float above the veil — dismiss it when the folder starts opening.
+    public static func shouldDismissToastWhenOpeningFolder(isToastVisible: Bool) -> Bool {
+        isToastVisible
+    }
+
+    /// While a folder is open or its close chrome is still traveling, a new
+    /// toast would sit above the veil. Defer until folder chrome is quiet.
+    public static func shouldPresentToastWhileFolderChromeQuiet(
+        folderOpen: Bool,
+        folderClosing: Bool
+    ) -> Bool {
+        !folderOpen && !folderClosing
+    }
+
     /// One mouse-wheel step. `holdDelay` is set when the step is real but the
     /// quiet period since the previous step has not elapsed. The caller must
     /// deliver that single direction when the delay ends; further steps in the
@@ -2646,6 +4013,12 @@ public enum LauncherLayout {
         let start = page * pageCapacity
         guard page >= 0, start < entries.count else { return [] }
         return Array(entries[start..<min(start + pageCapacity, entries.count)])
+    }
+
+    /// Top-level entry ids on `page` only (Command-A / current-page select-all).
+    /// Does not include other pages or folder members.
+    public static func itemIDs(onPage page: Int, from entries: [LauncherEntry]) -> [UUID] {
+        self.entries(onPage: page, from: entries).map(\.id)
     }
 
     /// Slot to focus on the destination page. `previousSlot` is nil when focus
@@ -2780,6 +4153,26 @@ public enum LauncherLayout {
         return trimmed
     }
 
+    /// Horizontal inset that centers a short search result row under the field.
+    /// Full rows and empty results keep `minimumInset` on both sides so dense
+    /// search stays on the same seven-column grid as the home pages.
+    public static func searchSectionHorizontalInset(
+        itemCount: Int,
+        columns: Int = pageColumns,
+        itemWidth: CGFloat,
+        interitemSpacing: CGFloat,
+        viewportWidth: CGFloat,
+        minimumInset: CGFloat = 8
+    ) -> CGFloat {
+        guard itemCount > 0, itemCount < max(columns, 1), itemWidth > 0 else {
+            return minimumInset
+        }
+        let rowWidth = CGFloat(itemCount) * itemWidth
+            + CGFloat(max(itemCount - 1, 0)) * interitemSpacing
+        let width = max(viewportWidth, 1)
+        return max(minimumInset, floor((width - rowWidth) / 2))
+    }
+
     /// Keep a scroll offset inside the document after results get shorter.
     /// A query change still belongs at the start; this only clamps.
     public static func clampedScrollOffset(
@@ -2813,6 +4206,87 @@ public enum LauncherLayout {
         if pageCount <= maxVisible { return Array(0..<pageCount) }
         let start = min(max(0, selectedPage - maxVisible / 2), pageCount - maxVisible)
         return Array(start..<(start + maxVisible))
+    }
+
+    /// Dots only appear when there are at least two pages. Search passes 0.
+    public static func pageIndicatorShouldShow(pageCount: Int) -> Bool {
+        pageCount >= 2
+    }
+
+    /// Entering search (or dropping below two pages) fades the dots with the
+    /// same clock as the search/grid crossfade. Reduced motion and a launcher
+    /// fade that is holding the frame snap instead.
+    public static func shouldAnimatePageIndicatorVisibility(
+        pageCount: Int,
+        currentlyShown: Bool,
+        reducesMotion: Bool,
+        holdsForLauncherFade: Bool
+    ) -> Bool {
+        let shouldShow = pageIndicatorShouldShow(pageCount: pageCount)
+        return shouldAnimatePagingChromeVisibility(
+            shouldShow: shouldShow,
+            currentlyShown: currentlyShown,
+            reducesMotion: reducesMotion,
+            holdsForLauncherFade: holdsForLauncherFade
+        )
+    }
+
+    /// Previous/next arrows share the search/grid fade clock with page dots.
+    public static func pageArrowShouldShow(hasMultiplePages: Bool, atUnavailableEdge: Bool) -> Bool {
+        hasMultiplePages && !atUnavailableEdge
+    }
+
+    public static func shouldAnimatePageArrowVisibility(
+        shouldShow: Bool,
+        currentlyShown: Bool,
+        reducesMotion: Bool,
+        holdsForLauncherFade: Bool
+    ) -> Bool {
+        shouldAnimatePagingChromeVisibility(
+            shouldShow: shouldShow,
+            currentlyShown: currentlyShown,
+            reducesMotion: reducesMotion,
+            holdsForLauncherFade: holdsForLauncherFade
+        )
+    }
+
+    /// Reduced motion: footer chrome / drag-hint presence snaps (opacity only;
+    /// not page-turn, swipe, or indicator selection).
+    public static func shouldSnapFooterChromeVisibilityForReducedMotion(
+        reducesMotion: Bool
+    ) -> Bool {
+        reducesMotion
+    }
+
+    /// Shared gate for page dots and page arrows when search (or page count)
+    /// makes them appear or disappear. Also used by footer chrome / drag-hint
+    /// presence fades. Reduced motion snaps (no opacity travel).
+    public static func shouldAnimatePagingChromeVisibility(
+        shouldShow: Bool,
+        currentlyShown: Bool,
+        reducesMotion: Bool,
+        holdsForLauncherFade: Bool
+    ) -> Bool {
+        guard shouldShow != currentlyShown else { return false }
+        if shouldSnapFooterChromeVisibilityForReducedMotion(reducesMotion: reducesMotion) {
+            return false
+        }
+        return !holdsForLauncherFade
+    }
+
+    /// Drag-hint label sits beside the page dots. Search and a closed layout hide it.
+    public static func footerDragHintShouldShow(
+        isSearching: Bool,
+        folderOpen: Bool,
+        isLayoutEditingEnabled: Bool,
+        hasEntries: Bool
+    ) -> Bool {
+        !isSearching && !folderOpen && isLayoutEditingEnabled && hasEntries
+    }
+
+    /// Whole footer (hints + page dots) hides while a folder is open.
+    public static func footerChromeShouldShow(folderOpen: Bool) -> Bool {
+        !folderOpen
     }
 
     public static func pageIndicatorSlots(
@@ -2982,6 +4456,114 @@ public enum LauncherLayout {
         return state
     }
 
+
+    /// One-shot top-level grid rearrange (settings). Folder membership is unchanged.
+    public enum GridRearrangeSort: String, Equatable, Sendable {
+        /// Localized display name (alias wins); folders use folder name.
+        case byName
+        /// System apps first, then everything else; name within each group.
+        case byKind
+    }
+
+    /// Confirm before one-key top-level rearrange. Cancel is first so Return/Esc
+    /// do not apply. Matches uninstall force-quit / related-cleanup alert policy.
+    public enum GridRearrangeConfirmAlert {
+        public static let cancelIsFirstButton = true
+        public static let messageTextKey = "重新排列主屏幕图标？"
+        public static func informativeTextKey(sort: GridRearrangeSort) -> String {
+            switch sort {
+            case .byName:
+                return "将按显示名称重排顶层图标；文件夹内应用不变。可在「恢复上次备份」撤销。"
+            case .byKind:
+                return "将把系统应用排在前面，其余按名称；文件夹内应用不变。可在「恢复上次备份」撤销。"
+            }
+        }
+        public static let cancelButtonTitleKey = "取消"
+        public static let confirmButtonTitleKey = "重新排列"
+        public static let cancelAccessibilityHelpKey = "取消，不改变当前布局"
+        public static let confirmAccessibilityHelpKey = "确认后重排顶层图标；可用恢复上次备份撤销"
+    }
+
+    /// Confirm before restoring the last automatic layout backup. Cancel first
+    /// so Return/Esc do not apply (parity with rearrange confirm).
+    public enum LayoutRestoreBackupConfirmAlert {
+        public static let cancelIsFirstButton = true
+        public static let messageTextKey = "恢复上次备份？"
+        public static let informativeTextKey = "将用自动保存前的布局替换当前主屏幕；再次点「恢复上次备份」可撤销本次恢复。"
+        public static let cancelButtonTitleKey = "取消"
+        public static let confirmButtonTitleKey = "恢复备份"
+        public static let cancelAccessibilityHelpKey = "取消，保留当前布局"
+        public static let confirmAccessibilityHelpKey = "确认后恢复上次自动备份；再次恢复可撤销"
+    }
+
+    /// Confirm before importing a layout JSON over the live grid. Cancel first
+    /// (parity with rearrange / restore-backup confirms). Shown after the open
+    /// panel returns a file.
+    public enum LayoutImportConfirmAlert {
+        public static let cancelIsFirstButton = true
+        public static let messageTextKey = "导入布局？"
+        public static let informativeTextKey = "将用所选 JSON 与当前应用列表合并后替换主屏幕布局。导入前会自动备份，可用「恢复上次备份」撤销。"
+        public static let cancelButtonTitleKey = "取消"
+        public static let confirmButtonTitleKey = "导入"
+        public static let cancelAccessibilityHelpKey = "取消，不导入文件"
+        public static let confirmAccessibilityHelpKey = "确认后导入所选布局；可用恢复上次备份撤销"
+    }
+
+    public static func gridRearrangeToastMessage(sort: GridRearrangeSort) -> String {
+        switch sort {
+        case .byName: return "已按名称重新排列"
+        case .byKind: return "已按类型重新排列"
+        }
+    }
+
+    /// Reorders only `orderedEntries`. Does not touch folder `itemIDs`, aliases,
+    /// or paging. Stable for equal names via UUID string.
+    public static func rearrangeTopLevelEntries(
+        in state: LayoutState,
+        catalog: [AppCandidate],
+        sort: GridRearrangeSort
+    ) -> LayoutState {
+        let byKey = AppCandidate.firstByDeduplicationKey(catalog)
+        func kindRank(for entry: LauncherEntry) -> Int {
+            switch entry {
+            case .folder:
+                return 1
+            case .app(let id):
+                guard let key = state.appKeys[id], let candidate = byKey[key] else { return 2 }
+                return isSystemApplication(candidate) ? 0 : 1
+            }
+        }
+        func displayName(for entry: LauncherEntry) -> String {
+            switch entry {
+            case .folder(let id):
+                return state.folders[id]?.name ?? id.uuidString
+            case .app(let id):
+                guard let key = state.appKeys[id] else { return id.uuidString }
+                if let alias = state.appAliases[key], !alias.isEmpty { return alias }
+                return byKey[key]?.displayName ?? id.uuidString
+            }
+        }
+        func tieBreak(_ entry: LauncherEntry) -> String {
+            entry.id.uuidString
+        }
+
+        var next = state
+        next.orderedEntries.sort { lhs, rhs in
+            if sort == .byKind {
+                let lk = kindRank(for: lhs)
+                let rk = kindRank(for: rhs)
+                if lk != rk { return lk < rk }
+            }
+            let nameOrder = displayName(for: lhs).localizedStandardCompare(displayName(for: rhs))
+            if nameOrder != .orderedSame { return nameOrder == .orderedAscending }
+            return tieBreak(lhs) < tieBreak(rhs)
+        }
+        if next.orderedEntries != state.orderedEntries {
+            next.updatedAt = .now
+        }
+        return next
+    }
+
     private static func isSystemApplication(_ candidate: AppCandidate) -> Bool {
         let path = candidate.canonicalURL.path
         return path.hasPrefix("/System/Applications/")
@@ -3016,6 +4598,17 @@ public enum LauncherLayout {
         return apps
     }
 
+    /// Deduplication keys of apps that sit on the top-level grid (not inside a folder).
+    /// Used so search can prefer those hits when match ranks tie.
+    public static func topLevelAppDeduplicationKeys(in state: LayoutState) -> Set<String> {
+        var keys = Set<String>()
+        for entry in state.orderedEntries {
+            guard case .app(let id) = entry, let key = state.appKeys[id] else { continue }
+            keys.insert(key)
+        }
+        return keys
+    }
+
     /// Apps in layout order, with each folder name inserted where that folder sits.
     /// Members stay in the same order `searchableApps` already uses.
     public static func searchHits(in state: LayoutState, catalog: [AppCandidate]) -> [LauncherSearchHit] {
@@ -3048,11 +4641,127 @@ public enum LauncherLayout {
         return hits
     }
 
+    /// Which centered empty chrome the grid area should show (PRD §2.7).
+    /// Search no-matches uses the grid area — not status-line only.
+    public enum LauncherEmptyChromeKind: Equatable, Sendable {
+        /// Catalog has no apps (rescan / cache actions).
+        case catalogUnavailable
+        /// User cancelled the first scan.
+        case catalogCancelled
+        /// Non-empty catalog, active search, zero hits (Esc clears).
+        case searchNoMatches
+    }
+
+    /// Decide empty chrome for the grid viewport. `nil` means hide empty chrome
+    /// (loading skeleton / status message / normal grid or results).
+    public static func emptyChromeKind(
+        isSearching: Bool,
+        presentedIsEmpty: Bool,
+        catalogIsEmpty: Bool,
+        isCatalogLoading: Bool,
+        catalogScanCancelled: Bool
+    ) -> LauncherEmptyChromeKind? {
+        if isCatalogLoading, catalogIsEmpty { return nil }
+        if catalogIsEmpty {
+            return catalogScanCancelled ? .catalogCancelled : .catalogUnavailable
+        }
+        if isSearching, presentedIsEmpty {
+            return .searchNoMatches
+        }
+        return nil
+    }
+
+    /// Folder that currently contains `appID` on the home grid, if any.
+    /// Used by search results to show where a member hit lives.
+    public static func containingFolderName(forAppID appID: UUID, in state: LayoutState) -> String? {
+        for folder in state.folders.values where folder.itemIDs.contains(appID) {
+            let trimmed = folder.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : folder.name
+        }
+        return nil
+    }
+
+    /// Two-line search title: primary app/alias name, optional folder context.
+    /// Empty / whitespace folder names omit the secondary line.
+    public static func searchHitTitle(
+        displayName: String,
+        containingFolderName: String?
+    ) -> String {
+        let primary = displayName
+        guard let raw = containingFolderName else { return primary }
+        let folder = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !folder.isEmpty else { return primary }
+        return primary + "\n" + folder
+    }
+
+    /// Accessibility / tooltip for a search app hit that lives in a folder.
+    public static func searchHitAccessibilityLabel(
+        displayName: String,
+        containingFolderName: String?
+    ) -> String {
+        guard let raw = containingFolderName else { return displayName }
+        let folder = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !folder.isEmpty else { return displayName }
+        return displayName + "，" + folder
+    }
+
+    /// Folder titles always keep a visible label. Whitespace-only or empty
+    /// drafts resolve back to `previous` (same rule `renameFolder` applies).
+    public static func resolvedFolderName(draft: String, previous: String) -> String {
+        let trimmed = String(draft.trimmingCharacters(in: .whitespacesAndNewlines).prefix(40))
+        return trimmed.isEmpty ? previous : trimmed
+    }
+
+    /// Finder/Launchpad-style rename: select the whole name when editing begins
+    /// so the next keystroke replaces it. Clicks after that place the caret.
+    public static let folderTitleSelectsAllOnBeginEditing = true
+
+    /// Alias alert rename: same select-all-on-begin policy as folder titles.
+    public static let aliasSelectsAllOnBeginEditing = true
+
+    /// Quiet edit affordance under the folder name (white hairline strength).
+    public static let folderTitleEditUnderlineAlpha: CGFloat = 0.55
+    public static let folderTitleEditUnderlineFadeAnimationKey = "folder-title-edit-underline"
+    /// Alias alert field uses the same fade clock / strength as the folder title.
+    public static let aliasEditUnderlineFadeAnimationKey = "alias-edit-underline"
+    public static let folderTitleEditUnderlineFadeDuration: TimeInterval = searchTransitionDuration
+    public static let aliasEditUnderlineFadeDuration: TimeInterval = searchTransitionDuration
+
+    public static func shouldAnimateFolderTitleEditUnderline(
+        fromOpacity: Float,
+        toOpacity: Float,
+        reducesMotion: Bool
+    ) -> Bool {
+        guard !reducesMotion else { return false }
+        return abs(fromOpacity - toOpacity) > 0.004
+    }
+
+    /// Pointer rename needs a double-click. Single-click does not open the
+    /// field editor (avoids accidental renames). Keyboard Tab/focus still edits.
+    public static func folderTitleShouldBeginEditingFromPointer(clickCount: Int) -> Bool {
+        clickCount >= 2
+    }
+
+    /// Pointer down outside the title while a rename is active cancels the
+    /// draft (same as Escape). The close button still commits via its action.
+    public static func folderTitleShouldCancelEditingOnOutsideClick(
+        isEditing: Bool,
+        clickIsOnTitle: Bool
+    ) -> Bool {
+        isEditing && !clickIsOnTitle
+    }
+
+    /// After a rename ends (Return commit, Escape cancel, or outside-click
+    /// cancel), prefer the first folder member for keyboard focus. Landing on
+    /// the empty collection view skips the focus fill and leaves Tab odd.
+    public static let folderTitleFocusesFirstMemberAfterEndingEdit = true
+
     public static func renameFolder(_ id: UUID, to name: String, in state: LayoutState) -> LayoutState {
         var state = state
-        let trimmed = String(name.trimmingCharacters(in: .whitespacesAndNewlines).prefix(40))
-        guard !trimmed.isEmpty, var folder = state.folders[id], folder.name != trimmed else { return state }
-        folder.name = trimmed
+        guard var folder = state.folders[id] else { return state }
+        let resolved = resolvedFolderName(draft: name, previous: folder.name)
+        guard folder.name != resolved else { return state }
+        folder.name = resolved
         state.folders[id] = folder
         state.updatedAt = .now
         return state
@@ -3070,6 +4779,294 @@ public enum LauncherLayout {
         }
         state.updatedAt = .now
         return state
+    }
+
+    /// Removes a successfully trashed app from layout identity (not a hide).
+    /// Clears alias and hidden marks so Settings cannot "restore" a missing bundle.
+    public static func forgetUninstalledApplication(withKey key: String, in state: LayoutState) -> LayoutState {
+        guard !key.isEmpty else { return state }
+        var state = state
+        state.hiddenAppKeys.remove(key)
+        state.appAliases.removeValue(forKey: key)
+        let removedIDs = Set(state.appKeys.compactMap { $0.value == key ? $0.key : nil })
+        state.orderedEntries.removeAll { entry in
+            if case .app(let id) = entry { return removedIDs.contains(id) }
+            return false
+        }
+        for folderID in Array(state.folders.keys) {
+            state.folders[folderID]?.itemIDs.removeAll { removedIDs.contains($0) }
+            dissolveIfNeeded(folderID, in: &state)
+        }
+        for id in removedIDs {
+            state.appKeys.removeValue(forKey: id)
+        }
+        state.updatedAt = .now
+        return state
+    }
+
+    /// Top-level entry ids (apps + folders) plus every folder member id.
+    /// Selection chrome may cover folder tiles and members; prune against this set.
+    public static func presentSelectableItemIDs(in state: LayoutState) -> Set<UUID> {
+        var ids = Set(state.orderedEntries.map(\.id))
+        ids.formUnion(state.folders.values.flatMap(\.itemIDs))
+        return ids
+    }
+
+    /// Drop selection ids that left the layout (hide, uninstall, reconcile, dissolve).
+    public static func prunedItemSelection(
+        _ selection: LauncherItemSelection,
+        in state: LayoutState
+    ) -> LauncherItemSelection {
+        selection.pruningAbsent(from: presentSelectableItemIDs(in: state))
+    }
+
+    /// Toast after hiding from the context menu (Settings can restore).
+    public static let hideApplicationToastHelpKey = "可在设置的「隐藏的应用」中恢复"
+
+    public static let hideApplicationToastMessageFormatKey = "已隐藏“%@”"
+
+    public static func hideApplicationToastMessage(displayName: String) -> String {
+        String(format: hideApplicationToastMessageFormatKey, displayName)
+    }
+
+    /// Plural toast after hiding several selected apps from the context menu.
+    public static let hideSelectedApplicationsToastMessageFormatKey = "已隐藏 %d 个应用"
+
+    public static func hideSelectedApplicationsToastMessage(count: Int) -> String {
+        String(format: hideSelectedApplicationsToastMessageFormatKey, max(count, 0))
+    }
+
+    /// App keys for batch hide, in selection order. Skips folder tiles and unknown ids.
+    public static func appKeysForBatchHide(
+        selection: LauncherItemSelection,
+        in state: LayoutState
+    ) -> [String] {
+        var keys: [String] = []
+        var seen = Set<String>()
+        for id in selection.orderedIDs {
+            guard state.folders[id] == nil,
+                  let key = state.appKeys[id],
+                  seen.insert(key).inserted else { continue }
+            keys.append(key)
+        }
+        return keys
+    }
+
+    /// Top-level app ids eligible for "move selection into new folder", selection order.
+    public static func topLevelAppIDsForBatchFolder(
+        selection: LauncherItemSelection,
+        in state: LayoutState
+    ) -> [UUID] {
+        let topLevelApps = Set(state.orderedEntries.compactMap { entry -> UUID? in
+            if case .app(let id) = entry { return id }
+            return nil
+        })
+        var unique: [UUID] = []
+        var seen = Set<UUID>()
+        for id in selection.orderedIDs where topLevelApps.contains(id) && seen.insert(id).inserted {
+            unique.append(id)
+        }
+        return unique
+    }
+
+    /// Hide several apps in one layout pass (compose of single-key hide).
+    public static func hideApplications(withKeys keys: [String], in state: LayoutState) -> LayoutState {
+        var state = state
+        var seen = Set<String>()
+        for key in keys where !key.isEmpty && seen.insert(key).inserted {
+            state = hideApplication(withKey: key, in: state)
+        }
+        return state
+    }
+
+    /// Build a new folder from ≥2 top-level apps. Preserves `orderedAppIDs` order inside the folder.
+    /// Inserts the folder at the earliest former index among those apps.
+    public static func createFolderFromTopLevelApps(
+        orderedAppIDs: [UUID],
+        in state: LayoutState,
+        name: String
+    ) -> Result<(state: LayoutState, folderID: UUID), LayoutMutationError> {
+        var seen = Set<UUID>()
+        var apps: [UUID] = []
+        for id in orderedAppIDs where seen.insert(id).inserted {
+            guard state.orderedEntries.contains(.app(id)) else { return .failure(.missingSource) }
+            guard state.folders[id] == nil else { return .failure(.nestedFolder) }
+            apps.append(id)
+        }
+        guard apps.count >= 2 else { return .failure(.missingSource) }
+
+        var state = state
+        var removalIndices: [Int] = []
+        for id in apps {
+            guard let index = state.orderedEntries.firstIndex(of: .app(id)) else {
+                return .failure(.missingSource)
+            }
+            removalIndices.append(index)
+        }
+        let insertAt = removalIndices.min() ?? 0
+        for index in removalIndices.sorted(by: >) {
+            state.orderedEntries.remove(at: index)
+        }
+        let folderID = uniqueFolderID(in: state)
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let folderName = trimmed.isEmpty ? "新建文件夹" : trimmed
+        state.folders[folderID] = LauncherFolder(id: folderID, name: folderName, itemIDs: apps)
+        state.orderedEntries.insert(.folder(folderID), at: min(insertAt, state.orderedEntries.count))
+        state.updatedAt = .now
+        return .success((state, folderID))
+    }
+
+
+    /// Top-level apps from `selection` that sit on the same page as `folderID`
+    /// and can be batch-moved into that existing folder (excludes the folder id).
+    /// Empty when the folder is missing or not on a page with other selected apps.
+    public static func topLevelAppIDsForBatchMoveIntoFolder(
+        selection: LauncherItemSelection,
+        folderID: UUID,
+        in state: LayoutState
+    ) -> [UUID] {
+        guard state.folders[folderID] != nil,
+              let folderIndex = state.orderedEntries.firstIndex(of: .folder(folderID)) else {
+            return []
+        }
+        let page = pageIndex(containingEntryAt: folderIndex)
+        let pageIDs = Set(itemIDs(onPage: page, from: state.orderedEntries))
+        guard pageIDs.contains(folderID) else { return [] }
+        return topLevelAppIDsForBatchFolder(selection: selection, in: state)
+            .filter { $0 != folderID && pageIDs.contains($0) }
+    }
+
+    /// Multi-select drag onto an existing folder tile: batch when the dragged
+    /// app is in the selection and ≥2 same-page top-level apps would move.
+    public static func shouldBatchMoveSelectionIntoFolder(
+        selection: LauncherItemSelection,
+        draggedID: UUID,
+        folderID: UUID,
+        in state: LayoutState
+    ) -> Bool {
+        guard state.folders[folderID] != nil else { return false }
+        guard selection.contains(draggedID) else { return false }
+        let apps = topLevelAppIDsForBatchMoveIntoFolder(
+            selection: selection,
+            folderID: folderID,
+            in: state
+        )
+        return apps.count >= 2 && apps.contains(draggedID)
+    }
+
+    /// Same-page top-level apps for a new folder from multi-select drop onto an
+    /// **app** tile: drop target first, then selected apps (selection order).
+    /// Excludes folders; empty when target is missing or is already a folder.
+    public static func topLevelAppIDsForBatchCreateFolder(
+        selection: LauncherItemSelection,
+        targetAppID: UUID,
+        in state: LayoutState
+    ) -> [UUID] {
+        guard state.folders[targetAppID] == nil,
+              state.orderedEntries.contains(.app(targetAppID)),
+              let targetIndex = state.orderedEntries.firstIndex(of: .app(targetAppID)) else {
+            return []
+        }
+        let page = pageIndex(containingEntryAt: targetIndex)
+        let pageIDs = Set(itemIDs(onPage: page, from: state.orderedEntries))
+        guard pageIDs.contains(targetAppID) else { return [] }
+
+        var apps: [UUID] = [targetAppID]
+        var seen: Set<UUID> = [targetAppID]
+        for id in topLevelAppIDsForBatchFolder(selection: selection, in: state)
+        where pageIDs.contains(id) && seen.insert(id).inserted {
+            apps.append(id)
+        }
+        return apps
+    }
+
+    /// Multi-select drag onto an **app** tile: batch-create a folder when the
+    /// dragged app is selected and ≥1 other same-page selected app will join
+    /// (plus the drop target). Single-item selection stays on `applyDrop` merge.
+    public static func shouldBatchCreateFolderFromSelection(
+        selection: LauncherItemSelection,
+        draggedID: UUID,
+        targetAppID: UUID,
+        in state: LayoutState
+    ) -> Bool {
+        guard draggedID != targetAppID else { return false }
+        guard selection.contains(draggedID) else { return false }
+        guard state.folders[targetAppID] == nil else { return false }
+        guard state.orderedEntries.contains(.app(targetAppID)) else { return false }
+        guard state.orderedEntries.contains(.app(draggedID)),
+              state.folders[draggedID] == nil else { return false }
+        guard let targetIndex = state.orderedEntries.firstIndex(of: .app(targetAppID)) else {
+            return false
+        }
+        let page = pageIndex(containingEntryAt: targetIndex)
+        let pageIDs = Set(itemIDs(onPage: page, from: state.orderedEntries))
+        let selectedOnPage = topLevelAppIDsForBatchFolder(selection: selection, in: state)
+            .filter { pageIDs.contains($0) && $0 != targetAppID }
+        // Need dragged + at least one other selected app on the page (not only clear single merge).
+        guard selectedOnPage.contains(draggedID), selectedOnPage.count >= 2 else { return false }
+        let apps = topLevelAppIDsForBatchCreateFolder(
+            selection: selection,
+            targetAppID: targetAppID,
+            in: state
+        )
+        return apps.count >= 3 && apps.contains(draggedID) && apps.contains(targetAppID)
+    }
+
+    /// Append top-level apps into an existing folder (selection / call order).
+    /// Folder tile stays; apps leave the top-level grid. Skips ids already inside.
+    public static func moveTopLevelApps(
+        _ orderedAppIDs: [UUID],
+        intoFolder folderID: UUID,
+        in state: LayoutState
+    ) -> Result<LayoutState, LayoutMutationError> {
+        guard state.folders[folderID] != nil else { return .failure(.missingTarget) }
+        guard state.orderedEntries.contains(.folder(folderID)) else {
+            return .failure(.missingTarget)
+        }
+
+        var seen = Set<UUID>()
+        var apps: [UUID] = []
+        for id in orderedAppIDs where seen.insert(id).inserted {
+            guard id != folderID else { continue }
+            guard state.folders[id] == nil else { return .failure(.nestedFolder) }
+            guard state.orderedEntries.contains(.app(id)) else {
+                return .failure(.missingSource)
+            }
+            if state.folders[folderID]?.itemIDs.contains(id) == true { continue }
+            apps.append(id)
+        }
+        guard !apps.isEmpty else { return .success(state) }
+
+        var state = state
+        for id in apps {
+            guard let index = state.orderedEntries.firstIndex(of: .app(id)) else {
+                return .failure(.missingSource)
+            }
+            _ = state.orderedEntries.remove(at: index)
+            guard var folder = state.folders[folderID] else { return .failure(.missingTarget) }
+            if !folder.itemIDs.contains(id) {
+                folder.itemIDs.append(id)
+                state.folders[folderID] = folder
+            }
+        }
+        state.updatedAt = .now
+        return .success(state)
+    }
+
+    /// After a tile is hidden, put keyboard on the next remaining id, else the previous.
+    public static func focusItemIDAfterHiding(
+        hiddenID: UUID,
+        remainingIDs: [UUID],
+        previousOrderedIDs: [UUID]
+    ) -> UUID? {
+        guard !remainingIDs.isEmpty else { return nil }
+        if let index = previousOrderedIDs.firstIndex(of: hiddenID) {
+            let after = previousOrderedIDs[(index + 1)...].first { remainingIDs.contains($0) }
+            if let after { return after }
+            let before = previousOrderedIDs[..<index].reversed().first { remainingIDs.contains($0) }
+            if let before { return before }
+        }
+        return remainingIDs.first
     }
 
     public static func hideApplication(withKey key: String, in state: LayoutState) -> LayoutState {

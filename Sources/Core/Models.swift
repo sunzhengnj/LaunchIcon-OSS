@@ -45,6 +45,8 @@ public struct AppCandidate: Codable, Hashable, Identifiable, Sendable {
 
 public struct CatalogScanReport: Sendable {
     public let candidates: [AppCandidate]
+    /// Other physical bundles hidden by bundle-ID deduplication.
+    public let duplicateCandidates: [AppCandidate]
     public let skippedPaths: [URL]
     public let unreadableMetadataPaths: [URL]
     public let unlaunchablePaths: [URL]
@@ -62,9 +64,11 @@ public struct CatalogScanReport: Sendable {
         skippedPaths: [URL],
         unreadableMetadataPaths: [URL] = [],
         unlaunchablePaths: [URL] = [],
+        duplicateCandidates: [AppCandidate] = [],
         wasCancelled: Bool = false
     ) {
         self.candidates = candidates
+        self.duplicateCandidates = duplicateCandidates
         self.skippedPaths = skippedPaths
         self.unreadableMetadataPaths = unreadableMetadataPaths
         self.unlaunchablePaths = unlaunchablePaths
@@ -264,11 +268,17 @@ public struct AppSearchIndex: Sendable {
 
     /// Same ranks as app filtering. A folder name uses the display-name ranks
     /// (exact, then prefix, then contains), including space-insensitive and
-    /// pinyin forms. Equal ranks keep the order of `hits`.
-    public func filter(_ hits: [LauncherSearchHit], query: String) -> [LauncherSearchHit] {
+    /// pinyin forms. At equal match rank, top-level apps (keys in
+    /// `topLevelKeys`) sort before folder members; folder name hits stay
+    /// between those tiers. Remaining ties keep `hits` order.
+    public func filter(
+        _ hits: [LauncherSearchHit],
+        query: String,
+        topLevelKeys: Set<String> = []
+    ) -> [LauncherSearchHit] {
         let normalizedQuery = Self.normalize(query.trimmingCharacters(in: .whitespacesAndNewlines))
         guard !normalizedQuery.isEmpty else { return hits }
-        return hits.enumerated().compactMap { offset, hit -> (Int, Int, LauncherSearchHit)? in
+        return hits.enumerated().compactMap { offset, hit -> (Int, Int, Int, LauncherSearchHit)? in
             let rank: Int?
             switch hit {
             case .app(let candidate):
@@ -277,13 +287,30 @@ public struct AppSearchIndex: Sendable {
                 rank = SearchText(name).matchRank(for: normalizedQuery)
             }
             guard let rank else { return nil }
-            return (rank, offset, hit)
+            let placement = Self.searchHitPlacementTier(hit, topLevelKeys: topLevelKeys)
+            return (rank, placement, offset, hit)
         }
         .sorted { lhs, rhs in
             if lhs.0 != rhs.0 { return lhs.0 < rhs.0 }
-            return lhs.1 < rhs.1
+            if lhs.1 != rhs.1 { return lhs.1 < rhs.1 }
+            return lhs.2 < rhs.2
         }
-        .map(\.2)
+        .map(\.3)
+    }
+
+    /// Equal-rank tie-break: top-level apps, then folder name hits, then folder members.
+    /// Empty `topLevelKeys` disables the tier (callers keep hit order only).
+    private static func searchHitPlacementTier(
+        _ hit: LauncherSearchHit,
+        topLevelKeys: Set<String>
+    ) -> Int {
+        guard !topLevelKeys.isEmpty else { return 0 }
+        switch hit {
+        case .app(let candidate):
+            return topLevelKeys.contains(candidate.deduplicationKey) ? 0 : 2
+        case .folder:
+            return 1
+        }
     }
 
     private static func indexAliases(_ aliases: [String: String]) -> [String: SearchText] {

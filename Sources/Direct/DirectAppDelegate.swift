@@ -10,6 +10,7 @@ func L(_ key: String) -> String {
 final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
     nonisolated(unsafe) private static var retained: DirectAppDelegate?
     private let hotKeyService = CarbonGlobalHotKeyService()
+    private let hotCornerMonitor = HotCornerMonitor()
     private let preferencesStore = LauncherPreferencesStore(
         suiteName: ProcessInfo.processInfo.environment["LAUNCHICON_TEST_PREFERENCES_SUITE"]
     )
@@ -20,6 +21,8 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
     private var hotKeyRegistered = false
     private var launcherController: LauncherWindowController?
     private var settingsController: SettingsWindowController?
+    /// True when `showSettings` hid a visible launcher; restore on settings close.
+    private var didHideLauncherToShowSettings = false
     private var statusItem: NSStatusItem?
     private var toggleMenuItem: NSMenuItem?
 
@@ -77,6 +80,7 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
         launcherController?.onSettingsRequested = { [weak self] in self?.showSettings() }
         launcherController?.onVisibilityChanged = { [weak self] in
             self?.refreshStatusItemToggleTitle()
+            self?.clearSettingsLauncherRestoreIfLauncherVisible()
         }
         launcherController?.onCatalogLoaded = { [weak self] report in
             self?.record("Discovery: \(report.candidates.count) candidates; skipped: \(report.skippedPaths.count)")
@@ -131,6 +135,7 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
             await preferencesStore.save(preferences)
         }
         if preferences.showsStatusItem { configureStatusItem() }
+        configureHotCornerMonitor(preferences.hotCorner)
         if let shortcutError {
             showSettings()
             settingsController?.presentShortcutRegistrationError(
@@ -166,6 +171,7 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         hotKeyService.unregister()
         Task { @MainActor [weak self] in
+            self?.hotCornerMonitor.stop()
             await self?.launcherController?.flushLayout()
             await self?.preferencesSaveTask?.value
             if let queue = self?.diagnosticsQueue {
@@ -257,6 +263,7 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
         item.menu = menu
         toggleMenuItem = toggleItem
         statusItem = item
+        refreshStatusItemToggleTitle()
     }
 
     @MainActor
@@ -265,6 +272,18 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
         case .optionSpace: [.option]
         case .optionShiftSpace: [.option, .shift]
         case .controlShiftSpace: [.control, .shift]
+        }
+    }
+
+    @MainActor
+    private func configureHotCornerMonitor(_ corner: LauncherHotCorner) {
+        hotCornerMonitor.update(corner: corner) { [weak self] in
+            // Presence fade via show/hide(animated:) — not settings snappy hide,
+            // and not page indicator/arrow snaps.
+            self?.launcherController?.respondToHotCornerTrigger()
+        }
+        if corner.isEnabled {
+            record("Hot corner \(corner.title): enabled")
         }
     }
 
@@ -298,6 +317,7 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
         preferences = proposed
         launcherController?.hidesAfterLaunch = proposed.hidesAfterLaunch
         launcherController?.setReducesMotion(proposed.reducesMotion)
+        configureHotCornerMonitor(proposed.hotCorner)
         if proposed.showsStatusItem {
             configureStatusItem()
             toggleMenuItem?.keyEquivalentModifierMask = menuModifiers(for: proposed.shortcut)
@@ -316,7 +336,13 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
 
     @MainActor
     private func showSettings() {
-        launcherController?.hide()
+        let launcherVisible = launcherController?.window?.isVisible == true
+        if LauncherLayout.shouldHideLauncherToShowSettings(launcherVisible: launcherVisible) {
+            launcherController?.hide(
+                animated: LauncherLayout.shouldAnimateLauncherHideForSettingsHandoff()
+            )
+            didHideLauncherToShowSettings = true
+        }
         let hiddenApplications = launcherController?.hiddenApplications() ?? []
         if settingsController == nil {
             let controller = SettingsWindowController(
@@ -329,12 +355,56 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
             controller.onRestoreHiddenApplication = { [weak self] key in
                 self?.launcherController?.restoreHiddenApplication(withKey: key) ?? false
             }
+            controller.onCleanUpLeftovers = { [weak self] progress in
+                await self?.launcherController?.cleanUpOrphanLeftovers(progress: progress)
+                    ?? L(AppOrphanLeftoverScanner.incompleteScanMessageKey)
+            }
             controller.onRescan = { [weak self] in
                 self?.launcherController?.reloadCatalog()
+            }
+            controller.onRearrangeTopLevel = { [weak self] sort in
+                self?.launcherController?.rearrangeTopLevelGrid(sort: sort) ?? false
+            }
+            controller.layoutBackupAvailable = { [weak self] in
+                self?.launcherController?.layoutBackupAvailable() ?? false
+            }
+            controller.onExportLayout = { [weak self] url in
+                await self?.launcherController?.exportLayout(to: url) ?? L("当前无法导出布局")
+            }
+            controller.onImportLayout = { [weak self] url in
+                await self?.launcherController?.importLayout(from: url) ?? L("当前无法导入布局")
+            }
+            controller.onRestoreLayoutBackup = { [weak self] in
+                await self?.launcherController?.restoreLastLayoutBackup() ?? L("当前无法恢复备份")
+            }
+            controller.onWindowWillClose = { [weak self] in
+                self?.settingsWindowWillClose()
             }
             settingsController = controller
         }
         settingsController?.show(preferences: preferences, hiddenApplications: hiddenApplications)
+    }
+
+    @MainActor
+    private func clearSettingsLauncherRestoreIfLauncherVisible() {
+        let visible = launcherController?.window?.isVisible == true
+        guard LauncherLayout.shouldClearSettingsLauncherRestoreFlag(
+            didHideLauncherToShowSettings: didHideLauncherToShowSettings,
+            launcherVisible: visible
+        ) else { return }
+        didHideLauncherToShowSettings = false
+    }
+
+    @MainActor
+    private func settingsWindowWillClose() {
+        let shouldRestore = LauncherLayout.shouldRestoreLauncherWhenSettingsCloses(
+            didHideLauncherToShowSettings: didHideLauncherToShowSettings
+        )
+        didHideLauncherToShowSettings = false
+        guard shouldRestore else { return }
+        launcherController?.show(
+            animated: LauncherLayout.shouldAnimateLauncherShowForSettingsHandoff()
+        )
     }
 
     @objc private func openSettings() {
@@ -378,13 +448,17 @@ extension DirectAppDelegate: NSMenuDelegate {
     }
 
     /// The toggle item keeps whatever title it had when the menu opened.
-    /// Show and hide publish the current choice so a fade does not leave「隐藏」
-    /// on an item that would now show the launcher.
+    /// Show/hide (and dismiss-arm / dismiss-cancel) publish the current choice
+    /// so a fade does not leave「隐藏」on an item that would now show the launcher.
     @MainActor
     private func refreshStatusItemToggleTitle() {
-        toggleMenuItem?.title = L(LauncherLayout.statusItemToggleTitle(
+        let title = LauncherLayout.statusItemToggleTitle(
             isVisible: launcherController?.window?.isVisible == true,
             isDismissing: launcherController?.isDismissing == true
-        ))
+        )
+        toggleMenuItem?.title = L(title)
+        // Keep VoiceOver / help in sync with the same visibilityToggle choice.
+        toggleMenuItem?.setAccessibilityTitle(L(title))
+        statusItem?.button?.toolTip = L(title)
     }
 }
