@@ -126,6 +126,9 @@ final class LauncherWindowController: NSWindowController {
     private var windowUpdateInterval: OSSignpostIntervalState?
     private var dismissTask: Task<Void, Never>?
     private var dismissGeneration = 0
+    /// Search held keyboard when settings instant-hid the launcher.
+    private var pendingSettingsHandoffSearchFocus = false
+    private var pendingSettingsHandoffSearchResultsChrome = false
     /// Set for the whole fade, including the moment before `dismissTask`
     /// exists. Page restore has to see the fade before that task is stored.
     private var dismissArmed = false
@@ -143,6 +146,7 @@ final class LauncherWindowController: NSWindowController {
         testWindowSize: NSSize? = nil
     ) {
         rootView = LauncherRootView()
+        rootView.catalogRoots = catalogRoots
         self.catalogRoots = catalogRoots
         self.layoutStore = layoutStore
         catalogSnapshotStore = CatalogSnapshotStore(
@@ -203,6 +207,7 @@ final class LauncherWindowController: NSWindowController {
             rootView?.scrollSearchResults(byPage: direction) ?? false
         }
         panel.escapeHandler = { [weak rootView] in rootView?.handleEscape() ?? false }
+        panel.selectAllHandler = { [weak rootView] in rootView?.selectAllItemsOnCurrentPage() ?? false }
         panel.settingsHandler = { [weak self] in self?.onSettingsRequested?() }
         rootView.onCandidateSelected = { [weak self] candidate in self?.launch(candidate) }
         rootView.onLayoutChanged = { [weak self] state in self?.schedulePersist(state) }
@@ -294,11 +299,18 @@ final class LauncherWindowController: NSWindowController {
         )
     }
 
-    func show() {
+    func show(animated: Bool = true) {
+        let wasDismissing = isDismissing
         dismissGeneration += 1
         dismissTask?.cancel()
         dismissTask = nil
         dismissArmed = false
+        // Mid-fade cancel: open status menu still said「显示」; flip to「隐藏」now.
+        if LauncherLayout.shouldRefreshStatusItemToggleTitleOnDismissCancel(
+            wasDismissing: wasDismissing
+        ) {
+            onVisibilityChanged?()
+        }
         rootView.releaseFrozenSearchField()
         guard let window else { return }
         let appearing = !window.isVisible
@@ -316,7 +328,41 @@ final class LauncherWindowController: NSWindowController {
         }
         rootView.updateDesktopBackground(for: screen)
         if appearing {
-            rootView.prepareForPresentation()
+            // Settings snappy restore uses animated: false — keep the query.
+            let clearsQuery = LauncherLayout.shouldClearSearchQueryWhenPreparingPresentation(
+                preservesQueryAcrossHandoff: !animated
+            )
+            rootView.prepareForPresentation(clearsSearchQuery: clearsQuery)
+            if LauncherLayout.shouldRestoreSearchResultsChromeAfterSettingsHandoff(
+                isSettingsHandoffRestore: !animated,
+                hadNonEmptyQueryBeforeHandoff: pendingSettingsHandoffSearchResultsChrome
+            ) {
+                rootView.snapSearchResultsChromeForSettingsHandoffRestore()
+            }
+            if LauncherLayout.shouldSuppressPageIndicatorAfterSettingsHandoff(
+                isSettingsHandoffRestore: !animated,
+                hadNonEmptyQueryBeforeHandoff: pendingSettingsHandoffSearchResultsChrome
+            ) {
+                rootView.snapPageIndicatorSuppressedForSettingsHandoffRestore()
+            }
+            if LauncherLayout.shouldSuppressPageArrowsAfterSettingsHandoff(
+                isSettingsHandoffRestore: !animated,
+                hadNonEmptyQueryBeforeHandoff: pendingSettingsHandoffSearchResultsChrome
+            ) {
+                rootView.snapPageArrowsSuppressedForSettingsHandoffRestore()
+            }
+            if LauncherLayout.shouldSnapSearchFooterChromeAfterSettingsHandoff(
+                isSettingsHandoffRestore: !animated,
+                hadNonEmptyQueryBeforeHandoff: pendingSettingsHandoffSearchResultsChrome
+            ) {
+                rootView.snapSearchFooterChromeForSettingsHandoffRestore()
+            }
+            if LauncherLayout.shouldSnapSearchAdjacentChromeAfterSettingsHandoff(
+                isSettingsHandoffRestore: !animated,
+                hadNonEmptyQueryBeforeHandoff: pendingSettingsHandoffSearchResultsChrome
+            ) {
+                rootView.snapSearchAdjacentChromeForSettingsHandoffRestore()
+            }
         } else {
             // A page slide was left where it was when the fade started. Land
             // it now that the launcher is up. A fresh appearance does this
@@ -367,11 +413,31 @@ final class LauncherWindowController: NSWindowController {
             isAppearing: appearing,
             isKey: wasKey
         )
+        let restoreSearchFocus = LauncherLayout.shouldRestoreSearchFocusAfterSettingsHandoff(
+            isSettingsHandoffRestore: !animated,
+            searchHeldFocusBeforeHandoff: pendingSettingsHandoffSearchFocus
+        )
+        pendingSettingsHandoffSearchFocus = false
+        pendingSettingsHandoffSearchResultsChrome = false
+        // Opacity-before-unhide: park transparent before orderFront so a model
+        // left at 1 (or mid-fade) cannot flash solid for a frame.
+        if animated && appearing {
+            rootView.parkLauncherPresenceHiddenForAppear()
+        }
         window.makeKeyAndOrderFront(nil)
-        if !keepFocus {
+        if restoreSearchFocus {
+            // Caret at end so the next character appends (not select-all).
+            _ = rootView.focusSearchFieldForSettingsHandoffRestore()
+        } else if !keepFocus {
             window.makeFirstResponder(rootView)
         }
-        rootView.animateLauncherPresence(visible: true, appearing: appearing)
+        if animated {
+            rootView.animateLauncherPresence(visible: true, appearing: appearing)
+        } else {
+            // Instant-hid for settings left opacity at 1; a normal appear would
+            // still fade up from 0. Snap so restore matches the snappy hide.
+            rootView.snapLauncherPresenceVisible()
+        }
         if directoryWatcher?.watchesAllRoots != true {
             reloadCatalogIfIdle()
         }
@@ -379,7 +445,7 @@ final class LauncherWindowController: NSWindowController {
         scheduleAutomatedLaunchVerificationIfNeeded()
     }
 
-    func hide() {
+    func hide(animated: Bool = true) {
         // Snapshot the query before a click that is already down can clear it.
         rootView.freezeSearchFieldForDismiss()
         // The icon menu tracks in its own window. Close it before the alias
@@ -393,6 +459,11 @@ final class LauncherWindowController: NSWindowController {
         // Arm before the page restore. `dismissTask` does not exist yet, and
         // committing now would reload the sliding grid before the fade.
         dismissArmed = true
+        // Status-menu toggle: rewrite「隐藏」→「显示」as soon as dismiss arms so
+        // an already-open menu bar item matches visibilityToggle mid-fade.
+        if LauncherLayout.shouldRefreshStatusItemToggleTitleOnDismissArm() {
+            onVisibilityChanged?()
+        }
         rootView.rememberGridPageForDismissal()
         // A wheel step can already be waiting out its quiet period. That wait
         // does not mark the grid as interrupted, so the restore above leaves
@@ -433,6 +504,35 @@ final class LauncherWindowController: NSWindowController {
         // already drawn, and do not let the hide completion remove it.
         rootView.settleToastFadeForDismissal()
         finishWindowUpdate(cancelled: true)
+        // Settings handoff (and any other immediate dismiss) skips the fade so
+        // the next window can appear on this turn. Cancel an in-flight fade.
+        if !animated {
+            pendingSettingsHandoffSearchFocus = LauncherLayout.shouldParkSearchFocusForSettingsHandoff(
+                searchHoldsKeyboardFocus: rootView.searchFieldHoldsKeyboardFocus()
+            )
+            pendingSettingsHandoffSearchResultsChrome = LauncherLayout.shouldParkSearchResultsChromeForSettingsHandoff(
+                queryIsNonEmpty: rootView.searchQueryIsNonEmpty()
+            )
+            if pendingSettingsHandoffSearchResultsChrome {
+                rootView.snapPageIndicatorSuppressedForSettingsHandoffRestore()
+                rootView.snapPageArrowsSuppressedForSettingsHandoffRestore()
+                rootView.snapSearchFooterChromeForSettingsHandoffRestore()
+                rootView.snapSearchAdjacentChromeForSettingsHandoffRestore()
+            }
+            dismissGeneration += 1
+            dismissTask?.cancel()
+            dismissTask = nil
+            dismissArmed = false
+            rootView.abandonFolderRenameForDismissal()
+            if let window {
+                window.ignoresMouseEvents = false
+                window.orderOut(nil)
+            }
+            rootView.applyDeferredVisualState()
+            NSApp.presentationOptions.subtract(launcherPresentationOptions)
+            onVisibilityChanged?()
+            return
+        }
         guard let window, window.isVisible, dismissTask == nil else {
             if dismissTask == nil {
                 dismissArmed = false
@@ -501,6 +601,26 @@ final class LauncherWindowController: NSWindowController {
         }
     }
 
+    /// Hot-corner edge trigger: same animated presence fade as the hotkey
+    /// (`show`/`hide` with `shouldAnimateLauncherPresenceForHotCorner`). Does
+    /// not snap page indicator/arrows (settings-handoff only).
+    func respondToHotCornerTrigger() {
+        // Settings handoff snaps page indicator/arrows; hot corner must not
+        // (shouldSnapPagingChromeForHotCornerTrigger == false — guarded in Core tests).
+        let animated = LauncherLayout.shouldAnimateLauncherPresenceForHotCorner()
+        guard let window else { return }
+        switch LauncherLayout.visibilityToggle(
+            isVisible: window.isVisible,
+            isDismissing: isDismissing
+        ) {
+        case .show:
+            show(animated: animated)
+        case .hide:
+            hide(animated: animated)
+        }
+    }
+
+
     func setReducesMotion(_ enabled: Bool) {
         rootView.setReducesMotion(enabled)
     }
@@ -512,6 +632,72 @@ final class LauncherWindowController: NSWindowController {
     @discardableResult
     func restoreHiddenApplication(withKey key: String) -> Bool {
         rootView.restoreHiddenApplication(withKey: key)
+    }
+
+    /// Settings 「残留文件…」: returns a one-line status for the settings window.
+    func cleanUpOrphanLeftovers(
+        progress: (@MainActor (String) -> Void)? = nil
+    ) async -> String {
+        await rootView.cleanUpOrphanLeftovers(progress: progress)
+    }
+
+    @discardableResult
+    func rearrangeTopLevelGrid(sort: LauncherLayout.GridRearrangeSort) -> Bool {
+        rootView.rearrangeTopLevelGrid(sort: sort)
+    }
+
+    /// Settings: automatic layout-v1.backup.json present next to the live store.
+    func layoutBackupAvailable() -> Bool {
+        layoutStore.hasBackupFile
+    }
+
+    /// Settings 「导出布局…」: write current in-memory layout to a user-chosen JSON URL.
+    func exportLayout(to url: URL) async -> String {
+        do {
+            try await layoutStore.export(rootView.layoutState, to: url)
+            return L("布局已导出")
+        } catch LayoutStoreIssue.unsupportedSchema(_) {
+            return L("布局版本不受支持，无法导出")
+        } catch {
+            return L("导出布局失败")
+        }
+    }
+
+    /// Settings 「导入布局…」: decode user JSON, reconcile with catalog, commit (save backs up prior).
+    func importLayout(from url: URL) async -> String {
+        do {
+            let imported = try await layoutStore.importLayout(from: url)
+            guard rootView.applyImportedLayout(imported) else {
+                return L("暂时无法整理，请查看主界面提示")
+            }
+            // Wait out the debounce so layout-v1.backup.json exists before Settings refreshes.
+            await finishPendingLayoutSaves()
+            return L("布局已导入")
+        } catch LayoutStoreIssue.unsupportedSchema(_) {
+            return L("布局版本不受支持，无法导入")
+        } catch LayoutStoreIssue.corruptedFile(_) {
+            return L("无法读取布局文件")
+        } catch {
+            return L("无法读取布局文件")
+        }
+    }
+
+    /// Settings 「恢复上次备份」: load automatic backup, reconcile, commit (save backs up prior = undo once).
+    func restoreLastLayoutBackup() async -> String {
+        do {
+            guard let backup = try await layoutStore.loadBackup() else {
+                return L("没有可用备份")
+            }
+            guard rootView.applyImportedLayout(backup) else {
+                return L("暂时无法整理，请查看主界面提示")
+            }
+            await finishPendingLayoutSaves()
+            return L("已恢复上次备份")
+        } catch LayoutStoreIssue.unsupportedSchema(_) {
+            return L("备份版本不受支持，无法恢复")
+        } catch {
+            return L("无法读取备份")
+        }
     }
 
     func flushLayout() async {
@@ -938,6 +1124,8 @@ private final class LauncherPanel: NSPanel, NSWindowDelegate {
     /// from a press that started earlier must not open an icon or Settings.
     var acceptsPointerActivation: () -> Bool = { true }
     var searchHandler: (() -> Void)?
+    /// Command-A: select all icons on the current page (nil / false → pass through).
+    var selectAllHandler: (() -> Bool)?
     var pageHandler: ((Int) -> Void)?
     /// Page Up/Down while search is showing. Return true to consume the key
     /// instead of turning a grid page.
@@ -974,6 +1162,10 @@ private final class LauncherPanel: NSPanel, NSWindowDelegate {
            event.charactersIgnoringModifiers?.lowercased() == "f" {
             searchHandler?()
             return true
+        }
+        if event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
+           event.charactersIgnoringModifiers?.lowercased() == "a" {
+            if selectAllHandler?() == true { return true }
         }
         return super.performKeyEquivalent(with: event)
     }
@@ -1048,7 +1240,12 @@ private final class LauncherPanel: NSPanel, NSWindowDelegate {
             }
         }
         if event.type == .leftMouseDown {
-            (contentView as? LauncherRootView)?.beginClick()
+            if let rootView = contentView as? LauncherRootView {
+                rootView.beginClick()
+                _ = rootView.cancelFolderTitleEditingIfClickOutsideTitle(
+                    at: event.locationInWindow
+                )
+            }
         }
         super.sendEvent(event)
         if event.type == .leftMouseUp,
@@ -1108,7 +1305,8 @@ private enum PresentedItem: Hashable {
 }
 
 @MainActor
-private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSCollectionViewDelegate, NSSearchFieldDelegate {
+private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDataSource, NSCollectionViewDelegate, NSSearchFieldDelegate {
+    var catalogRoots: [URL] = AppCatalogScanner.standardRoots
     var onCandidateSelected: ((AppCandidate) -> Void)?
     var onLayoutChanged: ((LayoutState) -> Void)?
     var onReloadRequested: (() -> Void)?
@@ -1121,8 +1319,8 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     private(set) var layoutState = LayoutState()
 
     private let searchField = NSSearchField()
+    private let searchChrome = NSVisualEffectView(frame: .zero)
     private let settingsButton = LauncherChromeButton()
-    private let clearButton = NSButton(title: "×", target: nil, action: nil)
     private let countLabel = NSTextField(labelWithString: "")
     private let readOnlyStatusLabel = NSTextField(labelWithString: "")
     private let readOnlyStatusRow = NSStackView()
@@ -1218,6 +1416,11 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     /// as a clear click and written back.
     private var isDiscardingSearchComposition = false
     private var launchingID: AppCandidate.ID?
+    /// ⌘-click multi-select set (Core `LauncherItemSelection`). Chrome only in this slice.
+    private var itemSelection = LauncherItemSelection.empty
+    /// Search keyboard-open target while the field keeps first responder.
+    /// Shows focus-fill chrome on the hit; Return / arrows use this id.
+    private var searchKeyboardHighlightID: UUID?
     /// The highlight id changed while the launcher was fading or already gone.
     /// Reloading then jumps the tiles under the fade.
     private var launchHighlightWaitsForLauncher = false
@@ -1233,9 +1436,19 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     private weak var pageTurnFocusedTile: AppGridTileView?
     private var stagingPage: Int?
     private var openedFolderID: UUID?
+    /// Parked until `onChromeCloseLanded` so grid focus fill does not paint
+    /// under traveling close chrome (mirror open member handoff).
+    private var pendingFolderCloseFocusRestoreID: UUID?
+    /// Snapshot of `orderedEntries` when close began — dissolve neighbor resolve.
+    private var pendingFolderCloseFocusPreviousEntries: [LauncherEntry]?
     /// True only while the alias alert's modal loop is running. Dismiss
     /// aborts that loop; Save has already cleared this and must be kept.
     private var isPromptingForAlias = false
+    var isPromptingForUninstall = false
+    /// Tile that opened uninstall; restored after sheets (Core policy).
+    private var uninstallSheetFocusItemID: UUID?
+    private weak var uninstallSheetFocusCollection: NSCollectionView?
+    private var uninstallTask: Task<Void, Never>?
     /// The icon menu passed to `popUpContextMenu`, if that call has not
     /// returned. Nil for the status-item menu.
     private var trackedIconContextMenu: NSMenu?
@@ -1335,6 +1548,8 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     private var folderBackdropStyleWaitsForLauncher = false
     /// Invalidates a closing backdrop's cleanup when it reopens or is pinned.
     private var folderBackdropAnimationGeneration = 0
+    /// Invalidates in-flight launcher fade/rise when a newer show/hide starts.
+    private var launcherPresenceGeneration: UInt64 = 0
     private let mergeFlightDuration: TimeInterval = 0.34
     private var folderLandingGeneration = 0
     /// Every landing that has not committed yet. A later tile must not drop
@@ -1356,9 +1571,12 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     )
     private var toastDismissTask: Task<Void, Never>?
     private var toastGeneration = 0
-    /// Toast requested while the launcher was fading or hidden. The newest
-    /// request wins. Nil help is a real value.
+    /// Last VoiceOver toast announcement (dedupe repeats).
+    private var lastAnnouncedToastMessage = ""
+    /// Toast requested while the launcher was fading/hidden, or while folder
+    /// chrome was up. The newest request wins. Nil help is a real value.
     private var deferredToast: DeferredToast?
+    /// True while `deferredToast` waits for launcher-up and folder-chrome-quiet.
     private var toastWaitsForLauncher = false
     /// The visible toast was asked to leave during the fade. Applied once
     /// the launcher is up, unless a newer toast replaces it.
@@ -1370,7 +1588,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     private var hasCachedCatalog = false
     private var showsRescanButton = false
     private var presentsCancelledEmptyCatalog = false
-    private var isLayoutEditingEnabled = false
+    var isLayoutEditingEnabled = false
     private var layoutEditingExplanation: String?
     private var layoutSaveFailed = false
     private var reducesMotionOverride = false
@@ -1381,6 +1599,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     private var searchChromeVisible = false
     private var searchChromeFading = false
     private var searchChromeGeneration = 0
+    private var footerHintGeneration = 0
     /// The fade pinned a search/grid crossfade that had already started.
     /// Applied once the launcher is up, or once the window is hidden.
     private var searchChromeWaitsForLauncher = false
@@ -1473,7 +1692,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     }
     override var acceptsFirstResponder: Bool { true }
 
-    private func displayName(for candidate: AppCandidate) -> String {
+    func displayName(for candidate: AppCandidate) -> String {
         layoutState.appAliases[candidate.deduplicationKey] ?? candidate.displayName
     }
 
@@ -1528,8 +1747,12 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         searchField.isBezeled = false
         searchField.drawsBackground = false
         searchField.translatesAutoresizingMaskIntoConstraints = false
+        // Productized clear: NSSearchField's built-in cancel (no custom clearButton).
+        if let cell = searchField.cell as? NSSearchFieldCell {
+            cell.cancelButtonCell?.setAccessibilityLabel(L("清除搜索"))
+            cell.cancelButtonCell?.setAccessibilityHelp(L("清除搜索并返回应用网格"))
+        }
 
-        let searchChrome = NSVisualEffectView(frame: .zero)
         searchChrome.material = .popover
         searchChrome.blendingMode = .withinWindow
         searchChrome.state = .active
@@ -1543,6 +1766,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         searchChrome.translatesAutoresizingMaskIntoConstraints = false
         card.addSubview(searchChrome)
         searchChrome.addSubview(searchField)
+        card.addSubview(countLabel)
 
         settingsButton.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: L("设置"))
         settingsButton.imagePosition = .imageOnly
@@ -1562,6 +1786,9 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         readOnlyStatusLabel.textColor = .labelColor
         readOnlyStatusLabel.alignment = .center
         readOnlyStatusLabel.lineBreakMode = .byTruncatingTail
+        readOnlyStatusLabel.setAccessibilityElement(true)
+        readOnlyStatusLabel.setAccessibilityRole(.staticText)
+        readOnlyStatusLabel.setAccessibilityLabel(L(LauncherLayout.readOnlyStatusAccessibilityLabelKey))
         readOnlyStatusLabel.isHidden = true
         readOnlyStatusLabel.translatesAutoresizingMaskIntoConstraints = false
         readOnlyStatusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -1590,9 +1817,13 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         readOnlyStatusRow.addArrangedSubview(readOnlyCachedButton)
         card.addSubview(readOnlyStatusRow)
 
-        clearButton.isHidden = true
+        countLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        countLabel.textColor = .secondaryLabelColor
+        countLabel.alignment = .right
         countLabel.isHidden = true
-        countLabel.setAccessibilityElement(false)
+        countLabel.translatesAutoresizingMaskIntoConstraints = false
+        countLabel.setAccessibilityLabel(L("应用数量"))
+        countLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         gridViewport.wantsLayer = true
         gridViewport.layer?.masksToBounds = true
@@ -1756,7 +1987,10 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         folderOverlay.translatesAutoresizingMaskIntoConstraints = false
         folderOverlay.onClose = { [weak self] in self?.closeFolder() }
         folderOverlay.onChromeCloseLanded = { [weak self] in
-            self?.releaseBorrowedPreviewPlate()
+            self?.finishFolderCloseChromeLand()
+        }
+        folderOverlay.onChromeOpenLanded = { [weak self] in
+            self?.focusOpenedFolderMemberAfterChromeLands()
         }
         folderOverlay.acceptsPointerActivation = { [weak self] in
             self?.acceptsPointerActivation() ?? false
@@ -1936,6 +2170,9 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             searchField.trailingAnchor.constraint(equalTo: searchChrome.trailingAnchor, constant: -8),
             searchField.centerYAnchor.constraint(equalTo: searchChrome.centerYAnchor),
             searchField.heightAnchor.constraint(equalToConstant: 28),
+            countLabel.trailingAnchor.constraint(equalTo: searchChrome.leadingAnchor, constant: -12),
+            countLabel.centerYAnchor.constraint(equalTo: searchChrome.centerYAnchor),
+            countLabel.leadingAnchor.constraint(greaterThanOrEqualTo: card.leadingAnchor, constant: 16),
             settingsButton.leadingAnchor.constraint(equalTo: searchChrome.trailingAnchor, constant: 10),
             settingsButton.centerYAnchor.constraint(equalTo: searchChrome.centerYAnchor),
             settingsButton.widthAnchor.constraint(equalToConstant: 38),
@@ -2004,52 +2241,127 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     /// invalidate it, or a hidden window never gets another callback.
     isolated deinit {
         previewPlateClock.stop()
+        uninstallTask?.cancel()
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { nil }
+
+    /// Land at full opacity / resting card transform with no fade or rise.
+    /// Used when settings restores a launcher that was instant-hidden.
+    func snapLauncherPresenceVisible() {
+        wantsLayer = true
+        contentCard.wantsLayer = true
+        launcherPresenceGeneration &+= 1
+        guard let layer, let cardLayer = contentCard.layer else {
+            alphaValue = 1
+            return
+        }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.removeAnimation(forKey: LauncherLayout.launcherPresenceFadeAnimationKey)
+        cardLayer.removeAnimation(forKey: LauncherLayout.launcherPresenceRiseAnimationKey)
+        layer.opacity = 1
+        cardLayer.transform = CATransform3DIdentity
+        CATransaction.commit()
+        alphaValue = 1
+    }
+
+    /// Park transparent (and appear-rise offset) before `orderFront` so a
+    /// fresh show cannot paint resting full opacity for a frame.
+    func parkLauncherPresenceHiddenForAppear() {
+        wantsLayer = true
+        contentCard.wantsLayer = true
+        launcherPresenceGeneration &+= 1
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer?.removeAnimation(forKey: LauncherLayout.launcherPresenceFadeAnimationKey)
+        contentCard.layer?.removeAnimation(forKey: LauncherLayout.launcherPresenceRiseAnimationKey)
+        layer?.opacity = 0
+        alphaValue = 0
+        if prefersReducedMotion {
+            contentCard.layer?.transform = CATransform3DIdentity
+        } else {
+            contentCard.layer?.transform = CATransform3DMakeTranslation(
+                0,
+                LauncherLayout.launcherPresenceAppearRiseOffset,
+                0
+            )
+        }
+        CATransaction.commit()
+    }
 
     @discardableResult
     func animateLauncherPresence(visible: Bool, appearing: Bool) -> TimeInterval {
         wantsLayer = true
         contentCard.wantsLayer = true
         let reduced = prefersReducedMotion
-        let duration = reduced ? 0.12 : (visible ? 0.22 : 0.15)
-        let timing = reduced
-            ? CAMediaTimingFunction(name: .easeOut)
-            : CAMediaTimingFunction(controlPoints: 0.2, 0.8, 0.2, 1.0)
-        guard let layer, let cardLayer = contentCard.layer else { return duration }
-        layer.removeAnimation(forKey: "launcherFade")
-        cardLayer.removeAnimation(forKey: "launcherRise")
-
-        let fade = CABasicAnimation(keyPath: "opacity")
-        fade.fromValue = (visible && appearing) ? 0 : (layer.presentation()?.opacity ?? (visible ? 0 : 1))
-        fade.toValue = visible ? 1 : 0
-        fade.duration = duration
-        fade.timingFunction = timing
-        // The model below is already the end opacity. Hold the picture on
-        // screen until this animation is attached, or the commit frame
-        // flashes the launcher full or gone.
-        fade.fillMode = .backwards
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        layer.opacity = visible ? 1 : 0
-        layer.add(fade, forKey: "launcherFade")
-
-        if reduced {
-            cardLayer.transform = CATransform3DIdentity
+        let duration = LauncherLayout.launcherPresenceFadeDuration(
+            visible: visible,
+            reducesMotion: reduced
+        )
+        // Reduced motion: snap opacity + resting card (no half-fade / rise).
+        // Hotkey, hot-corner, and menu toggle all go through show/hide → here.
+        if LauncherLayout.shouldSnapLauncherPresenceForReducedMotion(
+            reducesMotion: reduced
+        ) {
+            launcherPresenceGeneration &+= 1
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer?.removeAnimation(forKey: LauncherLayout.launcherPresenceFadeAnimationKey)
+            contentCard.layer?.removeAnimation(
+                forKey: LauncherLayout.launcherPresenceRiseAnimationKey
+            )
+            layer?.opacity = visible ? 1 : 0
+            alphaValue = visible ? 1 : 0
+            contentCard.layer?.transform = CATransform3DIdentity
             CATransaction.commit()
             return duration
         }
-        let targetY: CGFloat = visible ? 0 : -4
+        let timing = CAMediaTimingFunction(controlPoints: 0.2, 0.8, 0.2, 1.0)
+        guard let layer, let cardLayer = contentCard.layer else {
+            alphaValue = visible ? 1 : 0
+            return duration
+        }
+        // Read presentation BEFORE removing animations so a cancelled dismiss
+        // (or reverse mid-fade) continues from the picture already on screen.
+        let fromOpacity = LauncherLayout.launcherPresenceFadeFromOpacity(
+            visible: visible,
+            appearing: appearing,
+            presentedOpacity: layer.presentation()?.opacity,
+            modelOpacity: layer.opacity
+        )
+        let targetY: CGFloat = visible
+            ? 0
+            : LauncherLayout.launcherPresenceHideRiseOffset
         let startY: CGFloat
         if visible && appearing {
-            startY = -8
+            startY = LauncherLayout.launcherPresenceAppearRiseOffset
         } else if let presented = cardLayer.presentation()?.value(forKeyPath: "transform.translation.y") as? NSNumber {
             startY = CGFloat(presented.doubleValue)
         } else {
             startY = 0
         }
+
+        launcherPresenceGeneration &+= 1
+
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = fromOpacity
+        fade.toValue = visible ? 1 : 0
+        fade.duration = duration
+        fade.timingFunction = timing
+        // Model is already the end opacity. Hold the on-screen picture until
+        // this animation attaches, or the commit frame flashes full/gone.
+        fade.fillMode = .backwards
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.removeAnimation(forKey: LauncherLayout.launcherPresenceFadeAnimationKey)
+        cardLayer.removeAnimation(forKey: LauncherLayout.launcherPresenceRiseAnimationKey)
+        layer.opacity = visible ? 1 : 0
+        alphaValue = visible ? 1 : 0
+        layer.add(fade, forKey: LauncherLayout.launcherPresenceFadeAnimationKey)
+
         let rise = CABasicAnimation(keyPath: "transform.translation.y")
         rise.fromValue = startY
         rise.toValue = targetY
@@ -2057,7 +2369,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         rise.timingFunction = timing
         rise.fillMode = .backwards
         cardLayer.transform = CATransform3DMakeTranslation(0, targetY, 0)
-        cardLayer.add(rise, forKey: "launcherRise")
+        cardLayer.add(rise, forKey: LauncherLayout.launcherPresenceRiseAnimationKey)
         CATransaction.commit()
         return duration
     }
@@ -2071,8 +2383,8 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         wantsLayer = true
         contentCard.wantsLayer = true
         guard let layer, let cardLayer = contentCard.layer else { return }
-        let fading = layer.animation(forKey: "launcherFade") != nil
-        let rising = cardLayer.animation(forKey: "launcherRise") != nil
+        let fading = layer.animation(forKey: LauncherLayout.launcherPresenceFadeAnimationKey) != nil
+        let rising = cardLayer.animation(forKey: LauncherLayout.launcherPresenceRiseAnimationKey) != nil
         guard fading || rising else { return }
         let dismissing = launcherIsDismissing()
         let visible = window?.isVisible == true
@@ -2084,8 +2396,8 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             let frozenTransform = cardLayer.presentation()?.transform
             CATransaction.begin()
             CATransaction.setDisableActions(true)
-            layer.removeAnimation(forKey: "launcherFade")
-            cardLayer.removeAnimation(forKey: "launcherRise")
+            layer.removeAnimation(forKey: LauncherLayout.launcherPresenceFadeAnimationKey)
+            cardLayer.removeAnimation(forKey: LauncherLayout.launcherPresenceRiseAnimationKey)
             layer.opacity = opacity
             if let frozenTransform {
                 cardLayer.transform = frozenTransform
@@ -2099,8 +2411,8 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         ) else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        layer.removeAnimation(forKey: "launcherFade")
-        cardLayer.removeAnimation(forKey: "launcherRise")
+        layer.removeAnimation(forKey: LauncherLayout.launcherPresenceFadeAnimationKey)
+        cardLayer.removeAnimation(forKey: LauncherLayout.launcherPresenceRiseAnimationKey)
         // The model already holds the destination written when the animation
         // started. Reduced motion never travels the card, so a hide offset
         // stored by the old rise is dropped. Turning motion back on does not
@@ -2213,11 +2525,46 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         updateRecoveryButtons()
     }
 
-    private func updateRecoveryButtons() {
-        cachedCatalogButton.isHidden = !isCatalogLoading || !allCandidates.isEmpty || !hasCachedCatalog
-        emptyStateCachedButton.isHidden = isCatalogLoading || !allCandidates.isEmpty || !hasCachedCatalog
-        rescanButton.isHidden = isCatalogLoading || allCandidates.isEmpty || !showsRescanButton
-        readOnlyCachedButton.isHidden = isCatalogLoading || allCandidates.isEmpty || !showsRescanButton || !hasCachedCatalog
+    private func updateRecoveryButtons(
+        animated: Bool? = nil,
+        generation: UInt64? = nil
+    ) {
+        let animateStatus = animated ?? (
+            !prefersReducedMotion
+                && window?.isVisible == true
+                && !launcherIsDismissing()
+        )
+        let statusGeneration: UInt64
+        if let generation {
+            statusGeneration = generation
+        } else {
+            statusChromeGeneration &+= 1
+            statusGeneration = statusChromeGeneration
+        }
+        setStatusChromeVisible(
+            cachedCatalogButton,
+            visible: isCatalogLoading && allCandidates.isEmpty && hasCachedCatalog,
+            animated: animateStatus,
+            generation: statusGeneration
+        )
+        setStatusChromeVisible(
+            emptyStateCachedButton,
+            visible: !isCatalogLoading && allCandidates.isEmpty && hasCachedCatalog,
+            animated: animateStatus,
+            generation: statusGeneration
+        )
+        setStatusChromeVisible(
+            rescanButton,
+            visible: !isCatalogLoading && !allCandidates.isEmpty && showsRescanButton,
+            animated: animateStatus,
+            generation: statusGeneration
+        )
+        setStatusChromeVisible(
+            readOnlyCachedButton,
+            visible: !isCatalogLoading && !allCandidates.isEmpty && showsRescanButton && hasCachedCatalog,
+            animated: animateStatus,
+            generation: statusGeneration
+        )
         scanSkeleton.needsDisplay = true
         // Visibility changes after the last key-loop rebuild. Hidden parents
         // (the empty state) must not stay in the loop either.
@@ -2253,21 +2600,84 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     /// that field until the launcher is up.
     private func applyLayoutEditingChrome() {
         let reason = isLayoutEditingEnabled ? nil : layoutEditingExplanation
+        let gridHelp = L(LauncherLayout.layoutCollectionAccessibilityHelp(
+            layoutEditingEnabled: isLayoutEditingEnabled,
+            layoutEditingExplanation: reason,
+            editableHelp: "拖动应用以整理布局"
+        ))
+        let searchHelp = L(LauncherLayout.layoutCollectionAccessibilityHelp(
+            layoutEditingEnabled: isLayoutEditingEnabled,
+            layoutEditingExplanation: reason,
+            editableHelp: "搜索结果；拖动整理需完整扫描"
+        ))
         activeCollectionView.toolTip = reason
-        activeCollectionView.setAccessibilityHelp(reason ?? L("拖动应用以整理布局"))
+        activeCollectionView.setAccessibilityHelp(gridHelp)
         stagingCollectionView.toolTip = reason
+        stagingCollectionView.setAccessibilityHelp(gridHelp)
+        searchCollectionView.toolTip = reason
+        searchCollectionView.setAccessibilityHelp(searchHelp)
         folderOverlay.setEditingEnabled(isLayoutEditingEnabled, explanation: reason)
         updateReadOnlyStatus()
         updateFooterHint()
+        // Refresh tile AX help without a full reload when only the reason changed.
+        refreshTileReadonlyAccessibilityHelp()
     }
 
-    private func updateReadOnlyStatus() {
-        if layoutSaveFailed {
-            readOnlyStatusLabel.stringValue = L("布局未保存，请检查磁盘空间或文件权限")
-            readOnlyStatusLabel.isHidden = false
+    /// Push incomplete-scan / read-only help onto materialized tiles (VoiceOver).
+    private func refreshTileReadonlyAccessibilityHelp() {
+        let collections = [
+            activeCollectionView,
+            stagingCollectionView,
+            searchCollectionView,
+            folderOverlay.collectionView
+        ]
+        for collection in collections {
+            for item in collection.visibleItems() {
+                (item.view as? AppGridTileView)?.applyLayoutEditingAccessibilityHelp(
+                    layoutEditingEnabled: isLayoutEditingEnabled,
+                    layoutEditingExplanation: layoutEditingExplanation
+                )
+            }
+        }
+    }
+
+    private func updateReadOnlyStatus(
+        animated: Bool? = nil,
+        generation: UInt64? = nil
+    ) {
+        let animateStatus = animated ?? (
+            !prefersReducedMotion
+                && window?.isVisible == true
+                && !launcherIsDismissing()
+        )
+        let statusGeneration: UInt64
+        if let generation {
+            statusGeneration = generation
         } else {
-            readOnlyStatusLabel.stringValue = layoutEditingExplanation ?? ""
-            readOnlyStatusLabel.isHidden = isCatalogLoading || isLayoutEditingEnabled || allCandidates.isEmpty
+            statusChromeGeneration &+= 1
+            statusGeneration = statusChromeGeneration
+        }
+        let show: Bool
+        let text: String
+        if layoutSaveFailed {
+            text = L("布局未保存，请检查磁盘空间或文件权限")
+            show = true
+        } else {
+            text = layoutEditingExplanation ?? ""
+            show = !(isCatalogLoading || isLayoutEditingEnabled || allCandidates.isEmpty)
+        }
+        let labeled = LauncherLayout.statusChromeLabeledTextToShow(show: show, text: text)
+        setStatusChromeLabeledText(
+            readOnlyStatusLabel,
+            text: labeled,
+            animated: animateStatus,
+            generation: statusGeneration
+        )
+        // VoiceOver: the status line itself carries the block reason as help.
+        if show, !text.isEmpty {
+            readOnlyStatusLabel.setAccessibilityHelp(text)
+        } else {
+            readOnlyStatusLabel.setAccessibilityHelp(nil)
         }
     }
 
@@ -2375,6 +2785,44 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         return true
     }
 
+    /// Settings one-shot rearrange of the top-level grid. Persists via commitLayout
+    /// (LayoutStore writes a backup first). Clears multi-select; does not page.
+    @discardableResult
+    func rearrangeTopLevelGrid(sort: LauncherLayout.GridRearrangeSort) -> Bool {
+        guard isLayoutEditingEnabled else { return false }
+        let next = LauncherLayout.rearrangeTopLevelEntries(
+            in: layoutState,
+            catalog: allCandidates,
+            sort: sort
+        )
+        guard next.orderedEntries != layoutState.orderedEntries else {
+            showToast(L(LauncherLayout.gridRearrangeToastMessage(sort: sort)))
+            return true
+        }
+        if !itemSelection.isEmpty {
+            itemSelection.clear()
+            refreshItemSelectionChrome()
+        }
+        commitLayout(next)
+        showToast(L(LauncherLayout.gridRearrangeToastMessage(sort: sort)))
+        return true
+    }
+
+    /// Settings import / restore-last-backup. Reconciles with the live catalog,
+    /// clears multi-select, commits (LayoutStore backs up prior on persist). No paging.
+    @discardableResult
+    func applyImportedLayout(_ imported: LayoutState) -> Bool {
+        guard isLayoutEditingEnabled else { return false }
+        let reconciled = LauncherLayout.reconcile(candidates: allCandidates, into: imported)
+        if !itemSelection.isEmpty {
+            itemSelection.clear()
+            refreshItemSelectionChrome()
+        }
+        commitLayout(reconciled)
+        showToast(L("布局已更新"))
+        return true
+    }
+
     func setCatalog(_ candidates: [AppCandidate], layout: LayoutState) {
         // A deferred presentation still describes the tiles on screen.
         // Apply it before reading focus, or the captured id belongs to a
@@ -2416,6 +2864,8 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             }
         }
         layoutState = layout
+        // Catalog reconcile may remove apps/folders; prune multi-select with the new model.
+        itemSelection = LauncherLayout.prunedItemSelection(itemSelection, in: layoutState)
         rebuildSearchableAppsCache()
         let snapshot = DeferredCatalogPresentation(
             previousEntries: previousEntries,
@@ -2476,12 +2926,12 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             reloadVisibleCollections()
         }
         if dissolvedOpenFolder, let closingFolder = snapshot.closingFolder,
-           let focusID = LauncherLayout.entryReplacingDissolvedFolder(
-               folderID: closingFolder,
+           let focusID = LauncherLayout.folderCloseGridFocusID(
+               pendingFolderID: closingFolder,
                previousEntries: snapshot.previousEntries,
                currentEntries: layoutState.orderedEntries
            ) {
-            focusGridEntry(focusID)
+            focusMainGridEntry(focusID)
         }
         if !scatterSeeds.isEmpty {
             _ = playFolderDissolveScatter(scatterSeeds)
@@ -2525,7 +2975,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
 
     /// The window is still hidden. Drop a leftover search or open folder so the
     /// next presentation starts on the grid instead of the last session.
-    func prepareForPresentation() {
+    func prepareForPresentation(clearsSearchQuery: Bool = true) {
         // Hide may already have landed. Do it again so a transition that
         // finished after hide cannot leave the hosts mid-slide. Clearing a
         // search or folder below does not send the grid back to page 0.
@@ -2555,6 +3005,35 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         if openedFolderID != nil {
             _ = folderOverlay.cancelTitleEditingIfActive()
             closeFolder(immediately: true)
+        }
+        // Settings handoff restore keeps the query; a normal appear clears it.
+        guard clearsSearchQuery else {
+            if LauncherLayout.shouldEnsureSearchResultsChromeWhenPreservingQuery(
+                queryIsNonEmpty: isSearching
+            ) {
+                snapSearchResultsChromeForSettingsHandoffRestore()
+            }
+            if LauncherLayout.shouldEnsurePageIndicatorSuppressedWhenPreservingQuery(
+                queryIsNonEmpty: isSearching
+            ) {
+                snapPageIndicatorSuppressedForSettingsHandoffRestore()
+            }
+            if LauncherLayout.shouldEnsurePageArrowsSuppressedWhenPreservingQuery(
+                queryIsNonEmpty: isSearching
+            ) {
+                snapPageArrowsSuppressedForSettingsHandoffRestore()
+            }
+            if LauncherLayout.shouldEnsureSearchFooterChromeWhenPreservingQuery(
+                queryIsNonEmpty: isSearching
+            ) {
+                snapSearchFooterChromeForSettingsHandoffRestore()
+            }
+            if LauncherLayout.shouldEnsureSearchAdjacentChromeWhenPreservingQuery(
+                queryIsNonEmpty: isSearching
+            ) {
+                snapSearchAdjacentChromeForSettingsHandoffRestore()
+            }
+            return
         }
         // stringValue can already be empty while the field editor still holds
         // the query and writes it back when the window returns.
@@ -2629,9 +3108,9 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             isVisible: window?.isVisible == true
         ) else {
             // The in-flight completion would swap hosts and might start the
-            // queued turn. Ignore it. `animator().frame` has already written
-            // the destination, so removing the animation without the
-            // presentation frame would finish the slide under the fade.
+            // queued turn. Ignore it. The model frame is already the
+            // destination, so removing the animation without the presentation
+            // frame would finish the slide under the fade.
             holdInFlightPageSlide()
             return
         }
@@ -2829,6 +3308,23 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         noteSearchCompositionEnded()
     }
 
+    /// Pointer down outside the title cancels an in-progress rename (Escape).
+    /// The close button keeps its commit-on-close behavior and is excluded.
+    @discardableResult
+    func cancelFolderTitleEditingIfClickOutsideTitle(at windowPoint: NSPoint) -> Bool {
+        guard folderOverlay.isEditingTitle else { return false }
+        let hit = hitTest(windowPoint)
+        if folderOverlay.isCloseButtonHit(hit) { return false }
+        let onTitle = folderOverlay.isTitleHit(hit)
+        guard LauncherLayout.folderTitleShouldCancelEditingOnOutsideClick(
+            isEditing: true,
+            clickIsOnTitle: onTitle
+        ) else { return false }
+        // Dimmer / outside-panel close: discard without parking focus on a member.
+        let refocus = !folderOverlay.shouldClose(for: hit)
+        return folderOverlay.cancelTitleEditingIfActive(refocus: refocus)
+    }
+
     func handleEscape() -> Bool {
         // The field editor is clearing a marked range for this same Escape.
         // Do not also drop the query, close the folder, or dismiss.
@@ -2844,8 +3340,15 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             closeFolder()
             return true
         }
+        if !itemSelection.isEmpty {
+            itemSelection.clear()
+            refreshItemSelectionChrome()
+            return true
+        }
+        // Capture before clear — applySearch rebuilds the result list.
+        let focusedResult = focusedSearchResultID()
         guard clearSearchIfNeeded() else { return false }
-        _ = window?.makeFirstResponder(self)
+        handOffFocusAfterSearchCleared(focusedResult: focusedResult)
         return true
     }
 
@@ -3007,6 +3510,9 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         LauncherLayout.shouldPresentToastWhileLauncherIsUp(
             isDismissing: launcherIsDismissing(),
             isVisible: window?.isVisible == true
+        ) && LauncherLayout.shouldPresentToastWhileFolderChromeQuiet(
+            folderOpen: openedFolderID != nil,
+            folderClosing: folderOverlay.isAnimatingClose
         )
     }
 
@@ -3054,28 +3560,98 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     private func presentToast(_ message: String, help: String? = nil, autoDismiss: Bool = true) {
         toastGeneration += 1
         toastDismissTask?.cancel()
+        let toastWasHidden = toastView.isHidden
         toastLabel.stringValue = message
         toastView.setAccessibilityLabel(message)
-        toastView.toolTip = help
-        toastView.alphaValue = 0
-        toastView.isHidden = false
-        if prefersReducedMotion {
-            toastView.alphaValue = 1
+        if let help, !help.isEmpty {
+            toastView.setAccessibilityHelp(help)
         } else {
-            NSAnimationContext.runAnimationGroup { context in
-                context.duration = 0.12
-                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                toastView.animator().alphaValue = 1
+            toastView.setAccessibilityHelp(nil)
+        }
+        toastView.toolTip = help
+        if prefersReducedMotion {
+            revealToastWithoutAnimation()
+        } else {
+            // Parity with status/footer/settings message: clear opacity before
+            // unhide; if already shown but hide was interrupted, restore from
+            // presentation (do not snap to 0 — that blinks a solid toast).
+            toastView.wantsLayer = true
+            let presented = CGFloat(
+                toastView.layer?.presentation()?.opacity
+                    ?? toastView.layer?.opacity
+                    ?? Float(toastView.alphaValue)
+            )
+            let timing = CAMediaTimingFunction(name: .easeOut)
+            if LauncherLayout.toastShouldClearOpacityBeforeUnhide(
+                willShow: true,
+                currentlyHidden: toastWasHidden
+            ) {
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                toastView.alphaValue = 0
+                toastView.layer?.opacity = 0
+                toastView.isHidden = false
+                CATransaction.commit()
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                fadeViewOpacityFromPresentation(
+                    toastView,
+                    to: 1,
+                    duration: LauncherLayout.toastFadeDuration,
+                    timingFunction: timing,
+                    key: LauncherLayout.toastFadeAnimationKey
+                )
+                CATransaction.commit()
+            } else if LauncherLayout.toastShouldRestoreOpacityWhenAlreadyShown(
+                currentlyHidden: toastWasHidden,
+                currentOpacity: presented
+            ) {
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                toastView.isHidden = false
+                fadeViewOpacityFromPresentation(
+                    toastView,
+                    to: 1,
+                    duration: LauncherLayout.toastFadeDuration,
+                    timingFunction: timing,
+                    key: LauncherLayout.toastFadeAnimationKey
+                )
+                CATransaction.commit()
+            } else {
+                // Already solid — copy updated; keep opacity at 1.
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                if let layer = toastView.layer {
+                    for key in toastFadeKeys(on: layer) {
+                        layer.removeAnimation(forKey: key)
+                    }
+                    layer.opacity = 1
+                }
+                toastView.alphaValue = 1
+                toastView.isHidden = false
+                CATransaction.commit()
             }
         }
-        NSAccessibility.post(
-            element: NSApplication.shared,
-            notification: .announcementRequested,
-            userInfo: [
-                NSAccessibility.NotificationUserInfoKey.announcement: message,
-                NSAccessibility.NotificationUserInfoKey.priority: NSAccessibilityPriorityLevel.high.rawValue
-            ]
-        )
+        if LauncherLayout.toastShouldAnnounce(
+            message: message,
+            previousAnnounced: lastAnnouncedToastMessage,
+            toastWasHidden: toastWasHidden
+        ) {
+            let high = LauncherLayout.toastAnnouncementPriority(autoDismiss: autoDismiss)
+            NSAccessibility.post(
+                element: NSApplication.shared,
+                notification: .announcementRequested,
+                userInfo: [
+                    NSAccessibility.NotificationUserInfoKey.announcement: message,
+                    NSAccessibility.NotificationUserInfoKey.priority: (
+                        high
+                            ? NSAccessibilityPriorityLevel.high
+                            : NSAccessibilityPriorityLevel.medium
+                    ).rawValue
+                ]
+            )
+            lastAnnouncedToastMessage = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
         guard autoDismiss else { return }
         toastDismissTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 2_600_000_000)
@@ -3114,22 +3690,35 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         toastDismissTask = nil
         guard !toastView.isHidden else { return }
         guard animated, !prefersReducedMotion else {
-            toastView.alphaValue = 0
+            // Hidden + opacity 1: next present clears before unhide.
+            toastView.alphaValue = 1
+            toastView.layer?.opacity = 1
             toastView.isHidden = true
             return
         }
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = 0.12
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            toastView.animator().alphaValue = 0
-        }, completionHandler: { [weak self] in
+        let timing = CAMediaTimingFunction(name: .easeOut)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        CATransaction.setCompletionBlock { [weak self] in
             // Already on the main thread. A Task would leave the faded
             // bubble drawn for another turn.
             finishFlightOnLandingTurn { [weak self] in
                 guard self?.toastGeneration == generation else { return }
+                // Park alpha at 1 while hidden — next reveal clears opacity
+                // before unhide (toastShouldClearOpacityBeforeUnhide).
                 self?.toastView.isHidden = true
+                self?.toastView.alphaValue = 1
+                self?.toastView.layer?.opacity = 1
             }
-        })
+        }
+        fadeViewOpacityFromPresentation(
+            toastView,
+            to: 0,
+            duration: LauncherLayout.toastFadeDuration,
+            timingFunction: timing,
+            key: LauncherLayout.toastFadeAnimationKey
+        )
+        CATransaction.commit()
     }
 
     /// The preference changed. A fade that is still running jumps to the
@@ -3151,9 +3740,9 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         }
     }
 
-    /// `animator().alphaValue` writes the destination immediately. The
-    /// presentation opacity is the frame on screen. A fade-out completion
-    /// would still hide the bubble, so drop that generation.
+    /// Toast opacity fades hold presentation with fillMode.backwards; pin
+    /// copies the opacity already on screen. A fade-out completion would
+    /// still hide the bubble, so drop that generation.
     private func pinInFlightToastFade() {
         guard !toastView.isHidden else { return }
         toastView.wantsLayer = true
@@ -3241,6 +3830,103 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     @objc private func openSettings() {
         guard acceptsPointerActivation() else { return }
         onSettingsRequested?()
+    }
+
+
+    /// Non-empty trimmed query (field editor preferred while present).
+    func searchQueryIsNonEmpty() -> Bool {
+        !currentSearchQuery().trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Settings handoff: land search-results host before the first restored frame.
+    func snapSearchResultsChromeForSettingsHandoffRestore() {
+        guard searchQueryIsNonEmpty() else { return }
+        applySearch()
+        searchChromeGeneration &+= 1
+        searchChromeVisible = true
+        searchChromeFading = false
+        searchChromeWaitsForLauncher = false
+        landSearchChrome()
+    }
+
+    /// Settings handoff: force page dots off (search pageCount 0) with no fade.
+    func snapPageIndicatorSuppressedForSettingsHandoffRestore() {
+        pageIndicator.configure(
+            pageCount: 0,
+            selectedPage: currentPage,
+            animatedVisibility: false,
+            reducesMotion: true
+        )
+        updatePagingControls()
+    }
+
+    /// Settings handoff: force prev/next page arrows off with no presence fade.
+    func snapPageArrowsSuppressedForSettingsHandoffRestore() {
+        previousPageButton.setPagingAvailable(false, animated: false)
+        nextPageButton.setPagingAvailable(false, animated: false)
+        recoverFocusFromHiddenPagingControl()
+    }
+
+    /// Settings handoff: land search footer chrome (hide drag hint, Esc-clear
+    /// nav text) with no fade so grid hints do not flash under results.
+    func snapSearchFooterChromeForSettingsHandoffRestore() {
+        guard searchQueryIsNonEmpty() else { return }
+        footerHintGeneration &+= 1
+        let generation = footerHintGeneration
+        for view in [footerControls as NSView, dragHintLabel, navigationHintLabel] {
+            view.wantsLayer = true
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            view.layer?.removeAnimation(forKey: LauncherLayout.footerHintFadeAnimationKey)
+            CATransaction.commit()
+        }
+        let folderOpen = openedFolderID != nil
+        let showChrome = LauncherLayout.footerChromeShouldShow(folderOpen: folderOpen)
+        setFooterChromeVisible(showChrome, animated: false, generation: generation)
+        setFooterLabelVisible(
+            dragHintLabel,
+            visible: false,
+            animated: false,
+            generation: generation
+        )
+        setFooterNavigationText(
+            L("Esc 清除搜索"),
+            chromeVisible: showChrome,
+            animated: false,
+            generation: generation
+        )
+    }
+
+    /// Settings handoff: land search-adjacent chrome (results count + settings)
+    /// with no fade so idle "N 个项目" does not flash under results.
+    func snapSearchAdjacentChromeForSettingsHandoffRestore() {
+        guard searchQueryIsNonEmpty() else { return }
+        searchAdjacentChromeGeneration &+= 1
+        let generation = searchAdjacentChromeGeneration
+        for view in [countLabel as NSView, settingsButton, searchChrome] {
+            view.wantsLayer = true
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            view.layer?.removeAnimation(forKey: LauncherLayout.searchAdjacentChromeFadeAnimationKey)
+            view.layer?.removeAnimation(forKey: LauncherLayout.statusChromeFadeAnimationKey)
+            CATransaction.commit()
+        }
+        updateSearchAdjacentChrome(animated: false, generation: generation)
+    }
+
+    /// True when the search field or its field editor holds first responder.
+    func searchFieldHoldsKeyboardFocus() -> Bool {
+        let responder = window?.firstResponder
+        if responder === searchField { return true }
+        if let editor = searchField.currentEditor(), responder === editor { return true }
+        if let view = responder as? NSView, view.isDescendant(of: searchField) { return true }
+        return false
+    }
+
+    /// Settings handoff restore: put typing focus back without select-all.
+    @discardableResult
+    func focusSearchFieldForSettingsHandoffRestore() -> Bool {
+        focusSearchFieldAtEnd()
     }
 
     func focusSearch() {
@@ -3374,8 +4060,16 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         return hadQuery
     }
 
-    @objc private func clearSearch() {
-        _ = clearSearchIfNeeded()
+    /// System search cancel button finished. Custom clearButton was removed;
+    /// text-change usually emptied the query already — land focus if the field
+    /// still holds the keyboard on the idle grid.
+    func searchFieldDidEndSearching(_ sender: NSSearchField) {
+        guard sender === searchField else { return }
+        guard LauncherLayout.shouldFocusFirstGridItemAfterSearchFieldDidEndSearching(
+            isSearching: isSearching,
+            searchHoldsKeyboardFocus: searchFieldHoldsKeyboardFocus()
+        ) else { return }
+        focusFirstGridItemOnCurrentPage()
     }
 
     func controlTextDidChange(_ obj: Notification) {
@@ -3398,7 +4092,19 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             return
         }
         frozenSearchFieldText = nil
+        // Built-in clear / delete-all: leave the empty field like Esc.
+        let wasSearching = isSearching
         applySearch()
+        if LauncherLayout.shouldFocusFirstGridItemAfterSearchQueryEmptied(
+            wasSearching: wasSearching,
+            isSearchingNow: isSearching
+        ) {
+            focusFirstGridItemOnCurrentPage()
+        } else {
+            // Non-empty query with hits: pin first hit for keyboard open while
+            // the field keeps the caret (do not steal first responder).
+            syncSearchKeyboardHighlight(pinFirst: true)
+        }
     }
 
     /// Keep the first snapshot. A second `hide()` during the fade must not
@@ -3438,15 +4144,28 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             // Return confirms the IME candidate first. Launching here would open
             // whatever the unfinished pinyin currently matches.
             if textView.hasMarkedText() { return false }
-            switch currentPresentedItems().first {
-            case .app(_, let candidate):
-                onCandidateSelected?(candidate)
-            case .folder(let folder, _):
-                openFolder(folder.id)
-            case nil:
-                break
-            }
+            activateSearchKeyboardHighlightOrFirst()
             return true
+        }
+        // Arrow-down / up: move keyboard-open highlight among hits while the
+        // field stays first responder (typing uninterrupted). Does not page.
+        if isSearching, openedFolderID == nil, !textView.hasMarkedText(),
+           selector == #selector(NSResponder.moveDown(_:))
+            || selector == #selector(NSResponder.moveUp(_:)) {
+            let delta = selector == #selector(NSResponder.moveDown(_:)) ? 1 : -1
+            moveSearchKeyboardHighlight(by: delta)
+            return true
+        }
+        // Deliberate Tab: hand real first responder to the highlighted / first
+        // hit. Typing path never calls this — only insertTab. IME marked text
+        // stays in the field. Does not page.
+        if selector == #selector(NSResponder.insertTab(_:)),
+           LauncherLayout.shouldHandOffSearchFieldTabToHit(
+            isSearching: isSearching && openedFolderID == nil,
+            hasHits: !currentPresentedItems().isEmpty,
+            hasMarkedText: textView.hasMarkedText()
+           ) {
+            return focusSearchKeyboardHighlightOrFirstHit()
         }
         // The key loop only contains icons already on screen. Shift-Tab would
         // stop on the last visible hit and never reach one below the fold.
@@ -3556,6 +4275,19 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         // resume on this turn, and the tile has to know the fade is underway.
         if let tile = item.view as? AppGridTileView {
             tile.launcherIsDismissing = launcherIsDismissing
+            if collectionView === folderOverlay.collectionView {
+                tile.folderPanelChromeInFlight = { [weak self] in
+                    self?.folderOverlay.panelChromeInFlight ?? false
+                }
+                tile.keyboardFocusAvailable = { [weak self] in
+                    LauncherLayout.folderOverlayKeyboardFocusAvailable(
+                        panelChromeInFlight: self?.folderOverlay.panelChromeInFlight ?? true
+                    )
+                }
+            } else {
+                tile.folderPanelChromeInFlight = { false }
+                tile.keyboardFocusAvailable = { true }
+            }
         }
         let activate = { [weak self, weak collectionView] in
             guard let collectionView else { return }
@@ -3573,10 +4305,51 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         let hideApplication = { [weak self, weak collectionView] in
             guard let self, let collectionView,
                   let candidate = self.currentAppCandidate(withID: representedID, in: collectionView) else { return }
-            self.hideApplication(candidate)
+            self.hideApplication(candidate, focusID: representedID, in: collectionView)
+        }
+        let uninstallApplication = { [weak self, weak collectionView] in
+            guard let self, let collectionView,
+                  let candidate = self.currentAppCandidate(withID: representedID, in: collectionView) else { return }
+            guard self.uninstallTask == nil else { return }
+            self.noteUninstallSheetFocus(itemID: representedID, in: collectionView)
+            self.uninstallTask = Task { [weak self] in
+                guard let self else { return }
+                await self.promptToUninstall(candidate)
+                self.uninstallTask = nil
+            }
         }
         switch presented {
         case .app(_, let candidate):
+            let uninstall = uninstallDecision(for: candidate)
+            let uninstallMenu = AppUninstallEligibility.menuPresentation(
+                layoutEditingEnabled: isLayoutEditingEnabled,
+                decision: uninstall
+            )
+            let uninstallAction: (() -> Void)?
+            let uninstallEnabled: Bool
+            let uninstallDisabledReason: String?
+            switch uninstallMenu {
+            case .hidden:
+                uninstallAction = nil
+                uninstallEnabled = false
+                uninstallDisabledReason = nil
+            case .disabled(let explanationKey):
+                uninstallAction = uninstallApplication
+                uninstallEnabled = false
+                uninstallDisabledReason = explanationKey.map(L)
+            case .enabled:
+                uninstallAction = uninstallApplication
+                uninstallEnabled = true
+                uninstallDisabledReason = nil
+            }
+            let searchFolder: String? = {
+                guard collectionView === searchCollectionView,
+                      let name = LauncherLayout.containingFolderName(
+                        forAppID: representedID,
+                        in: layoutState
+                      ) else { return nil }
+                return String(format: L("文件夹 %@"), name)
+            }()
             item.configure(
                 candidate: candidate,
                 displayName: displayName(for: candidate),
@@ -3587,7 +4360,11 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
                 onActivate: activate,
                 onDragStart: beginDrag,
                 onRenameAlias: isLayoutEditingEnabled ? renameAlias : nil,
-                onHideApplication: isLayoutEditingEnabled ? hideApplication : nil
+                onHideApplication: isLayoutEditingEnabled ? hideApplication : nil,
+                onUninstallApplication: uninstallAction,
+                uninstallEnabled: uninstallEnabled,
+                uninstallDisabledReason: uninstallDisabledReason,
+                searchFolderContext: searchFolder
             )
         case .folder(let folder, let preview):
             item.configure(candidate: AppCandidate(
@@ -3598,7 +4375,8 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
                 discoveredAt: folder.createdAt
             ), displayName: folder.name, isLaunching: false, isFolder: true, preview: preview,
                 reducesMotion: prefersReducedMotion, onActivate: activate, onDragStart: beginDrag,
-                onRenameAlias: nil, onHideApplication: nil)
+                onRenameAlias: nil, onHideApplication: nil, onUninstallApplication: nil,
+                uninstallEnabled: false, uninstallDisabledReason: nil)
             if pendingMergeAnimation?.createdFolder == true,
                pendingMergeAnimation?.folderID == folder.id,
                collectionView === activeCollectionView || collectionView === stagingCollectionView {
@@ -3647,6 +4425,62 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
                 // not sit under that picture.
                 hideDropLandingContents(on: tile)
             }
+            tile.isSelected = itemSelection.contains(representedID)
+            tile.isSearchKeyboardHighlighted = (
+                collectionView === self.searchCollectionView
+                && self.searchKeyboardHighlightID == representedID
+            )
+            tile.applyLayoutEditingAccessibilityHelp(
+                layoutEditingEnabled: self.isLayoutEditingEnabled,
+                layoutEditingExplanation: self.layoutEditingExplanation
+            )
+            tile.onCommandToggleSelection = { [weak self] in
+                guard let self else { return }
+                self.itemSelection = LauncherItemSelection.applying(
+                    kind: .toggle,
+                    itemID: representedID,
+                    to: self.itemSelection
+                )
+                self.refreshItemSelectionChrome()
+            }
+            tile.onShiftSelectRange = { [weak self, weak collectionView] in
+                guard let self, let collectionView else { return }
+                let order = self.presentedItems(for: collectionView).map(\.id)
+                self.itemSelection = LauncherItemSelection.applyingRange(
+                    to: representedID,
+                    presentedOrder: order,
+                    current: self.itemSelection
+                )
+                self.refreshItemSelectionChrome()
+            }
+            tile.onPlainActivateClearsSelection = { [weak self] in
+                guard let self, !self.itemSelection.isEmpty else { return }
+                self.itemSelection.clear()
+                self.refreshItemSelectionChrome()
+            }
+            let multiSelectMenu = self.itemSelection.count > 1
+                && self.itemSelection.contains(representedID)
+                && self.isLayoutEditingEnabled
+            tile.onBatchHideSelection = multiSelectMenu
+                ? { [weak self, weak collectionView] in
+                    guard let self, let collectionView else { return }
+                    self.hideSelectedApplications(anchorFocusID: representedID, in: collectionView)
+                }
+                : nil
+            // New folder only on the main grid (not search / open folder).
+            let canBatchFolder = multiSelectMenu
+                && collectionView !== self.searchCollectionView
+                && collectionView !== self.folderOverlay.collectionView
+                && LauncherLayout.topLevelAppIDsForBatchFolder(
+                    selection: self.itemSelection,
+                    in: self.layoutState
+                ).count >= 2
+            tile.onBatchMoveSelectionToFolder = canBatchFolder
+                ? { [weak self] in
+                    self?.moveSelectionToNewFolder()
+                }
+                : nil
+            tile.refreshContextMenu()
             tile.onContextMenuTracking = { [weak self] menu in
                 self?.noteIconContextMenuTracking(menu)
             }
@@ -4360,18 +5194,39 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
                   let toFrame = collectionView.collectionViewLayout?.layoutAttributesForItem(
                     at: IndexPath(item: slot, section: 0)
                   )?.frame else {
-                tile.setReorderTranslation(.zero, animated: false)
+                // Missing attributes: only clear when we are allowed to snap.
+                if !animated {
+                    tile.setReorderTranslation(.zero, animated: false)
+                }
+                ready = false
                 continue
             }
-            if slot != itemIndex, fromFrame.size == .zero || toFrame.size == .zero || fromFrame == toFrame {
+            let framesUsable = LauncherLayout.reorderFramesUsable(
+                slot: slot,
+                itemIndex: itemIndex,
+                fromFrame: fromFrame,
+                toFrame: toFrame
+            )
+            if !framesUsable {
                 ready = false
+                // Animated path: keep the neighbor on the frame already drawn
+                // until layout publishes a usable gap (no snap-then-ease).
+                if LauncherLayout.shouldHoldReorderPresentationUntilFramesReady(
+                    animated: animated,
+                    framesUsable: false
+                ) {
+                    continue
+                }
             }
             // Layout frames are in the flipped collection view. The tile converts this delta.
             let translation = CGSize(
                 width: toFrame.origin.x - fromFrame.origin.x,
                 height: toFrame.origin.y - fromFrame.origin.y
             )
-            tile.setReorderTranslation(translation, animated: animated && ready)
+            tile.setReorderTranslation(
+                translation,
+                animated: animated && framesUsable
+            )
         }
         return ready
     }
@@ -4589,7 +5444,8 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         if isSearching {
             searchPresentedItems = appSearchIndex.filter(
                 LauncherLayout.searchHits(in: layoutState, catalog: allCandidates),
-                query: query
+                query: query,
+                topLevelKeys: LauncherLayout.topLevelAppDeduplicationKeys(in: layoutState)
             ).compactMap { hit in
                 switch hit {
                 case .app(let candidate):
@@ -4606,11 +5462,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             searchPresentedItems.removeAll(keepingCapacity: true)
         }
         if resetPage { currentPage = 0 }
-        clearButton.isHidden = true
         let presented = currentPresentedItems()
-        countLabel.stringValue = isSearching
-            ? String(format: L("%d 个结果"), presented.count)
-            : String(format: L("%d 个项目"), layoutState.orderedEntries.count)
         updateSearchChrome(searching: isSearching)
         updatePagination(resetToFirstPage: resetPage)
         reloadVisibleCollections(
@@ -4621,32 +5473,46 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             preservedFolderMember: preCapturedFolderMember,
             folderFocusCaptured: folderFocusCaptured
         )
-        emptyStateView.isHidden = true
+        // Preserve arrow highlight across reload when still present;
+        // clear when idle / no hits. Typing path pins first separately.
+        syncSearchKeyboardHighlight(pinFirst: false)
+        let animateStatus = !prefersReducedMotion
+            && window?.isVisible == true
+            && !launcherIsDismissing()
+        statusChromeGeneration &+= 1
+        let statusGeneration = statusChromeGeneration
         let showScanSkeleton = isCatalogLoading && allCandidates.isEmpty && !isSearching
-        scanSkeleton.isHidden = !showScanSkeleton
+        let emptyKind = LauncherLayout.emptyChromeKind(
+            isSearching: isSearching,
+            presentedIsEmpty: presented.isEmpty,
+            catalogIsEmpty: allCandidates.isEmpty,
+            isCatalogLoading: isCatalogLoading,
+            catalogScanCancelled: presentsCancelledEmptyCatalog
+        )
+        // Loading / non-search empty grid still uses the status line; search
+        // no-matches is grid chrome only (PRD: 网格区域显示「未找到匹配的应用」).
+        let statusMessage: String?
         if isCatalogLoading, allCandidates.isEmpty {
-            messageLabel.stringValue = L("正在准备应用…")
-            messageLabel.isHidden = false
-        } else if allCandidates.isEmpty {
-            messageLabel.isHidden = true
-            emptyStateView.isHidden = false
-            if presentsCancelledEmptyCatalog {
-                emptyStateTitle.stringValue = L("扫描已取消")
-                emptyStateDetail.stringValue = L("应用扫描已取消，请重新扫描。")
-                emptyStateReloadButton.setAccessibilityHelp(L("重新扫描应用"))
-            } else {
-                emptyStateTitle.stringValue = L("未找到可用的应用")
-                emptyStateDetail.stringValue = L("请确认应用位于 Applications 文件夹，然后重新扫描。")
-                emptyStateReloadButton.setAccessibilityHelp(L("重新扫描标准 Applications 文件夹"))
-            }
-        } else if presented.isEmpty {
-            messageLabel.stringValue = isSearching ? L("未找到匹配的应用，按 Esc 清除搜索") : L("正在准备应用…")
-            messageLabel.isHidden = false
+            statusMessage = L("正在准备应用…")
+        } else if !isSearching, presented.isEmpty, !allCandidates.isEmpty {
+            statusMessage = L("正在准备应用…")
         } else {
-            messageLabel.isHidden = true
+            statusMessage = nil
         }
-        updateRecoveryButtons()
-        updateReadOnlyStatus()
+        updateSearchAdjacentChrome(animated: animateStatus, generation: statusGeneration)
+        setStatusChromeVisible(scanSkeleton, visible: showScanSkeleton, animated: animateStatus, generation: statusGeneration)
+        setEmptyStateChrome(
+            kind: emptyKind,
+            animated: animateStatus,
+            generation: statusGeneration
+        )
+        setStatusChromeMessage(
+            statusMessage,
+            animated: animateStatus,
+            generation: statusGeneration
+        )
+        updateRecoveryButtons(animated: animateStatus, generation: statusGeneration)
+        updateReadOnlyStatus(animated: animateStatus, generation: statusGeneration)
     }
 
     private func rebuildSearchableAppsCache() {
@@ -4731,6 +5597,410 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         return true
     }
 
+    /// Catalog message / empty / skeleton / read-only label presence.
+    /// Clear opacity before unhiding; hide completion restores alpha to 1.
+    private var statusChromeGeneration: UInt64 = 0
+    /// Isolated from statusChromeGeneration so empty/read-only updates
+    /// cannot cancel search-adjacent hide completions (count/settings/pill).
+    private var searchAdjacentChromeGeneration: UInt64 = 0
+
+    /// Empty-state title/detail. When the stack stays visible and cancelled ↔
+    /// not-found flips, crossfade the host so copy does not hard-cut.
+    private func setEmptyStateChrome(
+        kind: LauncherLayout.LauncherEmptyChromeKind?,
+        animated: Bool,
+        generation: UInt64
+    ) {
+        let visible = kind != nil
+        let title: String
+        let detail: String
+        let showActions: Bool
+        let help: String
+        switch kind {
+        case .catalogCancelled:
+            title = L("扫描已取消")
+            detail = L("应用扫描已取消，请重新扫描。")
+            showActions = true
+            help = L("重新扫描应用")
+        case .catalogUnavailable:
+            title = L("未找到可用的应用")
+            detail = L("请确认应用位于 Applications 文件夹，然后重新扫描。")
+            showActions = true
+            help = L("重新扫描标准 Applications 文件夹")
+        case .searchNoMatches:
+            title = L("未找到匹配的应用")
+            detail = L("按 Esc 清除搜索")
+            showActions = false
+            help = L("重新扫描标准 Applications 文件夹")
+        case nil:
+            title = emptyStateTitle.stringValue
+            detail = emptyStateDetail.stringValue
+            showActions = false
+            help = L("重新扫描标准 Applications 文件夹")
+        }
+        let currentlyHidden = emptyStateView.isHidden
+        let textChanging = emptyStateTitle.stringValue != title
+            || emptyStateDetail.stringValue != detail
+        let applyCopy = {
+            self.emptyStateTitle.stringValue = title
+            self.emptyStateDetail.stringValue = detail
+            self.emptyStateReloadButton.isHidden = !showActions
+            // Catalog empty still lets updateRecoveryButtons reveal the cache
+            // action; search no-matches must not show rescan/cache buttons.
+            if !showActions {
+                self.emptyStateCachedButton.isHidden = true
+            }
+            self.emptyStateReloadButton.setAccessibilityHelp(help)
+            self.emptyStateView.setAccessibilityElement(visible)
+            self.emptyStateView.setAccessibilityLabel(visible ? title : nil)
+            self.emptyStateView.setAccessibilityIdentifier(
+                kind == .searchNoMatches ? "search.empty" : "catalog.empty"
+            )
+        }
+        if LauncherLayout.statusChromeShouldCrossfadeText(
+            willShow: visible,
+            currentlyHidden: currentlyHidden,
+            textChanging: textChanging,
+            animated: animated
+        ) {
+            let timing = CAMediaTimingFunction(name: .easeOut)
+            let half = LauncherLayout.searchTransitionDuration * 0.5
+            emptyStateView.wantsLayer = true
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            CATransaction.setCompletionBlock { [weak self] in
+                finishFlightOnLandingTurn { [weak self] in
+                    guard let self, self.statusChromeGeneration == generation else { return }
+                    applyCopy()
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    self.fadeViewOpacityFromPresentation(
+                        self.emptyStateView,
+                        to: 1,
+                        duration: half,
+                        timingFunction: timing,
+                        key: LauncherLayout.statusChromeFadeAnimationKey
+                    )
+                    CATransaction.commit()
+                }
+            }
+            fadeViewOpacityFromPresentation(
+                emptyStateView,
+                to: 0,
+                duration: half,
+                timingFunction: timing,
+                key: LauncherLayout.statusChromeFadeAnimationKey
+            )
+            CATransaction.commit()
+            return
+        }
+        applyCopy()
+        setStatusChromeVisible(
+            emptyStateView,
+            visible: visible,
+            animated: animated,
+            generation: generation
+        )
+    }
+
+    /// Search top chrome (field pill + count + settings). Quiet while folder
+    /// overlay is open or its close chrome is still traveling — folder is modal.
+    private func updateSearchAdjacentChrome(
+        animated: Bool? = nil,
+        generation: UInt64? = nil
+    ) {
+        let animateStatus = animated ?? (
+            !prefersReducedMotion
+                && window?.isVisible == true
+                && !launcherIsDismissing()
+        )
+        let statusGeneration: UInt64
+        if let generation {
+            statusGeneration = generation
+        } else {
+            searchAdjacentChromeGeneration &+= 1
+            statusGeneration = searchAdjacentChromeGeneration
+        }
+        let adjacentFadeKey = LauncherLayout.searchAdjacentChromeFadeAnimationKey
+        let adjacentRestore: (Bool, CGFloat) -> Bool = { hidden, opacity in
+            LauncherLayout.searchAdjacentChromeShouldRestoreOpacityWhenAlreadyShown(
+                currentlyHidden: hidden,
+                currentOpacity: opacity
+            )
+        }
+        let folderOpen = openedFolderID != nil
+        let folderClosing = folderOverlay.isAnimatingClose
+        let showAdjacent = LauncherLayout.searchAdjacentChromeShouldShow(
+            folderOpen: folderOpen,
+            folderClosing: folderClosing
+        )
+        let kind = LauncherLayout.searchCountLabelKind(
+            isSearching: isSearching,
+            folderOpen: folderOpen,
+            folderClosing: folderClosing
+        )
+        let countText: String?
+        switch kind {
+        case .results:
+            countText = String(format: L("%d 个结果"), currentPresentedItems().count)
+            countLabel.setAccessibilityLabel(L("搜索结果数量"))
+        case .items:
+            countText = String(format: L("%d 个项目"), layoutState.orderedEntries.count)
+            countLabel.setAccessibilityLabel(L("应用数量"))
+        case nil:
+            countText = nil
+        }
+        setStatusChromeLabeledText(
+            countLabel,
+            text: countText,
+            animated: animateStatus,
+            generation: statusGeneration,
+            fadeKey: adjacentFadeKey,
+            restoreGate: adjacentRestore
+        )
+        // Search row is fading out; do not leave keyboard on settings or the field.
+        if !showAdjacent {
+            let responder = window?.firstResponder
+            let onSettings = responder === settingsButton
+                || (responder as? NSView)?.isDescendant(of: settingsButton) == true
+            let onSearch = responder === searchField
+                || responder === searchChrome
+                || (responder as? NSView)?.isDescendant(of: searchChrome) == true
+            if onSettings || onSearch {
+                _ = window?.makeFirstResponder(self)
+            }
+        }
+        setStatusChromeVisible(
+            searchChrome,
+            visible: showAdjacent,
+            animated: animateStatus,
+            generation: statusGeneration,
+            fadeKey: adjacentFadeKey,
+            restoreGate: adjacentRestore
+        )
+        setStatusChromeVisible(
+            settingsButton,
+            visible: showAdjacent,
+            animated: animateStatus,
+            generation: statusGeneration,
+            fadeKey: adjacentFadeKey,
+            restoreGate: adjacentRestore
+        )
+    }
+
+    /// Catalog status message (loading / search empty).
+    private func setStatusChromeMessage(
+        _ text: String?,
+        animated: Bool,
+        generation: UInt64
+    ) {
+        setStatusChromeLabeledText(
+            messageLabel,
+            text: text,
+            animated: animated,
+            generation: generation
+        )
+    }
+
+    /// Labeled status chrome: hide/show with opacity-before-unhide; already
+    /// visible copy changes crossfade (read-only explanation, status message).
+    private func setStatusChromeLabeledText(
+        _ label: NSTextField,
+        text: String?,
+        animated: Bool,
+        generation: UInt64,
+        fadeKey: String = LauncherLayout.statusChromeFadeAnimationKey,
+        restoreGate: ((Bool, CGFloat) -> Bool)? = nil
+    ) {
+        let willShow = text != nil
+        let currentlyHidden = label.isHidden
+        let next = text ?? ""
+        let textChanging = label.stringValue != next
+        if LauncherLayout.statusChromeShouldCrossfadeText(
+            willShow: willShow,
+            currentlyHidden: currentlyHidden,
+            textChanging: textChanging,
+            animated: animated
+        ) {
+            let timing = CAMediaTimingFunction(name: .easeOut)
+            let half = LauncherLayout.searchTransitionDuration * 0.5
+            label.wantsLayer = true
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            CATransaction.setCompletionBlock { [weak self, weak label] in
+                finishFlightOnLandingTurn { [weak self, weak label] in
+                    guard let self, let label else { return }
+                    let live = fadeKey == LauncherLayout.searchAdjacentChromeFadeAnimationKey
+                        ? self.searchAdjacentChromeGeneration
+                        : self.statusChromeGeneration
+                    guard live == generation else { return }
+                    label.stringValue = next
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    self.fadeViewOpacityFromPresentation(
+                        label,
+                        to: 1,
+                        duration: half,
+                        timingFunction: timing,
+                        key: fadeKey
+                    )
+                    CATransaction.commit()
+                }
+            }
+            fadeViewOpacityFromPresentation(
+                label,
+                to: 0,
+                duration: half,
+                timingFunction: timing,
+                key: fadeKey
+            )
+            CATransaction.commit()
+            return
+        }
+        if willShow {
+            label.stringValue = next
+        }
+        setStatusChromeVisible(
+            label,
+            visible: willShow,
+            animated: animated,
+            generation: generation,
+            fadeKey: fadeKey,
+            restoreGate: restoreGate
+        )
+    }
+
+    private func setStatusChromeVisible(
+        _ view: NSView,
+        visible: Bool,
+        animated: Bool,
+        generation: UInt64,
+        fadeKey: String = LauncherLayout.statusChromeFadeAnimationKey,
+        restoreGate: ((Bool, CGFloat) -> Bool)? = nil
+    ) {
+        let currentlyHidden = view.isHidden
+        let currentlyShown = !currentlyHidden
+        view.wantsLayer = true
+        let presentedOpacity = CGFloat(
+            view.layer?.presentation()?.opacity
+                ?? view.layer?.opacity
+                ?? Float(view.alphaValue)
+        )
+        let shouldAnimate = animated
+            && !prefersReducedMotion
+            && window?.isVisible == true
+            && !launcherIsDismissing()
+        // Presence unchanged: an interrupted hide can leave the view unhidden
+        // at near-zero opacity (generation bump from recovery/rescan). Fade
+        // back up instead of early-outing and leaving empty/recovery invisible.
+        if visible == currentlyShown {
+            let shouldRestore = restoreGate?(currentlyHidden, presentedOpacity)
+                ?? LauncherLayout.statusChromeShouldRestoreOpacityWhenAlreadyShown(
+                    currentlyHidden: currentlyHidden,
+                    currentOpacity: presentedOpacity
+                )
+            if visible, shouldRestore {
+                if shouldAnimate {
+                    let timing = CAMediaTimingFunction(name: .easeOut)
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    fadeViewOpacityFromPresentation(
+                        view,
+                        to: 1,
+                        duration: LauncherLayout.searchTransitionDuration,
+                        timingFunction: timing,
+                        key: fadeKey
+                    )
+                    CATransaction.commit()
+                } else {
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    view.layer?.removeAnimation(forKey: fadeKey)
+                    view.alphaValue = 1
+                    view.layer?.opacity = 1
+                    CATransaction.commit()
+                }
+            }
+            return
+        }
+        if !visible {
+            if shouldAnimate {
+                let timing = CAMediaTimingFunction(name: .easeOut)
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                CATransaction.setCompletionBlock { [weak self, weak view] in
+                    finishFlightOnLandingTurn { [weak self, weak view] in
+                        guard let self, let view else { return }
+                        let live = fadeKey == LauncherLayout.searchAdjacentChromeFadeAnimationKey
+                            ? self.searchAdjacentChromeGeneration
+                            : self.statusChromeGeneration
+                        guard live == generation else { return }
+                        // Park alpha at 1 while hidden — next reveal clears
+                        // opacity before unhide (statusChromeShouldClearOpacity…).
+                        view.isHidden = true
+                        view.alphaValue = 1
+                        view.layer?.opacity = 1
+                    }
+                }
+                fadeViewOpacityFromPresentation(
+                    view,
+                    to: 0,
+                    duration: LauncherLayout.searchTransitionDuration,
+                    timingFunction: timing,
+                    key: fadeKey
+                )
+                CATransaction.commit()
+                return
+            }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            view.layer?.removeAnimation(forKey: fadeKey)
+            view.isHidden = true
+            view.alphaValue = 1
+            view.layer?.opacity = 1
+            CATransaction.commit()
+            return
+        }
+        // Hide completion restored alpha to 1 while hidden. Clear before
+        // revealing so empty-state / recovery / skeleton do not flash solid.
+        let clearBeforeUnhide = fadeKey == LauncherLayout.searchAdjacentChromeFadeAnimationKey
+            ? LauncherLayout.searchAdjacentChromeShouldClearOpacityBeforeUnhide(
+                willShow: true,
+                currentlyHidden: currentlyHidden
+            )
+            : LauncherLayout.statusChromeShouldClearOpacityBeforeUnhide(
+                willShow: true,
+                currentlyHidden: currentlyHidden
+            )
+        if shouldAnimate, clearBeforeUnhide {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            view.alphaValue = 0
+            view.layer?.opacity = 0
+            view.isHidden = false
+            CATransaction.commit()
+            let timing = CAMediaTimingFunction(name: .easeOut)
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            fadeViewOpacityFromPresentation(
+                view,
+                to: 1,
+                duration: LauncherLayout.searchTransitionDuration,
+                timingFunction: timing,
+                key: fadeKey
+            )
+            CATransaction.commit()
+            return
+        }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        view.layer?.removeAnimation(forKey: fadeKey)
+        view.alphaValue = 1
+        view.layer?.opacity = 1
+        view.isHidden = false
+        CATransaction.commit()
+    }
+
     /// Show the page that is current and hide the other one. A folder
     /// backdrop owns that opacity, so leave it alone while the folder is
     /// open or its dim animation is still on the layer. The hidden page is
@@ -4753,12 +6023,14 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         outgoing.alphaValue = 1
         outgoing.layer?.opacity = 1
         setSearchChromePointer(outgoing, accepts: true)
-        incoming.isHidden = false
-        setSearchChromePointer(incoming, accepts: true)
+        // Same transaction: set destination opacity before revealing so a host
+        // that was parked at alpha 0 (or still at 1 while hidden) does not flash.
         if !backdropIsAnimating(incoming), !isOpenFolderBackdrop(incoming) {
             incoming.alphaValue = 1
             incoming.layer?.opacity = 1
         }
+        incoming.isHidden = false
+        setSearchChromePointer(incoming, accepts: true)
         CATransaction.commit()
         guard openedFolderID == nil else { return }
         incoming.setAccessibilityHidden(false)
@@ -4794,9 +6066,100 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         }
     }
 
+
+    /// Opacity fade that keeps the on-screen presentation until attached.
+    /// `animator().alphaValue` writes the model immediately and flashes.
+    private func fadeViewOpacityFromPresentation(
+        _ view: NSView,
+        to toOpacity: CGFloat,
+        duration: TimeInterval,
+        timingFunction: CAMediaTimingFunction,
+        key: String,
+        fromPresentation: Bool = true
+    ) {
+        view.wantsLayer = true
+        let fromOpacity = (fromPresentation ? view.layer?.presentation()?.opacity : nil)
+            ?? view.layer?.opacity ?? Float(view.alphaValue)
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = fromOpacity
+        fade.toValue = Float(toOpacity)
+        fade.duration = duration
+        fade.timingFunction = timingFunction
+        fade.fillMode = .backwards
+        view.alphaValue = toOpacity
+        view.layer?.opacity = Float(toOpacity)
+        view.layer?.add(fade, forKey: key)
+    }
+
+    /// Frame slide that keeps the on-screen rect until attached. Used for
+    /// page hosts and icon flyers. `animator().frame` writes the destination
+    /// immediately and flashes. Size is included so merge/drop flights that
+    /// shrink still travel from the presented bounds.
+    private func animateViewFrameFromPresentation(
+        _ view: NSView,
+        to frame: NSRect,
+        duration: TimeInterval,
+        timingFunction: CAMediaTimingFunction,
+        key: String,
+        fromPresentation: Bool = true
+    ) {
+        view.wantsLayer = true
+        guard let layer = view.layer else {
+            view.frame = frame
+            return
+        }
+        let presented = (fromPresentation ? layer.presentation() : nil) ?? layer
+        let fromPosition = presented.position
+        let fromSize = presented.bounds.size
+        // AppKit layer-backed views commonly use anchorPoint=(0,0), not
+        // the center. Let AppKit map the destination frame to layer position.
+        view.frame = frame
+        let position = CABasicAnimation(keyPath: "position")
+        position.fromValue = NSValue(point: fromPosition)
+        position.toValue = NSValue(point: layer.position)
+        position.duration = duration
+        position.fillMode = .backwards
+        let size = CABasicAnimation(keyPath: "bounds.size")
+        size.fromValue = NSValue(size: fromSize)
+        size.toValue = NSValue(size: frame.size)
+        size.duration = duration
+        size.fillMode = .backwards
+        let group = CAAnimationGroup()
+        group.animations = [position, size]
+        group.duration = duration
+        group.timingFunction = timingFunction
+        group.fillMode = .backwards
+        layer.add(group, forKey: key)
+    }
+
+    /// Several flyers share one travel clock and one landing completion.
+    private func runFlyerFrameAnimations(
+        _ frames: [(view: NSView, destination: NSRect)],
+        duration: TimeInterval,
+        timingFunction: CAMediaTimingFunction,
+        completion: @escaping @MainActor () -> Void
+    ) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        CATransaction.setCompletionBlock {
+            finishFlightOnLandingTurn(completion)
+        }
+        for item in frames {
+            animateViewFrameFromPresentation(
+                item.view,
+                to: item.destination,
+                duration: duration,
+                timingFunction: timingFunction,
+                key: LauncherLayout.flyerSlideAnimationKey
+            )
+        }
+        CATransaction.commit()
+    }
+
     /// Search and the grid fade across each other. The page that is leaving
     /// stays drawn until the fade ends, and it does not take clicks. Reduced
-    /// motion, a launcher fade, or an open-folder backdrop lands at once.
+    /// motion snaps (no 0.12s half-fade); a launcher fade or open-folder
+    /// backdrop also lands at once.
     private func updateSearchChrome(searching: Bool) {
         let incoming: NSView = searching ? searchScrollView : gridViewport
         let outgoing: NSView = searching ? gridViewport : searchScrollView
@@ -4812,8 +6175,14 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             isDismissing: launcherIsDismissing(),
             isVisible: window?.isVisible == true
         )
+        let reduced = prefersReducedMotion || window?.isVisible != true
+        // Reduced motion: snap via landSearchChrome (duration 0, no half-fade).
+        if LauncherLayout.shouldSnapSearchChromeForReducedMotion(reducesMotion: reduced) {
+            landSearchChrome()
+            return
+        }
         let fade = LauncherLayout.searchChromeFade(
-            reducesMotion: prefersReducedMotion || window?.isVisible != true,
+            reducesMotion: reduced,
             holdsForLauncherFade: holdCrossfade,
             incomingIsFolderBackdrop: isOpenFolderBackdrop(incoming)
         )
@@ -4826,32 +6195,59 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             outgoing.setAccessibilityHidden(true)
             incoming.setAccessibilityHidden(false)
         }
-        let incomingStart: CGFloat = incoming.isHidden
+        let incomingWasHidden = incoming.isHidden
+        let incomingStart: CGFloat = incomingWasHidden
             ? 0
             : CGFloat(incoming.layer?.presentation()?.opacity ?? Float(incoming.alphaValue))
         let outgoingStart = CGFloat(outgoing.layer?.presentation()?.opacity ?? Float(outgoing.alphaValue))
+        // landSearchChrome restores the hidden host to alpha 1. Unhiding
+        // before clearing would paint a full-bright grid/search for a frame.
+        incoming.wantsLayer = true
+        outgoing.wantsLayer = true
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        if incomingWasHidden {
+            incoming.alphaValue = 0
+            incoming.layer?.opacity = 0
+        }
         incoming.isHidden = false
         outgoing.isHidden = false
-        setSearchChromeOpacity(incoming, incomingStart)
-        setSearchChromeOpacity(outgoing, outgoingStart)
+        incoming.alphaValue = incomingStart
+        incoming.layer?.opacity = Float(incomingStart)
+        outgoing.alphaValue = outgoingStart
+        outgoing.layer?.opacity = Float(outgoingStart)
+        CATransaction.commit()
         setSearchChromePointer(
             outgoing,
             accepts: LauncherLayout.searchChromeOutgoingAcceptsClicks(fadingOut: true)
         )
         setSearchChromePointer(incoming, accepts: true)
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = fade.duration
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            incoming.animator().alphaValue = fade.incomingOpacity
-            outgoing.animator().alphaValue = fade.outgoingOpacity
-        }, completionHandler: { [weak self] in
+        let timing = CAMediaTimingFunction(name: .easeOut)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        CATransaction.setCompletionBlock { [weak self] in
             // Already on the main thread. A Task would leave the page that
             // is leaving drawn for another turn after the fade has finished.
             finishFlightOnLandingTurn { [weak self] in
                 guard let self, self.searchChromeGeneration == generation else { return }
                 self.landSearchChrome()
             }
-        })
+        }
+        fadeViewOpacityFromPresentation(
+            incoming,
+            to: fade.incomingOpacity,
+            duration: fade.duration,
+            timingFunction: timing,
+            key: LauncherLayout.searchChromeFadeAnimationKey
+        )
+        fadeViewOpacityFromPresentation(
+            outgoing,
+            to: fade.outgoingOpacity,
+            duration: fade.duration,
+            timingFunction: timing,
+            key: LauncherLayout.searchChromeFadeAnimationKey
+        )
+        CATransaction.commit()
     }
 
     private func currentPresentedItems() -> [PresentedItem] {
@@ -4907,7 +6303,25 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         } else if !isSearching, pageCount > 0 {
             currentPage = min(currentPage, pageCount - 1)
         }
-        pageIndicator.configure(pageCount: isSearching ? 0 : pageCount, selectedPage: currentPage)
+        let indicatorCount = isSearching ? 0 : pageCount
+        let hold = LauncherLayout.shouldHoldSearchChromeAnimation(
+            isDismissing: launcherIsDismissing(),
+            isVisible: window?.isVisible == true
+        )
+        // isHidden stays false until the fade-out lands, so repeated search
+        // keystrokes retarget from the presented opacity instead of snapping.
+        let animateDots = LauncherLayout.shouldAnimatePageIndicatorVisibility(
+            pageCount: indicatorCount,
+            currentlyShown: !pageIndicator.isHidden,
+            reducesMotion: prefersReducedMotion || window?.isVisible != true,
+            holdsForLauncherFade: hold
+        )
+        pageIndicator.configure(
+            pageCount: indicatorCount,
+            selectedPage: currentPage,
+            animatedVisibility: animateDots,
+            reducesMotion: prefersReducedMotion
+        )
         updatePagingControls()
         if isSearching {
             layoutSearchCollection()
@@ -4937,17 +6351,15 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         let rows = max(1, (items + columns - 1) / columns)
         guard let layout = searchCollectionView.collectionViewLayout as? NSCollectionViewFlowLayout else { return }
         var inset = layout.sectionInset
-        let horizontalInset: CGFloat = 8
-        if items > 0, items < columns {
-            let rowWidth = CGFloat(items) * layout.itemSize.width
-                + CGFloat(items - 1) * layout.minimumInteritemSpacing
-            let centeredInset = max(horizontalInset, floor((width - rowWidth) / 2))
-            inset.left = centeredInset
-            inset.right = centeredInset
-        } else {
-            inset.left = horizontalInset
-            inset.right = horizontalInset
-        }
+        let horizontalInset = LauncherLayout.searchSectionHorizontalInset(
+            itemCount: items,
+            columns: columns,
+            itemWidth: layout.itemSize.width,
+            interitemSpacing: layout.minimumInteritemSpacing,
+            viewportWidth: width
+        )
+        inset.left = horizontalInset
+        inset.right = horizontalInset
         if layout.sectionInset.left != inset.left || layout.sectionInset.right != inset.right {
             layout.sectionInset = inset
         }
@@ -5053,6 +6465,9 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
                 + tiles
                 + pageIndicator.keyViews
                 + [previousPageButton, nextPageButton]
+            if folderOverlay.isAnimatingClose {
+                folderOverlay.breakKeyViewLoop()
+            }
         }
         let visibleKeyViews = keyViews.filter { view in
             !isEffectivelyHidden(view) && (view as? NSControl)?.isEnabled != false
@@ -5102,12 +6517,22 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     }
 
     /// Tab just before the first scrolling icon, or just after the last one.
-    /// Search returns to the settings button or the search field. A folder
-    /// returns to the close button or the title. Grid icons are not involved.
+    /// Search returns to the search field (Shift-Tab from first = reverse of
+    /// Tab handoff). A folder returns to the close button or the title.
+    /// Grid icons are not involved.
     private func focusOutsidePresentedList(in collectionView: NSCollectionView, by direction: Int) -> Bool {
         if collectionView === searchCollectionView {
+            // Shift-Tab from the first hit → field (natural reverse of Tab
+            // handoff). Tab past the last hit → field (unchanged). Settings
+            // remains on the key loop when idle or when search has no hits.
             if direction < 0 {
-                return window?.makeFirstResponder(settingsButton) == true
+                guard LauncherLayout.shouldReturnSearchHitBacktabToField(
+                    isSearchCollection: true,
+                    tabDirection: direction
+                ) else {
+                    return window?.makeFirstResponder(settingsButton) == true
+                }
+                return focusSearchFieldAtEnd()
             }
             // The field selects everything when it becomes first responder.
             // The next letter would replace the query the user just tabbed back to.
@@ -5180,7 +6605,67 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             }
         }
 
-        switch LauncherLayout.applyDrop(drop, to: layoutState, newFolderName: L("新建文件夹")) {
+        // Multi-select → existing folder on the same page: batch-move selected
+        // top-level apps. Single-item drag / new-folder merge / reorder unchanged.
+        let batchIntoFolder: (folderID: UUID, apps: [UUID])? = {
+            guard case .merge(let target) = drop.destination,
+                  case .topLevel(let folderID) = target,
+                  case .topLevel(let draggedID) = drop.source,
+                  LauncherLayout.shouldBatchMoveSelectionIntoFolder(
+                    selection: itemSelection,
+                    draggedID: draggedID,
+                    folderID: folderID,
+                    in: layoutState
+                  ) else { return nil }
+            let apps = LauncherLayout.topLevelAppIDsForBatchMoveIntoFolder(
+                selection: itemSelection,
+                folderID: folderID,
+                in: layoutState
+            )
+            return (folderID, apps)
+        }()
+
+        // Multi-select → app tile on the same page: new folder from selection + target.
+        let batchCreateFolderApps: [UUID]? = {
+            guard batchIntoFolder == nil,
+                  case .merge(let target) = drop.destination,
+                  case .topLevel(let targetAppID) = target,
+                  case .topLevel(let draggedID) = drop.source,
+                  LauncherLayout.shouldBatchCreateFolderFromSelection(
+                    selection: itemSelection,
+                    draggedID: draggedID,
+                    targetAppID: targetAppID,
+                    in: layoutState
+                  ) else { return nil }
+            return LauncherLayout.topLevelAppIDsForBatchCreateFolder(
+                selection: itemSelection,
+                targetAppID: targetAppID,
+                in: layoutState
+            )
+        }()
+
+        let dropResult: Result<LayoutState, LayoutMutationError>
+        if let batch = batchIntoFolder {
+            dropResult = LauncherLayout.moveTopLevelApps(
+                batch.apps,
+                intoFolder: batch.folderID,
+                in: layoutState
+            )
+        } else if let apps = batchCreateFolderApps {
+            dropResult = LauncherLayout.createFolderFromTopLevelApps(
+                orderedAppIDs: apps,
+                in: layoutState,
+                name: L("新建文件夹")
+            ).map(\.state)
+        } else {
+            dropResult = LauncherLayout.applyDrop(
+                drop,
+                to: layoutState,
+                newFolderName: L("新建文件夹")
+            )
+        }
+
+        switch dropResult {
         case .success(let next):
             if next == layoutState {
                 // Same slot. The drag picture is still lifted; showing the
@@ -5261,6 +6746,10 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             }
             commitLayout(next)
             dissolveScatterExcludedItemID = nil
+            if batchIntoFolder != nil || batchCreateFolderApps != nil, !itemSelection.isEmpty {
+                itemSelection.clear()
+                refreshItemSelectionChrome()
+            }
             if var pending = pendingMergeAnimation,
                pending.createdFolder,
                let folderID = pending.folderID,
@@ -5322,13 +6811,21 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         itemID: UUID,
         inOpenFolder: Bool
     ) {
+        let reduced = prefersReducedMotion
+        // Reduced motion: snap — do not queue a flyer (no start/flight travel).
+        if LauncherLayout.shouldSnapDropLandingForReducedMotion(reducesMotion: reduced) {
+            return
+        }
         guard let sourceFrame, let image,
               LauncherLayout.shouldPlayDropLanding(
-                reducesMotion: prefersReducedMotion,
+                reducesMotion: reduced,
                 isDismissing: launcherIsDismissing(),
                 isVisible: window?.isVisible == true
               ) else { return }
-        let start = LauncherLayout.dropLandingStartFrame(cell: sourceFrame, reducesMotion: false)
+        let start = LauncherLayout.dropLandingStartFrame(
+            cell: sourceFrame,
+            reducesMotion: reduced
+        )
         pendingDropLanding = PendingDropLanding(
             itemID: itemID,
             source: start,
@@ -5411,11 +6908,193 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         }
     }
 
-    private func hideApplication(_ candidate: AppCandidate) {
+    private func hideApplication(
+        _ candidate: AppCandidate,
+        focusID: UUID,
+        in collectionView: NSCollectionView
+    ) {
         // A click on the still-open menu would otherwise write the layout
         // after the launcher has started to leave.
         guard isLayoutEditingEnabled, acceptsIconContextMenuAction() else { return }
+        let name = displayName(for: candidate)
+        let previousIDs = presentedItems(for: collectionView).map(\.id)
         commitLayout(LauncherLayout.hideApplication(withKey: candidate.deduplicationKey, in: layoutState))
+        // Prefer the pre-hide order: reload may not have rebuilt presentedItems yet.
+        let remainingIDs = previousIDs.filter { $0 != focusID }
+        if let next = LauncherLayout.focusItemIDAfterHiding(
+            hiddenID: focusID,
+            remainingIDs: remainingIDs,
+            previousOrderedIDs: previousIDs
+        ) {
+            restoreFocusAfterAlias(next, in: collectionView)
+        } else {
+            _ = window?.makeFirstResponder(self)
+        }
+        showToast(
+            String(format: L(LauncherLayout.hideApplicationToastMessageFormatKey), name),
+            help: L(LauncherLayout.hideApplicationToastHelpKey)
+        )
+    }
+
+
+
+
+
+
+    private func hideSelectedApplications(
+        anchorFocusID: UUID,
+        in collectionView: NSCollectionView
+    ) {
+        guard isLayoutEditingEnabled, acceptsIconContextMenuAction() else { return }
+        let keys = LauncherLayout.appKeysForBatchHide(selection: itemSelection, in: layoutState)
+        guard !keys.isEmpty else { return }
+        let previousIDs = presentedItems(for: collectionView).map(\.id)
+        let hiddenIDs = Set(itemSelection.orderedIDs.filter { layoutState.appKeys[$0] != nil && layoutState.folders[$0] == nil })
+        commitLayout(LauncherLayout.hideApplications(withKeys: keys, in: layoutState))
+        itemSelection.clear()
+        refreshItemSelectionChrome()
+        let remainingIDs = previousIDs.filter { !hiddenIDs.contains($0) }
+        if let next = LauncherLayout.focusItemIDAfterHiding(
+            hiddenID: anchorFocusID,
+            remainingIDs: remainingIDs,
+            previousOrderedIDs: previousIDs
+        ) {
+            restoreFocusAfterAlias(next, in: collectionView)
+        } else {
+            _ = window?.makeFirstResponder(self)
+        }
+        let count = keys.count
+        if count == 1, let only = keys.first,
+           let candidate = allCandidates.first(where: { $0.deduplicationKey == only }) {
+            showToast(
+                String(format: L(LauncherLayout.hideApplicationToastMessageFormatKey), displayName(for: candidate)),
+                help: L(LauncherLayout.hideApplicationToastHelpKey)
+            )
+        } else {
+            showToast(
+                LauncherLayout.hideSelectedApplicationsToastMessage(count: count),
+                help: L(LauncherLayout.hideApplicationToastHelpKey)
+            )
+        }
+    }
+
+    private func moveSelectionToNewFolder() {
+        guard isLayoutEditingEnabled, acceptsIconContextMenuAction() else { return }
+        guard openedFolderID == nil, !isSearching else { return }
+        let apps = LauncherLayout.topLevelAppIDsForBatchFolder(selection: itemSelection, in: layoutState)
+        guard apps.count >= 2 else { return }
+        switch LauncherLayout.createFolderFromTopLevelApps(
+            orderedAppIDs: apps,
+            in: layoutState,
+            name: L("新建文件夹")
+        ) {
+        case .failure:
+            return
+        case .success(let result):
+            commitLayout(result.state)
+            itemSelection.clear()
+            refreshItemSelectionChrome()
+            focusGridEntry(result.folderID)
+            showToast(L("已移入新建文件夹"))
+        }
+    }
+
+
+    private func uninstallDecision(for candidate: AppCandidate) -> AppUninstallDecision {
+        UninstallCoordinator.uninstallDecision(for: candidate, host: self)
+    }
+
+    private func promptToUninstall(_ candidate: AppCandidate) async {
+        await UninstallCoordinator.promptToUninstall(candidate, host: self)
+    }
+
+    func cleanUpOrphanLeftovers(
+        progress: (@MainActor (String) -> Void)? = nil
+    ) async -> String {
+        await UninstallCoordinator.cleanUpOrphanLeftovers(host: self, progress: progress)
+    }
+
+    var uninstallCatalogRoots: [URL] { catalogRoots }
+    var uninstallCandidates: [AppCandidate] { allCandidates }
+
+    func showUninstallToast(_ message: String, help: String?, autoDismiss: Bool) {
+        showToast(message, help: help, autoDismiss: autoDismiss)
+    }
+
+    func hideUninstallToast(animated: Bool) {
+        hideToast(animated: animated)
+    }
+
+    func clearMatchingProgressToast(_ message: String) {
+        if deferredToast?.message == message {
+            deferredToast = nil
+            toastWaitsForLauncher = false
+        }
+        if toastLabel.stringValue == message {
+            hideToast(animated: true)
+        }
+    }
+
+    func requestCatalogReloadAfterUninstall() {
+        onReloadRequested?()
+    }
+
+    func noteUninstallSheetFocusItemID(_ id: UUID?) {
+        uninstallSheetFocusItemID = id
+        if id == nil {
+            uninstallSheetFocusCollection = nil
+        }
+    }
+
+    /// Call from the uninstall menu action with the collection that owns the tile.
+    func noteUninstallSheetFocus(itemID: UUID, in collectionView: NSCollectionView) {
+        uninstallSheetFocusItemID = itemID
+        uninstallSheetFocusCollection = collectionView
+    }
+
+    func restoreFocusAfterUninstallSheet() {
+        defer {
+            uninstallSheetFocusItemID = nil
+            uninstallSheetFocusCollection = nil
+        }
+        guard AppRelatedFileScanner.relatedCleanupRestoresLauncherFocusAfterSheet,
+              let id = uninstallSheetFocusItemID else { return }
+        let collection = uninstallSheetFocusCollection
+            ?? (openedFolderID != nil ? folderOverlay.collectionView
+                : (isSearching ? searchCollectionView : activeCollectionView))
+        restoreFocusAfterAlias(id, in: collection)
+    }
+
+    @discardableResult
+    func applySuccessfulUninstall(of candidate: AppCandidate, otherCopyMayExist: Bool) {
+        let key = candidate.deduplicationKey
+        let remaining = allCandidates.filter { $0.deduplicationKey != key }
+        allCandidates = remaining
+        catalogByKey = AppCandidate.firstByDeduplicationKey(remaining)
+        appSearchIndexGeneration &+= 1
+        appSearchIndexBuildTask?.cancel()
+        let generation = appSearchIndexGeneration
+        let aliases = layoutState.appAliases
+        let buildTask = Task.detached(priority: .utility) {
+            AppSearchIndex(candidates: remaining, aliases: aliases)
+        }
+        appSearchIndexBuildTask = buildTask
+        Task { @MainActor [weak self] in
+            let index = await buildTask.value
+            guard let self,
+                  self.appSearchIndexGeneration == generation,
+                  !buildTask.isCancelled else { return }
+            var currentIndex = index
+            currentIndex.setAliases(self.layoutState.appAliases)
+            self.appSearchIndex = currentIndex
+            self.appSearchIndexBuildTask = nil
+            self.refreshSearchResultsForInstalledIndex()
+        }
+        if !otherCopyMayExist {
+            let forgotten = LauncherLayout.forgetUninstalledApplication(withKey: key, in: layoutState)
+            let reconciled = LauncherLayout.reconcile(candidates: remaining, into: forgotten)
+            commitLayout(reconciled)
+        }
     }
 
     @discardableResult
@@ -5481,7 +7160,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         for layer in layers {
-            layer.removeAnimation(forKey: "launch-feedback")
+            layer.removeAnimation(forKey: LauncherLayout.launchFeedbackAnimationKey)
             layer.transform = CATransform3DIdentity
         }
         CATransaction.commit()
@@ -5521,17 +7200,148 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     private func pinInFlightLaunchFeedback() {
         for tile in visibleGridTiles() {
             guard let layer = tile.layer,
-                  layer.animation(forKey: "launch-feedback") != nil else { continue }
+                  layer.animation(forKey: LauncherLayout.launchFeedbackAnimationKey) != nil else { continue }
             let transform = layer.presentation()?.transform ?? layer.transform
             CATransaction.begin()
             CATransaction.setDisableActions(true)
-            layer.removeAnimation(forKey: "launch-feedback")
+            layer.removeAnimation(forKey: LauncherLayout.launchFeedbackAnimationKey)
             layer.transform = transform
             CATransaction.commit()
             if !heldLaunchFeedbackLayers.contains(where: { $0 === layer }) {
                 heldLaunchFeedbackLayers.append(layer)
             }
         }
+    }
+
+    /// Command-A: select every icon on the current page (or open folder / search list).
+    /// Does not turn pages. Returns false while a text field is editing so Cmd-A
+    /// still selects text. Esc / plain click clear stays on existing paths.
+    @discardableResult
+    func selectAllItemsOnCurrentPage() -> Bool {
+        if window?.firstResponder is NSTextView || window?.firstResponder is NSTextField {
+            return false
+        }
+        if folderOverlay.isEditingTitle {
+            return false
+        }
+        let ids: [UUID]
+        if openedFolderID != nil {
+            ids = presentedItems(for: folderOverlay.collectionView).map(\.id)
+        } else if isSearching {
+            ids = currentPresentedItems().map(\.id)
+        } else {
+            ids = LauncherLayout.itemIDs(onPage: currentPage, from: layoutState.orderedEntries)
+        }
+        itemSelection = LauncherItemSelection.selectingAll(ids: ids)
+        refreshItemSelectionChrome()
+        return true
+    }
+
+
+
+    /// Deliberate Tab from the search field: real first responder on the
+    /// keyboard-open highlight (or first hit). Does not run while typing.
+    @discardableResult
+    private func focusSearchKeyboardHighlightOrFirstHit() -> Bool {
+        let ids = currentPresentedItems().map(\.id)
+        guard let target = LauncherLayout.searchFieldTabHandoffTargetID(
+            highlightID: searchKeyboardHighlightID,
+            presentedIDs: ids
+        ) else { return false }
+        // Keep highlight id aligned with the tile that takes FR.
+        searchKeyboardHighlightID = target
+        refreshSearchKeyboardHighlightChrome()
+        return focusPresentedItem(id: target, in: searchCollectionView)
+    }
+
+    /// Pin or preserve the search keyboard-open highlight without stealing the
+    /// search field's first responder. Empty / idle clears chrome.
+    private func syncSearchKeyboardHighlight(pinFirst: Bool) {
+        let ids = currentPresentedItems().map(\.id)
+        searchKeyboardHighlightID = LauncherLayout.searchKeyboardHighlightID(
+            isSearching: isSearching,
+            presentedIDs: ids,
+            previousHighlightID: pinFirst ? nil : searchKeyboardHighlightID
+        )
+        refreshSearchKeyboardHighlightChrome()
+    }
+
+    private func moveSearchKeyboardHighlight(by delta: Int) {
+        guard isSearching, openedFolderID == nil else { return }
+        let ids = currentPresentedItems().map(\.id)
+        searchKeyboardHighlightID = LauncherLayout.searchKeyboardHighlightIDMoving(
+            from: searchKeyboardHighlightID,
+            in: ids,
+            by: delta
+        )
+        refreshSearchKeyboardHighlightChrome()
+        scrollSearchKeyboardHighlightIntoViewIfNeeded()
+    }
+
+    private func activateSearchKeyboardHighlightOrFirst() {
+        let items = currentPresentedItems()
+        let target = searchKeyboardHighlightID.flatMap { id in items.first { $0.id == id } }
+            ?? items.first
+        switch target {
+        case .app(_, let candidate):
+            onCandidateSelected?(candidate)
+        case .folder(let folder, _):
+            openFolder(folder.id)
+        case nil:
+            break
+        }
+    }
+
+    private func refreshSearchKeyboardHighlightChrome() {
+        searchCollectionView.layoutSubtreeIfNeeded()
+        let items = currentPresentedItems()
+        for (index, entry) in items.enumerated() {
+            guard let tile = searchCollectionView.item(at: IndexPath(item: index, section: 0))?.view as? AppGridTileView else {
+                continue
+            }
+            let highlighted = searchKeyboardHighlightID == entry.id
+            if tile.isSearchKeyboardHighlighted != highlighted {
+                tile.isSearchKeyboardHighlighted = highlighted
+            }
+        }
+    }
+
+    private func scrollSearchKeyboardHighlightIntoViewIfNeeded() {
+        guard let id = searchKeyboardHighlightID else { return }
+        let items = currentPresentedItems()
+        guard let itemIndex = items.firstIndex(where: { $0.id == id }) else { return }
+        let indexPath = IndexPath(item: itemIndex, section: 0)
+        guard let frame = searchCollectionView.collectionViewLayout?.layoutAttributesForItem(at: indexPath)?.frame else {
+            return
+        }
+        let barelyVisible = frame.insetBy(dx: 0, dy: frame.height * 0.5)
+        if !searchCollectionView.visibleRect.intersects(barelyVisible) {
+            searchCollectionView.scrollToItems(
+                at: Set([indexPath]),
+                scrollPosition: [.nearestHorizontalEdge, .nearestVerticalEdge]
+            )
+        }
+    }
+
+    /// Re-apply selection chrome on materialized tiles. Does not touch paging.
+    private func refreshItemSelectionChrome() {
+        func apply(to collection: NSCollectionView?) {
+            guard let collection else { return }
+            let items = presentedItems(for: collection)
+            for (index, entry) in items.enumerated() {
+                guard let tile = collection.item(at: IndexPath(item: index, section: 0))?.view as? AppGridTileView else {
+                    continue
+                }
+                let selected = itemSelection.contains(entry.id)
+                if tile.isSelected != selected {
+                    tile.isSelected = selected
+                }
+            }
+        }
+        apply(to: activeCollectionView)
+        apply(to: stagingCollectionView)
+        apply(to: searchCollectionView)
+        apply(to: folderOverlay.collectionView)
     }
 
     private func visibleGridTiles() -> [AppGridTileView] {
@@ -5622,8 +7432,8 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         finishDissolvedGridFade()
     }
 
-    /// The grid fade uses `animator().alphaValue`, so the model opacity is
-    /// already 1 and the presentation opacity is the frame on screen.
+    /// The grid fade writes model opacity 1 with a presentation-backed
+    /// CAAnimation; pin uses the opacity already on screen.
     private func pinInFlightDissolvedGridFade() -> Bool {
         var pinned = false
         for view in [activeCollectionView, stagingCollectionView] {
@@ -5684,8 +7494,13 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         memberIDs: [UUID],
         nextEntries: [LauncherEntry]
     ) -> [DissolveScatterSeed] {
+        let reduced = prefersReducedMotion
+        // Reduced motion: snap — no scatter flyers.
+        if LauncherLayout.shouldSnapDissolveScatterForReducedMotion(reducesMotion: reduced) {
+            return []
+        }
         guard LauncherLayout.shouldPlayFolderDissolveScatter(
-            reducesMotion: prefersReducedMotion,
+            reducesMotion: reduced,
             isDismissing: launcherIsDismissing(),
             isVisible: window?.isVisible == true
         ) else { return [] }
@@ -5717,8 +7532,13 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     @discardableResult
     private func playFolderDissolveScatter(_ seeds: [DissolveScatterSeed]) -> Bool {
         guard !seeds.isEmpty else { return false }
+        let reduced = prefersReducedMotion
+        if LauncherLayout.shouldSnapDissolveScatterForReducedMotion(reducesMotion: reduced)
+            || LauncherLayout.dissolveScatterTravelDuration(reducesMotion: reduced) <= 0 {
+            return false
+        }
         guard LauncherLayout.shouldPlayFolderDissolveScatter(
-            reducesMotion: prefersReducedMotion,
+            reducesMotion: reduced,
             isDismissing: launcherIsDismissing(),
             isVisible: window?.isVisible == true
         ) else { return false }
@@ -5738,7 +7558,10 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             images[seed.itemID] = seed.image
             tiles[seed.itemID] = tile
         }
-        let flights = LauncherLayout.folderDissolveFlights(placements: placements, reducesMotion: false)
+        let flights = LauncherLayout.folderDissolveFlights(
+            placements: placements,
+            reducesMotion: reduced
+        )
         guard !flights.isEmpty else { return false }
 
         var flyers: [(view: NSImageView, destination: CGRect)] = []
@@ -5765,22 +7588,19 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             "Folder dissolve scatter: icons=\(flyers.count) duration=\(String(format: "%.2f", LauncherLayout.folderDissolveFlightDuration))"
         )
 
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = LauncherLayout.folderDissolveFlightDuration
-            // The folder is closing on this same travel curve. A second copy
-            // of the control points would drift, and the icons would leave early.
-            context.timingFunction = folderChromeTiming(tracksIcon: true)
-            for flyer in flyers {
-                flyer.view.animator().frame = flyer.destination
-            }
-        }, completionHandler: { [weak self] in
-            // Already on the main thread. A Task would hold the flying
-            // picture on the cell for another turn.
-            finishFlightOnLandingTurn { [weak self] in
-                guard let self, self.dissolveScatterGeneration == generation else { return }
-                self.commitFolderDissolveScatter()
-            }
-        })
+        // Same travel curve as the closing folder. Hold each flyer frame
+        // from presentation so the commit does not snap to the cell.
+        let dissolveTiming = folderChromeTiming(tracksIcon: true)
+        let travel = LauncherLayout.dissolveScatterTravelDuration(reducesMotion: reduced)
+        guard travel > 0 else { return false }
+        runFlyerFrameAnimations(
+            flyers.map { ($0.view, $0.destination) },
+            duration: travel,
+            timingFunction: dissolveTiming
+        ) { [weak self] in
+            guard let self, self.dissolveScatterGeneration == generation else { return }
+            self.commitFolderDissolveScatter()
+        }
         return true
     }
 
@@ -5795,8 +7615,9 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     private func commitFolderDissolveScatter() {
         dissolveScatterGeneration &+= 1
         dissolveScatterWaitsForLauncher = false
-        for hidden in dissolveScatterHiddenTiles {
-            hidden.tile?.alphaValue = 1
+        let hidden = dissolveScatterHiddenTiles
+        for item in hidden {
+            item.tile?.alphaValue = 1
         }
         dissolveScatterHiddenTiles.removeAll()
         let flyers = dissolveScatterFlyers
@@ -5805,6 +7626,21 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             flyer.layer?.removeAllAnimations()
             flyer.removeFromSuperview()
         }
+        #if DEBUG
+        let environment = ProcessInfo.processInfo.environment
+        if (!flyers.isEmpty || !hidden.isEmpty),
+           environment["LAUNCHICON_TEST_LAYOUT_PATH"] != nil,
+           environment["LAUNCHICON_DIAGNOSTICS_PATH"] != nil {
+            let detached = flyers.allSatisfy {
+                $0.superview == nil && $0.layer?.animationKeys()?.isEmpty != false
+            }
+            let destinationsReady = hidden.allSatisfy { ($0.tile?.alphaValue ?? 1) >= 0.999 }
+            onDiagnosticEvent?(
+                "Scatter cleanup: flyers=\(flyers.count) remaining=\(dissolveScatterFlyers.count) "
+                    + "detached=\(detached) destinationsReady=\(destinationsReady)"
+            )
+        }
+        #endif
     }
 
     /// Leave each flyer on the frame already on screen. The model frame is
@@ -6060,8 +7896,14 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     /// Returns false when nothing traveled.
     @discardableResult
     private func playFolderPreviewGlyphFlight(folderID: UUID, tracksIcon: Bool) -> Bool {
+        let reduced = prefersReducedMotion
+        // Reduced motion: snap — no fly-in travel.
+        if LauncherLayout.shouldSnapFolderPreviewGlyphForReducedMotion(reducesMotion: reduced)
+            || LauncherLayout.folderPreviewGlyphTravelDuration(reducesMotion: reduced) <= 0 {
+            return false
+        }
         let canFly = LauncherLayout.shouldPlayFolderPreviewGlyphFlight(
-            reducesMotion: prefersReducedMotion,
+            reducesMotion: reduced,
             isDismissing: launcherIsDismissing(),
             isVisible: window?.isVisible == true,
             tracksIcon: tracksIcon
@@ -6132,7 +7974,10 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             let opacity = flyer.view.layer?.presentation()?.opacity ?? flyer.view.layer?.opacity ?? 1
             carriedOpacity[itemID] = CGFloat(opacity)
         }
-        let flights = LauncherLayout.folderPreviewGlyphFlights(placements: placements, reducesMotion: false)
+        let flights = LauncherLayout.folderPreviewGlyphFlights(
+            placements: placements,
+            reducesMotion: reduced
+        )
         guard !flights.isEmpty else { return false }
 
         var hidden: [PreviewGlyphHiddenContent] = []
@@ -6187,8 +8032,14 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     /// turns around from the frame on screen. Returns false when nothing traveled.
     @discardableResult
     private func playFolderPreviewGlyphReturn(folderID: UUID, tracksIcon: Bool) -> Bool {
+        let reduced = prefersReducedMotion
+        // Reduced motion: snap — no return travel.
+        if LauncherLayout.shouldSnapFolderPreviewGlyphForReducedMotion(reducesMotion: reduced)
+            || LauncherLayout.folderPreviewGlyphTravelDuration(reducesMotion: reduced) <= 0 {
+            return false
+        }
         guard LauncherLayout.shouldPlayFolderPreviewGlyphReturn(
-            reducesMotion: prefersReducedMotion,
+            reducesMotion: reduced,
             isDismissing: launcherIsDismissing(),
             isVisible: window?.isVisible == true,
             tracksIcon: tracksIcon
@@ -6223,7 +8074,10 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             images[itemID] = image
             tiles[itemID] = tile
         }
-        let flights = LauncherLayout.folderPreviewGlyphReturnFlights(placements: placements, reducesMotion: false)
+        let flights = LauncherLayout.folderPreviewGlyphReturnFlights(
+            placements: placements,
+            reducesMotion: reduced
+        )
         guard !flights.isEmpty else { return false }
 
         var hidden: [PreviewGlyphHiddenContent] = []
@@ -6359,20 +8213,15 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         let fadeWithFlight = LauncherLayout.folderOverflowIconFadeSharesFlightEase(
             returningToPlate: towardGlyphs
         )
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = duration
-            context.timingFunction = folderChromeTiming(tracksIcon: true)
-            for move in moves {
-                move.view.animator().frame = move.destination
-            }
-        }, completionHandler: { [weak self] in
-            // Already on the main thread. A Task would hold the flying
-            // picture on the cell for another turn.
-            finishFlightOnLandingTurn { [weak self] in
-                guard let self, self.previewGlyphFlightGeneration == generation else { return }
-                self.commitFolderPreviewGlyphFlight()
-            }
-        })
+        let glyphTiming = folderChromeTiming(tracksIcon: true)
+        runFlyerFrameAnimations(
+            moves.map { ($0.view, $0.destination) },
+            duration: duration,
+            timingFunction: glyphTiming
+        ) { [weak self] in
+            guard let self, self.previewGlyphFlightGeneration == generation else { return }
+            self.commitFolderPreviewGlyphFlight()
+        }
         if fadeWithFlight {
             let rising = moves.filter(\.sinksIntoPlate)
             if !rising.isEmpty {
@@ -6444,15 +8293,31 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             }
             return
         }
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = duration
-            context.timingFunction = wholeCellMergeFadeTiming()
-            for content in overflow {
-                guard let tile = content.tile else { continue }
-                tile.iconView.animator().alphaValue = 1
-                tile.titleLabel.animator().alphaValue = 1
+        // The model ends at full opacity. animator() wrote that 1 before the
+        // fade attached, so the commit frame flashed each overflow icon on.
+        // Hold the opacity already on screen until this fade is on. Clock and
+        // ease stay on the whole-cell dissolve (same as folderOverflowIconRevealOpacity).
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        let timing = wholeCellMergeFadeTiming()
+        for content in overflow {
+            guard let tile = content.tile else { continue }
+            let views: [NSView] = [tile.iconView, tile.titleLabel]
+            for view in views {
+                view.wantsLayer = true
+                let fromOpacity = view.layer?.presentation()?.opacity ?? view.layer?.opacity ?? 0
+                let fade = CABasicAnimation(keyPath: "opacity")
+                fade.fromValue = fromOpacity
+                fade.toValue = 1
+                fade.duration = duration
+                fade.timingFunction = timing
+                fade.fillMode = .backwards
+                view.alphaValue = 1
+                view.layer?.opacity = 1
+                view.layer?.add(fade, forKey: LauncherLayout.folderOverflowOpenFadeAnimationKey)
             }
-        })
+        }
+        CATransaction.commit()
     }
 
     /// Show the plate glyphs and drop the flyers. An opening flight also
@@ -6462,6 +8327,8 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     /// race with a fade finds the generation already moved.
     private func commitFolderPreviewGlyphFlight(revealCells: Bool? = nil) {
         let reveal = revealCells ?? !previewGlyphFlightReturnsHome
+        let wasReturning = previewGlyphFlightReturnsHome
+        let sourceTile = previewGlyphSourceTile
         previewGlyphFlightGeneration &+= 1
         previewGlyphFlightWaitsForLauncher = false
         previewGlyphFlightReturnsHome = false
@@ -6485,6 +8352,21 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             flyer.layer?.removeAllAnimations()
             flyer.removeFromSuperview()
         }
+        #if DEBUG
+        let environment = ProcessInfo.processInfo.environment
+        if environment["LAUNCHICON_TEST_LAYOUT_PATH"] != nil,
+           environment["LAUNCHICON_DIAGNOSTICS_PATH"] != nil {
+            let detached = flyers.allSatisfy {
+                $0.superview == nil && $0.layer?.animationKeys()?.isEmpty != false
+            }
+            let sourceReady = sourceTile.map { !$0.openFlightHidesPreviewGlyphs } ?? true
+            onDiagnosticEvent?(
+                "Folder glyph cleanup: flyers=\(flyers.count) remaining=\(previewGlyphFlyers.count) "
+                    + "detached=\(detached) revealCells=\(reveal) sourceReady=\(sourceReady) "
+                    + "returning=\(wasReturning)"
+            )
+        }
+        #endif
     }
 
     /// Leave each glyph on the frame already on screen. The model frame is
@@ -6562,6 +8444,10 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         // Blank the grid only when the fade-in is about to play. During the
         // launcher fade, leave the opacity already on screen. A scatter flight
         // keeps the cells up: the leftover icon is flying toward one of them.
+        // Reduced motion snaps — do not blank for a half-fade.
+        let snapDissolvedGridFade = LauncherLayout.shouldSnapDissolvedGridFadeForReducedMotion(
+            reducesMotion: prefersReducedMotion
+        )
         let playDissolvedGridFade = dissolvesOpenFolder
             && !holdDissolvedGridFade
             && window?.isVisible == true
@@ -6575,13 +8461,15 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         } else {
             scatterSeeds = []
         }
-        if playDissolvedGridFade, scatterSeeds.isEmpty {
+        if playDissolvedGridFade, scatterSeeds.isEmpty, !snapDissolvedGridFade {
             activeCollectionView.alphaValue = 0
         }
         if next.appAliases != layoutState.appAliases {
             appSearchIndex.setAliases(next.appAliases)
         }
         layoutState = next
+        // Hide / uninstall / reconcile / folder dissolve: drop stale multi-select ids.
+        itemSelection = LauncherLayout.prunedItemSelection(itemSelection, in: layoutState)
         rebuildSearchableAppsCache()
         if let closingFolder, layoutState.folders[closingFolder] == nil {
             // The reload below throws away a focus set here. Restore it after.
@@ -6595,26 +8483,40 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             folderFocusCaptured: true
         )
         if dissolvesOpenFolder, let closingFolder,
-           let focusID = LauncherLayout.entryReplacingDissolvedFolder(
-               folderID: closingFolder,
+           let focusID = LauncherLayout.folderCloseGridFocusID(
+               pendingFolderID: closingFolder,
                previousEntries: previousEntries,
                currentEntries: layoutState.orderedEntries
            ) {
-            focusGridEntry(focusID)
+            focusMainGridEntry(focusID)
         } else if let preservedFolderMember, openedFolderID != nil {
             restoreOpenFolderMemberFocus(preservedFolderMember)
         }
         let playedScatter = playFolderDissolveScatter(scatterSeeds)
         if dissolvesOpenFolder, !playedScatter {
             if playDissolvedGridFade {
-                if scatterSeeds.isEmpty == false {
-                    activeCollectionView.alphaValue = 0
-                }
                 dissolvedGridFadeWaitsForLauncher = false
-                NSAnimationContext.runAnimationGroup { context in
-                    context.duration = prefersReducedMotion ? 0.12 : 0.22
-                    context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                    activeCollectionView.animator().alphaValue = 1
+                // Reduced motion: snap opaque grid (no 0.12s half-fade).
+                if snapDissolvedGridFade {
+                    finishDissolvedGridFade()
+                } else {
+                    if scatterSeeds.isEmpty == false {
+                        activeCollectionView.alphaValue = 0
+                    }
+                    let gridFadeDuration = LauncherLayout.dissolvedGridFadeDuration(
+                        reducesMotion: prefersReducedMotion
+                    )
+                    let gridTiming = CAMediaTimingFunction(name: .easeOut)
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    fadeViewOpacityFromPresentation(
+                        activeCollectionView,
+                        to: 1,
+                        duration: gridFadeDuration,
+                        timingFunction: gridTiming,
+                        key: LauncherLayout.dissolvedGridFadeAnimationKey
+                    )
+                    CATransaction.commit()
                 }
             } else if holdDissolvedGridFade {
                 // Do not start a fade under the launcher fade. An in-flight
@@ -6760,7 +8662,13 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     /// onto the cell. A folder that already exists uses
     /// `playIncomingFolderPreviewLanding` instead.
     private func playMergePreviewLanding(_ pending: PendingMergeAnimation) -> Bool {
-        guard pending.createdFolder, !prefersReducedMotion,
+        let reduced = prefersReducedMotion
+        // Reduced motion: snap — no merge-preview flyer travel.
+        if LauncherLayout.shouldSnapFolderMergePreviewForReducedMotion(reducesMotion: reduced)
+            || LauncherLayout.folderMergePreviewTravelDuration(reducesMotion: reduced) <= 0 {
+            return false
+        }
+        guard pending.createdFolder,
               let folderID = pending.folderID,
               let residentFrame = pending.residentIconFrame,
               let incomingFrame = pending.incomingIconFrame,
@@ -6774,7 +8682,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             resident: residentFrame,
             incoming: incomingFrame,
             destinations: Array(glyphFrames.prefix(2)),
-            reducesMotion: false
+            reducesMotion: reduced
         )
         guard landings.count == 2 else { return false }
 
@@ -6856,20 +8764,15 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             CATransaction.commit()
         }
         onDiagnosticEvent?("Merge preview landing started: icons=\(boxes.count) reducedMotion=\(prefersReducedMotion)")
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = duration
-            context.timingFunction = folderChromeTiming(tracksIcon: true)
-            for box in boxes {
-                box.view.animator().frame = box.destination
-            }
-        }, completionHandler: { [weak self] in
-            // Already on the main thread. A Task would hold the flying
-            // picture on the preview slot for another turn.
-            finishFlightOnLandingTurn { [weak self] in
-                guard let self, self.mergePreviewFlightGeneration == generation else { return }
-                self.commitMergePreviewLanding()
-            }
-        })
+        let mergeBoxesTiming = folderChromeTiming(tracksIcon: true)
+        runFlyerFrameAnimations(
+            boxes.map { ($0.view, $0.destination) },
+            duration: duration,
+            timingFunction: mergeBoxesTiming
+        ) { [weak self] in
+            guard let self, self.mergePreviewFlightGeneration == generation else { return }
+            self.commitMergePreviewLanding()
+        }
         return true
     }
 
@@ -6880,7 +8783,13 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     /// that path still springs the tile. A full plate uses
     /// `playIncomingFolderPreviewCenterLanding` instead.
     private func playIncomingFolderPreviewLanding(_ pending: PendingMergeAnimation) -> Bool {
-        guard !pending.createdFolder, !prefersReducedMotion,
+        let reduced = prefersReducedMotion
+        // Reduced motion: snap — no incoming-slot flyer travel.
+        if LauncherLayout.shouldSnapFolderIncomingPreviewForReducedMotion(reducesMotion: reduced)
+            || LauncherLayout.folderIncomingPreviewTravelDuration(reducesMotion: reduced) <= 0 {
+            return false
+        }
+        guard !pending.createdFolder,
               let folderID = pending.folderID,
               let slot = pending.incomingPreviewSlot,
               let incomingFrame = pending.incomingIconFrame,
@@ -6892,7 +8801,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
               let landing = LauncherLayout.folderIncomingPreviewLanding(
                 incoming: incomingFrame,
                 destination: frames[slot],
-                reducesMotion: false
+                reducesMotion: reduced
               ) else { return false }
 
         removeMergeFlyer()
@@ -6909,18 +8818,14 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         let generation = mergePreviewFlightGeneration
         let duration = landing.duration
         onDiagnosticEvent?("Merge preview landing started: icons=1 reducedMotion=\(prefersReducedMotion)")
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = duration
-            context.timingFunction = folderChromeTiming(tracksIcon: true)
-            view.animator().frame = landing.destination
-        }, completionHandler: { [weak self] in
-            // Already on the main thread. A Task would hold the flying
-            // picture on the preview slot for another turn.
-            finishFlightOnLandingTurn { [weak self] in
-                guard let self, self.mergePreviewFlightGeneration == generation else { return }
-                self.commitMergePreviewLanding()
-            }
-        })
+        runFlyerFrameAnimations(
+            [(view, landing.destination)],
+            duration: duration,
+            timingFunction: folderChromeTiming(tracksIcon: true)
+        ) { [weak self] in
+            guard let self, self.mergePreviewFlightGeneration == generation else { return }
+            self.commitMergePreviewLanding()
+        }
         return true
     }
 
@@ -6931,7 +8836,13 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     /// the plate does not spring. Reduced motion, a new folder, and a plate
     /// we can't measure keep the older flight.
     private func playIncomingFolderPreviewCenterLanding(_ pending: PendingMergeAnimation) -> Bool {
-        guard !pending.createdFolder, !prefersReducedMotion,
+        let reduced = prefersReducedMotion
+        // Reduced motion: snap — no center-landing flyer travel.
+        if LauncherLayout.shouldSnapFolderIncomingPreviewForReducedMotion(reducesMotion: reduced)
+            || LauncherLayout.folderIncomingPreviewTravelDuration(reducesMotion: reduced) <= 0 {
+            return false
+        }
+        guard !pending.createdFolder,
               pending.incomingPreviewSlot == nil,
               let folderID = pending.folderID,
               let incomingFrame = pending.incomingIconFrame,
@@ -6942,7 +8853,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
               let landing = LauncherLayout.folderIncomingPreviewCenterLanding(
                 incoming: incomingFrame,
                 well: well,
-                reducesMotion: false
+                reducesMotion: reduced
               ) else { return false }
 
         removeMergeFlyer()
@@ -6978,18 +8889,14 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         view.layer?.opacity = 0
         view.layer?.add(fade, forKey: "merge-center-fade")
         CATransaction.commit()
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = duration
-            context.timingFunction = folderChromeTiming(tracksIcon: true)
-            view.animator().frame = landing.destination
-        }, completionHandler: { [weak self] in
-            // Already on the main thread. A Task would hold the flying
-            // picture on the preview slot for another turn.
-            finishFlightOnLandingTurn { [weak self] in
-                guard let self, self.mergePreviewFlightGeneration == generation else { return }
-                self.commitMergePreviewLanding()
-            }
-        })
+        runFlyerFrameAnimations(
+            [(view, landing.destination)],
+            duration: duration,
+            timingFunction: folderChromeTiming(tracksIcon: true)
+        ) { [weak self] in
+            guard let self, self.mergePreviewFlightGeneration == generation else { return }
+            self.commitMergePreviewLanding()
+        }
         return true
     }
 
@@ -7142,35 +9049,28 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         mergeAnimationView = flyer
         onDiagnosticEvent?("Merge flyer started: reducedMotion=\(prefersReducedMotion)")
         if prefersReducedMotion {
-            // The model is hidden. animator() wrote that 0 before the fade
-            // attached, so the commit frame blanked the icon. Hold the
-            // opacity already on screen until this fade is on. The icon
-            // still does not fly.
+            // Reduced motion: snap flyer off (no 0.12s merge-reduced half-fade).
+            // Icon still does not fly — remove at once.
+            let snap = LauncherLayout.shouldSnapMergeFlyerForReducedMotion(
+                reducesMotion: true
+            )
+            let duration = LauncherLayout.mergeReducedFadeDuration(reducesMotion: true)
             flyer.wantsLayer = true
-            let fromOpacity = flyer.layer?.presentation()?.opacity ?? flyer.layer?.opacity ?? 1
-            let fade = CABasicAnimation(keyPath: "opacity")
-            fade.fromValue = fromOpacity
-            fade.toValue = 0
-            fade.duration = 0.12
-            fade.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            fade.fillMode = .backwards
             CATransaction.begin()
             CATransaction.setDisableActions(true)
-            CATransaction.setCompletionBlock { [weak self, weak flyer] in
-                // Already on the main thread. A Task would leave the faded
-                // picture on the cell for another turn.
-                finishFlightOnLandingTurn { [weak self, weak flyer] in
-                    guard let self, self.mergeFlightGeneration == generation else { return }
-                    flyer?.removeFromSuperview()
-                    if self.mergeAnimationView === flyer {
-                        self.mergeAnimationView = nil
-                    }
-                }
-            }
             flyer.alphaValue = 0
             flyer.layer?.opacity = 0
-            flyer.layer?.add(fade, forKey: "merge-reduced-fade")
+            if snap, duration <= 0 {
+                flyer.layer?.removeAnimation(forKey: "merge-reduced-fade")
+            }
             CATransaction.commit()
+            finishFlightOnLandingTurn { [weak self, weak flyer] in
+                guard let self, self.mergeFlightGeneration == generation else { return }
+                flyer?.removeFromSuperview()
+                if self.mergeAnimationView === flyer {
+                    self.mergeAnimationView = nil
+                }
+            }
             return
         }
 
@@ -7201,22 +9101,17 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         flyer.layer?.opacity = 0
         flyer.layer?.add(fade, forKey: "merge-flight-fade")
         CATransaction.commit()
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = mergeFlightDuration
-            // Same travel curve as the folder these icons are joining.
-            context.timingFunction = folderChromeTiming(tracksIcon: true)
-            flyer.animator().frame = dest
-        }, completionHandler: { [weak self, weak flyer] in
-            // Already on the main thread. A Task would leave the flying
-            // picture on the cell for another turn.
-            finishFlightOnLandingTurn { [weak self, weak flyer] in
-                guard let self, self.mergeFlightGeneration == generation else { return }
-                flyer?.removeFromSuperview()
-                if self.mergeAnimationView === flyer {
-                    self.mergeAnimationView = nil
-                }
+        runFlyerFrameAnimations(
+            [(flyer, dest)],
+            duration: mergeFlightDuration,
+            timingFunction: folderChromeTiming(tracksIcon: true)
+        ) { [weak self, weak flyer] in
+            guard let self, self.mergeFlightGeneration == generation else { return }
+            flyer?.removeFromSuperview()
+            if self.mergeAnimationView === flyer {
+                self.mergeAnimationView = nil
             }
-        })
+        }
     }
 
     private func materializedFolderItem(_ folderID: UUID) -> NSCollectionViewItem? {
@@ -7256,8 +9151,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         item.view.wantsLayer = true
         guard let layer = item.view.layer else { return }
         if prefersReducedMotion {
-            // The short fade used to return without a landing token, so a
-            // dismiss could not pin it. Track it the same way as the spring.
+            // Reduced motion snaps the new folder (no 0.12s opacity half-fade).
             let dismissing = launcherIsDismissing()
             let visible = window?.isVisible == true
             guard LauncherLayout.shouldAnimateReducedMotionFolderLanding(
@@ -7265,7 +9159,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
                 isVisible: visible
             ) else {
                 // Hidden: draw the final tile. Still on screen: do not start
-                // the fade, and do not jump a frame the hold already pinned.
+                // a reveal, and do not jump a frame the hold already pinned.
                 if LauncherLayout.shouldCommitFolderLanding(
                     isDismissing: dismissing,
                     isVisible: visible
@@ -7276,23 +9170,17 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
                 }
                 return
             }
-            // The model is the shown folder. The fade starts from hidden.
-            // Writing full opacity before the animation is attached flashes
-            // the new folder solid on the commit frame.
-            let animation = CABasicAnimation(keyPath: "opacity")
-            animation.fromValue = 0
-            animation.toValue = 1
-            animation.duration = 0.12
-            animation.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            animation.fillMode = .backwards
-            let generation = beginTrackedFolderLanding(on: layer)
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            layer.opacity = 1
-            layer.transform = CATransform3DIdentity
-            layer.add(animation, forKey: "folder-created")
-            CATransaction.commit()
-            finishFolderLandingLater(on: layer, generation: generation, after: 0.12)
+            // Snap opaque + identity (duration 0; no folder-created half-fade).
+            if LauncherLayout.shouldSnapFolderCreatedForReducedMotion(
+                reducesMotion: true
+            ), LauncherLayout.folderCreatedFadeDuration(reducesMotion: true) <= 0 {
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                commitFolderLandingVisual(on: layer)
+                CATransaction.commit()
+                layer.setValue(nil, forKey: "folderLandingToken")
+                forgetTrackedFolderLanding(layer: layer, generation: nil)
+            }
             return
         }
 
@@ -7632,10 +9520,16 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             }
             return
         }
+        let reduced = prefersReducedMotion
+        if LauncherLayout.shouldSnapDropLandingForReducedMotion(reducesMotion: reduced)
+            || LauncherLayout.dropLandingTravelDuration(reducesMotion: reduced) <= 0 {
+            commitDropLanding()
+            return
+        }
         guard let flight = LauncherLayout.dropLandingFlight(
             from: pending.source,
             to: destination,
-            reducesMotion: prefersReducedMotion
+            reducesMotion: reduced
         ) else {
             commitDropLanding()
             return
@@ -7650,18 +9544,14 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         dropLandingGeneration &+= 1
         let generation = dropLandingGeneration
         onDiagnosticEvent?("Drop landing started: reducedMotion=\(prefersReducedMotion)")
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = flight.duration
-            context.timingFunction = folderChromeTiming(tracksIcon: true)
-            flyer.animator().frame = flight.destination
-        }, completionHandler: { [weak self] in
-            // Already on the main thread. A Task would hold the flying
-            // picture on the cell for another turn.
-            finishFlightOnLandingTurn { [weak self] in
-                guard let self, self.dropLandingGeneration == generation else { return }
-                self.commitDropLanding()
-            }
-        })
+        runFlyerFrameAnimations(
+            [(flyer, flight.destination)],
+            duration: flight.duration,
+            timingFunction: folderChromeTiming(tracksIcon: true)
+        ) { [weak self] in
+            guard let self, self.dropLandingGeneration == generation else { return }
+            self.commitDropLanding()
+        }
     }
 
     private func dropLandingDestinationFrame(for pending: PendingDropLanding) -> CGRect? {
@@ -7719,12 +9609,29 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     private func commitDropLanding() {
         dropLandingGeneration &+= 1
         dropLandingWaitsForLauncher = false
-        pendingDropLanding = nil
         let flyer = dropLandingView
+        let hadFlyer = flyer != nil
+        let hadHiddenDestination = dropLandingItemID != nil
+        let hadPending = pendingDropLanding != nil
+        pendingDropLanding = nil
         dropLandingView = nil
         flyer?.layer?.removeAllAnimations()
         flyer?.removeFromSuperview()
         revealDropLandingContents()
+        #if DEBUG
+        let environment = ProcessInfo.processInfo.environment
+        if (hadFlyer || hadHiddenDestination || hadPending),
+           environment["LAUNCHICON_TEST_LAYOUT_PATH"] != nil,
+           environment["LAUNCHICON_DIAGNOSTICS_PATH"] != nil {
+            let detached = flyer.map {
+                $0.superview == nil && $0.layer?.animationKeys()?.isEmpty != false
+            } ?? true
+            onDiagnosticEvent?(
+                "Drop cleanup: flyerDetached=\(detached) pendingCleared=\(pendingDropLanding == nil) "
+                    + "itemCleared=\(dropLandingItemID == nil)"
+            )
+        }
+        #endif
     }
 
     private func freezeDropLandingFlyer(_ flyer: NSView) {
@@ -7752,14 +9659,22 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     /// over the early part of the flight. The model ends at 0. That write
     /// and the fade share one transaction: committing the model first drops
     /// the shadow before `fillMode` backwards can hold it. A launcher fade
-    /// copies the opacity already on screen. Reduced motion never lifted,
-    /// and does not call this.
+    /// copies the opacity already on screen. Reduced motion never lifted —
+    /// snap/identity presentation skips the fade.
     private func fadeLiftShadow(on flyer: NSView, flightDuration: TimeInterval) {
+        let reduced = prefersReducedMotion
+        // Reduced motion: no lift shadow to fade.
+        if LauncherLayout.shouldSnapDragLiftForReducedMotion(reducesMotion: reduced) {
+            return
+        }
         let duration = LauncherLayout.dropLandingShadowFadeDuration(flight: flightDuration)
         guard duration > 0 else { return }
         flyer.wantsLayer = true
         guard let layer = flyer.layer else { return }
-        let lift = LauncherLayout.dragLiftPresentation(for: flyer.bounds.size, reducesMotion: false)
+        let lift = LauncherLayout.dragLiftPresentation(
+            for: flyer.bounds.size,
+            reducesMotion: reduced
+        )
         guard lift.shadowOpacity > 0, lift.shadowRadius > 0 else { return }
         let fade = CABasicAnimation(keyPath: "shadowOpacity")
         fade.fromValue = Float(lift.shadowOpacity)
@@ -7926,16 +9841,21 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         }
         if let itemView = collectionView.item(at: indexPath)?.view {
             let frame = itemView.convert(itemView.bounds, to: self)
-            let sourceImage = itemView.draggingImage()
+            let sourceImage = (itemView as? AppGridTileView)?.draggingImageWithoutCellChrome()
+                ?? itemView.draggingImage()
             let pointer = convert(event.locationInWindow, from: nil)
             dragPreview = (
                 sourceRef, frame, sourceImage,
                 CGPoint(x: pointer.x - frame.midX, y: pointer.y - frame.midY)
             )
             let sourceInCollection = itemView.convert(itemView.bounds, to: collectionView)
+            let reduced = prefersReducedMotion
+            let snapLift = LauncherLayout.shouldSnapDragLiftForReducedMotion(
+                reducesMotion: reduced
+            )
             let presentation = LauncherLayout.dragLiftPresentation(
                 for: sourceInCollection.size,
-                reducesMotion: prefersReducedMotion
+                reducesMotion: reduced
             )
             draggingItem.setDraggingFrame(
                 presentation.canvasFrame(centering: sourceInCollection),
@@ -7950,7 +9870,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
                 session: session,
                 sourceImage: sourceImage,
                 sourceSize: sourceInCollection.size,
-                showsLift: presentation.shadowOpacity > 0
+                showsLift: !snapLift && presentation.shadowOpacity > 0
             )
             dragLiftDropWaitsForLauncher = false
             didConsumeClick = true
@@ -8000,7 +9920,22 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         let backdrop = isSearching ? searchScrollView : gridViewport
         resetFolderBackdrop(backdrop === gridViewport ? searchScrollView : gridViewport)
         if immediately {
-            resetFolderBackdrop(backdrop)
+            if open {
+                // Snap to the open veil; resetFolderBackdrop would flash full
+                // grid opacity under an open folder.
+                finishFolderBackdropOpen(backdrop)
+            } else {
+                resetFolderBackdrop(backdrop)
+            }
+        } else if LauncherLayout.shouldSnapFolderBackdropForReducedMotion(
+            reducesMotion: prefersReducedMotion
+        ) {
+            // Reduced motion: snap veil (no 0.12s opacity half-fade).
+            if open {
+                finishFolderBackdropOpen(backdrop)
+            } else {
+                resetFolderBackdrop(backdrop)
+            }
         } else {
             animateFolderBackdrop(backdrop, open: open, motion: motion)
         }
@@ -8092,8 +10027,21 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             bounds: view.bounds,
             focus: focus
         )
-        let duration = motion?.duration ?? (reduced ? 0.12 : 0.22)
+        let duration = LauncherLayout.folderBackdropFadeDuration(
+            reducesMotion: reduced,
+            motionDuration: motion?.duration
+        )
         let timing = folderChromeTiming(tracksIcon: tracksIcon)
+
+        // Duration 0 (reduced): snap; setFolderBackdrop usually returns early.
+        if duration <= 0 {
+            if open {
+                finishFolderBackdropOpen(view)
+            } else {
+                resetFolderBackdrop(view)
+            }
+            return
+        }
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -8164,11 +10112,21 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         guard acceptsPointerActivation() else { return }
         onDiagnosticEvent?("Folder open requested: id=\(id.uuidString)")
         guard let folder = layoutState.folders[id] else { return }
+        // A still-landing close must not restore grid focus over this open.
+        pendingFolderCloseFocusRestoreID = nil
+        pendingFolderCloseFocusPreviousEntries = nil
         settleInterruptedPaging()
+        // Folder owns the card. A toast still up would float above the veil.
+        if LauncherLayout.shouldDismissToastWhenOpeningFolder(
+            isToastVisible: !toastView.isHidden
+        ) {
+            hideToast(animated: true)
+        }
         // Record the entry before AppKit and accessibility mutations can fail synchronously.
         onDiagnosticEvent?("Folder open started: id=\(id.uuidString); storedMembers=\(folder.itemIDs.count)")
         openedFolderID = id
         updatePagingControls()
+        updateSearchAdjacentChrome()
         setLauncherContentAccessibilityHidden(true)
         let items = presentedItems(for: folderOverlay.collectionView)
         folderOverlay.show(folder: folder, items: items)
@@ -8224,18 +10182,67 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
                 self.playFolderPreviewGlyphFlight(folderID: id, tracksIcon: collapse.tracksIcon)
             }
             self.rebuildKeyViewLoop()
-            // The title can already be editing by the time this hop runs.
-            // Moving focus back to the first icon would cancel that edit.
-            if let responder = self.window?.firstResponder as? NSView,
-               responder === self.folderOverlay || responder.isDescendant(of: self.folderOverlay) {
+            // Member focus fill waits for open chrome (`onChromeOpenLanded`).
+            // Focusing here would paint the 8% focus plate while the panel is
+            // still scaling/fading from the icon.
+        }
+    }
+
+    /// After open chrome lands: focus the first member (unless the title,
+    /// close button, or a member already has the keyboard). Stray overlay
+    /// chrome (collection / panel) does not count — that used to skip the
+    /// handoff and leave focus fill unpainted.
+    private func focusOpenedFolderMemberAfterChromeLands() {
+        guard openedFolderID != nil else { return }
+        let responder = window?.firstResponder as? NSView
+        let owner = folderOpenFocusOwner(for: responder)
+        switch LauncherLayout.folderOpenFocusHandoff(owner: owner) {
+        case .preserveControl:
+            return
+        case .refreshMemberChrome:
+            rebuildKeyViewLoop()
+            folderMemberTile(containing: responder)?.refreshFocusChrome()
+        case .focusFirstMember:
+            // Chrome landed: members accept again; rebuild before focusing.
+            rebuildKeyViewLoop()
+            let keyViews = folderOverlay.keyViews
+            if let target = keyViews.first(where: { $0 is AppGridTileView }),
+               window?.makeFirstResponder(target) == true {
+                NSAccessibility.post(element: target, notification: .focusedUIElementChanged)
+                // Chrome may still have been "in flight" when becomeFirstResponder
+                // painted; refresh once idle so the 8% fill appears with the land.
+                (target as? AppGridTileView)?.refreshFocusChrome()
                 return
             }
-            let keyViews = folderOverlay.keyViews
-            if let target = keyViews.first(where: { $0 is AppGridTileView }) ?? keyViews.first,
-               self.window?.makeFirstResponder(target) == true {
-                NSAccessibility.post(element: target, notification: .focusedUIElementChanged)
+            // Empty folder: no member tile — title, not an empty collection view.
+            let memberCount = presentedItems(for: folderOverlay.collectionView).count
+            if LauncherLayout.folderOpenEmptyFocusesTitle(memberCount: memberCount) {
+                _ = folderOverlay.focusTitleField()
             }
         }
+    }
+
+    private func folderOpenFocusOwner(for responder: NSView?) -> LauncherLayout.FolderOpenFocusOwner {
+        guard let responder else { return .outsideOverlay }
+        if folderOverlay.isTitleHit(responder) || folderOverlay.isCloseButtonHit(responder) {
+            return .titleOrClose
+        }
+        if folderMemberTile(containing: responder) != nil {
+            return .memberTile
+        }
+        if responder === folderOverlay || responder.isDescendant(of: folderOverlay) {
+            return .otherOverlayChrome
+        }
+        return .outsideOverlay
+    }
+
+    private func folderMemberTile(containing view: NSView?) -> AppGridTileView? {
+        var current = view
+        while let node = current {
+            if let tile = node as? AppGridTileView { return tile }
+            current = node.superview
+        }
+        return nil
     }
 
     private func closeFolder(
@@ -8245,7 +10252,12 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     ) {
         let closingFolderID = openedFolderID
         guard closingFolderID != nil else { return }
-        // Moving focus ends title editing and would save whatever is marked.
+        // Dimmer / backdrop close cancels an in-progress rename (Escape).
+        // The close button commits first via its own action before onClose.
+        if folderOverlay.isEditingTitle {
+            _ = folderOverlay.cancelTitleEditingIfActive(refocus: false)
+        }
+        // Moving focus would otherwise save whatever is marked.
         folderOverlay.discardMarkedTitleComposition()
         let dissolved = closingFolderID.map { layoutState.folders[$0] == nil } ?? false
         let iconFrame = closingFolderID.flatMap { folderIconFrameInOverlay($0) }
@@ -8289,13 +10301,53 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             immediately: snapClosed,
             collapse: collapse
         )
+        // isAnimatingClose is true until land — keep count hidden through the veil.
+        updateSearchAdjacentChrome()
         updatePagingControls()
         setLauncherContentAccessibilityHidden(false)
         NSAccessibility.post(element: self, notification: .layoutChanged)
         rebuildKeyViewLoop()
-        if restoreFocus, let closingFolderID {
-            focusGridEntry(closingFolderID)
+        if LauncherLayout.folderCloseShouldRestoreGridFocusOnChromeLand(
+            restoreFocusRequested: restoreFocus
+        ), let closingFolderID {
+            pendingFolderCloseFocusRestoreID = closingFolderID
+            pendingFolderCloseFocusPreviousEntries = layoutState.orderedEntries
+        } else {
+            pendingFolderCloseFocusRestoreID = nil
+            pendingFolderCloseFocusPreviousEntries = nil
         }
+        // Snap/immediate animateClose invokes onChromeCloseLanded on this turn.
+    }
+
+    /// After close chrome lands: restore grid focus (if parked) and drop the
+    /// borrowed preview plate. Focus fill then paints on a settled grid tile.
+    private func finishFolderCloseChromeLand() {
+        let pendingID = pendingFolderCloseFocusRestoreID
+        let previousEntries = pendingFolderCloseFocusPreviousEntries ?? layoutState.orderedEntries
+        pendingFolderCloseFocusRestoreID = nil
+        pendingFolderCloseFocusPreviousEntries = nil
+        releaseBorrowedPreviewPlate()
+        updateSearchAdjacentChrome()
+        // Folder veil is gone — present any toast that waited for quiet chrome.
+        applyDeferredToast()
+        guard let pendingID,
+              openedFolderID == nil,
+              LauncherLayout.folderCloseShouldRestoreGridFocusOnChromeLand(
+                restoreFocusRequested: true
+              ) else { return }
+        // Esc / dimmer: folder tile on the main grid (not search). Dissolved
+        // mid-close: neighbor that took the slot.
+        let focusID = LauncherLayout.folderCloseGridFocusID(
+            pendingFolderID: pendingID,
+            previousEntries: previousEntries,
+            currentEntries: layoutState.orderedEntries
+        )
+        guard let focusID else {
+            _ = window?.makeFirstResponder(self)
+            return
+        }
+        focusMainGridEntry(focusID)
+        (window?.firstResponder as? AppGridTileView)?.refreshFocusChrome()
     }
 
     /// Focus a grid entry, turning to its page when a dissolve or a layout
@@ -8329,6 +10381,10 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             return
         }
         guard let slot = LauncherLayout.focusSlot(previousSlot: preserved.index, itemCount: items.count) else {
+            // Empty folder after last member left: title, then close.
+            if LauncherLayout.folderOpenEmptyFocusesTitle(memberCount: items.count) {
+                if folderOverlay.focusTitleField() { return }
+            }
             _ = folderOverlay.focusCloseButton()
             return
         }
@@ -8361,6 +10417,90 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
               window?.makeFirstResponder(tile) == true else { return false }
         NSAccessibility.post(element: tile, notification: .focusedUIElementChanged)
         return true
+    }
+
+
+    /// Esc or programmatic clear: restore a focused result, else first page tile.
+    private func handOffFocusAfterSearchCleared(focusedResult: UUID?) {
+        let hadFocusedResult = focusedResult != nil
+        if LauncherLayout.shouldRestoreGridFocusAfterClearingSearch(
+            hadFocusedSearchResult: hadFocusedResult
+        ), let focusedResult {
+            focusGridEntry(focusedResult)
+            (window?.firstResponder as? AppGridTileView)?.refreshFocusChrome()
+        } else if LauncherLayout.shouldFocusFirstGridItemAfterClearingSearch(
+            hadFocusedSearchResult: hadFocusedResult
+        ) {
+            focusFirstGridItemOnCurrentPage()
+        } else {
+            _ = window?.makeFirstResponder(self)
+        }
+    }
+
+    /// After search clears from the field: first tile on the page already
+    /// showing. Empty grid falls back to the root view.
+    private func focusFirstGridItemOnCurrentPage() {
+        activeCollectionView.layoutSubtreeIfNeeded()
+        let items = presentedItems(for: activeCollectionView)
+        guard let first = items.first else {
+            _ = window?.makeFirstResponder(self)
+            return
+        }
+        focusGridEntry(first.id)
+        (window?.firstResponder as? AppGridTileView)?.refreshFocusChrome()
+    }
+
+    /// Close-folder restore and dissolve neighbor: always the main grid tile,
+    /// even when a search query is still up under the folder chrome.
+    private func focusMainGridEntry(_ id: UUID) {
+        let wasSearching = isSearching
+        // focusGridEntry diverts to search while querying; temporarily treat as
+        // idle grid for this handoff only (query text / results stay).
+        if wasSearching {
+            // Walk the grid path without clearing the query.
+            focusGridEntryOnMainGridOnly(id)
+            return
+        }
+        focusGridEntry(id)
+    }
+
+    private func focusGridEntryOnMainGridOnly(_ id: UUID) {
+        guard let index = layoutState.orderedEntries.firstIndex(where: { $0.id == id }) else {
+            // Dissolved / missing: try first grid item on the current page.
+            focusFirstGridItemOnCurrentPage()
+            return
+        }
+        let page = LauncherLayout.pageIndex(containingEntryAt: index)
+        let count = LauncherLayout.pageCount(forEntryCount: layoutState.orderedEntries.count)
+        if count > 0 {
+            let bounded = min(max(page, 0), count - 1)
+            if bounded != currentPage {
+                currentPage = bounded
+                stagingPage = nil
+                isPagingGesture = false
+                layoutCollectionViews()
+                activeCollectionView.reloadData()
+                updatePagingControls()
+                rebuildKeyViewLoop()
+            }
+        }
+        activeCollectionView.layoutSubtreeIfNeeded()
+        let items = presentedItems(for: activeCollectionView)
+        guard let itemIndex = items.firstIndex(where: { $0.id == id }) else {
+            focusFirstGridItemOnCurrentPage()
+            return
+        }
+        let indexPath = IndexPath(item: itemIndex, section: 0)
+        if activeCollectionView.item(at: indexPath) == nil {
+            activeCollectionView.reloadData()
+            activeCollectionView.layoutSubtreeIfNeeded()
+        }
+        guard let tile = activeCollectionView.item(at: indexPath)?.view as? AppGridTileView,
+              window?.makeFirstResponder(tile) == true else {
+            focusFirstGridItemOnCurrentPage()
+            return
+        }
+        NSAccessibility.post(element: tile, notification: .focusedUIElementChanged)
     }
 
     private func focusGridEntry(_ id: UUID) {
@@ -8462,6 +10602,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         previousPageButton.setAccessibilityHidden(hidden)
         nextPageButton.setAccessibilityHidden(hidden)
         messageLabel.setAccessibilityHidden(hidden)
+        countLabel.setAccessibilityHidden(hidden)
         emptyStateView.setAccessibilityHidden(hidden)
         for collectionView in [activeCollectionView, stagingCollectionView, searchCollectionView] {
             collectionView.setAccessibilityHidden(hidden)
@@ -8480,7 +10621,6 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         if isPageTransitioning {
             queuedPage = boundedPage
             updatePagingControls()
-            pageIndicator.configure(pageCount: pageCount, selectedPage: boundedPage)
             return
         }
         guard boundedPage != currentPage else { return }
@@ -8506,8 +10646,37 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             inFlightPage: transitionTargetPage,
             queuedPage: queuedPage
         )
-        previousPageButton.isHidden = !hasMultiplePages || anchor <= 0
-        nextPageButton.isHidden = !hasMultiplePages || anchor >= pageCount - 1
+        let hold = LauncherLayout.shouldHoldSearchChromeAnimation(
+            isDismissing: launcherIsDismissing(),
+            isVisible: window?.isVisible == true
+        )
+        let reduce = prefersReducedMotion || window?.isVisible != true
+        let showPrevious = LauncherLayout.pageArrowShouldShow(
+            hasMultiplePages: hasMultiplePages,
+            atUnavailableEdge: anchor <= 0
+        )
+        let showNext = LauncherLayout.pageArrowShouldShow(
+            hasMultiplePages: hasMultiplePages,
+            atUnavailableEdge: anchor >= pageCount - 1
+        )
+        previousPageButton.setPagingAvailable(
+            showPrevious,
+            animated: LauncherLayout.shouldAnimatePageArrowVisibility(
+                shouldShow: showPrevious,
+                currentlyShown: !previousPageButton.isHidden,
+                reducesMotion: reduce,
+                holdsForLauncherFade: hold
+            )
+        )
+        nextPageButton.setPagingAvailable(
+            showNext,
+            animated: LauncherLayout.shouldAnimatePageArrowVisibility(
+                shouldShow: showNext,
+                currentlyShown: !nextPageButton.isHidden,
+                reducesMotion: reduce,
+                holdsForLauncherFade: hold
+            )
+        )
         updateFooterHint()
         recoverFocusFromHiddenPagingControl()
     }
@@ -8533,16 +10702,358 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     }
 
     private func updateFooterHint() {
-        footerControls.isHidden = openedFolderID != nil
-        if isSearching {
-            dragHintLabel.isHidden = true
-            navigationHintLabel.stringValue = L("Esc 清除搜索")
+        let folderOpen = openedFolderID != nil
+        let hold = LauncherLayout.shouldHoldSearchChromeAnimation(
+            isDismissing: launcherIsDismissing(),
+            isVisible: window?.isVisible == true
+        )
+        let reduce = prefersReducedMotion || window?.isVisible != true
+        let animate = !reduce && !hold
+        footerHintGeneration &+= 1
+        let generation = footerHintGeneration
+
+        let showChrome = LauncherLayout.footerChromeShouldShow(folderOpen: folderOpen)
+        setFooterChromeVisible(showChrome, animated: animate, generation: generation)
+
+        let showDrag = LauncherLayout.footerDragHintShouldShow(
+            isSearching: isSearching,
+            folderOpen: folderOpen,
+            isLayoutEditingEnabled: isLayoutEditingEnabled,
+            hasEntries: !layoutState.orderedEntries.isEmpty
+        )
+        if showDrag {
+            dragHintLabel.stringValue = pageCount > 1
+                ? L("拖拽整理 · 悬停左右边缘跨页")
+                : L("拖拽整理")
+        }
+        let dragVisible = showDrag && showChrome
+        // Presence/opacity only — not page-turn / swipe / indicator selection.
+        let dragAnimate = animate && LauncherLayout.shouldAnimatePagingChromeVisibility(
+            shouldShow: dragVisible,
+            currentlyShown: !dragHintLabel.isHidden,
+            reducesMotion: reduce,
+            holdsForLauncherFade: hold
+        )
+        setFooterLabelVisible(
+            dragHintLabel,
+            visible: dragVisible,
+            animated: dragAnimate,
+            generation: generation
+        )
+
+        let navText = isSearching
+            ? L("Esc 清除搜索")
+            : (pageCount > 1 ? L("← → 翻页 · Esc 返回") : L("Esc 返回"))
+        setFooterNavigationText(
+            navText,
+            chromeVisible: showChrome,
+            animated: animate,
+            generation: generation
+        )
+    }
+
+    /// Folder open hides the whole footer (hints + page dots). Fade from the
+    /// opacity on screen so the stack does not vanish under the panel.
+    private func setFooterChromeVisible(_ visible: Bool, animated: Bool, generation: Int) {
+        let currentlyShown = !footerControls.isHidden
+        let reduced = prefersReducedMotion || window?.isVisible != true
+        let hold = LauncherLayout.shouldHoldSearchChromeAnimation(
+            isDismissing: launcherIsDismissing(),
+            isVisible: window?.isVisible == true
+        )
+        // Presence/opacity only — not page-turn / swipe / indicator selection.
+        let shouldAnimate = animated
+            && !LauncherLayout.shouldSnapFooterChromeVisibilityForReducedMotion(reducesMotion: reduced)
+            && LauncherLayout.shouldAnimatePagingChromeVisibility(
+                shouldShow: visible,
+                currentlyShown: currentlyShown,
+                reducesMotion: reduced,
+                holdsForLauncherFade: hold
+            )
+        guard visible != currentlyShown else {
+            if visible {
+                restoreInterruptedFooterFade(
+                    footerControls,
+                    animated: shouldAnimate || animated
+                )
+            }
             return
         }
+        if !visible {
+            if shouldAnimate {
+                let timing = CAMediaTimingFunction(name: .easeOut)
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                CATransaction.setCompletionBlock { [weak self] in
+                    finishFlightOnLandingTurn { [weak self] in
+                        guard let self, self.footerHintGeneration == generation else { return }
+                        self.footerControls.isHidden = true
+                        self.footerControls.alphaValue = 1
+                        self.footerControls.layer?.opacity = 1
+                    }
+                }
+                fadeViewOpacityFromPresentation(
+                    footerControls,
+                    to: 0,
+                    duration: LauncherLayout.searchTransitionDuration,
+                    timingFunction: timing,
+                    key: LauncherLayout.footerHintFadeAnimationKey
+                )
+                CATransaction.commit()
+                return
+            }
+            footerControls.isHidden = true
+            footerControls.alphaValue = 1
+            footerControls.layer?.opacity = 1
+            return
+        }
+        // Hide completion restores alpha to 1 while hidden. Clear opacity
+        // before revealing so the commit frame does not flash the full footer.
+        footerControls.wantsLayer = true
+        if shouldAnimate {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            footerControls.alphaValue = 0
+            footerControls.layer?.opacity = 0
+            footerControls.isHidden = false
+            CATransaction.commit()
+            let timing = CAMediaTimingFunction(name: .easeOut)
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            fadeViewOpacityFromPresentation(
+                footerControls,
+                to: 1,
+                duration: LauncherLayout.searchTransitionDuration,
+                timingFunction: timing,
+                key: LauncherLayout.footerHintFadeAnimationKey
+            )
+            CATransaction.commit()
+            return
+        }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        footerControls.alphaValue = 1
+        footerControls.layer?.opacity = 1
+        footerControls.isHidden = false
+        CATransaction.commit()
+    }
 
-        dragHintLabel.isHidden = !isLayoutEditingEnabled || layoutState.orderedEntries.isEmpty
-        dragHintLabel.stringValue = pageCount > 1 ? L("拖拽整理 · 悬停左右边缘跨页") : L("拖拽整理")
-        navigationHintLabel.stringValue = pageCount > 1 ? L("← → 翻页 · Esc 返回") : L("Esc 返回")
+    /// Already-shown footer chrome whose hide fade was cut off sits near 0.
+    /// Fade back from the opacity on screen instead of popping to full.
+    private func restoreInterruptedFooterFade(_ view: NSView, animated: Bool) {
+        view.wantsLayer = true
+        let presented = CGFloat(
+            view.layer?.presentation()?.opacity ?? view.layer?.opacity ?? Float(view.alphaValue)
+        )
+        guard presented < 0.99 || view.alphaValue < 0.99 else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        if animated, !prefersReducedMotion, window?.isVisible == true {
+            fadeViewOpacityFromPresentation(
+                view,
+                to: 1,
+                duration: LauncherLayout.searchTransitionDuration,
+                timingFunction: CAMediaTimingFunction(name: .easeOut),
+                key: LauncherLayout.footerHintFadeAnimationKey
+            )
+        } else {
+            view.layer?.removeAnimation(forKey: LauncherLayout.footerHintFadeAnimationKey)
+            view.alphaValue = 1
+            view.layer?.opacity = 1
+        }
+        CATransaction.commit()
+    }
+
+    /// Drag-hint presence beside the page dots. Search hides it with the same
+    /// clock as the search/grid crossfade.
+    private func setFooterLabelVisible(
+        _ label: NSTextField,
+        visible: Bool,
+        animated: Bool,
+        generation: Int
+    ) {
+        let currentlyShown = !label.isHidden
+        guard visible != currentlyShown else {
+            if visible {
+                restoreInterruptedFooterFade(label, animated: animated)
+            }
+            return
+        }
+        if !visible {
+            if animated {
+                let timing = CAMediaTimingFunction(name: .easeOut)
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                CATransaction.setCompletionBlock { [weak self] in
+                    finishFlightOnLandingTurn { [weak self] in
+                        guard let self, self.footerHintGeneration == generation else { return }
+                        label.isHidden = true
+                        label.alphaValue = 1
+                        label.layer?.opacity = 1
+                    }
+                }
+                fadeViewOpacityFromPresentation(
+                    label,
+                    to: 0,
+                    duration: LauncherLayout.searchTransitionDuration,
+                    timingFunction: timing,
+                    key: LauncherLayout.footerHintFadeAnimationKey
+                )
+                CATransaction.commit()
+                return
+            }
+            label.isHidden = true
+            label.alphaValue = 1
+            label.layer?.opacity = 1
+            return
+        }
+        // Same as footer chrome: opacity was restored to 1 while hidden.
+        label.wantsLayer = true
+        if animated {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            label.alphaValue = 0
+            label.layer?.opacity = 0
+            label.isHidden = false
+            CATransaction.commit()
+            let timing = CAMediaTimingFunction(name: .easeOut)
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            fadeViewOpacityFromPresentation(
+                label,
+                to: 1,
+                duration: LauncherLayout.searchTransitionDuration,
+                timingFunction: timing,
+                key: LauncherLayout.footerHintFadeAnimationKey
+            )
+            CATransaction.commit()
+            return
+        }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        label.alphaValue = 1
+        label.layer?.opacity = 1
+        label.isHidden = false
+        CATransaction.commit()
+    }
+
+    /// Navigation hint keeps a label on screen; swap the string through a
+    /// short opacity dip so search "Esc 清除" does not pop in solid.
+    private func setFooterNavigationText(
+        _ text: String,
+        chromeVisible: Bool,
+        animated: Bool,
+        generation: Int
+    ) {
+        guard chromeVisible else {
+            navigationHintLabel.stringValue = text
+            return
+        }
+        let textChanging = navigationHintLabel.stringValue != text
+        let currentlyHidden = navigationHintLabel.isHidden
+        guard textChanging else {
+            if LauncherLayout.footerNavigationShouldSnapUnhide(
+                isHidden: currentlyHidden,
+                textChanging: false
+            ) {
+                navigationHintLabel.wantsLayer = true
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                navigationHintLabel.alphaValue = 1
+                navigationHintLabel.layer?.opacity = 1
+                navigationHintLabel.isHidden = false
+                CATransaction.commit()
+            } else if LauncherLayout.footerNavigationShouldRestoreOpacityWhenTextUnchanged(
+                isHidden: currentlyHidden,
+                textChanging: false,
+                currentOpacity: navigationHintLabel.alphaValue
+            ) {
+                // Cut-off swap (type → clear before the half-dip landed): the
+                // generation guard drops the fade-in, leaving the model at 0.
+                navigationHintLabel.wantsLayer = true
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                if animated {
+                    fadeViewOpacityFromPresentation(
+                        navigationHintLabel,
+                        to: 1,
+                        duration: LauncherLayout.searchTransitionDuration * 0.5,
+                        timingFunction: CAMediaTimingFunction(name: .easeOut),
+                        key: LauncherLayout.footerHintFadeAnimationKey
+                    )
+                } else {
+                    navigationHintLabel.layer?.removeAnimation(forKey: LauncherLayout.footerHintFadeAnimationKey)
+                    navigationHintLabel.alphaValue = 1
+                    navigationHintLabel.layer?.opacity = 1
+                }
+                CATransaction.commit()
+            }
+            return
+        }
+        navigationHintLabel.wantsLayer = true
+        guard animated else {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            navigationHintLabel.stringValue = text
+            navigationHintLabel.alphaValue = 1
+            navigationHintLabel.layer?.opacity = 1
+            navigationHintLabel.isHidden = false
+            CATransaction.commit()
+            return
+        }
+        let timing = CAMediaTimingFunction(name: .easeOut)
+        let half = LauncherLayout.searchTransitionDuration * 0.5
+        // Hidden → new text: clear opacity before unhide, then fade in only.
+        // Unhiding at alpha 1 then dipping to 0 flashed the old/empty line.
+        if LauncherLayout.footerNavigationShouldClearOpacityBeforeUnhide(
+            isHidden: currentlyHidden,
+            textChanging: true
+        ) {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            navigationHintLabel.stringValue = text
+            navigationHintLabel.alphaValue = 0
+            navigationHintLabel.layer?.opacity = 0
+            navigationHintLabel.isHidden = false
+            CATransaction.commit()
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            fadeViewOpacityFromPresentation(
+                navigationHintLabel,
+                to: 1,
+                duration: half,
+                timingFunction: timing,
+                key: LauncherLayout.footerHintFadeAnimationKey
+            )
+            CATransaction.commit()
+            return
+        }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        CATransaction.setCompletionBlock { [weak self] in
+            finishFlightOnLandingTurn { [weak self] in
+                guard let self, self.footerHintGeneration == generation else { return }
+                self.navigationHintLabel.stringValue = text
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                self.fadeViewOpacityFromPresentation(
+                    self.navigationHintLabel,
+                    to: 1,
+                    duration: half,
+                    timingFunction: timing,
+                    key: LauncherLayout.footerHintFadeAnimationKey
+                )
+                CATransaction.commit()
+            }
+        }
+        fadeViewOpacityFromPresentation(
+            navigationHintLabel,
+            to: 0,
+            duration: half,
+            timingFunction: timing,
+            key: LauncherLayout.footerHintFadeAnimationKey
+        )
+        CATransaction.commit()
     }
 
     private var isPaging: Bool { isPagingGesture || isPageTransitioning }
@@ -8580,9 +11091,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         )
         positionPages(
             activeX: follow.activeX,
-            stagingX: follow.stagingX,
-            activeAlpha: 1 - progress,
-            stagingAlpha: progress
+            stagingX: follow.stagingX
         )
     }
 
@@ -8618,17 +11127,29 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         prepareStagingPage(targetPage)
         let pageWidth = max(gridViewport.bounds.width, 1)
         let travel = pageTravelDistance(for: pageWidth, discrete: discrete)
+        let stagingStartsFromModel = discrete && !isPagingGesture
+        if stagingStartsFromModel {
+            // A parked host always sits to the right. Seed the incoming page
+            // on the requested side before capturing the animation start.
+            positionPages(
+                activeX: 0,
+                stagingX: CGFloat(direction) * travel,
+                activeAlpha: 1,
+                stagingAlpha: 1
+            )
+        }
         isPagingGesture = true
         isPageTransitioning = true
         updatePagingControls()
         positionPages(
             activeX: -CGFloat(direction) * travel,
             stagingX: 0,
-            activeAlpha: 0,
+            activeAlpha: 1,
             stagingAlpha: 1,
             animated: true,
             finishPage: targetPage,
-            discreteSlide: discrete
+            discreteSlide: discrete,
+            stagingStartsFromModel: stagingStartsFromModel
         )
     }
 
@@ -8638,11 +11159,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         currentPage = targetPage
         pageIndicator.configure(
             pageCount: pageCount,
-            selectedPage: LauncherLayout.pagingControlPage(
-                currentPage: currentPage,
-                inFlightPage: transitionTargetPage,
-                queuedPage: queuedPage
-            )
+            selectedPage: targetPage
         )
         updatePagingControls()
         swap(&activeHost, &stagingHost)
@@ -8738,7 +11255,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             activeX: 0,
             stagingX: stagingX,
             activeAlpha: 1,
-            stagingAlpha: stagingX == nil ? nil : 0,
+            stagingAlpha: stagingX == nil ? nil : 1,
             animated: true,
             settle: true
         )
@@ -8789,7 +11306,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         menu.cancelTrackingWithoutAnimation()
     }
 
-    private func acceptsIconContextMenuAction() -> Bool {
+    func acceptsIconContextMenuAction() -> Bool {
         LauncherLayout.shouldApplyIconContextMenuAction(
             isDismissing: launcherIsDismissing(),
             isVisible: window?.isVisible == true,
@@ -8801,8 +11318,10 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
     /// alert returns, so dismiss cancels it instead of leaving it up. The
     /// flag is clear once Save has already returned.
     func abandonAliasPromptBecauseLauncherIsDismissing() {
-        guard LauncherLayout.shouldAbandonAliasPromptOnDismiss(isPrompting: isPromptingForAlias) else { return }
-        NSApp.abortModal()
+        let prompting = isPromptingForAlias || isPromptingForUninstall
+        guard LauncherLayout.shouldAbandonAliasPromptOnDismiss(isPrompting: prompting) else { return }
+        uninstallTask?.cancel()
+        if NSApp.modalWindow != nil { NSApp.abortModal() }
     }
 
     /// A folder title still in the field editor is a draft. `orderOut` would
@@ -9012,7 +11531,8 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         animated: Bool = false,
         finishPage: Int? = nil,
         settle: Bool = false,
-        discreteSlide: Bool = false
+        discreteSlide: Bool = false,
+        stagingStartsFromModel: Bool = false
     ) {
         if LauncherLayout.shouldHoldPageSlide(
             isDismissing: launcherIsDismissing(),
@@ -9040,7 +11560,10 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
             }
         }
         let reduceMotion = prefersReducedMotion
-        guard animated, !reduceMotion else {
+        let travel = max(pageTravelDistance(for: bounds.width, discrete: discreteSlide), 1)
+        let remainingFraction = min(abs(activeX - activeHost.frame.minX) / travel, 1)
+        let duration = LauncherLayout.pageSlideCompletionDuration(remainingFraction: remainingFraction)
+        guard animated, !reduceMotion, duration > 0 else {
             pageTransitionGeneration += 1
             apply()
             if let finishPage {
@@ -9052,30 +11575,25 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         }
         pageTransitionGeneration += 1
         let generation = pageTransitionGeneration
-        let travel = max(pageTravelDistance(for: bounds.width, discrete: discreteSlide), 1)
-        let remainingFraction = min(abs(activeX - activeHost.frame.minX) / travel, 1)
-        let duration = max(0.12, LauncherLayout.pageAnimationDuration * pow(remainingFraction, 0.55))
         if let finishPage {
             pageIndicator.animateSelection(toPage: finishPage, duration: duration)
         } else if settle {
             pageIndicator.animateToRestingSelection(duration: duration)
         }
         gridViewport.layoutSubtreeIfNeeded()
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = duration
-            context.timingFunction = CAMediaTimingFunction(
-                controlPoints: Float(LauncherLayout.pageTurnCurveX1),
-                Float(LauncherLayout.pageTurnCurveY1),
-                Float(LauncherLayout.pageTurnCurveX2),
-                Float(LauncherLayout.pageTurnCurveY2)
-            )
-            self.activeHost.animator().frame = bounds.offsetBy(dx: activeX, dy: 0)
-            self.activeHost.animator().alphaValue = activeAlpha
-            if let stagingX {
-                self.stagingHost.animator().frame = bounds.offsetBy(dx: stagingX, dy: 0)
-                self.stagingHost.animator().alphaValue = stagingAlpha ?? 1
-            }
-        }, completionHandler: { [weak self] in
+        let timing = CAMediaTimingFunction(
+            controlPoints: Float(LauncherLayout.pageTurnCurveX1),
+            Float(LauncherLayout.pageTurnCurveY1),
+            Float(LauncherLayout.pageTurnCurveX2),
+            Float(LauncherLayout.pageTurnCurveY2)
+        )
+        // Opacity and frame both hold presentation with fillMode.backwards so
+        // the commit frame does not flash destination alpha or position.
+        let activeFrame = bounds.offsetBy(dx: activeX, dy: 0)
+        let stagingFrame = stagingX.map { bounds.offsetBy(dx: $0, dy: 0) }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        CATransaction.setCompletionBlock { [weak self] in
             // Already on the main thread. A Task would leave the pages
             // sitting for another turn after the slide has arrived.
             finishFlightOnLandingTurn { [weak self] in
@@ -9086,7 +11604,42 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
                     self.finishSettle()
                 }
             }
-        })
+        }
+        fadeViewOpacityFromPresentation(
+            activeHost,
+            to: activeAlpha,
+            duration: duration,
+            timingFunction: timing,
+            key: LauncherLayout.pageHostFadeAnimationKey
+        )
+        animateViewFrameFromPresentation(
+            activeHost,
+            to: activeFrame,
+            duration: duration,
+            timingFunction: timing,
+            key: LauncherLayout.pageHostSlideAnimationKey
+        )
+        activeHost.syncDocumentFrame()
+        if let stagingFrame {
+            fadeViewOpacityFromPresentation(
+                stagingHost,
+                to: stagingAlpha ?? 1,
+                duration: duration,
+                timingFunction: timing,
+                key: LauncherLayout.pageHostFadeAnimationKey,
+                fromPresentation: !stagingStartsFromModel
+            )
+            animateViewFrameFromPresentation(
+                stagingHost,
+                to: stagingFrame,
+                duration: duration,
+                timingFunction: timing,
+                key: LauncherLayout.pageHostSlideAnimationKey,
+                fromPresentation: !stagingStartsFromModel
+            )
+            stagingHost.syncDocumentFrame()
+        }
+        CATransaction.commit()
     }
 
     private func layoutCollectionViews() {
@@ -9094,6 +11647,7 @@ private final class LauncherRootView: NSView, NSCollectionViewDataSource, NSColl
         let frame = gridViewport.bounds
         activeHost.unpark()
         activeHost.frame = frame
+        activeHost.alphaValue = 1
         activeHost.syncDocumentFrame()
         stagingHost.park(in: frame)
         stagingPage = nil
@@ -9203,8 +11757,9 @@ private final class PagingPageHost: NSScrollView {
     }
 
     func unpark() {
+        // Position/fade callers own opacity; revealing a dragged page must
+        // not overwrite the partially visible frame before its next fade.
         isHidden = false
-        alphaValue = 1
     }
 
     @available(*, unavailable)
@@ -9443,6 +11998,7 @@ private final class PagingCollectionView: NSCollectionView {
     private var accumulatedDelta: CGFloat = 0
     private var lastTimestamp: TimeInterval?
     private var lastVelocity: CGFloat = 0
+    private var preciseScrollUsesHorizontalAxis: Bool?
     private var accumulatedDiscreteDelta: CGFloat = 0
     private var lastDiscreteScrollTimestamp: TimeInterval?
     private var lastDiscretePageTurnTimestamp: TimeInterval = -.infinity
@@ -9498,8 +12054,26 @@ private final class PagingCollectionView: NSCollectionView {
             return
         }
 
-        let delta = Self.dominantScrollDelta(from: event)
-        guard delta != 0 else { return }
+        let delta: CGFloat
+        if event.hasPreciseScrollingDeltas {
+            if event.phase == .began { preciseScrollUsesHorizontalAxis = nil }
+            let dx = event.scrollingDeltaX
+            let dy = event.scrollingDeltaY
+            if preciseScrollUsesHorizontalAxis == nil, (dx != 0 || dy != 0) {
+                preciseScrollUsesHorizontalAxis = abs(dx) >= abs(dy)
+            }
+            delta = preciseScrollUsesHorizontalAxis.map { $0 ? dx : dy } ?? 0
+        } else {
+            delta = Self.dominantScrollDelta(from: event)
+        }
+        guard delta != 0 else {
+            if event.hasPreciseScrollingDeltas,
+               (event.phase == .ended || event.phase == .cancelled),
+               lastTimestamp != nil {
+                finishGesture()
+            }
+            return
+        }
 
         if event.hasPreciseScrollingDeltas {
             if event.phase == .began || lastTimestamp == nil {
@@ -9601,6 +12175,7 @@ private final class PagingCollectionView: NSCollectionView {
         accumulatedDelta = 0
         lastVelocity = 0
         lastTimestamp = nil
+        preciseScrollUsesHorizontalAxis = nil
     }
 
     /// Drop distance accumulated while a page animation was ignoring updates.
@@ -9621,6 +12196,7 @@ private final class PagingCollectionView: NSCollectionView {
     func cancelPagingInput() {
         discardInProgressPageGesture()
         lastTimestamp = nil
+        preciseScrollUsesHorizontalAxis = nil
         accumulatedDiscreteDelta = 0
         lastDiscreteScrollTimestamp = nil
         cancelHeldDiscretePageTurn()
@@ -9642,6 +12218,7 @@ private final class PageIndicatorView: NSStackView {
     private var weightDuration: TimeInterval = 0
     private var weightFrom: [Int: CGFloat] = [:]
     private var weightTo: [Int: CGFloat] = [:]
+    private var visibilityGeneration = 0
 
     var keyViews: [NSView] {
         arrangedSubviews
@@ -9670,8 +12247,78 @@ private final class PageIndicatorView: NSStackView {
         weightDriver.stop()
     }
 
-    func configure(pageCount: Int, selectedPage: Int) {
+    /// Rebuild page dots. When `animatedVisibility` is true, entering search
+    /// (or dropping below two pages) fades the dots out from the opacity on
+    /// screen before clearing them; revealing fades them in. Snap otherwise.
+    func configure(
+        pageCount: Int,
+        selectedPage: Int,
+        animatedVisibility: Bool = false,
+        reducesMotion: Bool = false
+    ) {
         stopWeightAnimation()
+        let shouldShow = LauncherLayout.pageIndicatorShouldShow(pageCount: pageCount)
+        let currentlyShown = isPageIndicatorVisuallyShown
+        let animate = animatedVisibility
+            && LauncherLayout.shouldAnimatePageIndicatorVisibility(
+                pageCount: pageCount,
+                currentlyShown: currentlyShown,
+                reducesMotion: reducesMotion,
+                holdsForLauncherFade: false
+            )
+
+        if currentlyShown && !shouldShow {
+            visibilityGeneration &+= 1
+            let generation = visibilityGeneration
+            if animate {
+                // Keep the current dots drawn while they fade, matching the
+                // search/grid crossfade clock. Rebuild only after the fade.
+                animateVisibility(to: 0, generation: generation) { [weak self] in
+                    guard let self, self.visibilityGeneration == generation else { return }
+                    self.rebuildSlots(pageCount: pageCount, selectedPage: selectedPage)
+                    self.isHidden = true
+                    self.setOpacityWithoutAnimation(1)
+                }
+                return
+            }
+            rebuildSlots(pageCount: pageCount, selectedPage: selectedPage)
+            isHidden = true
+            setOpacityWithoutAnimation(1)
+            return
+        }
+
+        rebuildSlots(pageCount: pageCount, selectedPage: selectedPage)
+        guard shouldShow else {
+            visibilityGeneration &+= 1
+            isHidden = true
+            setOpacityWithoutAnimation(1)
+            return
+        }
+
+        if !currentlyShown && animate {
+            visibilityGeneration &+= 1
+            let generation = visibilityGeneration
+            // Opacity may still be 1 from the previous hide cleanup. Clear it
+            // before revealing so dots do not flash solid for a frame.
+            setOpacityWithoutAnimation(0)
+            isHidden = false
+            animateVisibility(to: 1, generation: generation, completion: nil)
+            return
+        }
+
+        visibilityGeneration &+= 1
+        isHidden = false
+        setOpacityWithoutAnimation(1)
+    }
+
+    private var isPageIndicatorVisuallyShown: Bool {
+        guard !isHidden else { return false }
+        wantsLayer = true
+        let opacity = layer?.presentation()?.opacity ?? layer?.opacity ?? Float(alphaValue)
+        return CGFloat(opacity) > 0.01
+    }
+
+    private func rebuildSlots(pageCount: Int, selectedPage: Int) {
         let slots = LauncherLayout.pageIndicatorSlots(pageCount: pageCount, selectedPage: selectedPage)
         if configuredPageCount == pageCount, configuredSelectedPage == selectedPage, arrangedSubviews.count == slots.count {
             for case let dot as PageDotButton in arrangedSubviews {
@@ -9679,7 +12326,6 @@ private final class PageIndicatorView: NSStackView {
                 dot.isCurrent = current
                 dot.visualWeight = current ? 1 : 0
             }
-            isHidden = pageCount < 2
             return
         }
         configuredPageCount = pageCount
@@ -9721,14 +12367,67 @@ private final class PageIndicatorView: NSStackView {
                 addArrangedSubview(ellipsis)
             }
         }
-        isHidden = pageCount < 2
         guard let focusedTag else { return }
+        let shouldShow = LauncherLayout.pageIndicatorShouldShow(pageCount: pageCount)
         let dots = arrangedSubviews.compactMap { $0 as? PageDotButton }
-        if !isHidden, let restored = dots.first(where: { $0.tag == focusedTag }) ?? dots.first(where: { $0.tag == selectedPage }) {
+        if shouldShow, let restored = dots.first(where: { $0.tag == focusedTag }) ?? dots.first(where: { $0.tag == selectedPage }) {
             window?.makeFirstResponder(restored)
         } else if let content = window?.contentView {
             window?.makeFirstResponder(content)
         }
+    }
+
+    /// Ease-out from the opacity already on screen. Model lands at the end;
+    /// fillMode.backwards holds the commit frame so dots do not snap away.
+    private func animateVisibility(
+        to alpha: CGFloat,
+        generation: Int,
+        completion: (() -> Void)?
+    ) {
+        wantsLayer = true
+        guard let layer else {
+            alphaValue = alpha
+            completion?()
+            return
+        }
+        let from = layer.presentation()?.opacity ?? layer.opacity
+        let timing = CAMediaTimingFunction(name: .easeOut)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.removeAnimation(forKey: LauncherLayout.pageIndicatorFadeAnimationKey)
+        guard abs(CGFloat(from) - alpha) > 0.004 else {
+            alphaValue = alpha
+            layer.opacity = Float(alpha)
+            CATransaction.commit()
+            completion?()
+            return
+        }
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = from
+        fade.toValue = Float(alpha)
+        fade.duration = LauncherLayout.searchTransitionDuration
+        fade.timingFunction = timing
+        fade.fillMode = .backwards
+        CATransaction.setCompletionBlock { [weak self] in
+            finishFlightOnLandingTurn { [weak self] in
+                guard let self, self.visibilityGeneration == generation else { return }
+                completion?()
+            }
+        }
+        alphaValue = alpha
+        layer.opacity = Float(alpha)
+        layer.add(fade, forKey: LauncherLayout.pageIndicatorFadeAnimationKey)
+        CATransaction.commit()
+    }
+
+    private func setOpacityWithoutAnimation(_ alpha: CGFloat) {
+        wantsLayer = true
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer?.removeAnimation(forKey: LauncherLayout.pageIndicatorFadeAnimationKey)
+        alphaValue = alpha
+        layer?.opacity = Float(alpha)
+        CATransaction.commit()
     }
 
     /// Stop on the weight already drawn. A fade that is holding the page
@@ -10051,7 +12750,11 @@ private final class AppGridItem: NSCollectionViewItem {
         onActivate: @escaping () -> Void,
         onDragStart: @escaping (NSEvent) -> Bool,
         onRenameAlias: (() -> Void)?,
-        onHideApplication: (() -> Void)?
+        onHideApplication: (() -> Void)?,
+        onUninstallApplication: (() -> Void)?,
+        uninstallEnabled: Bool,
+        uninstallDisabledReason: String?,
+        searchFolderContext: String? = nil
     ) {
         guard let tile = view as? AppGridTileView else { return }
         tile.configure(
@@ -10064,7 +12767,11 @@ private final class AppGridItem: NSCollectionViewItem {
             onActivate: onActivate,
             onDragStart: onDragStart,
             onRenameAlias: onRenameAlias,
-            onHideApplication: onHideApplication
+            onHideApplication: onHideApplication,
+            onUninstallApplication: onUninstallApplication,
+            uninstallEnabled: uninstallEnabled,
+            uninstallDisabledReason: uninstallDisabledReason,
+            searchFolderContext: searchFolderContext
         )
     }
 
@@ -10085,6 +12792,12 @@ private final class AppGridTileView: NSView {
     var reducesMotion = false
     var iconGeneration = 0
     var onActivate: (() -> Void)?
+    /// ⌘-click: toggle multi-select without activating.
+    var onCommandToggleSelection: (() -> Void)?
+    /// Shift-click: select contiguous range in presented order (no paging).
+    var onShiftSelectRange: (() -> Void)?
+    /// Plain click path: clear multi-select chrome before activate.
+    var onPlainActivateClearsSelection: (() -> Void)?
     var onFocus: (() -> Void)?
     var onPage: ((Int) -> Void)?
     var onVerticalPage: ((Int) -> Bool)?
@@ -10095,9 +12808,21 @@ private final class AppGridTileView: NSView {
     /// True while the launcher is fading. A decoded icon waits instead of
     /// swapping the placeholder under that fade. A hidden window is not fading.
     var launcherIsDismissing: () -> Bool = { false }
+    /// Folder overlay members: suppress keyboard-focus fill while panel chrome
+    /// (open/close scale or fade) is still in flight. Grid tiles leave this false.
+    var folderPanelChromeInFlight: () -> Bool = { false }
+    /// Bumped on every chrome-fill apply so a stale fade-out cannot nil a newer fill.
+    private var chromeFillGeneration: UInt64 = 0
     private var onDragStart: ((NSEvent) -> Bool)?
     private var onRenameAlias: (() -> Void)?
     private var onHideApplication: (() -> Void)?
+    /// Multi-select (≥2) context-menu hide; when set, replaces single hide title.
+    var onBatchHideSelection: (() -> Void)?
+    /// Multi-select (≥2 top-level apps) → new folder.
+    var onBatchMoveSelectionToFolder: (() -> Void)?
+    private var onUninstallApplication: (() -> Void)?
+    private var uninstallEnabled = false
+    private var uninstallDisabledReason: String?
     private var iconLoadTask: Task<Void, Never>?
     /// Decoded while the launcher was fading. Applied once the fade is over.
     private var deferredIconImage: NSImage?
@@ -10111,7 +12836,12 @@ private final class AppGridTileView: NSView {
     /// tile and clears `onActivate`. The click still has to open that app.
     private var armedActivate: (() -> Void)?
 
-    override var acceptsFirstResponder: Bool { true }
+    /// Folder members refuse Tab while close chrome travels (grid tiles stay true).
+    var keyboardFocusAvailable: () -> Bool = { true }
+
+    override var acceptsFirstResponder: Bool {
+        keyboardFocusAvailable()
+    }
 
     var isLaunching = false {
         didSet {
@@ -10132,6 +12862,23 @@ private final class AppGridTileView: NSView {
         }
     }
 
+    /// ⌘-click multi-select chrome (independent of keyboard focus).
+    var isSelected = false {
+        didSet {
+            guard isSelected != oldValue else { return }
+            updateDropTargetAppearance()
+        }
+    }
+
+    /// Search keyboard-open highlight while the field stays first responder.
+    /// Same focus-fill chrome as real first-responder focus; does not take FR.
+    var isSearchKeyboardHighlighted = false {
+        didSet {
+            guard isSearchKeyboardHighlighted != oldValue else { return }
+            updateDropTargetAppearance()
+        }
+    }
+
     private var baseAccessibilityHelp = ""
 
     override init(frame frameRect: NSRect) {
@@ -10140,6 +12887,7 @@ private final class AppGridTileView: NSView {
         wantsLayer = true
         layer?.cornerRadius = 12
         layer?.masksToBounds = true
+        layer?.backgroundColor = nil
         clipsToBounds = true
         focusRingType = .none
         setAccessibilityElement(true)
@@ -10203,7 +12951,11 @@ private final class AppGridTileView: NSView {
         onActivate: @escaping () -> Void,
         onDragStart: @escaping (NSEvent) -> Bool,
         onRenameAlias: (() -> Void)?,
-        onHideApplication: (() -> Void)?
+        onHideApplication: (() -> Void)?,
+        onUninstallApplication: (() -> Void)?,
+        uninstallEnabled: Bool,
+        uninstallDisabledReason: String?,
+        searchFolderContext: String? = nil
     ) {
         self.reducesMotion = reducesMotion
         self.isFolder = isFolder
@@ -10218,6 +12970,9 @@ private final class AppGridTileView: NSView {
         self.onDragStart = onDragStart
         self.onRenameAlias = onRenameAlias
         self.onHideApplication = onHideApplication
+        self.onUninstallApplication = onUninstallApplication
+        self.uninstallEnabled = uninstallEnabled
+        self.uninstallDisabledReason = uninstallDisabledReason
         previewCandidates = preview
         iconGeneration += 1
         let generation = iconGeneration
@@ -10227,9 +12982,30 @@ private final class AppGridTileView: NSView {
         loadedIconWaitsForLauncher = false
         launchHighlightKey = isFolder ? nil : candidate.id
         restingTitle = displayName
-        titleLabel.stringValue = isLaunching ? L("正在启动…") : displayName
-        toolTip = displayName
-        setAccessibilityLabel(isFolder ? String(format: L("文件夹 %@"), displayName) : displayName)
+        let folderContext = searchFolderContext?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let folderLine = (folderContext?.isEmpty == false) ? folderContext : nil
+        if isLaunching {
+            titleLabel.stringValue = L("正在启动…")
+        } else if let folderLine, !isFolder {
+            titleLabel.stringValue = LauncherLayout.searchHitTitle(
+                displayName: displayName,
+                containingFolderName: folderLine
+            )
+        } else {
+            titleLabel.stringValue = displayName
+        }
+        if let folderLine, !isFolder {
+            toolTip = String(format: L("%@ — 文件夹 %@"), displayName, folderLine)
+            setAccessibilityLabel(
+                LauncherLayout.searchHitAccessibilityLabel(
+                    displayName: displayName,
+                    containingFolderName: folderLine
+                )
+            )
+        } else {
+            toolTip = displayName
+            setAccessibilityLabel(isFolder ? String(format: L("文件夹 %@"), displayName) : displayName)
+        }
         baseAccessibilityHelp = isFolder ? L("按下以打开文件夹") : L("按下以打开应用")
         setAccessibilityHelp(baseAccessibilityHelp)
         updateDropTargetAppearance()
@@ -10320,6 +13096,8 @@ private final class AppGridTileView: NSView {
         deferredPreviewImages = nil
         loadedIconWaitsForLauncher = false
         launcherIsDismissing = { false }
+        folderPanelChromeInFlight = { false }
+        keyboardFocusAvailable = { true }
         launchHighlightKey = nil
         restingTitle = ""
         isLaunching = false
@@ -10334,6 +13112,9 @@ private final class AppGridTileView: NSView {
         previewPlateOpacity = 1
         isFolder = false
         onActivate = nil
+        onCommandToggleSelection = nil
+        onShiftSelectRange = nil
+        onPlainActivateClearsSelection = nil
         onFocus = nil
         onPage = nil
         onVerticalPage = nil
@@ -10344,12 +13125,22 @@ private final class AppGridTileView: NSView {
         onDragStart = nil
         onRenameAlias = nil
         onHideApplication = nil
+        onBatchHideSelection = nil
+        onBatchMoveSelectionToFolder = nil
+        onUninstallApplication = nil
+        uninstallEnabled = false
+        uninstallDisabledReason = nil
         menu = nil
         toolTip = nil
         baseAccessibilityHelp = ""
         isDropTarget = false
+        isSelected = false
+        isSearchKeyboardHighlighted = false
+        chromeFillGeneration &+= 1
         alphaValue = 1
         layer?.opacity = 1
+        layer?.removeAnimation(forKey: LauncherLayout.tileChromeFillFadeAnimationKey)
+        layer?.backgroundColor = nil
         reorderClock.stop()
         reorderGeneration += 1
         reorderSlideHeld = false
@@ -10388,12 +13179,24 @@ private final class AppGridTileView: NSView {
             pinReorderSlideForDismissal()
             return
         }
+        let snapReduced = LauncherLayout.shouldSnapReorderSlideForReducedMotion(
+            reducesMotion: reducesMotion
+        )
         guard translation != reorderTarget
-            || ((!animated || reducesMotion) && reorderPresented != translation) else { return }
+            || ((!animated || snapReduced) && reorderPresented != translation) else { return }
         reorderTarget = translation
         reorderSlideHeld = false
-        layer?.transform = CATransform3DIdentity
-        guard animated, !reducesMotion,
+        // AppKit may stamp a transform on the item layer during a drag. Clear
+        // it without fighting the host-frame presentation the spring drives.
+        if let layer, !CATransform3DIsIdentity(layer.transform) {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.transform = CATransform3DIdentity
+            CATransaction.commit()
+        }
+        // Reduced motion: snap to gap (duration 0; no reorder spring travel).
+        guard animated, !snapReduced,
+              LauncherLayout.reorderSlideSpringDuration(reducesMotion: reducesMotion) > 0,
               translation != reorderPresented || reorderVelocity != .zero else {
             reorderClock.stop()
             reorderGeneration += 1
@@ -10402,7 +13205,11 @@ private final class AppGridTileView: NSView {
             applyReorderSlidePresentation()
             return
         }
+        // Spring already running: retarget only. Presented position stays put
+        // so the neighbor does not snap then ease toward the new gap.
         guard !reorderClock.isRunning else { return }
+        // Hold presentation until the display-link spring is attached — do not
+        // write reorderPresented to the target here.
         reorderLastTick = CACurrentMediaTime()
         reorderGeneration += 1
         reorderClock.start(on: self, generation: reorderGeneration)
@@ -10575,31 +13382,106 @@ private final class AppGridTileView: NSView {
         // reloaded view can fail the bounds test even though the press never
         // became a drag, which used to focus the result without opening it.
         if !didStartItemDrag, mouseDownPoint != nil, inside || stayedPut {
-            activate?()
+            let mods = event.modifierFlags
+            // Shift-click: contiguous range in presented order (no activate / page).
+            if mods.contains(.shift), let onShiftSelectRange {
+                onShiftSelectRange()
+            } else if mods.contains(.command), let onCommandToggleSelection {
+                // ⌘-click toggles multi-select chrome without opening/activating.
+                onCommandToggleSelection()
+            } else {
+                onPlainActivateClearsSelection?()
+                activate?()
+            }
         }
         mouseDownPoint = nil
         didStartItemDrag = false
         armedActivate = nil
     }
 
+    func refreshContextMenu() {
+        configureContextMenu()
+    }
+
+    /// Incomplete-scan / read-only: keep open help, append why drag/uninstall is blocked.
+    func applyLayoutEditingAccessibilityHelp(
+        layoutEditingEnabled: Bool,
+        layoutEditingExplanation: String?
+    ) {
+        let help = L(LauncherLayout.tileAccessibilityHelp(
+            isFolder: isFolder,
+            layoutEditingEnabled: layoutEditingEnabled,
+            layoutEditingExplanation: layoutEditingExplanation
+        ))
+        baseAccessibilityHelp = help
+        // Drop-target chrome may temporarily override help; restore when idle.
+        if !isDropTarget {
+            setAccessibilityHelp(help)
+        }
+    }
+
     private func configureContextMenu() {
-        guard !isFolder, onRenameAlias != nil, onHideApplication != nil else {
+        let batchHide = onBatchHideSelection != nil
+        let batchFolder = onBatchMoveSelectionToFolder != nil
+        let canSingleHide = onHideApplication != nil
+        let hasAlias = onRenameAlias != nil
+        let hasUninstall = onUninstallApplication != nil
+        // Incomplete-scan read-only clears rename/hide callbacks but still
+        // passes a disabled uninstall action — keep that item for VoiceOver.
+        guard !isFolder, hasAlias || canSingleHide || batchHide || hasUninstall else {
             menu = nil
             return
         }
         let contextMenu = NSMenu()
-        let aliasItem = contextMenu.addItem(
-            withTitle: L("设置别名…"),
-            action: #selector(renameAlias),
-            keyEquivalent: ""
-        )
-        aliasItem.target = self
-        let hideItem = contextMenu.addItem(
-            withTitle: L("隐藏应用"),
-            action: #selector(hideApplication),
-            keyEquivalent: ""
-        )
-        hideItem.target = self
+        if hasAlias {
+            let aliasItem = contextMenu.addItem(
+                withTitle: L("设置别名…"),
+                action: #selector(renameAlias),
+                keyEquivalent: ""
+            )
+            aliasItem.target = self
+        }
+        if batchHide {
+            let hideItem = contextMenu.addItem(
+                withTitle: L("隐藏所选应用"),
+                action: #selector(hideSelectedApplications),
+                keyEquivalent: ""
+            )
+            hideItem.target = self
+            hideItem.setAccessibilityLabel(L("隐藏所选应用"))
+        } else if canSingleHide {
+            let hideItem = contextMenu.addItem(
+                withTitle: L("隐藏应用"),
+                action: #selector(hideApplication),
+                keyEquivalent: ""
+            )
+            hideItem.target = self
+        }
+        if batchFolder {
+            let folderItem = contextMenu.addItem(
+                withTitle: L("移入新建文件夹"),
+                action: #selector(moveSelectionToNewFolder),
+                keyEquivalent: ""
+            )
+            folderItem.target = self
+            folderItem.setAccessibilityLabel(L("移入新建文件夹"))
+        }
+        // Uninstall stays single-item only (batch uninstall is out of scope).
+        if !batchHide, onUninstallApplication != nil {
+            let uninstallItem = contextMenu.addItem(
+                withTitle: L("卸载应用…"),
+                action: #selector(uninstallApplication),
+                keyEquivalent: ""
+            )
+            uninstallItem.target = self
+            uninstallItem.isEnabled = uninstallEnabled
+            uninstallItem.toolTip = uninstallDisabledReason
+            if let uninstallDisabledReason, !uninstallEnabled {
+                uninstallItem.setAccessibilityHelp(uninstallDisabledReason)
+            } else {
+                uninstallItem.setAccessibilityHelp(L("将应用移到废纸篓"))
+            }
+        }
         menu = contextMenu
     }
 
@@ -10611,7 +13493,20 @@ private final class AppGridTileView: NSView {
         onHideApplication?()
     }
 
+    @objc private func hideSelectedApplications() {
+        onBatchHideSelection?()
+    }
+
+    @objc private func moveSelectionToNewFolder() {
+        onBatchMoveSelectionToFolder?()
+    }
+
+    @objc private func uninstallApplication() {
+        onUninstallApplication?()
+    }
+
     override func becomeFirstResponder() -> Bool {
+        guard keyboardFocusAvailable() else { return false }
         let accepted = super.becomeFirstResponder()
         if accepted {
             onFocus?()
@@ -10840,29 +13735,130 @@ private final class AppGridTileView: NSView {
         updateDropTargetAppearance()
     }
 
+    /// Drag-lift snapshot without baking focus/drop/launch cell chrome into the image.
+    /// Policy: `LauncherLayout.tileChromeFillAlphaForDragLiftSnapshot()` is always idle (0),
+    /// so the temporary background is cleared to `nil` rather than white@0.
+    func draggingImageWithoutCellChrome() -> NSImage {
+        guard let layer else { return draggingImage() }
+        let previous = layer.backgroundColor
+        let snapshotAlpha = LauncherLayout.tileChromeFillAlphaForDragLiftSnapshot()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.backgroundColor = snapshotAlpha > 0
+            ? NSColor.white.withAlphaComponent(snapshotAlpha).cgColor
+            : nil
+        CATransaction.commit()
+        let image = draggingImage()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.backgroundColor = previous
+        CATransaction.commit()
+        return image
+    }
+
+    /// Re-apply cell chrome after folder panel chrome lands (focus fill may appear).
+    func refreshFocusChrome() {
+        updateDropTargetAppearance()
+    }
+
     private func updateDropTargetAppearance(focused: Bool? = nil) {
         if let layer {
-            let focused = focused ?? (window?.firstResponder === self)
-            let opacity: CGFloat = isLaunching ? 0.35 : (isDropTarget ? 0.12 : (focused ? 0.08 : 0))
+            let focused = focused ?? LauncherLayout.tileShowsKeyboardFocusChrome(
+                isFirstResponder: window?.firstResponder === self,
+                isSearchKeyboardHighlighted: isSearchKeyboardHighlighted
+            )
+            let opacity = LauncherLayout.tileChromeFillAlpha(
+                isLaunching: isLaunching,
+                isDropTarget: isDropTarget,
+                focused: focused,
+                selected: isSelected,
+                folderPanelChromeInFlight: folderPanelChromeInFlight()
+            )
+            chromeFillGeneration &+= 1
+            let generation = chromeFillGeneration
+            let fromAlpha = presentedChromeFillAlpha(on: layer)
+            let animate = LauncherLayout.shouldAnimateTileChromeFocusFill(
+                fromAlpha: fromAlpha,
+                toAlpha: opacity,
+                reducesMotion: reducesMotion
+            )
             CATransaction.begin()
             CATransaction.setDisableActions(true)
+            layer.removeAnimation(forKey: LauncherLayout.tileChromeFillFadeAnimationKey)
             layer.borderWidth = 0
             layer.borderColor = nil
-            layer.backgroundColor = NSColor.white.withAlphaComponent(opacity).cgColor
+            if animate {
+                let fromColor = NSColor.white.withAlphaComponent(fromAlpha).cgColor
+                let toColor = NSColor.white.withAlphaComponent(opacity).cgColor
+                let fade = CABasicAnimation(keyPath: "backgroundColor")
+                fade.fromValue = fromColor
+                fade.toValue = toColor
+                fade.duration = LauncherLayout.tileChromeFillFadeDuration
+                fade.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                // Hold the fill already on screen until this animation attaches,
+                // or Tab between members snaps the 8% plate.
+                fade.fillMode = .backwards
+                if opacity <= 0 {
+                    CATransaction.setCompletionBlock { [weak self] in
+                        finishFlightOnLandingTurn { [weak self] in
+                            guard let self,
+                                  self.chromeFillGeneration == generation,
+                                  let layer = self.layer else { return }
+                            CATransaction.begin()
+                            CATransaction.setDisableActions(true)
+                            layer.removeAnimation(forKey: LauncherLayout.tileChromeFillFadeAnimationKey)
+                            // Resting tiles stay fully clear — nil, not white@0.
+                            layer.backgroundColor = nil
+                            CATransaction.commit()
+                        }
+                    }
+                }
+                // Model lands on the end fill; presentation holds `from` first.
+                layer.backgroundColor = toColor
+                layer.add(fade, forKey: LauncherLayout.tileChromeFillFadeAnimationKey)
+            } else {
+                // Resting tiles must stay fully clear. Prefer nil over white@0 so
+                // Core Animation does not keep a resting gray/white plate.
+                layer.backgroundColor = opacity > 0
+                    ? NSColor.white.withAlphaComponent(opacity).cgColor
+                    : nil
+            }
             CATransaction.commit()
         }
         if isDropTarget {
             setAccessibilitySelected(true)
             setAccessibilityHelp(isFolder ? L("拖放到此文件夹") : L("拖放到此以合并"))
         } else {
-            setAccessibilitySelected(false)
+            setAccessibilitySelected(isSelected)
             if !baseAccessibilityHelp.isEmpty {
                 setAccessibilityHelp(baseAccessibilityHelp)
             }
         }
     }
 
+    /// Alpha of the white chrome fill currently on screen (presentation first).
+    private func presentedChromeFillAlpha(on layer: CALayer) -> CGFloat {
+        if let presented = layer.presentation()?.backgroundColor,
+           let color = NSColor(cgColor: presented) {
+            return color.alphaComponent
+        }
+        if let model = layer.backgroundColor, let color = NSColor(cgColor: model) {
+            return color.alphaComponent
+        }
+        return 0
+    }
+
     private func playLaunchFeedback() {
+        // Reduced motion: snap resting transform (no scale pulse).
+        if LauncherLayout.shouldSnapLaunchPressForReducedMotion(reducesMotion: reducesMotion) {
+            guard let layer else { return }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.removeAnimation(forKey: LauncherLayout.launchFeedbackAnimationKey)
+            layer.transform = CATransform3DIdentity
+            CATransaction.commit()
+            return
+        }
         guard LauncherLayout.shouldPlayLaunchFeedback(
             isDismissing: launcherIsDismissing(),
             reducesMotion: reducesMotion
@@ -10878,22 +13874,35 @@ private final class AppGridTileView: NSView {
             CATransform3DMakeScale(scale, scale, 1),
             CATransform3DMakeTranslation(shift.x, shift.y, 0)
         )
+        // Model stays identity (resting). Start from the transform already on
+        // screen — a prior pulse or hold may not be identity — and hold that
+        // presentation until the press is attached (fillMode.backwards).
+        let fromTransform = layer.presentation()?.transform ?? layer.transform
         let animation = CABasicAnimation(keyPath: "transform")
-        animation.fromValue = NSValue(caTransform3D: CATransform3DIdentity)
+        animation.fromValue = NSValue(caTransform3D: fromTransform)
         animation.toValue = NSValue(caTransform3D: pressed)
-        animation.duration = LauncherLayout.launchPressHalfDuration
+        let half = LauncherLayout.launchPressPulseHalfDuration(reducesMotion: reducesMotion)
+        guard half > 0 else { return }
+        animation.duration = half
         animation.autoreverses = true
         animation.timingFunction = CAMediaTimingFunction(name: .easeOut)
-        layer.add(animation, forKey: "launch-feedback")
+        animation.fillMode = .backwards
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.removeAnimation(forKey: LauncherLayout.launchFeedbackAnimationKey)
+        layer.transform = CATransform3DIdentity
+        layer.add(animation, forKey: LauncherLayout.launchFeedbackAnimationKey)
+        CATransaction.commit()
     }
 
     /// The preference changed. The pulse returns to the normal scale instead
     /// of finishing. The model scale is already 1.
     func snapLaunchFeedbackForMotionChange() {
-        guard let layer, layer.animation(forKey: "launch-feedback") != nil else { return }
+        guard let layer,
+              layer.animation(forKey: LauncherLayout.launchFeedbackAnimationKey) != nil else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        layer.removeAnimation(forKey: "launch-feedback")
+        layer.removeAnimation(forKey: LauncherLayout.launchFeedbackAnimationKey)
         layer.transform = CATransform3DIdentity
         CATransaction.commit()
     }
@@ -10973,6 +13982,17 @@ private final class LauncherChromeButton: NSButton {
     var onVerticalPage: ((Int) -> Bool)?
     var onType: ((NSEvent) -> Bool)?
     var onDelete: ((LauncherSearchDeletion) -> Bool)?
+    /// Folder close button refuses Tab while close chrome travels.
+    var keyboardFocusAvailable: () -> Bool = { true }
+
+    override var acceptsFirstResponder: Bool {
+        keyboardFocusAvailable()
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        guard keyboardFocusAvailable() else { return false }
+        return super.becomeFirstResponder()
+    }
 
     override func insertTab(_ sender: Any?) {
         if onInsertTab?() == true { return }
@@ -11064,6 +14084,7 @@ private final class PagingArrowButton: NSButton {
     private var isHovering = false
     private var dragHoverWorkItem: DispatchWorkItem?
     private var isDragHovering = false
+    private var presenceGeneration = 0
 
     init(symbolName: String, accessibilityLabel: String) {
         super.init(frame: .zero)
@@ -11190,6 +14211,59 @@ private final class PagingArrowButton: NSButton {
         return resigned
     }
 
+    /// Search, folder overlay, or first/last page make the arrow unavailable.
+    /// Match page-indicator: fade from presentation when visible, then hide.
+    /// Revealing unhides and resumes hover/focus opacity.
+    func setPagingAvailable(_ available: Bool, animated: Bool) {
+        let currentlyShown = !isHidden
+        guard available != currentlyShown else {
+            if available { updateVisibility(animated: false) }
+            return
+        }
+        presenceGeneration &+= 1
+        let generation = presenceGeneration
+        if !available {
+            dragHoverWorkItem?.cancel()
+            dragHoverWorkItem = nil
+            isHovering = false
+            isDragHovering = false
+            wantsLayer = true
+            let opacity = layer?.presentation()?.opacity ?? layer?.opacity ?? Float(alphaValue)
+            if animated, CGFloat(opacity) > 0.01 {
+                animatePresence(to: 0, generation: generation) { [weak self] in
+                    guard let self, self.presenceGeneration == generation else { return }
+                    self.isHidden = true
+                    self.setAlphaWithoutAnimation(0)
+                }
+                return
+            }
+            isHidden = true
+            setAlphaWithoutAnimation(0)
+            return
+        }
+        // Hide path restores alpha after the fade. Clear it before revealing
+        // so the arrow does not flash at full opacity for a frame.
+        if animated {
+            setAlphaWithoutAnimation(0)
+            isHidden = false
+            let shown = LauncherLayout.pageButtonHoverShown(
+                pointerInside: isHovering,
+                dragInside: isDragHovering,
+                focused: window?.firstResponder === self
+            )
+            let target = LauncherLayout.pageButtonHoverFade(shown: shown).opacity
+            if target > 0.01 {
+                installHoverPlate()
+                animatePresence(to: target, generation: generation, completion: nil)
+                return
+            }
+            updateVisibility(animated: false)
+            return
+        }
+        isHidden = false
+        updateVisibility(animated: false)
+    }
+
     /// While the launcher fade is up, keep the opacity already on screen.
     /// A later pass snaps to hover or focus. The fade is not replayed.
     func settleHoverFadeForDismissal() {
@@ -11229,6 +14303,7 @@ private final class PagingArrowButton: NSButton {
     }
 
     private func updateVisibility(animated: Bool) {
+        if isHidden { return }
         if holdingHoverFade {
             pinHoverFade()
             return
@@ -11239,13 +14314,24 @@ private final class PagingArrowButton: NSButton {
             focused: window?.firstResponder === self
         )
         let fade = LauncherLayout.pageButtonHoverFade(shown: shown)
+        let reduced = reducesMotion()
         installHoverPlate()
+        // Reduced motion: snap hover opacity only (no page-turn / presence retune).
+        if LauncherLayout.shouldSnapPageButtonHoverForReducedMotion(reducesMotion: reduced) {
+            setAlphaWithoutAnimation(fade.opacity)
+            return
+        }
         if animated, LauncherLayout.shouldAnimatePageButtonHover(
             isDismissing: launcherIsDismissing(),
             isVisible: window?.isVisible == true,
-            reducesMotion: reducesMotion()
+            reducesMotion: reduced
         ) {
-            animateHoverOpacity(to: fade.opacity, duration: fade.duration)
+            let duration = LauncherLayout.pageButtonHoverOpacityFadeDuration(reducesMotion: reduced)
+            if duration > 0 {
+                animateHoverOpacity(to: fade.opacity, duration: duration)
+            } else {
+                setAlphaWithoutAnimation(fade.opacity)
+            }
         } else {
             setAlphaWithoutAnimation(fade.opacity)
         }
@@ -11286,10 +14372,10 @@ private final class PagingArrowButton: NSButton {
         fade.toValue = Float(alpha)
         fade.duration = duration
         fade.timingFunction = CAMediaTimingFunction(
-            controlPoints: Float(LauncherLayout.pageTurnCurveX1),
-            Float(LauncherLayout.pageTurnCurveY1),
-            Float(LauncherLayout.pageTurnCurveX2),
-            Float(LauncherLayout.pageTurnCurveY2)
+            controlPoints: Float(LauncherLayout.pageButtonHoverCurveX1),
+            Float(LauncherLayout.pageButtonHoverCurveY1),
+            Float(LauncherLayout.pageButtonHoverCurveX2),
+            Float(LauncherLayout.pageButtonHoverCurveY2)
         )
         // The model below is already the end opacity. Hold the opacity on
         // screen until this animation is attached, or the commit frame
@@ -11316,31 +14402,190 @@ private final class PagingArrowButton: NSButton {
         CATransaction.commit()
     }
 
+    /// Presence fade shares the search chrome clock. Distinct from hover so a
+    /// hide during hover does not steal the hover animation key mid-flight.
+    private func animatePresence(
+        to alpha: CGFloat,
+        generation: Int,
+        completion: (() -> Void)?
+    ) {
+        wantsLayer = true
+        guard let layer else {
+            alphaValue = alpha
+            completion?()
+            return
+        }
+        let from = layer.presentation()?.opacity ?? layer.opacity
+        let timing = CAMediaTimingFunction(name: .easeOut)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.removeAnimation(forKey: LauncherLayout.pageArrowPresenceAnimationKey)
+        layer.removeAnimation(forKey: "pageButtonHover")
+        guard abs(CGFloat(from) - alpha) > 0.004 else {
+            alphaValue = alpha
+            layer.opacity = Float(alpha)
+            CATransaction.commit()
+            completion?()
+            return
+        }
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = from
+        fade.toValue = Float(alpha)
+        fade.duration = LauncherLayout.searchTransitionDuration
+        fade.timingFunction = timing
+        fade.fillMode = .backwards
+        CATransaction.setCompletionBlock { [weak self] in
+            finishFlightOnLandingTurn { [weak self] in
+                guard let self, self.presenceGeneration == generation else { return }
+                completion?()
+            }
+        }
+        alphaValue = alpha
+        layer.opacity = Float(alpha)
+        layer.add(fade, forKey: LauncherLayout.pageArrowPresenceAnimationKey)
+        CATransaction.commit()
+    }
+
     private func setAlphaWithoutAnimation(_ alpha: CGFloat) {
         wantsLayer = true
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         layer?.removeAllAnimations()
         alphaValue = alpha
+        layer?.opacity = Float(alpha)
         CATransaction.commit()
     }
 }
 
-@MainActor
 private final class AliasNameField: NSTextField, NSTextFieldDelegate {
     private weak var saveButton: NSButton?
     private weak var cancelButton: NSButton?
     private var saveKeyEquivalent = "\r"
     private var cancelKeyEquivalent = "\u{1b}"
     private var isStrippingMarkedAlias = false
+    /// Quiet edit hairline (same clock as folder title). Opacity fades from
+    /// presentation so begin/end rename does not snap the underline.
+    private let editUnderlineLayer = CAShapeLayer()
+    private var editUnderlineFadeGeneration: UInt64 = 0
+    private var editUnderlineVisible = false
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         delegate = self
+        // Match folder-title rename chrome: no system bezel / focus ring.
+        isBezeled = false
+        drawsBackground = false
+        focusRingType = .none
+        configureEditUnderlineLayer()
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { nil }
+
+    private func configureEditUnderlineLayer() {
+        wantsLayer = true
+        editUnderlineLayer.fillColor = nil
+        // Alert accessory sits on light/dark system chrome — label color, not white.
+        editUnderlineLayer.strokeColor = NSColor.secondaryLabelColor
+            .withAlphaComponent(LauncherLayout.folderTitleEditUnderlineAlpha).cgColor
+        editUnderlineLayer.lineWidth = 1
+        editUnderlineLayer.opacity = 0
+        editUnderlineLayer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
+        layer?.addSublayer(editUnderlineLayer)
+    }
+
+    override func layout() {
+        super.layout()
+        updateEditUnderlineGeometry()
+        // Appearance can flip while the modal is up — keep stroke readable.
+        editUnderlineLayer.strokeColor = NSColor.secondaryLabelColor
+            .withAlphaComponent(LauncherLayout.folderTitleEditUnderlineAlpha).cgColor
+    }
+
+    private func updateEditUnderlineGeometry() {
+        let y = bounds.minY + 0.5
+        let path = CGMutablePath()
+        path.move(to: CGPoint(x: bounds.minX + 4, y: y))
+        path.addLine(to: CGPoint(x: bounds.maxX - 4, y: y))
+        editUnderlineLayer.frame = bounds
+        editUnderlineLayer.path = path
+    }
+
+    private var prefersReducedMotion: Bool {
+        NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
+
+    private func setEditUnderlineVisible(_ visible: Bool, animated: Bool) {
+        guard visible != editUnderlineVisible
+            || abs(editUnderlineLayer.opacity - (visible ? 1 : 0)) > 0.004 else {
+            return
+        }
+        editUnderlineVisible = visible
+        editUnderlineFadeGeneration &+= 1
+        let generation = editUnderlineFadeGeneration
+        let target: Float = visible ? 1 : 0
+        let from = editUnderlineLayer.presentation()?.opacity ?? editUnderlineLayer.opacity
+        let reduce = prefersReducedMotion || window?.isVisible != true
+        let shouldAnimate = animated
+            && LauncherLayout.shouldAnimateFolderTitleEditUnderline(
+                fromOpacity: from,
+                toOpacity: target,
+                reducesMotion: reduce
+            )
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        editUnderlineLayer.removeAnimation(
+            forKey: LauncherLayout.aliasEditUnderlineFadeAnimationKey
+        )
+        updateEditUnderlineGeometry()
+        if shouldAnimate {
+            let fade = CABasicAnimation(keyPath: "opacity")
+            fade.fromValue = from
+            fade.toValue = target
+            fade.duration = LauncherLayout.aliasEditUnderlineFadeDuration
+            fade.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            fade.fillMode = .backwards
+            if !visible {
+                CATransaction.setCompletionBlock { [weak self] in
+                    guard let self,
+                          self.editUnderlineFadeGeneration == generation else { return }
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    self.editUnderlineLayer.removeAnimation(
+                        forKey: LauncherLayout.aliasEditUnderlineFadeAnimationKey
+                    )
+                    self.editUnderlineLayer.opacity = 0
+                    CATransaction.commit()
+                }
+            }
+            editUnderlineLayer.opacity = target
+            editUnderlineLayer.add(
+                fade,
+                forKey: LauncherLayout.aliasEditUnderlineFadeAnimationKey
+            )
+        } else {
+            editUnderlineLayer.opacity = target
+        }
+        CATransaction.commit()
+    }
+
+    override func textDidBeginEditing(_ notification: Notification) {
+        super.textDidBeginEditing(notification)
+        setEditUnderlineVisible(true, animated: true)
+        selectAllAliasTextIfNeeded()
+    }
+
+    override func textDidEndEditing(_ notification: Notification) {
+        super.textDidEndEditing(notification)
+        setEditUnderlineVisible(false, animated: true)
+    }
+
+    /// Select the whole alias when a rename session starts (Core policy).
+    private func selectAllAliasTextIfNeeded() {
+        guard LauncherLayout.aliasSelectsAllOnBeginEditing,
+              let editor = currentEditor() else { return }
+        editor.selectAll(nil)
+    }
 
     func adoptAlertButtons(_ buttons: [NSButton]) {
         saveButton = buttons.first
@@ -11381,15 +14626,163 @@ private final class AliasNameField: NSTextField, NSTextFieldDelegate {
     }
 }
 
+
 @MainActor
 private final class FolderTitleField: NSTextField {
     var pointerEditingAvailable: () -> Bool = { true }
+    /// Quiet edit hairline under the name. Opacity fades from presentation.
+    private let editUnderlineLayer = CAShapeLayer()
+    private var editUnderlineFadeGeneration: UInt64 = 0
+    private var editUnderlineVisible = false
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        configureEditUnderlineLayer()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configureEditUnderlineLayer()
+    }
+
+    private func configureEditUnderlineLayer() {
+        wantsLayer = true
+        editUnderlineLayer.fillColor = nil
+        editUnderlineLayer.strokeColor = NSColor.white
+            .withAlphaComponent(LauncherLayout.folderTitleEditUnderlineAlpha).cgColor
+        editUnderlineLayer.lineWidth = 1
+        editUnderlineLayer.opacity = 0
+        editUnderlineLayer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
+        layer?.addSublayer(editUnderlineLayer)
+    }
+
+    override func layout() {
+        super.layout()
+        updateEditUnderlineGeometry()
+    }
+
+    private func updateEditUnderlineGeometry() {
+        let y = bounds.minY + 0.5
+        let path = CGMutablePath()
+        path.move(to: CGPoint(x: bounds.minX + 8, y: y))
+        path.addLine(to: CGPoint(x: bounds.maxX - 8, y: y))
+        editUnderlineLayer.frame = bounds
+        editUnderlineLayer.path = path
+    }
+
+    private var prefersReducedMotion: Bool {
+        NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
+
+    /// Fade the edit hairline in/out from the opacity already on screen.
+    private func setEditUnderlineVisible(_ visible: Bool, animated: Bool) {
+        guard visible != editUnderlineVisible || abs(editUnderlineLayer.opacity - (visible ? 1 : 0)) > 0.004 else {
+            return
+        }
+        editUnderlineVisible = visible
+        editUnderlineFadeGeneration &+= 1
+        let generation = editUnderlineFadeGeneration
+        let target: Float = visible ? 1 : 0
+        let from = editUnderlineLayer.presentation()?.opacity ?? editUnderlineLayer.opacity
+        let reduce = prefersReducedMotion || window?.isVisible != true
+        let shouldAnimate = animated
+            && LauncherLayout.shouldAnimateFolderTitleEditUnderline(
+                fromOpacity: from,
+                toOpacity: target,
+                reducesMotion: reduce
+            )
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        editUnderlineLayer.removeAnimation(
+            forKey: LauncherLayout.folderTitleEditUnderlineFadeAnimationKey
+        )
+        updateEditUnderlineGeometry()
+        if shouldAnimate {
+            let fade = CABasicAnimation(keyPath: "opacity")
+            fade.fromValue = from
+            fade.toValue = target
+            fade.duration = LauncherLayout.folderTitleEditUnderlineFadeDuration
+            fade.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            // Hold the hairline already on screen until attached — begin/end
+            // edit must not snap the underline full or gone.
+            fade.fillMode = .backwards
+            if !visible {
+                // Title-readiness harness compiles this type alone — avoid
+                // file-private landing helpers; CA completion is already main.
+                CATransaction.setCompletionBlock { [weak self] in
+                    guard let self,
+                          self.editUnderlineFadeGeneration == generation else { return }
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    self.editUnderlineLayer.removeAnimation(
+                        forKey: LauncherLayout.folderTitleEditUnderlineFadeAnimationKey
+                    )
+                    self.editUnderlineLayer.opacity = 0
+                    CATransaction.commit()
+                }
+            }
+            editUnderlineLayer.opacity = target
+            editUnderlineLayer.add(
+                fade,
+                forKey: LauncherLayout.folderTitleEditUnderlineFadeAnimationKey
+            )
+        } else {
+            editUnderlineLayer.opacity = target
+        }
+        CATransaction.commit()
+    }
+
+    override var acceptsFirstResponder: Bool {
+        LauncherLayout.folderTitleKeyboardFocusAvailable(
+            hasFieldEditor: currentEditor() != nil,
+            pointerEditingAvailable: pointerEditingAvailable()
+        )
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        guard LauncherLayout.folderTitleKeyboardFocusAvailable(
+            hasFieldEditor: currentEditor() != nil,
+            pointerEditingAvailable: pointerEditingAvailable()
+        ) else { return false }
+        return super.becomeFirstResponder()
+    }
 
     override func isAccessibilityHidden() -> Bool {
-        // The panel's hit test suppresses pointer editing while it travels.
-        // Keep a keyboard editor exposed, but do not advertise a clickable
-        // title at its resting frame before the panel has arrived.
-        super.isAccessibilityHidden() || (currentEditor() == nil && !pointerEditingAvailable())
+        // The panel's hit test suppresses pointer editing while chrome is in
+        // flight (scale or fade). Keep a keyboard editor exposed, but do not
+        // advertise a clickable title before the panel has arrived.
+        LauncherLayout.folderTitleAccessibilityHidden(
+            baseHidden: super.isAccessibilityHidden(),
+            hasFieldEditor: currentEditor() != nil,
+            pointerEditingAvailable: pointerEditingAvailable()
+        )
+    }
+
+    override func textDidBeginEditing(_ notification: Notification) {
+        super.textDidBeginEditing(notification)
+        // Field editor is up — fade the hairline in from presentation.
+        setEditUnderlineVisible(true, animated: true)
+    }
+
+    override func textDidEndEditing(_ notification: Notification) {
+        super.textDidEndEditing(notification)
+        setEditUnderlineVisible(false, animated: true)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        // Already editing: place the caret / extend selection as usual.
+        if currentEditor() != nil {
+            super.mouseDown(with: event)
+            return
+        }
+        guard pointerEditingAvailable() else { return }
+        guard LauncherLayout.folderTitleShouldBeginEditingFromPointer(
+            clickCount: event.clickCount
+        ) else {
+            // Single-click does not start a rename.
+            return
+        }
+        super.mouseDown(with: event)
     }
 
     var onBacktab: (() -> Bool)?
@@ -11408,6 +14801,8 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
     /// A completion that lost the generation does not call this. The grid
     /// draws the preview plate again here.
     var onChromeCloseLanded: (() -> Void)?
+    /// Fired when open scale/fade has landed (or open had nothing to animate).
+    var onChromeOpenLanded: (() -> Void)?
     var onActivateApp: ((AppCandidate) -> Void)?
     /// False while the launcher is fading or already ordered out. Releasing
     /// the close button or the dimmer must not close the folder or save the
@@ -11482,7 +14877,10 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
         titleField.onBacktab = { [weak self] in self?.onBacktabFromTitle?() ?? false }
         titleField.pointerEditingAvailable = { [weak self] in
             guard let self else { return false }
-            return !self.isAnimatingClose && !self.panelTransformInFlight
+            return LauncherLayout.folderTitlePointerEditingAvailable(
+                isAnimatingClose: self.isAnimatingClose,
+                panelAnimationKeys: self.panel.layer?.animationKeys() ?? []
+            )
         }
         titleField.translatesAutoresizingMaskIntoConstraints = false
         panel.addSubview(titleField)
@@ -11496,6 +14894,11 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
         closeButton.target = self
         closeButton.action = #selector(close)
         closeButton.onInsertTab = { [weak self] in self?.onTabToMembers?() ?? false }
+        closeButton.keyboardFocusAvailable = { [weak self] in
+            LauncherLayout.folderOverlayKeyboardFocusAvailable(
+                panelChromeInFlight: self?.panelChromeInFlight ?? true
+            )
+        }
         closeButton.translatesAutoresizingMaskIntoConstraints = false
         panel.addSubview(closeButton)
 
@@ -11549,20 +14952,32 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
 
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard !isAnimatingClose else { return self }
-        // While the panel is still flying, its layout frame is the resting
-        // place and its pixels are somewhere else. Ignore the resting frame
-        // so a click does not open an icon that has not arrived, and accept
-        // the pixels so a click on the traveling panel does not dismiss it.
-        guard panelTransformInFlight else { return super.hitTest(point) }
+        // While the panel is still flying or fading, its layout frame may be
+        // the resting place and its pixels somewhere else (or not fully
+        // opaque). Ignore the resting frame so a click does not open an icon
+        // or begin a rename before chrome has landed, and accept the pixels
+        // so a click on the traveling panel does not dismiss it.
+        guard panelChromeInFlight else { return super.hitTest(point) }
         if presentedPanelContains(point) { return panel }
         let hit = super.hitTest(point)
         if hit === panel || hit?.isDescendant(of: panel) == true { return panel }
         return hit
     }
 
-    private var panelTransformInFlight: Bool {
-        let keys = panel.layer?.animationKeys() ?? []
-        return keys.contains("folderOpenScale") || keys.contains("folderCloseScale")
+    /// Used by hit-testing and by folder-member focus fill.
+    var panelChromeInFlight: Bool {
+        LauncherLayout.folderPanelChromeInFlight(
+            isAnimatingClose: isAnimatingClose,
+            panelAnimationKeys: panel.layer?.animationKeys() ?? []
+        )
+    }
+
+    /// Retarget visible member focus fills (idle while chrome travels; 8% after
+    /// land). Mirrors title edit-underline fade: presentation → fillMode.backwards.
+    func refreshVisibleMemberFocusChrome() {
+        for item in collectionView.visibleItems() {
+            (item.view as? AppGridTileView)?.refreshFocusChrome()
+        }
     }
 
     /// Layer anchor is the view origin. `m41`/`m42` are the origin offset
@@ -11618,9 +15033,18 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
     func setEditingEnabled(_ enabled: Bool, explanation: String?) {
         titleEditingEnabled = enabled
         titleField.toolTip = explanation
-        titleField.setAccessibilityHelp(explanation ?? L("编辑文件夹名称"))
+        let titleHelp = L(LauncherLayout.layoutCollectionAccessibilityHelp(
+            layoutEditingEnabled: enabled,
+            layoutEditingExplanation: explanation,
+            editableHelp: "编辑文件夹名称"
+        ))
+        titleField.setAccessibilityHelp(titleHelp)
         collectionView.toolTip = explanation
-        collectionView.setAccessibilityHelp(explanation ?? L("拖动应用以整理文件夹"))
+        collectionView.setAccessibilityHelp(L(LauncherLayout.layoutCollectionAccessibilityHelp(
+            layoutEditingEnabled: enabled,
+            layoutEditingExplanation: explanation,
+            editableHelp: "拖动应用以整理文件夹"
+        )))
         guard titleField.currentEditor() == nil else { return }
         titleField.isEditable = enabled
     }
@@ -11628,7 +15052,11 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
     func show(folder: LauncherFolder, items: [PresentedItem]) {
         updateTitle(for: folder)
         setAccessibilityHidden(false)
-        isHidden = false
+        // Do not unhide here. After a close the model is already the resting
+        // open panel; revealing before animateOpen would paint that full-size
+        // chrome for every layout frame between show and the open animations.
+        // animateOpen sets isHidden = false in the same transaction as
+        // fillMode.backwards. A reversed close is already visible.
         collectionView.reloadData()
         scrollContentsToTop()
         NSAccessibility.post(element: panel, notification: .layoutChanged)
@@ -11651,7 +15079,16 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
 
     @discardableResult
     func focusTitleField() -> Bool {
-        window?.makeFirstResponder(titleField) == true
+        guard window?.makeFirstResponder(titleField) == true else { return false }
+        selectAllTitleTextIfNeeded()
+        return true
+    }
+
+    /// Select the whole name when a rename session starts (Core policy).
+    private func selectAllTitleTextIfNeeded() {
+        guard LauncherLayout.folderTitleSelectsAllOnBeginEditing,
+              let editor = titleField.currentEditor() else { return }
+        editor.selectAll(nil)
     }
 
     func updateTitle(for folder: LauncherFolder) {
@@ -11794,10 +15231,15 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
             ? (presentedPanel?.cornerRadius ?? collapse.collapsedCornerRadius)
             : collapse.collapsedCornerRadius
         animationGeneration &+= 1
+        let generation = animationGeneration
         isAnimatingClose = false
         let duration = collapse.duration
         let timing = folderChromeTiming(tracksIcon: collapse.tracksIcon)
 
+        // Phase 1: park at the from-picture, then reveal. isHidden can flush a
+        // display outside Core Animation; writing the resting open chrome first
+        // would flash a full-size panel/dimmer for that frame (same class of
+        // bug as toast/footer opacity-before-unhide).
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         panelLayer?.removeAnimation(forKey: "folderOpenScale")
@@ -11808,18 +15250,50 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
         panelLayer?.removeAnimation(forKey: "folderCloseCorner")
         dimmerLayer?.removeAnimation(forKey: "folderOpenFade")
         dimmerLayer?.removeAnimation(forKey: "folderCloseFade")
+        panelLayer?.opacity = fromOpacity
+        panelLayer?.transform = fromTransform
+        panelLayer?.cornerRadius = fromRadius
+        dimmerLayer?.opacity = fromDimmerOpacity
+        isHidden = false
+        CATransaction.commit()
+
+        // Reduced motion: duration 0 — snap after park (no opacity half-fade).
+        // Park-before-reveal (fromDimmerOpacity) already ran above.
+        if duration <= 0 {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            panelLayer?.opacity = 1
+            panelLayer?.transform = CATransform3DIdentity
+            panelLayer?.cornerRadius = restingRadius
+            dimmerLayer?.opacity = 1
+            CATransaction.commit()
+            finishFlightOnLandingTurn { [weak self] in
+                guard let self, self.animationGeneration == generation, !self.isAnimatingClose else { return }
+                self.onChromeOpenLanded?()
+            }
+            refreshVisibleMemberFocusChrome()
+            return
+        }
+
+        // Phase 2: resting end state + fillMode.backwards from the parked picture.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         panelLayer?.opacity = 1
         panelLayer?.transform = CATransform3DIdentity
         panelLayer?.cornerRadius = restingRadius
         dimmerLayer?.opacity = 1
+        CATransaction.setCompletionBlock { [weak self] in
+            finishFlightOnLandingTurn { [weak self] in
+                guard let self, self.animationGeneration == generation, !self.isAnimatingClose else { return }
+                self.onChromeOpenLanded?()
+            }
+        }
         if fromOpacity < 0.999 {
             let fade = CABasicAnimation(keyPath: "opacity")
             fade.fromValue = fromOpacity
             fade.toValue = 1
             fade.duration = duration
             fade.timingFunction = timing
-            // The model is already the open panel. Hold the picture on screen
-            // until this animation is attached, or the commit frame flashes full size.
             fade.fillMode = .backwards
             panelLayer?.add(fade, forKey: "folderOpenFade")
         }
@@ -11831,7 +15305,6 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
         dimmerFade.fillMode = .backwards
         dimmerLayer?.add(dimmerFade, forKey: "folderOpenFade")
         // Reduced motion never scales, including when a close is reversed.
-        // The transform above is already identity, so the fade is the whole open.
         if collapse.animatesTransform {
             let move = CABasicAnimation(keyPath: "transform")
             move.fromValue = NSValue(caTransform3D: fromTransform)
@@ -11840,8 +15313,6 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
             move.timingFunction = timing
             move.fillMode = .backwards
             panelLayer?.add(move, forKey: "folderOpenScale")
-            // The layer radius scales with the panel. Start where the plate's
-            // corner is, and settle on the full-size 22. Same clock as the grow.
             if abs(fromRadius - restingRadius) > 0.5 {
                 let corner = CABasicAnimation(keyPath: "cornerRadius")
                 corner.fromValue = fromRadius
@@ -11853,6 +15324,9 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
             }
         }
         CATransaction.commit()
+        // Open chrome keys are attached — suppress any leftover member fill
+        // (e.g. reversed close) until onChromeOpenLanded refreshes for land.
+        refreshVisibleMemberFocusChrome()
     }
 
     func animateClose(
@@ -11860,17 +15334,33 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
         immediately: Bool = false,
         collapse: LauncherLayout.FolderChromeCollapse? = nil
     ) {
+        // Reduced motion: snap shut (no 0.12s half-fade).
+        if !immediately, LauncherLayout.shouldSnapFolderChromeForReducedMotion(
+            reducesMotion: reducesMotion
+        ) {
+            animateClose(reducesMotion: true, immediately: true, collapse: collapse)
+            return
+        }
         if immediately {
             animationGeneration &+= 1
+            // Park in-flight so member focus fill fades/clears before the snap hide
+            // (same suppress policy as animated close).
+            isAnimatingClose = true
+            refreshVisibleMemberFocusChrome()
             isAnimatingClose = false
             setAccessibilityHidden(true)
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            // Hide before clearing transforms. Resting open chrome at opacity 1
+            // must not paint for a frame while isHidden is still settling.
+            isHidden = true
             panel.layer?.removeAllAnimations()
-            panel.layer?.opacity = 1
+            dimmer.layer?.removeAllAnimations()
+            panel.layer?.opacity = 0
+            dimmer.layer?.opacity = 0
             panel.layer?.transform = CATransform3DIdentity
             panel.layer?.cornerRadius = LauncherLayout.folderPanelCornerRadius
-            dimmer.layer?.removeAllAnimations()
-            dimmer.layer?.opacity = 1
-            isHidden = true
+            CATransaction.commit()
             onChromeCloseLanded?()
             return
         }
@@ -11889,6 +15379,9 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
         let generation = animationGeneration
         isAnimatingClose = true
         setAccessibilityHidden(true)
+        // Suppress member focus fill while close chrome travels (parity with
+        // title underline hide) — policy alone does not re-apply chrome.
+        refreshVisibleMemberFocusChrome()
 
         let duration = collapse.duration
         let timing = folderChromeTiming(tracksIcon: collapse.tracksIcon)
@@ -11942,14 +15435,21 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
             // panel up for another turn, and the preview plate would wait.
             finishFlightOnLandingTurn { [weak self] in
                 guard let self, self.animationGeneration == generation else { return }
+                // Hide first, then park transparent. Restoring opacity/transform
+                // to the resting open chrome while still visible flashes a full
+                // panel/dimmer under a delayed isHidden (toast keeps 0; footer
+                // restores only after hide — we keep 0 until the next open parks).
                 self.isHidden = true
                 self.isAnimatingClose = false
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
                 panelLayer.removeAllAnimations()
-                panelLayer.opacity = 1
+                dimmerLayer.removeAllAnimations()
+                panelLayer.opacity = 0
+                dimmerLayer.opacity = 0
                 panelLayer.transform = CATransform3DIdentity
                 panelLayer.cornerRadius = LauncherLayout.folderPanelCornerRadius
-                dimmerLayer.removeAllAnimations()
-                dimmerLayer.opacity = 1
+                CATransaction.commit()
                 self.onChromeCloseLanded?()
             }
         }
@@ -11995,8 +15495,22 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
     }
 
     var keyViews: [NSView] {
+        // Closing: omit overlay controls so rebuildKeyViewLoop cannot re-chain
+        // Tab through dying members before grid restore lands. Open travel
+        // keeps the list (members refuse acceptsFirstResponder until land).
+        guard LauncherLayout.folderOverlayKeyViewsShouldIncludeControls(
+            isAnimatingClose: isAnimatingClose
+        ) else { return [] }
         collectionView.layoutSubtreeIfNeeded()
         return [titleField, closeButton] + orderedAppTiles
+    }
+
+    /// Break stale nextKeyView links among overlay controls when close starts.
+    func breakKeyViewLoop() {
+        let views: [NSView] = [titleField, closeButton] + orderedAppTiles
+        for view in views {
+            view.nextKeyView = nil
+        }
     }
 
     private var orderedAppTiles: [AppGridTileView] {
@@ -12144,9 +15658,9 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
         // stayed open instead of showing the renamed icon.
         if selector == #selector(NSResponder.insertNewline(_:)) {
             discardMarkedTitleComposition(in: textView)
-            if window?.makeFirstResponder(collectionView) != true {
-                _ = window?.makeFirstResponder(closeButton)
-            }
+            // Commit path: same first-member handoff as Escape cancel so the
+            // folder keeps a focused tile instead of an empty collection view.
+            refocusAfterTitleEditingEnds()
             return true
         }
         // The field editor, not the text field, receives Shift-Tab while the
@@ -12165,12 +15679,55 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
 
     /// Escape cancels the draft and leaves the folder open. A second Escape
     /// still closes it, because the field editor is no longer first responder.
-    func cancelTitleEditingIfActive() -> Bool {
+    func cancelTitleEditingIfActive(refocus: Bool = true) -> Bool {
         guard restoreTitleAndAbortEditing() else { return false }
-        if window?.makeFirstResponder(collectionView) != true {
-            _ = window?.makeFirstResponder(closeButton)
-        }
+        guard refocus else { return true }
+        refocusAfterTitleEditingEnds()
         return true
+    }
+
+    /// Prefer the first member after rename ends (Return commit or Escape /
+    /// outside-click cancel). Empty folders focus the title (not an empty
+    /// collection), then close as last resort.
+    private func refocusAfterTitleEditingEnds() {
+        guard LauncherLayout.folderTitleFocusesFirstMemberAfterEndingEdit else {
+            if window?.makeFirstResponder(collectionView) != true {
+                _ = window?.makeFirstResponder(closeButton)
+            }
+            return
+        }
+        let memberCount = orderedAppTiles.count
+        switch LauncherLayout.folderTitleEndFocusTarget(memberCount: memberCount) {
+        case .firstMember:
+            if let first = orderedAppTiles.first,
+               window?.makeFirstResponder(first) == true {
+                return
+            }
+            // Members disappeared mid-handoff — same empty policy.
+            fallthrough
+        case .title:
+            if focusTitleField() { return }
+            _ = focusCloseButton()
+        case .close:
+            _ = focusCloseButton()
+        }
+    }
+
+    /// True when `view` is the title field or its field editor.
+    func isTitleHit(_ view: NSView?) -> Bool {
+        guard let view else { return false }
+        if view === titleField { return true }
+        if view.isDescendant(of: titleField) { return true }
+        // Field editor is often a child of the window, not the text field.
+        if let editor = titleField.currentEditor() as? NSView {
+            if view === editor || view.isDescendant(of: editor) { return true }
+        }
+        return false
+    }
+
+    func isCloseButtonHit(_ view: NSView?) -> Bool {
+        guard let view else { return false }
+        return view === closeButton || view.isDescendant(of: closeButton)
     }
 
     /// Losing key is about to end the editor. Restoring the name here is
@@ -12197,12 +15754,15 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
 
     func controlTextDidBeginEditing(_ obj: Notification) {
         titleBeforeEdit = titleField.stringValue
+        titleField.needsDisplay = true
+        selectAllTitleTextIfNeeded()
         #if DEBUG
         auditTitleFieldEditor(stage: "begin")
         #endif
     }
 
     func controlTextDidEndEditing(_ obj: Notification) {
+        titleField.needsDisplay = true
         #if DEBUG
         auditTitleFieldEditor(stage: "end")
         #endif
@@ -12210,7 +15770,13 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
             titleField.isEditable = titleEditingEnabled
             return
         }
-        let committed = onRename?(titleField.stringValue) ?? titleBeforeEdit
+        // Empty/whitespace drafts keep the previous label (placeholder only
+        // while the field is cleared during the edit).
+        let committed = onRename?(titleField.stringValue)
+            ?? LauncherLayout.resolvedFolderName(
+                draft: titleField.stringValue,
+                previous: titleBeforeEdit
+            )
         titleBeforeEdit = committed
         if titleField.stringValue != committed {
             titleField.stringValue = committed
@@ -12221,9 +15787,7 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
         // folder open, so the grid never shows the new name.
         DispatchQueue.main.async { [weak self] in
             guard let self, self.titleField.currentEditor() != nil else { return }
-            if self.window?.makeFirstResponder(self.collectionView) != true {
-                _ = self.window?.makeFirstResponder(self.closeButton)
-            }
+            self.refocusAfterTitleEditingEnds()
         }
     }
 
@@ -12241,7 +15805,19 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
     @objc private func close() {
         guard acceptsPointerActivation() else { return }
         discardMarkedTitleComposition()
-        _ = onRename?(titleField.stringValue)
+        let committed = onRename?(titleField.stringValue) ?? titleField.stringValue
+        titleBeforeEdit = committed
+        if titleField.stringValue != committed {
+            titleField.stringValue = committed
+        }
+        // End the editor after commit so closeFolder's outside-cancel path is a
+        // no-op (dimmer still cancels; the close button must keep the rename).
+        if titleField.currentEditor() != nil {
+            isDiscardingTitleEdit = true
+            titleField.abortEditing()
+            isDiscardingTitleEdit = false
+            titleField.isEditable = titleEditingEnabled
+        }
         onClose?()
     }
 }

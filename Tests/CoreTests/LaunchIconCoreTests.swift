@@ -428,14 +428,119 @@ final class LaunchIconCoreTests: XCTestCase {
             shortcut: .optionShiftSpace,
             showsStatusItem: false,
             hidesAfterLaunch: false,
-            reducesMotion: true
+            reducesMotion: true,
+            hotCorner: .topRight
         )
         await store.save(changed)
         let restored = await store.load()
         XCTAssertEqual(restored, changed)
+        XCTAssertEqual(restored.hotCorner, .topRight)
         defaults.set("unrecognized", forKey: "LaunchIcon.Preferences.shortcut")
         let fallback = await store.load()
         XCTAssertEqual(fallback.shortcut, .optionSpace)
+        defaults.set("unrecognized", forKey: "LaunchIcon.Preferences.hotCorner")
+        let hotFallback = await store.load()
+        XCTAssertEqual(hotFallback.hotCorner, .off)
+    }
+
+    func testHotCornerGeometryAndEdgeTrigger() {
+        let screen = CGRect(x: 100, y: 200, width: 800, height: 600)
+        XCTAssertEqual(
+            LauncherLayout.hotCorner(at: CGPoint(x: 100, y: 800), screenFrame: screen),
+            .topLeft
+        )
+        XCTAssertEqual(
+            LauncherLayout.hotCorner(at: CGPoint(x: 900, y: 800), screenFrame: screen),
+            .topRight
+        )
+        XCTAssertEqual(
+            LauncherLayout.hotCorner(at: CGPoint(x: 100, y: 200), screenFrame: screen),
+            .bottomLeft
+        )
+        XCTAssertEqual(
+            LauncherLayout.hotCorner(at: CGPoint(x: 900, y: 200), screenFrame: screen),
+            .bottomRight
+        )
+        XCTAssertNil(LauncherLayout.hotCorner(at: CGPoint(x: 500, y: 500), screenFrame: screen))
+        // Outside threshold
+        XCTAssertNil(LauncherLayout.hotCorner(at: CGPoint(x: 100 + 6, y: 800), screenFrame: screen))
+
+        XCTAssertFalse(
+            LauncherLayout.shouldFireHotCorner(configured: .off, previousHit: nil, currentHit: .topLeft)
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldFireHotCorner(
+                configured: .topLeft, previousHit: nil, currentHit: .topLeft
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldFireHotCorner(
+                configured: .topLeft, previousHit: .topLeft, currentHit: .topLeft
+            ),
+            "must edge-trigger only"
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldFireHotCorner(
+                configured: .topLeft, previousHit: .topRight, currentHit: .topLeft
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldFireHotCorner(
+                configured: .topLeft, previousHit: nil, currentHit: .bottomLeft
+            )
+        )
+
+        let secondary = CGRect(x: 900, y: 0, width: 400, height: 300)
+        XCTAssertEqual(
+            LauncherLayout.hotCorner(
+                at: CGPoint(x: 1300, y: 300),
+                screenFrames: [screen, secondary]
+            ),
+            .topRight
+        )
+    }
+
+
+    func testHotCornerUsesAnimatedLauncherPresenceNotPagingSnaps() {
+        XCTAssertTrue(LauncherLayout.shouldAnimateLauncherPresenceForHotCorner())
+        XCTAssertFalse(LauncherLayout.shouldSnapPagingChromeForHotCornerTrigger())
+        // Distinct from settings handoff (instant hide / no appear fade).
+        XCTAssertNotEqual(
+            LauncherLayout.shouldAnimateLauncherPresenceForHotCorner(),
+            LauncherLayout.shouldAnimateLauncherHideForSettingsHandoff()
+        )
+        XCTAssertNotEqual(
+            LauncherLayout.shouldAnimateLauncherPresenceForHotCorner(),
+            LauncherLayout.shouldAnimateLauncherShowForSettingsHandoff()
+        )
+    }
+
+
+    func testLauncherPresenceSnapsUnderReducedMotion() {
+        XCTAssertTrue(
+            LauncherLayout.shouldSnapLauncherPresenceForReducedMotion(reducesMotion: true)
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldSnapLauncherPresenceForReducedMotion(reducesMotion: false)
+        )
+        XCTAssertEqual(
+            LauncherLayout.launcherPresenceFadeDuration(visible: true, reducesMotion: true),
+            0
+        )
+        XCTAssertEqual(
+            LauncherLayout.launcherPresenceFadeDuration(visible: false, reducesMotion: true),
+            0
+        )
+        XCTAssertEqual(
+            LauncherLayout.launcherPresenceFadeDuration(visible: true, reducesMotion: false),
+            0.22
+        )
+        XCTAssertEqual(
+            LauncherLayout.launcherPresenceFadeDuration(visible: false, reducesMotion: false),
+            0.15
+        )
+        // Hot corner still uses the animated show/hide entry (which snaps when reduced).
+        XCTAssertTrue(LauncherLayout.shouldAnimateLauncherPresenceForHotCorner())
     }
 
     func testStandardRootsPreferUserThenSharedThenSystemAndCryptexApplications() {
@@ -530,6 +635,10 @@ final class LaunchIconCoreTests: XCTestCase {
 
         let report = await AppCatalogScanner().scan(roots: [userRoot, sharedRoot])
         XCTAssertEqual(report.candidates.map(\.canonicalURL), [sharedRoot.appendingPathComponent("Example.app")])
+        XCTAssertEqual(report.duplicateCandidates.map(\.canonicalURL), [userRoot.appendingPathComponent("Example.app")])
+        XCTAssertTrue(AppUninstallEligibility.hasOtherCopy(
+            of: report.candidates[0], in: report, registeredURLs: []
+        ))
         XCTAssertTrue(report.skippedPaths.isEmpty)
 
         let userExecutable = userRoot.appendingPathComponent("Example.app/Contents/MacOS/Example")
@@ -537,6 +646,7 @@ final class LaunchIconCoreTests: XCTestCase {
         try FileManager.default.createSymbolicLink(at: userExecutable, withDestinationURL: URL(fileURLWithPath: "/usr/bin/true"))
         let bothExecutable = await AppCatalogScanner().scan(roots: [userRoot, sharedRoot])
         XCTAssertEqual(bothExecutable.candidates.map(\.canonicalURL), [userRoot.appendingPathComponent("Example.app")])
+        XCTAssertEqual(bothExecutable.duplicateCandidates.map(\.canonicalURL), [sharedRoot.appendingPathComponent("Example.app")])
     }
 
     func testDisambiguateDisplayNamesPrefersApplicationBundleNameThenBundleIdentifier() {
@@ -680,6 +790,30 @@ final class LaunchIconCoreTests: XCTestCase {
         let backupURL = await store.backupURL
         XCTAssertEqual(loaded, second)
         XCTAssertTrue(FileManager.default.fileExists(atPath: backupURL.path))
+        XCTAssertTrue(store.hasBackupFile)
+        let backup = try await store.loadBackup()
+        XCTAssertEqual(backup, first)
+    }
+
+    func testLayoutStoreExportImportRoundTripDoesNotTouchLiveFiles() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let liveURL = directory.appendingPathComponent("layout-v1.json")
+        let store = JSONLayoutStore(fileURL: liveURL)
+        let live = LayoutState(orderedEntries: [.app(UUID())])
+        try await store.save(live)
+        let liveData = try Data(contentsOf: liveURL)
+        XCTAssertFalse(store.hasBackupFile)
+
+        let exportURL = directory.appendingPathComponent("LaunchIcon-layout-export.json")
+        let exported = LayoutState(orderedEntries: [.folder(UUID()), .app(UUID())])
+        try await store.export(exported, to: exportURL)
+        XCTAssertEqual(try Data(contentsOf: liveURL), liveData, "export must not rewrite live primary")
+        XCTAssertFalse(store.hasBackupFile, "export must not create automatic backup")
+
+        let imported = try await store.importLayout(from: exportURL)
+        XCTAssertEqual(imported, exported)
+        XCTAssertEqual(try Data(contentsOf: liveURL), liveData, "importLayout must not write live primary")
     }
 
     func testUnchangedCatalogDoesNotRewriteLayoutOrCreateBackup() async throws {
@@ -1913,38 +2047,28 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertTrue(LauncherLayout.shouldTurnPage(distance: 10, velocity: 500, pageWidth: 1000))
     }
 
-    func testArrowPageTurnSlidesFartherThanAFingerDrag() {
+    func testPageTurnsKeepAdjacentHostsFromOverlapping() {
         XCTAssertEqual(LauncherLayout.pageTurnDistanceFraction, 0.18, accuracy: 0.001)
-        XCTAssertEqual(LauncherLayout.pageDragSlideFraction, 0.18, accuracy: 0.001)
-        XCTAssertEqual(LauncherLayout.discretePageSlideFraction, 0.36, accuracy: 0.001)
-        XCTAssertGreaterThan(
-            LauncherLayout.discretePageSlideFraction,
-            LauncherLayout.pageTurnDistanceFraction
-        )
-        XCTAssertEqual(
-            LauncherLayout.pageSlideDistance(pageWidth: 1000, discrete: false),
-            180,
-            accuracy: 0.001
-        )
-        XCTAssertEqual(
-            LauncherLayout.pageSlideDistance(pageWidth: 1000, discrete: true),
-            360,
-            accuracy: 0.001
-        )
+        for discrete in [false, true] {
+            let travel = LauncherLayout.pageSlideDistance(pageWidth: 1000, discrete: discrete)
+            let outgoing = CGRect(x: -travel / 2, y: 0, width: 1000, height: 600)
+            let incoming = CGRect(x: travel / 2, y: 0, width: 1000, height: 600)
+            XCTAssertLessThanOrEqual(outgoing.maxX, incoming.minX)
+        }
         XCTAssertEqual(LauncherLayout.pageSlideDistance(pageWidth: 0, discrete: true), 0, accuracy: 0.001)
         XCTAssertEqual(LauncherLayout.pageSlideDistance(pageWidth: -40, discrete: true), 0, accuracy: 0.001)
         XCTAssertEqual(LauncherLayout.pageSlideDistance(pageWidth: .nan, discrete: true), 0, accuracy: 0.001)
         XCTAssertEqual(LauncherLayout.pageSlideDistance(pageWidth: .infinity, discrete: false), 0, accuracy: 0.001)
 
         let fullDrag = LauncherLayout.pageDragFollowOffsets(distance: -1000, pageWidth: 1000, direction: 1)
-        XCTAssertEqual(fullDrag.activeX, -180, accuracy: 0.001)
+        XCTAssertEqual(fullDrag.activeX, -1000, accuracy: 0.001)
         XCTAssertEqual(fullDrag.stagingX, 0, accuracy: 0.001)
         let untouched = LauncherLayout.pageDragFollowOffsets(distance: 0, pageWidth: 1000, direction: 1)
         XCTAssertEqual(untouched.activeX, 0, accuracy: 0.001)
-        XCTAssertEqual(untouched.stagingX, 180, accuracy: 0.001)
+        XCTAssertEqual(untouched.stagingX, 1000, accuracy: 0.001)
         let halfway = LauncherLayout.pageDragFollowOffsets(distance: -500, pageWidth: 800, direction: 1)
-        XCTAssertEqual(halfway.activeX, -500 * 0.18, accuracy: 0.001)
-        XCTAssertEqual(halfway.stagingX, 800 * 0.18 - 500 * 0.18, accuracy: 0.001)
+        XCTAssertEqual(halfway.activeX, -500, accuracy: 0.001)
+        XCTAssertEqual(halfway.stagingX, 300, accuracy: 0.001)
         XCTAssertFalse(LauncherLayout.shouldTurnPage(distance: 179, velocity: 0, pageWidth: 1000))
         XCTAssertTrue(LauncherLayout.shouldTurnPage(distance: 180, velocity: 0, pageWidth: 1000))
     }
@@ -2037,17 +2161,17 @@ final class LaunchIconCoreTests: XCTestCase {
     }
 
     func testPageTurnCurveEasesOutAheadOfTheClock() {
-        XCTAssertEqual(LauncherLayout.pageTurnCurveX1, 0.2, accuracy: 0.000_001)
-        XCTAssertEqual(LauncherLayout.pageTurnCurveY1, 0.8, accuracy: 0.000_001)
-        XCTAssertEqual(LauncherLayout.pageTurnCurveX2, 0.2, accuracy: 0.000_001)
-        XCTAssertEqual(LauncherLayout.pageTurnCurveY2, 1, accuracy: 0.000_001)
         XCTAssertEqual(LauncherLayout.pageTurnCurveProgress(0), 0, accuracy: 0.000_001)
         XCTAssertEqual(LauncherLayout.pageTurnCurveProgress(1), 1, accuracy: 0.000_001)
         XCTAssertEqual(LauncherLayout.pageTurnCurveProgress(-0.2), 0, accuracy: 0.000_001)
         XCTAssertEqual(LauncherLayout.pageTurnCurveProgress(1.4), 1, accuracy: 0.000_001)
+        // The previous curve jumped almost 40% in its first 28 ms and had
+        // already travelled 95% halfway through a 280 ms page turn.
+        XCTAssertLessThan(LauncherLayout.pageTurnCurveProgress(0.1), 0.28)
         let midpoint = LauncherLayout.pageTurnCurveProgress(0.5)
-        XCTAssertEqual(midpoint, 0.946, accuracy: 0.01)
-        XCTAssertGreaterThan(midpoint, 0.9)
+        XCTAssertGreaterThan(midpoint, 0.75)
+        XCTAssertLessThan(midpoint, 0.87)
+        XCTAssertGreaterThan(LauncherLayout.pageTurnCurveProgress(0.75), 0.95)
         var previous: CGFloat = -0.01
         for step in 0...20 {
             let progress = LauncherLayout.pageTurnCurveProgress(CGFloat(step) / 20)
@@ -2055,6 +2179,22 @@ final class LaunchIconCoreTests: XCTestCase {
             XCTAssertLessThanOrEqual(progress, 1)
             previous = progress
         }
+    }
+
+    func testPageSlideCompletionDoesNotWaitAfterFingerReachesDestination() {
+        XCTAssertEqual(LauncherLayout.pageSlideCompletionDuration(remainingFraction: 0), 0)
+        XCTAssertEqual(
+            LauncherLayout.pageSlideCompletionDuration(remainingFraction: 1),
+            LauncherLayout.pageAnimationDuration,
+            accuracy: 0.001
+        )
+        let shortTail = LauncherLayout.pageSlideCompletionDuration(remainingFraction: 0.01)
+        XCTAssertLessThanOrEqual(shortTail, 0.07, "1% travel must not occupy a 120 ms dead tail")
+        XCTAssertGreaterThan(shortTail, 0)
+        XCTAssertGreaterThan(
+            LauncherLayout.pageSlideCompletionDuration(remainingFraction: 0.25),
+            shortTail
+        )
     }
 
     func testPageDotWeightUsesThePageClockFromTheFirstFrame() {
@@ -2970,6 +3110,26 @@ final class LaunchIconCoreTests: XCTestCase {
         )
     }
 
+
+    func testStatusItemToggleTitleRefreshGatesDuringDismissFade() {
+        XCTAssertTrue(LauncherLayout.shouldRefreshStatusItemToggleTitleOnDismissArm())
+        XCTAssertTrue(
+            LauncherLayout.shouldRefreshStatusItemToggleTitleOnDismissCancel(wasDismissing: true)
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldRefreshStatusItemToggleTitleOnDismissCancel(wasDismissing: false)
+        )
+        // Mid-fade: visible + dismissing →「显示」(not stale「隐藏»).
+        XCTAssertEqual(
+            LauncherLayout.statusItemToggleTitle(isVisible: true, isDismissing: true),
+            "显示 LaunchIcon"
+        )
+        XCTAssertEqual(
+            LauncherLayout.visibilityToggle(isVisible: true, isDismissing: true),
+            .show
+        )
+    }
+
     func testDismissAnimationSuspendsLauncherKeyboard() {
         XCTAssertFalse(LauncherLayout.shouldSuspendLauncherKeyboard(isDismissing: false))
         XCTAssertTrue(LauncherLayout.shouldSuspendLauncherKeyboard(isDismissing: true))
@@ -3277,6 +3437,29 @@ final class LaunchIconCoreTests: XCTestCase {
             LauncherLayout.shouldSnapInFlightLauncherPresence(isDismissing: true, isVisible: true),
             !LauncherLayout.shouldHoldInFlightLauncherPresence(isDismissing: true, isVisible: true)
         )
+
+        XCTAssertEqual(
+            LauncherLayout.launcherPresenceFadeFromOpacity(
+                visible: true, appearing: true, presentedOpacity: 0.4, modelOpacity: 1
+            ),
+            0,
+            "fresh appear always parks from 0"
+        )
+        XCTAssertEqual(
+            LauncherLayout.launcherPresenceFadeFromOpacity(
+                visible: true, appearing: false, presentedOpacity: 0.35, modelOpacity: 0
+            ),
+            0.35,
+            "cancelled dismiss continues from presentation"
+        )
+        XCTAssertEqual(
+            LauncherLayout.launcherPresenceFadeFromOpacity(
+                visible: false, appearing: false, presentedOpacity: nil, modelOpacity: 0.8
+            ),
+            0.8
+        )
+        XCTAssertEqual(LauncherLayout.launcherPresenceFadeAnimationKey, "launcherFade")
+        XCTAssertEqual(LauncherLayout.launcherPresenceRiseAnimationKey, "launcherRise")
         XCTAssertFalse(
             LauncherLayout.shouldDropInFlightDragLift(
                 isDismissing: true, isVisible: true, reducesMotion: true
@@ -3767,6 +3950,7 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertEqual(LauncherLayout.launchPressScale, 0.93, accuracy: 0.001)
         XCTAssertEqual(LauncherLayout.launchPressHalfDuration, 0.045, accuracy: 0.001)
         XCTAssertEqual(LauncherLayout.launchPressHalfDuration * 2, 0.09, accuracy: 0.001)
+        XCTAssertEqual(LauncherLayout.launchFeedbackAnimationKey, "launch-feedback")
         let pressedIcon = CGPoint(x: 56, y: 76)
         let pressShift = LauncherLayout.originPinnedScaleTranslation(
             point: pressedIcon,
@@ -3954,6 +4138,1840 @@ final class LaunchIconCoreTests: XCTestCase {
             accuracy: 0.001
         )
     }
+
+    func testTileChromeAlphasKeepIdleFullyTransparent() {
+        XCTAssertEqual(LauncherLayout.tileChromeIdleAlpha, 0, accuracy: 0.0001)
+        XCTAssertEqual(LauncherLayout.tileChromeFocusAlpha, 0.08, accuracy: 0.0001)
+        XCTAssertEqual(LauncherLayout.tileChromeDropTargetAlpha, 0.12, accuracy: 0.0001)
+        XCTAssertEqual(LauncherLayout.tileChromeLaunchingAlpha, 0.35, accuracy: 0.0001)
+        XCTAssertLessThan(LauncherLayout.tileChromeIdleAlpha, LauncherLayout.tileChromeFocusAlpha)
+        XCTAssertLessThan(LauncherLayout.tileChromeFocusAlpha, LauncherLayout.tileChromeSelectionAlpha)
+        XCTAssertLessThan(LauncherLayout.tileChromeSelectionAlpha, LauncherLayout.tileChromeDropTargetAlpha)
+        XCTAssertLessThan(LauncherLayout.tileChromeDropTargetAlpha, LauncherLayout.tileChromeLaunchingAlpha)
+        XCTAssertEqual(LauncherLayout.tileChromeSelectionAlpha, 0.10, accuracy: 0.0001)
+
+        XCTAssertEqual(
+            LauncherLayout.tileChromeFillAlpha(isLaunching: false, isDropTarget: false, focused: false),
+            LauncherLayout.tileChromeIdleAlpha,
+            accuracy: 0.0001
+        )
+        XCTAssertEqual(
+            LauncherLayout.tileChromeFillAlpha(isLaunching: false, isDropTarget: false, focused: true),
+            LauncherLayout.tileChromeFocusAlpha,
+            accuracy: 0.0001
+        )
+        XCTAssertEqual(
+            LauncherLayout.tileChromeFillAlpha(
+                isLaunching: false,
+                isDropTarget: false,
+                focused: false,
+                selected: true
+            ),
+            LauncherLayout.tileChromeSelectionAlpha,
+            accuracy: 0.0001
+        )
+        XCTAssertEqual(
+            LauncherLayout.tileChromeFillAlpha(
+                isLaunching: false,
+                isDropTarget: false,
+                focused: true,
+                selected: true
+            ),
+            LauncherLayout.tileChromeSelectionAlpha,
+            accuracy: 0.0001
+        )
+        XCTAssertEqual(
+            LauncherLayout.tileChromeFillAlpha(
+                isLaunching: false,
+                isDropTarget: false,
+                focused: false,
+                selected: true,
+                folderPanelChromeInFlight: true
+            ),
+            LauncherLayout.tileChromeIdleAlpha,
+            accuracy: 0.0001
+        )
+        XCTAssertEqual(
+            LauncherLayout.tileChromeFillAlpha(
+                isLaunching: false,
+                isDropTarget: true,
+                focused: false,
+                selected: true
+            ),
+            LauncherLayout.tileChromeDropTargetAlpha,
+            accuracy: 0.0001
+        )
+        XCTAssertEqual(
+            LauncherLayout.tileChromeFillAlpha(
+                isLaunching: false,
+                isDropTarget: false,
+                focused: true,
+                folderPanelChromeInFlight: true
+            ),
+            LauncherLayout.tileChromeIdleAlpha,
+            accuracy: 0.0001
+        )
+        XCTAssertEqual(
+            LauncherLayout.tileChromeFillAlpha(
+                isLaunching: false,
+                isDropTarget: true,
+                focused: true,
+                folderPanelChromeInFlight: true
+            ),
+            LauncherLayout.tileChromeDropTargetAlpha,
+            accuracy: 0.0001
+        )
+        XCTAssertEqual(
+            LauncherLayout.tileChromeFillAlpha(isLaunching: false, isDropTarget: true, focused: true),
+            LauncherLayout.tileChromeDropTargetAlpha,
+            accuracy: 0.0001
+        )
+        XCTAssertEqual(
+            LauncherLayout.tileChromeFillAlpha(isLaunching: true, isDropTarget: true, focused: true),
+            LauncherLayout.tileChromeLaunchingAlpha,
+            accuracy: 0.0001
+        )
+        // Drag-lift must never bake focus/drop/launch chrome into the flying image.
+        XCTAssertEqual(
+            LauncherLayout.tileChromeFillAlphaForDragLiftSnapshot(),
+            0,
+            accuracy: 0.0001
+        )
+        XCTAssertEqual(
+            LauncherLayout.tileChromeFillAlphaForDragLiftSnapshot(),
+            LauncherLayout.tileChromeIdleAlpha,
+            accuracy: 0.0001
+        )
+        XCTAssertLessThan(
+            LauncherLayout.tileChromeFillAlphaForDragLiftSnapshot(),
+            LauncherLayout.tileChromeFocusAlpha
+        )
+        XCTAssertEqual(
+            LauncherLayout.tileChromeFillFadeDuration,
+            LauncherLayout.searchTransitionDuration,
+            accuracy: 0.0001
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldAnimateTileChromeFocusFill(
+                fromAlpha: 0,
+                toAlpha: LauncherLayout.tileChromeFocusAlpha,
+                reducesMotion: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldAnimateTileChromeFocusFill(
+                fromAlpha: LauncherLayout.tileChromeFocusAlpha,
+                toAlpha: 0,
+                reducesMotion: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldAnimateTileChromeFocusFill(
+                fromAlpha: 0,
+                toAlpha: LauncherLayout.tileChromeFocusAlpha,
+                reducesMotion: true
+            )
+        )
+        // Drop / launch stay immediate.
+        XCTAssertFalse(
+            LauncherLayout.shouldAnimateTileChromeFocusFill(
+                fromAlpha: LauncherLayout.tileChromeFocusAlpha,
+                toAlpha: LauncherLayout.tileChromeDropTargetAlpha,
+                reducesMotion: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldAnimateTileChromeFocusFill(
+                fromAlpha: 0,
+                toAlpha: LauncherLayout.tileChromeLaunchingAlpha,
+                reducesMotion: false
+            )
+        )
+    }
+
+    func testShouldDismissToastWhenOpeningFolder() {
+        XCTAssertTrue(
+            LauncherLayout.shouldDismissToastWhenOpeningFolder(isToastVisible: true)
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldDismissToastWhenOpeningFolder(isToastVisible: false)
+        )
+    }
+
+    func testSettingsLauncherVisibilityRestorePolicy() {
+        XCTAssertTrue(
+            LauncherLayout.shouldHideLauncherToShowSettings(launcherVisible: true)
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldHideLauncherToShowSettings(launcherVisible: false)
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldRestoreLauncherWhenSettingsCloses(
+                didHideLauncherToShowSettings: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldRestoreLauncherWhenSettingsCloses(
+                didHideLauncherToShowSettings: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldClearSettingsLauncherRestoreFlag(
+                didHideLauncherToShowSettings: true,
+                launcherVisible: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldClearSettingsLauncherRestoreFlag(
+                didHideLauncherToShowSettings: true,
+                launcherVisible: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldClearSettingsLauncherRestoreFlag(
+                didHideLauncherToShowSettings: false,
+                launcherVisible: true
+            )
+        )
+        XCTAssertFalse(LauncherLayout.shouldAnimateLauncherHideForSettingsHandoff())
+        XCTAssertFalse(LauncherLayout.shouldAnimateLauncherShowForSettingsHandoff())
+        XCTAssertFalse(
+            LauncherLayout.shouldClearSearchQueryWhenPreparingPresentation(
+                preservesQueryAcrossHandoff: true
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldClearSearchQueryWhenPreparingPresentation(
+                preservesQueryAcrossHandoff: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldParkSearchFocusForSettingsHandoff(
+                searchHoldsKeyboardFocus: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldParkSearchFocusForSettingsHandoff(
+                searchHoldsKeyboardFocus: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldRestoreSearchFocusAfterSettingsHandoff(
+                isSettingsHandoffRestore: true,
+                searchHeldFocusBeforeHandoff: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldRestoreSearchFocusAfterSettingsHandoff(
+                isSettingsHandoffRestore: true,
+                searchHeldFocusBeforeHandoff: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldRestoreSearchFocusAfterSettingsHandoff(
+                isSettingsHandoffRestore: false,
+                searchHeldFocusBeforeHandoff: true
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldParkSearchResultsChromeForSettingsHandoff(
+                queryIsNonEmpty: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldParkSearchResultsChromeForSettingsHandoff(
+                queryIsNonEmpty: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldRestoreSearchResultsChromeAfterSettingsHandoff(
+                isSettingsHandoffRestore: true,
+                hadNonEmptyQueryBeforeHandoff: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldRestoreSearchResultsChromeAfterSettingsHandoff(
+                isSettingsHandoffRestore: true,
+                hadNonEmptyQueryBeforeHandoff: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldRestoreSearchResultsChromeAfterSettingsHandoff(
+                isSettingsHandoffRestore: false,
+                hadNonEmptyQueryBeforeHandoff: true
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldEnsureSearchResultsChromeWhenPreservingQuery(
+                queryIsNonEmpty: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldEnsureSearchResultsChromeWhenPreservingQuery(
+                queryIsNonEmpty: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldSuppressPageIndicatorAfterSettingsHandoff(
+                isSettingsHandoffRestore: true,
+                hadNonEmptyQueryBeforeHandoff: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldSuppressPageIndicatorAfterSettingsHandoff(
+                isSettingsHandoffRestore: true,
+                hadNonEmptyQueryBeforeHandoff: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldSuppressPageIndicatorAfterSettingsHandoff(
+                isSettingsHandoffRestore: false,
+                hadNonEmptyQueryBeforeHandoff: true
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldEnsurePageIndicatorSuppressedWhenPreservingQuery(
+                queryIsNonEmpty: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldEnsurePageIndicatorSuppressedWhenPreservingQuery(
+                queryIsNonEmpty: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldSuppressPageArrowsAfterSettingsHandoff(
+                isSettingsHandoffRestore: true,
+                hadNonEmptyQueryBeforeHandoff: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldSuppressPageArrowsAfterSettingsHandoff(
+                isSettingsHandoffRestore: true,
+                hadNonEmptyQueryBeforeHandoff: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldSuppressPageArrowsAfterSettingsHandoff(
+                isSettingsHandoffRestore: false,
+                hadNonEmptyQueryBeforeHandoff: true
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldEnsurePageArrowsSuppressedWhenPreservingQuery(
+                queryIsNonEmpty: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldEnsurePageArrowsSuppressedWhenPreservingQuery(
+                queryIsNonEmpty: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldSnapSearchFooterChromeAfterSettingsHandoff(
+                isSettingsHandoffRestore: true,
+                hadNonEmptyQueryBeforeHandoff: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldSnapSearchFooterChromeAfterSettingsHandoff(
+                isSettingsHandoffRestore: true,
+                hadNonEmptyQueryBeforeHandoff: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldSnapSearchFooterChromeAfterSettingsHandoff(
+                isSettingsHandoffRestore: false,
+                hadNonEmptyQueryBeforeHandoff: true
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldEnsureSearchFooterChromeWhenPreservingQuery(
+                queryIsNonEmpty: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldEnsureSearchFooterChromeWhenPreservingQuery(
+                queryIsNonEmpty: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldSnapSearchAdjacentChromeAfterSettingsHandoff(
+                isSettingsHandoffRestore: true,
+                hadNonEmptyQueryBeforeHandoff: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldSnapSearchAdjacentChromeAfterSettingsHandoff(
+                isSettingsHandoffRestore: true,
+                hadNonEmptyQueryBeforeHandoff: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldSnapSearchAdjacentChromeAfterSettingsHandoff(
+                isSettingsHandoffRestore: false,
+                hadNonEmptyQueryBeforeHandoff: true
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldEnsureSearchAdjacentChromeWhenPreservingQuery(
+                queryIsNonEmpty: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldEnsureSearchAdjacentChromeWhenPreservingQuery(
+                queryIsNonEmpty: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldRestoreGridFocusAfterClearingSearch(
+                hadFocusedSearchResult: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldRestoreGridFocusAfterClearingSearch(
+                hadFocusedSearchResult: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldFocusFirstGridItemAfterClearingSearch(
+                hadFocusedSearchResult: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldFocusFirstGridItemAfterClearingSearch(
+                hadFocusedSearchResult: true
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldFocusFirstGridItemAfterSearchQueryEmptied(
+                wasSearching: true,
+                isSearchingNow: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldFocusFirstGridItemAfterSearchQueryEmptied(
+                wasSearching: false,
+                isSearchingNow: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldFocusFirstGridItemAfterSearchQueryEmptied(
+                wasSearching: true,
+                isSearchingNow: true
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldFocusFirstGridItemAfterSearchFieldDidEndSearching(
+                isSearching: false,
+                searchHoldsKeyboardFocus: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldFocusFirstGridItemAfterSearchFieldDidEndSearching(
+                isSearching: true,
+                searchHoldsKeyboardFocus: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldFocusFirstGridItemAfterSearchFieldDidEndSearching(
+                isSearching: false,
+                searchHoldsKeyboardFocus: false
+            )
+        )
+    }
+
+    func testSearchKeyboardHighlightPinsFirstHitWithoutStealingFieldFocusPolicy() {
+        let a = UUID()
+        let b = UUID()
+        let c = UUID()
+        XCTAssertEqual(
+            LauncherLayout.searchKeyboardHighlightID(
+                isSearching: true,
+                presentedIDs: [a, b, c],
+                previousHighlightID: nil
+            ),
+            a
+        )
+        // Query edit passes nil previous → always first.
+        XCTAssertEqual(
+            LauncherLayout.searchKeyboardHighlightID(
+                isSearching: true,
+                presentedIDs: [b, c],
+                previousHighlightID: nil
+            ),
+            b
+        )
+        // Preserve arrow target when still present.
+        XCTAssertEqual(
+            LauncherLayout.searchKeyboardHighlightID(
+                isSearching: true,
+                presentedIDs: [a, b, c],
+                previousHighlightID: b
+            ),
+            b
+        )
+        // Drop stale highlight → first.
+        XCTAssertEqual(
+            LauncherLayout.searchKeyboardHighlightID(
+                isSearching: true,
+                presentedIDs: [a, c],
+                previousHighlightID: b
+            ),
+            a
+        )
+        XCTAssertNil(
+            LauncherLayout.searchKeyboardHighlightID(
+                isSearching: false,
+                presentedIDs: [a],
+                previousHighlightID: a
+            )
+        )
+        XCTAssertNil(
+            LauncherLayout.searchKeyboardHighlightID(
+                isSearching: true,
+                presentedIDs: [],
+                previousHighlightID: a
+            )
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchKeyboardHighlightIDMoving(from: a, in: [a, b, c], by: 1),
+            b
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchKeyboardHighlightIDMoving(from: b, in: [a, b, c], by: -1),
+            a
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchKeyboardHighlightIDMoving(from: c, in: [a, b, c], by: 1),
+            c
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchKeyboardHighlightIDMoving(from: nil, in: [a, b, c], by: 1),
+            a
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchKeyboardHighlightIDMoving(from: nil, in: [a, b, c], by: -1),
+            c
+        )
+        XCTAssertTrue(
+            LauncherLayout.tileShowsKeyboardFocusChrome(
+                isFirstResponder: false,
+                isSearchKeyboardHighlighted: true
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.tileShowsKeyboardFocusChrome(
+                isFirstResponder: true,
+                isSearchKeyboardHighlighted: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.tileShowsKeyboardFocusChrome(
+                isFirstResponder: false,
+                isSearchKeyboardHighlighted: false
+            )
+        )
+    }
+
+    func testSearchFieldTabHandoffToHighlightAndBacktabToField() {
+        let a = UUID()
+        let b = UUID()
+        XCTAssertTrue(
+            LauncherLayout.shouldHandOffSearchFieldTabToHit(
+                isSearching: true,
+                hasHits: true,
+                hasMarkedText: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldHandOffSearchFieldTabToHit(
+                isSearching: true,
+                hasHits: true,
+                hasMarkedText: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldHandOffSearchFieldTabToHit(
+                isSearching: true,
+                hasHits: false,
+                hasMarkedText: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldHandOffSearchFieldTabToHit(
+                isSearching: false,
+                hasHits: true,
+                hasMarkedText: false
+            )
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchFieldTabHandoffTargetID(highlightID: b, presentedIDs: [a, b]),
+            b
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchFieldTabHandoffTargetID(highlightID: nil, presentedIDs: [a, b]),
+            a
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchFieldTabHandoffTargetID(highlightID: UUID(), presentedIDs: [a, b]),
+            a
+        )
+        XCTAssertNil(
+            LauncherLayout.searchFieldTabHandoffTargetID(highlightID: a, presentedIDs: [])
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldReturnSearchHitBacktabToField(
+                isSearchCollection: true,
+                tabDirection: -1
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldReturnSearchHitBacktabToField(
+                isSearchCollection: true,
+                tabDirection: 1
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldReturnSearchHitBacktabToField(
+                isSearchCollection: false,
+                tabDirection: -1
+            )
+        )
+    }
+
+    func testShouldPresentToastWhileFolderChromeQuiet() {
+        XCTAssertTrue(
+            LauncherLayout.shouldPresentToastWhileFolderChromeQuiet(
+                folderOpen: false,
+                folderClosing: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldPresentToastWhileFolderChromeQuiet(
+                folderOpen: true,
+                folderClosing: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldPresentToastWhileFolderChromeQuiet(
+                folderOpen: false,
+                folderClosing: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldPresentToastWhileFolderChromeQuiet(
+                folderOpen: true,
+                folderClosing: true
+            )
+        )
+    }
+
+    func testFolderTitleEditUnderlineFadeMatchesSearchChromeClock() {
+        XCTAssertEqual(
+            LauncherLayout.folderTitleEditUnderlineAlpha,
+            0.55,
+            accuracy: 0.0001
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderTitleEditUnderlineFadeDuration,
+            LauncherLayout.searchTransitionDuration,
+            accuracy: 0.0001
+        )
+        XCTAssertEqual(
+            LauncherLayout.aliasEditUnderlineFadeDuration,
+            LauncherLayout.searchTransitionDuration,
+            accuracy: 0.0001
+        )
+        XCTAssertEqual(
+            LauncherLayout.aliasEditUnderlineFadeDuration,
+            LauncherLayout.folderTitleEditUnderlineFadeDuration,
+            accuracy: 0.0001
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldAnimateFolderTitleEditUnderline(
+                fromOpacity: 0,
+                toOpacity: 1,
+                reducesMotion: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldAnimateFolderTitleEditUnderline(
+                fromOpacity: 0,
+                toOpacity: 1,
+                reducesMotion: true
+            )
+        )
+    }
+
+    func testAppUninstallEligibilityBlocksSystemAndSelf() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let system = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/System/Applications/Calculator.app"),
+            bundleIdentifier: "com.apple.calculator",
+            displayName: "计算器",
+            sourcePriority: 2,
+            discoveredAt: now
+        )
+        let systemDecision = AppUninstallEligibility.evaluate(
+            candidate: system,
+            layoutEditingEnabled: true,
+            selfBundleURL: URL(fileURLWithPath: "/Applications/LaunchIcon.app"),
+            selfBundleIdentifier: "com.sunzheng.LaunchIcon"
+        )
+        XCTAssertFalse(systemDecision.isAllowed)
+        XCTAssertEqual(systemDecision.blockReason, .systemProtected)
+        XCTAssertEqual(systemDecision.explanationKey, "系统应用受保护，无法卸载")
+
+        let cryptex = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/System/Cryptexes/App/System/Applications/Safari.app"),
+            bundleIdentifier: "com.apple.Safari",
+            displayName: "Safari",
+            sourcePriority: 3,
+            discoveredAt: now
+        )
+        XCTAssertFalse(
+            AppUninstallEligibility.evaluate(
+                candidate: cryptex,
+                layoutEditingEnabled: true,
+                selfBundleURL: nil,
+                selfBundleIdentifier: nil
+            ).isAllowed
+        )
+
+        let selfApp = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/LaunchIcon.app"),
+            bundleIdentifier: "com.sunzheng.LaunchIcon",
+            displayName: "LaunchIcon",
+            sourcePriority: 1,
+            discoveredAt: now
+        )
+        let selfDecision = AppUninstallEligibility.evaluate(
+            candidate: selfApp,
+            layoutEditingEnabled: true,
+            selfBundleURL: URL(fileURLWithPath: "/Applications/LaunchIcon.app"),
+            selfBundleIdentifier: "com.sunzheng.LaunchIcon"
+        )
+        XCTAssertFalse(selfDecision.isAllowed)
+        XCTAssertEqual(selfDecision.blockReason, .selfApplication)
+
+        let editingOff = AppUninstallEligibility.evaluate(
+            candidate: system,
+            layoutEditingEnabled: false,
+            selfBundleURL: nil,
+            selfBundleIdentifier: nil
+        )
+        XCTAssertFalse(editingOff.isAllowed)
+        XCTAssertEqual(editingOff.blockReason, .layoutEditingDisabled)
+
+        XCTAssertTrue(AppUninstallEligibility.isSystemProtectedPath("/System/Applications/X.app"))
+        XCTAssertFalse(AppUninstallEligibility.isSystemProtectedPath("/Applications/X.app"))
+        XCTAssertFalse(AppUninstallEligibility.isSystemProtectedPath("/Users/me/Applications/X.app"))
+    }
+
+    func testWritableUserApplicationsBundleEnablesUninstallMenu() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LaunchIcon-UninstallMenuEnabled-\(UUID().uuidString)", isDirectory: true)
+        let apps = root.appendingPathComponent("Applications", isDirectory: true)
+        let bundle = apps.appendingPathComponent("UserSample.app", isDirectory: true)
+        try FileManager.default.createDirectory(at: bundle, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let candidate = AppCandidate(
+            canonicalURL: bundle,
+            bundleIdentifier: "com.example.UserSample",
+            displayName: "UserSample",
+            sourcePriority: 0,
+            discoveredAt: Date()
+        )
+        let decision = AppUninstallEligibility.evaluate(
+            candidate: candidate,
+            layoutEditingEnabled: true,
+            selfBundleURL: URL(fileURLWithPath: "/Applications/LaunchIcon.app"),
+            selfBundleIdentifier: "com.sunzheng.LaunchIcon"
+        )
+        XCTAssertTrue(decision.isAllowed)
+        XCTAssertEqual(
+            AppUninstallEligibility.menuPresentation(layoutEditingEnabled: true, decision: decision),
+            .enabled
+        )
+    }
+
+    func testAppUninstallMenuPresentationDisablesWhenReadOnlyAndDisablesProtected() {
+        let systemBlocked = AppUninstallDecision(allowed: false, blockReason: .systemProtected)
+        // Incomplete scan / read-only: still expose uninstall disabled + reason (VoiceOver).
+        XCTAssertEqual(
+            AppUninstallEligibility.menuPresentation(layoutEditingEnabled: false, decision: systemBlocked),
+            .disabled(explanationKey: "系统应用受保护，无法卸载")
+        )
+        XCTAssertEqual(
+            AppUninstallEligibility.menuPresentation(layoutEditingEnabled: true, decision: systemBlocked),
+            .disabled(explanationKey: "系统应用受保护，无法卸载")
+        )
+        XCTAssertEqual(
+            AppUninstallEligibility.menuPresentation(
+                layoutEditingEnabled: true,
+                decision: AppUninstallDecision(allowed: true)
+            ),
+            .enabled
+        )
+        let editingOff = AppUninstallDecision(allowed: false, blockReason: .layoutEditingDisabled)
+        XCTAssertEqual(
+            AppUninstallEligibility.menuPresentation(layoutEditingEnabled: false, decision: editingOff),
+            .disabled(explanationKey: "暂时无法整理应用，请先完成扫描")
+        )
+    }
+
+    func testAppUninstallEligibilityAllowsWritableUserApplicationsBundle() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LaunchIcon-UninstallEligibility-\(UUID().uuidString)", isDirectory: true)
+        let apps = root.appendingPathComponent("Applications", isDirectory: true)
+        let bundle = apps.appendingPathComponent("Sample.app", isDirectory: true)
+        try FileManager.default.createDirectory(at: bundle, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let candidate = AppCandidate(
+            canonicalURL: bundle,
+            bundleIdentifier: "com.example.Sample",
+            displayName: "Sample",
+            sourcePriority: 0,
+            discoveredAt: Date()
+        )
+        let decision = AppUninstallEligibility.evaluate(
+            candidate: candidate,
+            layoutEditingEnabled: true,
+            selfBundleURL: URL(fileURLWithPath: "/Applications/LaunchIcon.app"),
+            selfBundleIdentifier: "com.sunzheng.LaunchIcon",
+            fileManager: .default
+        )
+        XCTAssertTrue(decision.isAllowed, "\(String(describing: decision.blockReason))")
+        XCTAssertNil(decision.blockReason)
+        XCTAssertEqual(
+            AppUninstallEligibility.menuPresentation(layoutEditingEnabled: true, decision: decision),
+            .enabled,
+            "Writable user Applications bundles must expose an enabled uninstall item"
+        )
+        XCTAssertEqual(
+            AppUninstallEligibility.menuPresentation(layoutEditingEnabled: false, decision: decision),
+            .disabled(explanationKey: "暂时无法整理应用，请先完成扫描")
+        )
+
+        let missing = AppCandidate(
+            canonicalURL: apps.appendingPathComponent("Gone.app"),
+            bundleIdentifier: "com.example.Gone",
+            displayName: "Gone",
+            sourcePriority: 0,
+            discoveredAt: Date()
+        )
+        let missingDecision = AppUninstallEligibility.evaluate(
+            candidate: missing,
+            layoutEditingEnabled: true,
+            selfBundleURL: nil,
+            selfBundleIdentifier: nil
+        )
+        XCTAssertFalse(missingDecision.isAllowed)
+        XCTAssertEqual(missingDecision.blockReason, .missingBundle)
+    }
+
+    func testForgetUninstalledApplicationClearsAliasHideAndSlots() {
+        let key = "bundle:com.example.Sample"
+        var id = UUID()
+        var state = LayoutState(
+            orderedEntries: [.app(id)],
+            folders: [:],
+            appKeys: [id: key],
+            hiddenAppKeys: [key],
+            appAliases: [key: "别名"],
+            updatedAt: Date()
+        )
+        state = LauncherLayout.forgetUninstalledApplication(withKey: key, in: state)
+        XCTAssertTrue(state.orderedEntries.isEmpty)
+        XCTAssertNil(state.appKeys[id])
+        XCTAssertFalse(state.hiddenAppKeys.contains(key))
+        XCTAssertNil(state.appAliases[key])
+    }
+
+    func testRemainingCopyKeepsFolderPlacementAndAliasAfterCatalogReconcile() {
+        let key = "bundle:com.example.sample"
+        let appID = UUID(), otherID = UUID(), folderID = UUID()
+        let state = LayoutState(
+            orderedEntries: [.folder(folderID)],
+            folders: [folderID: LauncherFolder(id: folderID, name: "Work", itemIDs: [appID, otherID])],
+            appKeys: [appID: key, otherID: "bundle:com.example.other"],
+            appAliases: [key: "我的别名"], updatedAt: .now
+        )
+        let remainingCopy = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Users/me/Applications/Sample.app"),
+            bundleIdentifier: "com.example.Sample", displayName: "Sample", sourcePriority: 0, discoveredAt: .now
+        )
+        let other = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Other.app"),
+            bundleIdentifier: "com.example.Other", displayName: "Other", sourcePriority: 0, discoveredAt: .now
+        )
+        let reconciled = LauncherLayout.reconcile(candidates: [remainingCopy, other], into: state)
+        XCTAssertEqual(reconciled.orderedEntries, [.folder(folderID)])
+        XCTAssertEqual(reconciled.folders[folderID]?.itemIDs, [appID, otherID])
+        XCTAssertEqual(reconciled.appKeys[appID], key)
+        XCTAssertEqual(reconciled.appAliases[key], "我的别名")
+    }
+
+    func testTrashApplicationBundleMovesIntoTrash() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LaunchIcon-TrashBundle-\(UUID().uuidString)", isDirectory: true)
+        let bundle = root.appendingPathComponent("TrashMe.app", isDirectory: true)
+        try FileManager.default.createDirectory(at: bundle, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let marker = bundle.appendingPathComponent("Contents", isDirectory: true)
+        try FileManager.default.createDirectory(at: marker, withIntermediateDirectories: true)
+
+        let trashed = try AppBundleUninstaller.trashApplicationBundle(at: bundle)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: bundle.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: trashed.path))
+        // Clean the trashed copy so the test leaves no debris.
+        try? FileManager.default.removeItem(at: trashed)
+    }
+
+    func testAppRelatedFileScannerDiscoversBundleIDPaths() throws {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LaunchIcon-RelatedScan-\(UUID().uuidString)", isDirectory: true)
+        let library = home.appendingPathComponent("Library", isDirectory: true)
+        let support = library.appendingPathComponent("Application Support/com.example.Sample", isDirectory: true)
+        let prefs = library.appendingPathComponent("Preferences/com.example.Sample.plist", isDirectory: false)
+        let caches = library.appendingPathComponent("Caches/com.example.Sample", isDirectory: true)
+        let group = library.appendingPathComponent("Group Containers/ABCD.com.example.Sample", isDirectory: true)
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: caches, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: group, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: prefs.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("x".utf8).write(to: prefs)
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let candidate = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Sample.app"),
+            bundleIdentifier: "com.example.Sample",
+            displayName: "Sample",
+            sourcePriority: 0,
+            discoveredAt: Date()
+        )
+        let found = AppRelatedFileScanner.discover(candidate: candidate, homeDirectory: home)
+        let paths = Set(found.map(\.url.lastPathComponent))
+        XCTAssertTrue(paths.contains("com.example.Sample"))
+        XCTAssertTrue(paths.contains("com.example.Sample.plist"))
+        XCTAssertTrue(paths.contains("ABCD.com.example.Sample"))
+        XCTAssertTrue(found.contains(where: { $0.kind == .applicationSupport }))
+        XCTAssertTrue(found.contains(where: { $0.kind == .preferences }))
+        XCTAssertTrue(found.contains(where: { $0.kind == .groupContainers }))
+    }
+
+    func testAppRelatedFileScannerRejectsUnsafePackageNamesAndOutsideHome() throws {
+        XCTAssertFalse(AppRelatedFileScanner.isSafePackageNameFallback("data"))
+        XCTAssertFalse(AppRelatedFileScanner.isSafePackageNameFallback("ab"))
+        XCTAssertTrue(AppRelatedFileScanner.isSafePackageNameFallback("SampleApp"))
+
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LaunchIcon-RelatedSafe-\(UUID().uuidString)", isDirectory: true)
+        let library = home.appendingPathComponent("Library/Application Support/SampleApp", isDirectory: true)
+        try FileManager.default.createDirectory(at: library, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let candidate = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/SampleApp.app"),
+            bundleIdentifier: nil,
+            displayName: "SampleApp",
+            sourcePriority: 0,
+            discoveredAt: Date()
+        )
+        let found = AppRelatedFileScanner.discover(candidate: candidate, homeDirectory: home)
+        XCTAssertEqual(found.count, 1)
+        XCTAssertEqual(found[0].kind, .applicationSupport)
+    }
+
+
+
+    func testEmptyRelatedFilesMessageKeyIsLocalizedLiteral() {
+        XCTAssertEqual(
+            AppRelatedFileScanner.emptyRelatedFilesMessageKey,
+            "未发现可清理的相关用户文件"
+        )
+        // discover on a home with Library but no matching paths stays empty.
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LaunchIcon-RelatedEmpty-\(UUID().uuidString)", isDirectory: true)
+        let library = home.appendingPathComponent("Library", isDirectory: true)
+        try? FileManager.default.createDirectory(at: library, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let candidate = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/NoSupport.app"),
+            bundleIdentifier: "com.example.NoSupport.\(UUID().uuidString)",
+            displayName: "NoSupport",
+            sourcePriority: 0,
+            discoveredAt: Date()
+        )
+        let found = AppRelatedFileScanner.discover(candidate: candidate, homeDirectory: home)
+        XCTAssertTrue(found.isEmpty)
+        XCTAssertFalse(AppRelatedFileScanner.relatedCleanupConfirmEnabled(selectedCount: found.count))
+    }
+
+    func testOrphanLeftoverProgressAndCancelMessageKeys() {
+        XCTAssertEqual(AppOrphanLeftoverScanner.cancelledMessageKey, "已取消残留文件清理")
+        XCTAssertTrue(AppOrphanLeftoverScanner.noneFoundMessageKey.contains("未发现可清理的残留文件"))
+        XCTAssertEqual(AppOrphanLeftoverScanner.scanningProgressMessageKey, "正在查找残留文件…")
+        XCTAssertEqual(AppOrphanLeftoverScanner.trashingProgressMessageKey, "正在移到废纸篓…")
+        XCTAssertEqual(AppOrphanLeftoverScanner.recheckingProgressMessageKey, "正在确认安装状态…")
+        XCTAssertNotEqual(AppOrphanLeftoverScanner.noneFoundMessageKey, "未发现可清理的残留文件",
+                          "empty-state copy should explain matching scope")
+    }
+
+    func testRelatedCleanupProgressCancelAndSelectionStillValid() {
+        XCTAssertEqual(AppRelatedFileScanner.scanningProgressMessageKey, "正在查找相关文件…")
+        XCTAssertEqual(AppRelatedFileScanner.recheckingProgressMessageKey, "正在确认相关文件…")
+        XCTAssertEqual(AppRelatedFileScanner.cancelledMessageKey, "已取消相关文件清理")
+        XCTAssertTrue(AppRelatedFileScanner.changedBeforeTrashMessageKey.contains("未移到废纸篓"))
+        let a = AppRelatedFileCandidate(
+            url: URL(fileURLWithPath: "/tmp/Library/Caches/com.example.A"),
+            kind: .caches, byteSize: 1
+        )
+        let b = AppRelatedFileCandidate(
+            url: URL(fileURLWithPath: "/tmp/Library/Caches/com.example.B"),
+            kind: .caches, byteSize: 1
+        )
+        XCTAssertTrue(AppRelatedFileScanner.relatedCleanupSelectionStillValid(selected: [], rediscovered: [a]))
+        XCTAssertTrue(AppRelatedFileScanner.relatedCleanupSelectionStillValid(selected: [a], rediscovered: [a, b]))
+        XCTAssertFalse(AppRelatedFileScanner.relatedCleanupSelectionStillValid(selected: [a, b], rediscovered: [a]))
+    }
+
+    func testPerformRefusesRelatedWhenPathIdentityChangesBeforeTrash() throws {
+        let (home, library) = try makeUninstallHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LaunchIcon-RelatedIdentityPerform-\(UUID().uuidString)", isDirectory: true)
+        let bundle = root.appendingPathComponent("Keep.app", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let contents = bundle.appendingPathComponent("Contents", isDirectory: true)
+        try FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)
+        let plist: [String: Any] = ["CFBundleIdentifier": "com.example.Keep"]
+        let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+        try data.write(to: contents.appendingPathComponent("Info.plist"))
+        let candidate = AppCandidate(
+            canonicalURL: bundle, bundleIdentifier: "com.example.Keep",
+            displayName: "Keep", sourcePriority: 0, discoveredAt: Date()
+        )
+        let bundleIdentity = try XCTUnwrap(AppUninstallEligibility.captureBundleIdentity(of: candidate))
+        let relatedURL = library.appendingPathComponent("Caches/com.example.Keep", isDirectory: true)
+        try FileManager.default.createDirectory(at: relatedURL, withIntermediateDirectories: true)
+        let related = [AppRelatedFileCandidate(url: relatedURL, kind: .caches, byteSize: 1)]
+        let relatedIdentity = try XCTUnwrap(AppUninstallEligibility.capturePathIdentity(of: relatedURL))
+        // Swap the related directory inode while keeping the pathname.
+        try FileManager.default.removeItem(at: relatedURL)
+        try FileManager.default.createDirectory(at: relatedURL, withIntermediateDirectories: true)
+        var trashCalls: [URL] = []
+        let report = AppUninstallExecutor.perform(
+            bundleURL: bundle,
+            related: related,
+            homeDirectory: home,
+            expectedIdentity: bundleIdentity,
+            expectedRelatedIdentities: [relatedIdentity],
+            candidate: candidate,
+            trash: { url in
+                trashCalls.append(url)
+                return url
+            }
+        )
+        // Bundle may trash (identity OK); related must refuse identity mismatch.
+        XCTAssertTrue(report.bundleTrashed)
+        XCTAssertEqual(trashCalls.first, bundle)
+        XCTAssertEqual(report.trashedRelated.count, 0)
+        XCTAssertEqual(report.failedRelated.count, 1)
+        XCTAssertEqual(report.failedRelated.first?.reason, AppUninstallFailureReason.identityMismatch)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: relatedURL.path))
+    }
+
+    func testRelatedCleanupDefaultsToOptInSelection() {
+        XCTAssertFalse(AppRelatedFileScanner.relatedCleanupDefaultSelected)
+        XCTAssertFalse(AppRelatedFileScanner.relatedCleanupConfirmEnabled(selectedCount: 0))
+        XCTAssertTrue(AppRelatedFileScanner.relatedCleanupConfirmEnabled(selectedCount: 1))
+        XCTAssertTrue(AppRelatedFileScanner.relatedCleanupReviewMessageKey.contains("默认不选"))
+        XCTAssertFalse(AppRelatedFileScanner.relatedCleanupReviewMessageKey.contains("默认全选"))
+        XCTAssertTrue(AppRelatedFileScanner.relatedCleanupAlertCancelIsFirstButton)
+        XCTAssertTrue(AppRelatedFileScanner.relatedCleanupRestoresLauncherFocusAfterSheet)
+        XCTAssertEqual(
+            AppRelatedFileScanner.relatedCleanupItemAccessibilityHelp(
+                kindLabel: "缓存",
+                sizeLabel: "1.2 MB"
+            ),
+            "缓存，1.2 MB"
+        )
+        XCTAssertEqual(
+            AppRelatedFileScanner.relatedCleanupTrashAccessibilityHelp(selectedCount: 0),
+            AppRelatedFileScanner.relatedCleanupTrashDisabledAccessibilityHelpKey
+        )
+        XCTAssertEqual(
+            AppRelatedFileScanner.relatedCleanupTrashAccessibilityHelp(selectedCount: 2),
+            AppRelatedFileScanner.relatedCleanupTrashEnabledAccessibilityHelpKey
+        )
+        XCTAssertEqual(
+            AppRelatedFileScanner.relatedFilesToggleAccessibilityHelp(isEnabled: true),
+            AppRelatedFileScanner.relatedFilesToggleAccessibilityHelpKey
+        )
+        XCTAssertEqual(
+            AppRelatedFileScanner.relatedFilesToggleAccessibilityHelp(isEnabled: false),
+            AppRelatedFileScanner.relatedFilesToggleDisabledAccessibilityHelpKey
+        )
+    }
+
+    func testRelatedCleanupConfirmRequiresSelection() {
+        XCTAssertFalse(AppRelatedFileScanner.relatedCleanupConfirmEnabled(selectedCount: 0))
+        XCTAssertTrue(AppRelatedFileScanner.relatedCleanupConfirmEnabled(selectedCount: 1))
+        XCTAssertEqual(AppRelatedFileScanner.selectedByteTotal(of: []), 0)
+        XCTAssertEqual(
+            AppRelatedFileScanner.formatByteSize(AppRelatedFileScanner.selectedByteTotal(of: [])),
+            AppRelatedFileScanner.formatByteSize(0)
+        )
+    }
+
+    // MARK: - Uninstall hardening (edge cases)
+
+    func testUninstallCopyCheckIgnoresSamePathAndDetectsRegisteredSibling() {
+        let target = sampleCandidate()
+        let alias = URL(fileURLWithPath: target.canonicalURL.path + "/../Sample.app")
+        let sibling = URL(fileURLWithPath: "/Users/other/Applications/Sample.app")
+        let report = CatalogScanReport(candidates: [target], skippedPaths: [])
+        XCTAssertFalse(AppUninstallEligibility.hasOtherCopy(
+            of: target, in: report, registeredURLs: [alias]
+        ))
+        XCTAssertTrue(AppUninstallEligibility.hasOtherCopy(
+            of: target, in: report, registeredURLs: [sibling]
+        ))
+    }
+
+    func testUninstallProcessScopeKeepsOtherCopyAndIncludesNestedHelper() {
+        let target = URL(fileURLWithPath: "/Applications/Sample.app")
+        let other = URL(fileURLWithPath: "/Users/other/Applications/Sample.app")
+        let helper = target.appendingPathComponent("Contents/Library/LoginItems/Helper.app")
+        let executable = target.appendingPathComponent("Contents/MacOS/Sample")
+        XCTAssertTrue(AppUninstallEligibility.runningProcessBelongsToTarget(
+            bundleURL: target, executableURL: executable, targetURL: target
+        ))
+        XCTAssertTrue(AppUninstallEligibility.runningProcessBelongsToTarget(
+            bundleURL: helper, executableURL: nil, targetURL: target
+        ))
+        XCTAssertTrue(AppUninstallEligibility.runningProcessBelongsToTarget(
+            bundleURL: nil, executableURL: executable, targetURL: target
+        ))
+        XCTAssertFalse(AppUninstallEligibility.runningProcessBelongsToTarget(
+            bundleURL: other, executableURL: other.appendingPathComponent("Contents/MacOS/Sample"), targetURL: target
+        ))
+        XCTAssertFalse(AppUninstallEligibility.runningProcessBelongsToTarget(
+            bundleURL: URL(fileURLWithPath: "/Applications/Sample.app-copy"), executableURL: nil, targetURL: target
+        ))
+    }
+
+    func testUninstallIdentityRejectsReplacedBundleAtSamePath() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("LaunchIcon-UninstallIdentity-\(UUID())")
+        let app = root.appendingPathComponent("Selected.app")
+        func install(_ bundleID: String) throws {
+            let contents = app.appendingPathComponent("Contents")
+            try FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)
+            let plist = ["CFBundleIdentifier": bundleID]
+            let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+            try data.write(to: contents.appendingPathComponent("Info.plist"))
+        }
+        defer { try? FileManager.default.removeItem(at: root) }
+        try install("com.example.Selected")
+        let candidate = AppCandidate(canonicalURL: app, bundleIdentifier: "com.example.Selected",
+                                     displayName: "Selected", sourcePriority: 0, discoveredAt: .now)
+        let identity = try XCTUnwrap(AppUninstallEligibility.captureBundleIdentity(of: candidate))
+        XCTAssertTrue(AppUninstallEligibility.matchesBundleIdentity(identity, of: candidate))
+        try FileManager.default.removeItem(at: app)
+        try install("com.example.Replacement")
+        XCTAssertFalse(AppUninstallEligibility.matchesBundleIdentity(identity, of: candidate))
+        try FileManager.default.removeItem(at: app)
+        try install("com.example.Selected")
+        XCTAssertFalse(AppUninstallEligibility.matchesBundleIdentity(identity, of: candidate),
+                       "A new physical copy with the same ID must require a fresh confirmation")
+    }
+
+    func testUninstallSafetyScanFindsHiddenCopyWithinRoot() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("LaunchIcon-HiddenCopy-\(UUID())")
+        let visible = root.appendingPathComponent("Visible.app")
+        let hidden = root.appendingPathComponent(".Archive/Hidden.app")
+        defer { try? FileManager.default.removeItem(at: root) }
+        for app in [visible, hidden] {
+            let contents = app.appendingPathComponent("Contents")
+            try FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)
+            let data = try PropertyListSerialization.data(
+                fromPropertyList: ["CFBundleIdentifier": "com.example.Copy"], format: .xml, options: 0
+            )
+            try data.write(to: contents.appendingPathComponent("Info.plist"))
+        }
+        let report = await AppCatalogScanner().scanIncludingHiddenApplications(roots: [root])
+        let physicalCopies = report.candidates + report.duplicateCandidates
+        let visibleURL = visible.resolvingSymlinksInPath().standardizedFileURL
+        let hiddenURL = hidden.resolvingSymlinksInPath().standardizedFileURL
+        let target = try XCTUnwrap(physicalCopies.first { $0.canonicalURL == visibleURL })
+        XCTAssertTrue(physicalCopies.contains { $0.canonicalURL == hiddenURL })
+        XCTAssertTrue(AppUninstallEligibility.hasOtherCopy(of: target, in: report, registeredURLs: []))
+    }
+
+    private func makeUninstallHome() throws -> (home: URL, library: URL) {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LaunchIcon-UninstallHome-\(UUID().uuidString)", isDirectory: true)
+        let library = home.appendingPathComponent("Library", isDirectory: true)
+        try FileManager.default.createDirectory(at: library, withIntermediateDirectories: true)
+        return (home, library)
+    }
+
+    private func sampleCandidate(bundleID: String? = "com.example.Sample", name: String = "Sample") -> AppCandidate {
+        AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/\(name).app"),
+            bundleIdentifier: bundleID,
+            displayName: name,
+            sourcePriority: 0,
+            discoveredAt: Date()
+        )
+    }
+
+    func testBundleIDMatchingUsesTokenBoundariesNotSubstrings() {
+        let id = "com.example.Sample"
+        XCTAssertTrue(AppRelatedFileScanner.nameMatchesBundleID("com.example.Sample", bundleID: id, allowsTeamPrefix: false))
+        XCTAssertTrue(AppRelatedFileScanner.nameMatchesBundleID("COM.EXAMPLE.SAMPLE", bundleID: id, allowsTeamPrefix: false))
+        XCTAssertTrue(AppRelatedFileScanner.nameMatchesBundleID("com.example.Sample.helper.plist", bundleID: id, allowsTeamPrefix: false))
+        XCTAssertTrue(AppRelatedFileScanner.nameMatchesBundleID("ABCD.com.example.Sample", bundleID: id, allowsTeamPrefix: true))
+        XCTAssertFalse(AppRelatedFileScanner.nameMatchesBundleID("ABCD.com.example.Sample", bundleID: id, allowsTeamPrefix: false))
+        XCTAssertFalse(AppRelatedFileScanner.nameMatchesBundleID("com.example.Sample2", bundleID: id, allowsTeamPrefix: true))
+        XCTAssertFalse(AppRelatedFileScanner.nameMatchesBundleID("com.example.SampleOther", bundleID: id, allowsTeamPrefix: true))
+        XCTAssertFalse(AppRelatedFileScanner.nameMatchesBundleID("xcom.example.Sample", bundleID: id, allowsTeamPrefix: true))
+        // Two-component IDs match exactly only.
+        XCTAssertTrue(AppRelatedFileScanner.nameMatchesBundleID("md.obsidian", bundleID: "md.obsidian", allowsTeamPrefix: true))
+        XCTAssertFalse(AppRelatedFileScanner.nameMatchesBundleID("md.obsidian.helper", bundleID: "md.obsidian", allowsTeamPrefix: true))
+    }
+
+    func testUsableBundleIDRejectsTraversalAndGenericTokens() {
+        XCTAssertNil(AppRelatedFileScanner.usableBundleID("../../Documents"))
+        XCTAssertNil(AppRelatedFileScanner.usableBundleID("com.example/../x"))
+        XCTAssertNil(AppRelatedFileScanner.usableBundleID("single"))
+        XCTAssertNil(AppRelatedFileScanner.usableBundleID("a.b"))
+        XCTAssertNil(AppRelatedFileScanner.usableBundleID("com..example"))
+        XCTAssertNil(AppRelatedFileScanner.usableBundleID("   "))
+        XCTAssertNil(AppRelatedFileScanner.usableBundleID(nil))
+        XCTAssertEqual(AppRelatedFileScanner.usableBundleID(" com.example.Sample "), "com.example.Sample")
+        XCTAssertEqual(AppRelatedFileScanner.usableBundleID("md.obsidian"), "md.obsidian")
+    }
+
+    func testScannerDoesNotMatchSiblingBundleIDsInGroupContainersOrAgents() throws {
+        let (home, library) = try makeUninstallHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let fm = FileManager.default
+        for name in ["Group Containers/TEAM.com.example.Sample", "Group Containers/TEAM.com.example.Sample2",
+                     "Group Containers/group.com.example.SampleOther"] {
+            try fm.createDirectory(at: library.appendingPathComponent(name), withIntermediateDirectories: true)
+        }
+        let agents = library.appendingPathComponent("LaunchAgents", isDirectory: true)
+        try fm.createDirectory(at: agents, withIntermediateDirectories: true)
+        try Data("x".utf8).write(to: agents.appendingPathComponent("com.example.Sample.agent.plist"))
+        try Data("x".utf8).write(to: agents.appendingPathComponent("com.example.Sample2.agent.plist"))
+        let found = AppRelatedFileScanner.discover(candidate: sampleCandidate(), homeDirectory: home)
+        let names = Set(found.map(\.url.lastPathComponent))
+        XCTAssertEqual(names, ["TEAM.com.example.Sample", "com.example.Sample.agent.plist"])
+    }
+
+    func testScannerRejectsGenericAndVendorPackageNameFallbacks() throws {
+        for name in ["Google", "Microsoft", "Adobe", "Mozilla", "Apple", "Support", "Chrome"] {
+            XCTAssertFalse(AppRelatedFileScanner.isSafePackageNameFallback(name), name)
+        }
+        let (home, library) = try makeUninstallHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(
+            at: library.appendingPathComponent("Application Support/Google", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        let candidate = sampleCandidate(bundleID: nil, name: "Google")
+        XCTAssertTrue(AppRelatedFileScanner.discover(candidate: candidate, homeDirectory: home).isEmpty)
+    }
+
+    func testScannerNeverFollowsSymlinksOutOfLibrary() throws {
+        let (home, library) = try makeUninstallHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let fm = FileManager.default
+        let precious = home.appendingPathComponent("Documents/Precious", isDirectory: true)
+        try fm.createDirectory(at: precious, withIntermediateDirectories: true)
+        try Data("keep".utf8).write(to: precious.appendingPathComponent("a.txt"))
+        let caches = library.appendingPathComponent("Caches", isDirectory: true)
+        try fm.createDirectory(at: caches, withIntermediateDirectories: true)
+        let link = caches.appendingPathComponent("com.example.Sample")
+        try fm.createSymbolicLink(at: link, withDestinationURL: precious)
+
+        XCTAssertTrue(AppRelatedFileScanner.discover(candidate: sampleCandidate(), homeDirectory: home).isEmpty)
+        XCTAssertFalse(AppRelatedFileSafety.isSafeToTrash(link, homeDirectory: home))
+
+        // Even if a stale checklist still carries the link, execution refuses it.
+        let stale = AppRelatedFileCandidate(url: link, kind: .caches, byteSize: 1)
+        var trashCalls: [URL] = []
+        let moved = AppUninstallExecutor.trashRelated(
+            [stale],
+            homeDirectory: home,
+            trash: { url in
+                trashCalls.append(url)
+                return url
+            }
+        )
+        XCTAssertTrue(trashCalls.isEmpty)
+        XCTAssertTrue(moved.trashed.isEmpty)
+        XCTAssertEqual(moved.failed.first?.reason, AppUninstallFailureReason.unsafePath)
+        XCTAssertTrue(fm.fileExists(atPath: precious.appendingPathComponent("a.txt").path))
+    }
+
+    func testRelatedSafetyRejectsPathsOutsideLibraryAndWholeCategories() throws {
+        let (home, library) = try makeUninstallHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        XCTAssertFalse(AppRelatedFileSafety.isSafeToTrash(home.appendingPathComponent("Documents/x"), homeDirectory: home))
+        XCTAssertFalse(AppRelatedFileSafety.isSafeToTrash(URL(fileURLWithPath: "/Applications/Foo.app"), homeDirectory: home))
+        XCTAssertFalse(AppRelatedFileSafety.isSafeToTrash(library, homeDirectory: home))
+        XCTAssertFalse(AppRelatedFileSafety.isSafeToTrash(library.appendingPathComponent("Caches"), homeDirectory: home))
+        XCTAssertFalse(AppRelatedFileSafety.isSafeToTrash(
+            library.appendingPathComponent("Caches/../../Documents/x"), homeDirectory: home))
+        XCTAssertTrue(AppRelatedFileSafety.isSafeToTrash(
+            library.appendingPathComponent("Caches/com.example.Sample"), homeDirectory: home))
+    }
+
+    private struct FakeTrashError: Error {}
+
+    func testExecutorAbortsWhenIdentityChangesBeforeTrash() throws {
+        let (home, library) = try makeUninstallHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LaunchIcon-TrashIdentity-\(UUID().uuidString)", isDirectory: true)
+        let bundle = root.appendingPathComponent("Swap.app", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        func install(_ id: String) throws {
+            let contents = bundle.appendingPathComponent("Contents", isDirectory: true)
+            try FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)
+            let plist: [String: Any] = ["CFBundleIdentifier": id]
+            let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+            try data.write(to: contents.appendingPathComponent("Info.plist"))
+        }
+        try install("com.example.Original")
+        let candidate = AppCandidate(
+            canonicalURL: bundle, bundleIdentifier: "com.example.Original",
+            displayName: "Swap", sourcePriority: 0, discoveredAt: Date()
+        )
+        let identity = try XCTUnwrap(AppUninstallEligibility.captureBundleIdentity(of: candidate))
+        let relatedURL = library.appendingPathComponent("Caches/com.example.Original", isDirectory: true)
+        try FileManager.default.createDirectory(at: relatedURL, withIntermediateDirectories: true)
+        let related = [AppRelatedFileCandidate(url: relatedURL, kind: .caches, byteSize: 1)]
+        // Replace the physical directory while keeping the pathname.
+        try FileManager.default.removeItem(at: bundle)
+        try install("com.example.Original")
+        var trashCalls: [URL] = []
+        let report = AppUninstallExecutor.perform(
+            bundleURL: bundle,
+            related: related,
+            homeDirectory: home,
+            expectedIdentity: identity,
+            candidate: candidate,
+            trash: { url in
+                trashCalls.append(url)
+                return url
+            }
+        )
+        XCTAssertEqual(report.outcome, AppUninstallOutcome.bundleFailed)
+        XCTAssertEqual(report.bundleFailure?.reason, AppUninstallFailureReason.identityMismatch)
+        XCTAssertTrue(trashCalls.isEmpty, "identity mismatch must refuse before any trashItem")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: relatedURL.path))
+    }
+
+    func testExecutorCancelBeforeTrashLeavesEverything() throws {
+        let (home, _) = try makeUninstallHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        var calls = 0
+        let report = AppUninstallExecutor.perform(
+            bundleURL: URL(fileURLWithPath: "/Applications/Sample.app"),
+            related: [],
+            homeDirectory: home,
+            trash: { url in
+                calls += 1
+                return url
+            },
+            isCancelled: { true }
+        )
+        XCTAssertEqual(report.outcome, AppUninstallOutcome.bundleFailed)
+        XCTAssertEqual(report.bundleFailure?.reason, AppUninstallFailureReason.cancelled)
+        XCTAssertEqual(calls, 0)
+    }
+
+    func testExecutorCancelMidRelatedAccountsForRemainder() throws {
+        let (home, library) = try makeUninstallHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        var related: [AppRelatedFileCandidate] = []
+        for name in ["Caches/com.example.Sample", "Application Support/com.example.Sample", "Logs/com.example.Sample"] {
+            let url = library.appendingPathComponent(name, isDirectory: true)
+            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+            related.append(AppRelatedFileCandidate(url: url, kind: .caches, byteSize: 1))
+        }
+        var calls = 0
+        let report = AppUninstallExecutor.perform(
+            bundleURL: URL(fileURLWithPath: "/Applications/Sample.app"),
+            related: related,
+            homeDirectory: home,
+            trash: { url in
+                calls += 1
+                return url
+            },
+            isCancelled: {
+                // Cancel after the bundle and the first related item succeed.
+                calls >= 2
+            }
+        )
+        XCTAssertTrue(report.bundleTrashed)
+        XCTAssertEqual(report.trashedRelated.count, 1)
+        XCTAssertEqual(report.failedRelated.count, 2)
+        XCTAssertTrue(report.failedRelated.allSatisfy { $0.reason == AppUninstallFailureReason.cancelled })
+        XCTAssertEqual(report.trashedRelated.count + report.failedRelated.count, related.count)
+    }
+
+    func testPathIdentityRejectsReplacedRelatedFile() throws {
+        let (home, library) = try makeUninstallHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let url = library.appendingPathComponent("Caches/com.example.Sample", isDirectory: true)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        let identity = try XCTUnwrap(AppUninstallEligibility.capturePathIdentity(of: url))
+        XCTAssertTrue(AppUninstallEligibility.matchesPathIdentity(identity))
+        try FileManager.default.removeItem(at: url)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        XCTAssertFalse(AppUninstallEligibility.matchesPathIdentity(identity))
+
+        let stale = AppRelatedFileCandidate(url: url, kind: .caches, byteSize: 1)
+        var calls = 0
+        let moved = AppUninstallExecutor.trashRelated(
+            [stale],
+            homeDirectory: home,
+            expectedIdentities: [identity],
+            trash: { url in
+                calls += 1
+                return url
+            }
+        )
+        XCTAssertEqual(calls, 0)
+        XCTAssertTrue(moved.trashed.isEmpty)
+        XCTAssertEqual(moved.failed.first?.reason, AppUninstallFailureReason.identityMismatch)
+    }
+
+    func testTrashRelatedRequiresSnapshotWhenIdentitiesProvided() throws {
+        let (home, library) = try makeUninstallHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let url = library.appendingPathComponent("Caches/com.example.Sample", isDirectory: true)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        let other = library.appendingPathComponent("Caches/com.example.Other", isDirectory: true)
+        try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+        let identity = try XCTUnwrap(AppUninstallEligibility.capturePathIdentity(of: url))
+        let moved = AppUninstallExecutor.trashRelated(
+            [AppRelatedFileCandidate(url: other, kind: .caches, byteSize: 1)],
+            homeDirectory: home,
+            expectedIdentities: [identity],
+            trash: { $0 }
+        )
+        XCTAssertTrue(moved.trashed.isEmpty)
+        XCTAssertEqual(moved.failed.first?.reason, AppUninstallFailureReason.identityMismatch)
+    }
+
+    func testExecutorReportsPartialRelatedFailuresWithoutSilentLoss() throws {
+        let (home, library) = try makeUninstallHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let fm = FileManager.default
+        var related: [AppRelatedFileCandidate] = []
+        for name in ["Caches/com.example.Sample", "Application Support/com.example.Sample", "Logs/com.example.Sample"] {
+            let url = library.appendingPathComponent(name, isDirectory: true)
+            try fm.createDirectory(at: url, withIntermediateDirectories: true)
+            related.append(AppRelatedFileCandidate(url: url, kind: .caches, byteSize: 10))
+        }
+        let bundle = URL(fileURLWithPath: "/Applications/Sample.app")
+        var calls: [String] = []
+        let report = AppUninstallExecutor.perform(
+            bundleURL: bundle, related: related, homeDirectory: home,
+            trash: { url in
+                calls.append(url.path)
+                if url.path.contains("Application Support") {
+                    throw NSError(domain: NSCocoaErrorDomain, code: NSFileWriteNoPermissionError)
+                }
+                if url.path.contains("/Logs/") { throw FakeTrashError() }
+                return url
+            }
+        )
+        XCTAssertTrue(report.bundleTrashed)
+        XCTAssertEqual(report.outcome, .partialRelated)
+        XCTAssertEqual(report.trashedRelated.count, 1)
+        XCTAssertEqual(report.failedRelated.count, 2)
+        XCTAssertEqual(
+            Set(report.failedRelated.map(\.reason)), [.permissionDenied, .other]
+        )
+        // Every selected item was attempted: trashed + failed == selected.
+        XCTAssertEqual(report.trashedRelated.count + report.failedRelated.count, related.count)
+        XCTAssertEqual(report.failureLines.count, 2)
+        XCTAssertEqual(calls.first, bundle.path, "bundle moves first")
+    }
+
+    func testExecutorLeavesRelatedFilesUntouchedWhenBundleCannotMove() throws {
+        let (home, library) = try makeUninstallHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let url = library.appendingPathComponent("Caches/com.example.Sample", isDirectory: true)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        var calls = 0
+        let report = AppUninstallExecutor.perform(
+            bundleURL: URL(fileURLWithPath: "/Applications/Sample.app"),
+            related: [AppRelatedFileCandidate(url: url, kind: .caches, byteSize: 1)],
+            homeDirectory: home,
+            trash: { _ in
+                calls += 1
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(EACCES))
+            }
+        )
+        XCTAssertEqual(calls, 1, "related files must not be attempted after bundle failure")
+        XCTAssertEqual(report.outcome, AppUninstallOutcome.bundleFailed)
+        XCTAssertEqual(report.bundleFailure?.reason, AppUninstallFailureReason.permissionDenied)
+        XCTAssertTrue(report.trashedRelated.isEmpty)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    func testUninstallOutcomeMappingAndUndoHint() {
+        let url = URL(fileURLWithPath: "/tmp/x")
+        let fail = AppUninstallFailure(url: url, reason: .other, detail: "d")
+        XCTAssertEqual(AppUninstallReport(bundleTrashed: true, bundleFailure: nil, trashedRelated: [], failedRelated: []).outcome, .bundleOnly)
+        XCTAssertEqual(AppUninstallReport(bundleTrashed: true, bundleFailure: nil, trashedRelated: [url], failedRelated: []).outcome, .bundleAndAllRelated)
+        XCTAssertEqual(AppUninstallReport(bundleTrashed: true, bundleFailure: nil, trashedRelated: [url], failedRelated: [fail]).outcome, .partialRelated)
+        XCTAssertEqual(AppUninstallReport(bundleTrashed: false, bundleFailure: fail, trashedRelated: [], failedRelated: []).outcome, .bundleFailed)
+        XCTAssertTrue(AppUninstallReport.undoHintKey.contains("废纸篓"))
+        XCTAssertEqual(AppUninstallFailureReason.classify(NSError(domain: NSCocoaErrorDomain, code: NSFileReadNoPermissionError)), .permissionDenied)
+        XCTAssertEqual(AppUninstallFailureReason.classify(NSError(domain: NSPOSIXErrorDomain, code: Int(EPERM))), .permissionDenied)
+        XCTAssertEqual(AppUninstallFailureReason.classify(NSError(domain: NSCocoaErrorDomain, code: NSFileNoSuchFileError)), .missing)
+        let wrapped = NSError(domain: "X", code: 1, userInfo: [NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: Int(EACCES))])
+        XCTAssertEqual(AppUninstallFailureReason.classify(wrapped), .permissionDenied)
+        XCTAssertEqual(AppUninstallFailureReason.classify(FakeTrashError()), .other)
+    }
+
+    func testForgetUninstalledApplicationRemovesFolderMembershipEverywhere() {
+        let key = "bundle:com.example.Sample"
+        let other = "bundle:com.example.Other"
+        let a = UUID(), b = UUID(), c = UUID(), folderID = UUID()
+        var state = LayoutState(
+            orderedEntries: [.app(a), .folder(folderID), .app(c)],
+            folders: [folderID: LauncherFolder(id: folderID, name: "F", itemIDs: [b, c], createdAt: Date())],
+            appKeys: [a: key, b: key, c: other],
+            hiddenAppKeys: [key],
+            appAliases: [key: "别名"],
+            updatedAt: Date()
+        )
+        state = LauncherLayout.forgetUninstalledApplication(withKey: key, in: state)
+        XCTAssertFalse(state.appKeys.values.contains(key))
+        XCTAssertFalse(state.orderedEntries.contains(.app(a)))
+        XCTAssertFalse(state.folders.values.contains { $0.itemIDs.contains(b) })
+        XCTAssertTrue(state.hiddenAppKeys.isEmpty)
+        XCTAssertTrue(state.appAliases.isEmpty)
+        // The other app survives.
+        XCTAssertEqual(state.appKeys[c], other)
+        // Reconciling with a catalog that no longer has the app must not resurrect it.
+        let remaining = [AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Other.app"),
+            bundleIdentifier: "com.example.Other",
+            displayName: "Other", sourcePriority: 0, discoveredAt: Date()
+        )]
+        let reconciled = LauncherLayout.reconcile(candidates: remaining, into: state)
+        XCTAssertFalse(reconciled.appKeys.values.contains(key))
+        XCTAssertFalse(reconciled.hiddenAppKeys.contains(key))
+    }
+
+    func testUninstallBlockedWhenEditingTurnsOffOrBundleVanishesAfterConfirm() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LaunchIcon-UninstallRecheck-\(UUID().uuidString)", isDirectory: true)
+        let bundle = root.appendingPathComponent("Recheck.app", isDirectory: true)
+        try FileManager.default.createDirectory(at: bundle, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let candidate = AppCandidate(
+            canonicalURL: bundle, bundleIdentifier: "com.example.Recheck",
+            displayName: "Recheck", sourcePriority: 0, discoveredAt: Date()
+        )
+        func decide(editing: Bool) -> AppUninstallDecision {
+            AppUninstallEligibility.evaluate(
+                candidate: candidate, layoutEditingEnabled: editing,
+                selfBundleURL: nil, selfBundleIdentifier: nil, isSandboxed: false
+            )
+        }
+        XCTAssertTrue(decide(editing: true).isAllowed)
+        // Scan restarts while the sheet is up -> editing off -> re-check blocks.
+        XCTAssertEqual(decide(editing: false).blockReason, .layoutEditingDisabled)
+        XCTAssertEqual(
+            AppUninstallEligibility.menuPresentation(layoutEditingEnabled: false, decision: decide(editing: false)),
+            .disabled(explanationKey: "暂时无法整理应用，请先完成扫描")
+        )
+        // Bundle removed while the sheet is up -> re-check blocks.
+        try FileManager.default.removeItem(at: bundle)
+        XCTAssertEqual(decide(editing: true).blockReason, .missingBundle)
+    }
+
+    func testSandboxedBuildExplainsInsteadOfUninstalling() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LaunchIcon-UninstallSandbox-\(UUID().uuidString)", isDirectory: true)
+        let bundle = root.appendingPathComponent("Boxed.app", isDirectory: true)
+        try FileManager.default.createDirectory(at: bundle, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let candidate = AppCandidate(
+            canonicalURL: bundle, bundleIdentifier: "com.example.Boxed",
+            displayName: "Boxed", sourcePriority: 0, discoveredAt: Date()
+        )
+        let decision = AppUninstallEligibility.evaluate(
+            candidate: candidate, layoutEditingEnabled: true,
+            selfBundleURL: nil, selfBundleIdentifier: nil, isSandboxed: true
+        )
+        XCTAssertFalse(decision.isAllowed)
+        XCTAssertEqual(decision.blockReason, .sandboxedBuild)
+        XCTAssertEqual(decision.explanationKey, AppUninstallPlatform.sandboxedExplanationKey)
+        XCTAssertEqual(
+            AppUninstallEligibility.menuPresentation(layoutEditingEnabled: true, decision: decision),
+            .disabled(explanationKey: AppUninstallPlatform.sandboxedExplanationKey)
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: bundle.path))
+        XCTAssertTrue(AppUninstallPlatform.isSandboxed(environment: ["APP_SANDBOX_CONTAINER_ID": "com.example.Boxed"]))
+        XCTAssertFalse(AppUninstallPlatform.isSandboxed(environment: [:]))
+        XCTAssertFalse(AppUninstallPlatform.isSandboxed(environment: ["APP_SANDBOX_CONTAINER_ID": ""]))
+        XCTAssertFalse(AppUninstallPlatform.orphanCleanupAvailable(isSandboxed: true))
+        XCTAssertTrue(AppUninstallPlatform.orphanCleanupAvailable(isSandboxed: false))
+    }
+
+    func testOrphanLeftoverScannerFindsOnlyUninstalledBundleIDItems() throws {
+        let (home, library) = try makeUninstallHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let fm = FileManager.default
+        func dir(_ rel: String, bytes: Int = 0) throws {
+            let url = library.appendingPathComponent(rel, isDirectory: true)
+            try fm.createDirectory(at: url, withIntermediateDirectories: true)
+            if bytes > 0 { try Data(repeating: 1, count: bytes).write(to: url.appendingPathComponent("f.bin")) }
+        }
+        try dir("Application Support/com.gone.Old", bytes: 50_000)   // 3 components -> orphan
+        try dir("Caches/com.gone.Old", bytes: 100)
+        try dir("Saved Application State/com.gone.Old.savedState")
+        try dir("Application Support/com.keep.Present")              // installed
+        try dir("Caches/com.keep.Present.helper")                    // installed helper
+        try dir("Caches/com.keep.OtherProduct")                      // vendor shared with installed app
+        try dir("Application Support/com.apple.Safari")              // Apple
+        try dir("Application Support/Random Folder")                 // not a bundle ID
+        try dir("Application Support/gone.tiny")                     // 2 components
+        try dir("Application Support/com.running.Elsewhere")         // installed outside scan roots
+        let prefs = library.appendingPathComponent("Preferences", isDirectory: true)
+        try fm.createDirectory(at: prefs, withIntermediateDirectories: true)
+        try Data("x".utf8).write(to: prefs.appendingPathComponent("com.gone.Old.plist"))
+        // Symlink named like an orphan must never be offered.
+        let outside = home.appendingPathComponent("Documents/Keep", isDirectory: true)
+        try fm.createDirectory(at: outside, withIntermediateDirectories: true)
+        try fm.createSymbolicLink(
+            at: library.appendingPathComponent("Caches/com.gone.Linked"), withDestinationURL: outside
+        )
+
+        let found = AppOrphanLeftoverScanner.discover(
+            homeDirectory: home,
+            installedBundleIdentifiers: ["com.keep.Present"],
+            isInstalledElsewhere: { $0 == "com.running.Elsewhere" }
+        )
+        let names = found.map(\.url.lastPathComponent)
+        XCTAssertEqual(Set(names), ["com.gone.Old", "com.gone.Old.savedState", "com.gone.Old.plist"])
+        XCTAssertEqual(found.count, 4) // Application Support + Caches both named com.gone.Old
+        XCTAssertEqual(found.first?.kind, .applicationSupport, "size-descending order")
+        XCTAssertTrue(found.allSatisfy { AppRelatedFileSafety.isSafeToTrash($0.url, homeDirectory: home) })
+        XCTAssertEqual(AppRelatedFileScanner.selectedByteTotal(of: found), found.reduce(0) { $0 + ($1.byteSize ?? 0) })
+        // Empty installed set must not widen to Apple / short IDs.
+        let all = AppOrphanLeftoverScanner.discover(homeDirectory: home, installedBundleIdentifiers: [])
+        XCTAssertFalse(all.contains { $0.url.lastPathComponent.contains("apple") })
+        XCTAssertFalse(all.contains { $0.url.lastPathComponent == "gone.tiny" })
+        XCTAssertNil(AppOrphanLeftoverScanner.candidateOrphanBundleID("com.apple.Safari"))
+        XCTAssertNil(AppOrphanLeftoverScanner.candidateOrphanBundleID("group.com.foo.bar"))
+        XCTAssertNil(AppOrphanLeftoverScanner.candidateOrphanBundleID("../com.foo.bar"))
+    }
+
+    func testRelatedAndOrphanScannersDoNotSizeContainerContents() throws {
+        let (home, library) = try makeUninstallHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let container = library.appendingPathComponent("Containers/com.example.Sample", isDirectory: true)
+        let group = library.appendingPathComponent("Group Containers/TEAM.com.example.Sample", isDirectory: true)
+        try FileManager.default.createDirectory(at: container, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: group, withIntermediateDirectories: true)
+        try Data(repeating: 1, count: 4096).write(to: container.appendingPathComponent("private.bin"))
+        try Data(repeating: 1, count: 2048).write(to: group.appendingPathComponent("private.bin"))
+
+        let candidate = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Sample.app"),
+            bundleIdentifier: "com.example.Sample", displayName: "Sample",
+            sourcePriority: 0, discoveredAt: Date()
+        )
+        let related = AppRelatedFileScanner.discover(candidate: candidate, homeDirectory: home)
+        XCTAssertNotNil(related.first(where: { $0.kind == .containers }))
+        XCTAssertNotNil(related.first(where: { $0.kind == .groupContainers }))
+        XCTAssertNil(related.first(where: { $0.kind == .containers })?.byteSize)
+        XCTAssertNil(related.first(where: { $0.kind == .groupContainers })?.byteSize)
+
+        let orphans = AppOrphanLeftoverScanner.discover(homeDirectory: home, installedBundleIdentifiers: [])
+        XCTAssertNotNil(orphans.first(where: { $0.kind == .containers }))
+        XCTAssertNil(orphans.first(where: { $0.kind == .containers })?.byteSize)
+    }
+
+    func testOrphanLeftoverScannerStopsWhenCancelled() throws {
+        let (home, library) = try makeUninstallHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(
+            at: library.appendingPathComponent("Application Support/com.example.Sample", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        var checks = 0
+        let found = AppOrphanLeftoverScanner.discover(
+            homeDirectory: home,
+            installedBundleIdentifiers: [],
+            isCancelled: {
+                checks += 1
+                return checks >= 2
+            }
+        )
+        XCTAssertTrue(found.isEmpty)
+        XCTAssertGreaterThanOrEqual(checks, 2)
+    }
+
+    func testRelatedFileScannerStopsWhenCancelled() throws {
+        let (home, library) = try makeUninstallHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(
+            at: library.appendingPathComponent("Application Support/com.example.Sample", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        let candidate = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Sample.app"),
+            bundleIdentifier: "com.example.Sample", displayName: "Sample",
+            sourcePriority: 0, discoveredAt: Date()
+        )
+        var checks = 0
+        let found = AppRelatedFileScanner.discover(
+            candidate: candidate, homeDirectory: home,
+            isCancelled: {
+                checks += 1
+                return checks >= 2
+            }
+        )
+        XCTAssertTrue(found.isEmpty)
+        XCTAssertGreaterThanOrEqual(checks, 2)
+    }
+
+    func testOrphanRecheckExcludesAppInstalledAfterInitialDiscovery() async throws {
+        let (home, library) = try makeUninstallHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let leftover = library.appendingPathComponent("Application Support/com.example.Returned", isDirectory: true)
+        try FileManager.default.createDirectory(at: leftover, withIntermediateDirectories: true)
+        let initial = AppOrphanLeftoverScanner.discover(
+            homeDirectory: home, installedBundleIdentifiers: []
+        )
+        XCTAssertEqual(initial.map(\.url), [leftover])
+
+        let appRoot = home.appendingPathComponent("Applications", isDirectory: true)
+        let contents = appRoot.appendingPathComponent("Returned.app/Contents", isDirectory: true)
+        try FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)
+        let plist = ["CFBundleIdentifier": "com.example.Returned", "CFBundleName": "Returned"]
+        let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+        try data.write(to: contents.appendingPathComponent("Info.plist"))
+
+        let currentCatalog = await AppCatalogScanner().scan(roots: [appRoot])
+        XCTAssertTrue(currentCatalog.canPersistReconciledLayout)
+        let installedIDs = Set(currentCatalog.candidates.compactMap(\.bundleIdentifier))
+        let rechecked = AppOrphanLeftoverScanner.discover(
+            homeDirectory: home, installedBundleIdentifiers: installedIDs
+        )
+        XCTAssertTrue(rechecked.isEmpty)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: leftover.path))
+    }
+
+    func testAppRelatedFileScannerOrdersByDescendingSize() throws {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LaunchIcon-RelatedSizeOrder-\(UUID().uuidString)", isDirectory: true)
+        let library = home.appendingPathComponent("Library", isDirectory: true)
+        let support = library.appendingPathComponent("Application Support/com.example.Sample", isDirectory: true)
+        let prefs = library.appendingPathComponent("Preferences/com.example.Sample.plist", isDirectory: false)
+        let caches = library.appendingPathComponent("Caches/com.example.Sample", isDirectory: true)
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: caches, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: prefs.deletingLastPathComponent(), withIntermediateDirectories: true)
+        // Small prefs vs larger support payload so size-desc order is deterministic.
+        try Data(repeating: 1, count: 32).write(to: prefs)
+        try Data(repeating: 2, count: 120_000).write(to: support.appendingPathComponent("payload.bin"))
+        try Data(repeating: 3, count: 4_000).write(to: caches.appendingPathComponent("cache.bin"))
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let candidate = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Sample.app"),
+            bundleIdentifier: "com.example.Sample",
+            displayName: "Sample",
+            sourcePriority: 0,
+            discoveredAt: Date()
+        )
+        let found = AppRelatedFileScanner.discover(candidate: candidate, homeDirectory: home)
+        XCTAssertEqual(found.count, 3)
+        let sizes = found.map { $0.byteSize ?? 0 }
+        XCTAssertEqual(sizes, sizes.sorted(by: >), "discover should return size-descending order")
+        XCTAssertEqual(found.first?.kind, .applicationSupport)
+        XCTAssertEqual(found.last?.kind, .preferences)
+        XCTAssertEqual(
+            AppRelatedFileScanner.selectedByteTotal(of: found),
+            sizes.reduce(0, +)
+        )
+        XCTAssertEqual(AppRelatedFileScanner.selectedByteTotal(of: Array(found.dropFirst())), sizes.dropFirst().reduce(0, +))
+    }
+
+    func testAppRelatedFileScannerFindsUserLaunchAgentByBundleID() throws {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LaunchIcon-RelatedAgents-\(UUID().uuidString)", isDirectory: true)
+        let agents = home.appendingPathComponent("Library/LaunchAgents", isDirectory: true)
+        try FileManager.default.createDirectory(at: agents, withIntermediateDirectories: true)
+        let plist = agents.appendingPathComponent("com.example.Sample.helper.plist")
+        try Data("<?=xml?>".utf8).write(to: plist)
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let candidate = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Sample.app"),
+            bundleIdentifier: "com.example.Sample",
+            displayName: "Sample",
+            sourcePriority: 0,
+            discoveredAt: Date()
+        )
+        let found = AppRelatedFileScanner.discover(candidate: candidate, homeDirectory: home)
+        XCTAssertTrue(found.contains(where: { $0.kind == .launchAgents }))
+        XCTAssertEqual(AppRelatedFileScanner.formatByteSize(nil), "—")
+        XCTAssertFalse(AppRelatedFileScanner.formatByteSize(2_000_000).isEmpty)
+    }
+
+    func testAppUninstallRunningMatchUsesBundleIDOrPath() {
+        let candidate = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Sample.app"),
+            bundleIdentifier: "com.example.Sample",
+            displayName: "Sample",
+            sourcePriority: 0,
+            discoveredAt: Date()
+        )
+        XCTAssertTrue(
+            AppRelatedFileScanner.isRunning(
+                candidate: candidate,
+                runningBundleIdentifiers: ["com.example.Sample"],
+                runningBundlePaths: []
+            )
+        )
+        XCTAssertTrue(
+            AppRelatedFileScanner.isRunning(
+                candidate: candidate,
+                runningBundleIdentifiers: [],
+                runningBundlePaths: ["/Applications/Sample.app"]
+            )
+        )
+        XCTAssertFalse(
+            AppRelatedFileScanner.isRunning(
+                candidate: candidate,
+                runningBundleIdentifiers: ["com.other"],
+                runningBundlePaths: ["/Applications/Other.app"]
+            )
+        )
+    }
+
+
+
 
     func testDragLiftScalesTheSourceAndReservesShadowUnlessMotionIsReduced() {
         let source = CGSize(width: 100, height: 120)
@@ -4315,6 +6333,863 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertEqual(LauncherLayout.pageToRestore(currentPage: -2, inFlightPage: nil, queuedPage: nil, pageCount: 3), 0)
     }
 
+    func testFlyerSlideAnimationKeyIsDistinctFromPageHostKeys() {
+        XCTAssertEqual(LauncherLayout.flyerSlideAnimationKey, "flyer-slide")
+        XCTAssertNotEqual(
+            LauncherLayout.flyerSlideAnimationKey,
+            LauncherLayout.pageHostSlideAnimationKey
+        )
+        XCTAssertNotEqual(
+            LauncherLayout.flyerSlideAnimationKey,
+            LauncherLayout.pageHostFadeAnimationKey
+        )
+    }
+
+    func testPageHostSlideAnimationKeyIsDistinctFromFade() {
+        XCTAssertEqual(LauncherLayout.pageHostFadeAnimationKey, "page-host-fade")
+        XCTAssertEqual(LauncherLayout.pageHostSlideAnimationKey, "page-host-slide")
+        XCTAssertNotEqual(
+            LauncherLayout.pageHostFadeAnimationKey,
+            LauncherLayout.pageHostSlideAnimationKey
+        )
+    }
+
+    func testFolderTitleStaysHiddenUntilChromeLands() {
+        XCTAssertTrue(
+            LauncherLayout.folderTitlePointerEditingAvailable(
+                isAnimatingClose: false,
+                panelAnimationKeys: []
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.folderTitlePointerEditingAvailable(
+                isAnimatingClose: true,
+                panelAnimationKeys: []
+            )
+        )
+        // Scale flight (full motion) and fade-only (reduced motion) both block.
+        for key in ["folderOpenScale", "folderCloseScale", "folderOpenFade", "folderCloseFade"] {
+            XCTAssertFalse(
+                LauncherLayout.folderTitlePointerEditingAvailable(
+                    isAnimatingClose: false,
+                    panelAnimationKeys: [key]
+                ),
+                key
+            )
+        }
+        XCTAssertTrue(
+            LauncherLayout.folderTitlePointerEditingAvailable(
+                isAnimatingClose: false,
+                panelAnimationKeys: ["unrelated"]
+            )
+        )
+        // AX: keyboard editor stays exposed; idle title waits for chrome.
+        XCTAssertFalse(
+            LauncherLayout.folderTitleAccessibilityHidden(
+                baseHidden: false,
+                hasFieldEditor: true,
+                pointerEditingAvailable: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.folderTitleAccessibilityHidden(
+                baseHidden: false,
+                hasFieldEditor: false,
+                pointerEditingAvailable: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.folderTitleAccessibilityHidden(
+                baseHidden: false,
+                hasFieldEditor: false,
+                pointerEditingAvailable: true
+            )
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderTitleBlockingChromeAnimationKeys,
+            Set(["folderOpenScale", "folderCloseScale", "folderOpenFade", "folderCloseFade"])
+        )
+    }
+
+    func testFolderTitleKeyboardFocusWaitsForChrome() {
+        XCTAssertFalse(
+            LauncherLayout.folderTitleKeyboardFocusAvailable(
+                hasFieldEditor: false,
+                pointerEditingAvailable: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.folderTitleKeyboardFocusAvailable(
+                hasFieldEditor: false,
+                pointerEditingAvailable: true
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.folderTitleKeyboardFocusAvailable(
+                hasFieldEditor: true,
+                pointerEditingAvailable: false
+            )
+        )
+    }
+
+
+    func testFolderMemberFocusFillWaitsForPanelChrome() {
+        XCTAssertTrue(
+            LauncherLayout.folderPanelChromeInFlight(
+                isAnimatingClose: false,
+                panelAnimationKeys: ["folderOpenFade"]
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.folderPanelChromeInFlight(
+                isAnimatingClose: false,
+                panelAnimationKeys: ["folderOpenScale"]
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.folderPanelChromeInFlight(
+                isAnimatingClose: true,
+                panelAnimationKeys: []
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.folderPanelChromeInFlight(
+                isAnimatingClose: false,
+                panelAnimationKeys: ["folderOpenCorner"]
+            )
+        )
+        XCTAssertEqual(
+            LauncherLayout.tileChromeFillAlpha(
+                isLaunching: false,
+                isDropTarget: false,
+                focused: true,
+                folderPanelChromeInFlight: true
+            ),
+            0,
+            accuracy: 0.0001
+        )
+        XCTAssertEqual(
+            LauncherLayout.tileChromeFillAlpha(
+                isLaunching: false,
+                isDropTarget: false,
+                focused: true,
+                folderPanelChromeInFlight: false
+            ),
+            LauncherLayout.tileChromeFocusAlpha,
+            accuracy: 0.0001
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderOpenFocusHandoff(owner: .outsideOverlay),
+            .focusFirstMember
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderOpenFocusHandoff(owner: .otherOverlayChrome),
+            .focusFirstMember
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderOpenFocusHandoff(owner: .memberTile),
+            .refreshMemberChrome
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderOpenFocusHandoff(owner: .titleOrClose),
+            .preserveControl
+        )
+        XCTAssertTrue(
+            LauncherLayout.folderCloseShouldRestoreGridFocusOnChromeLand(
+                restoreFocusRequested: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.folderCloseShouldRestoreGridFocusOnChromeLand(
+                restoreFocusRequested: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.folderOverlayKeyboardFocusAvailable(panelChromeInFlight: true)
+        )
+        XCTAssertTrue(
+            LauncherLayout.folderOverlayKeyboardFocusAvailable(panelChromeInFlight: false)
+        )
+        XCTAssertFalse(
+            LauncherLayout.folderOverlayKeyViewsShouldIncludeControls(isAnimatingClose: true)
+        )
+        XCTAssertTrue(
+            LauncherLayout.folderOverlayKeyViewsShouldIncludeControls(isAnimatingClose: false)
+        )
+    }
+
+
+
+    func testFolderEmptyFocusesTitleNotEmptyCollection() {
+        XCTAssertTrue(LauncherLayout.folderOpenEmptyFocusesTitle(memberCount: 0))
+        XCTAssertFalse(LauncherLayout.folderOpenEmptyFocusesTitle(memberCount: 1))
+        XCTAssertFalse(LauncherLayout.folderOpenEmptyFocusesTitle(memberCount: 8))
+        XCTAssertEqual(
+            LauncherLayout.folderTitleEndFocusTarget(memberCount: 3),
+            .firstMember
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderTitleEndFocusTarget(memberCount: 0),
+            .title
+        )
+        // Non-empty open handoff unchanged.
+        XCTAssertEqual(
+            LauncherLayout.folderOpenFocusHandoff(owner: .outsideOverlay),
+            .focusFirstMember
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderOpenFocusHandoff(owner: .titleOrClose),
+            .preserveControl
+        )
+        XCTAssertTrue(LauncherLayout.folderTitleFocusesFirstMemberAfterEndingEdit)
+    }
+
+
+
+
+    func testSearchAdjacentChromeRestoreParityWithStatus() {
+        XCTAssertEqual(
+            LauncherLayout.searchAdjacentChromeShouldRestoreOpacityWhenAlreadyShown(
+                currentlyHidden: false,
+                currentOpacity: 0.2
+            ),
+            LauncherLayout.statusChromeShouldRestoreOpacityWhenAlreadyShown(
+                currentlyHidden: false,
+                currentOpacity: 0.2
+            )
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchAdjacentChromeShouldClearOpacityBeforeUnhide(
+                willShow: true,
+                currentlyHidden: true
+            ),
+            LauncherLayout.statusChromeShouldClearOpacityBeforeUnhide(
+                willShow: true,
+                currentlyHidden: true
+            )
+        )
+        XCTAssertNotEqual(
+            LauncherLayout.searchAdjacentChromeFadeAnimationKey,
+            LauncherLayout.statusChromeFadeAnimationKey
+        )
+        XCTAssertFalse(
+            LauncherLayout.searchAdjacentChromeShouldShow(folderOpen: true, folderClosing: false)
+        )
+        XCTAssertTrue(
+            LauncherLayout.searchAdjacentChromeShouldShow(folderOpen: false, folderClosing: false)
+        )
+    }
+
+    func testSettingsPresenceOpacityGatesAndFocusPolicy() {
+        XCTAssertTrue(
+            LauncherLayout.settingsPresenceShouldClearOpacityBeforeUnhide(
+                willShow: true,
+                currentlyVisible: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.settingsPresenceShouldClearOpacityBeforeUnhide(
+                willShow: true,
+                currentlyVisible: true
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.settingsPresenceShouldRestoreOpacityWhenAlreadyShown(
+                currentlyVisible: true,
+                currentOpacity: 0.2
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.settingsPresenceShouldRestoreOpacityWhenAlreadyShown(
+                currentlyVisible: true,
+                currentOpacity: 1.0
+            )
+        )
+        // Already key + visible → do not re-activate (focus steal guard).
+        XCTAssertFalse(
+            LauncherLayout.settingsPresenceShouldBecomeKeyOnShow(
+                currentlyVisible: true,
+                isKeyWindow: true
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.settingsPresenceShouldBecomeKeyOnShow(
+                currentlyVisible: false,
+                isKeyWindow: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.settingsPresenceShouldBecomeKeyOnShow(
+                currentlyVisible: true,
+                isKeyWindow: false
+            )
+        )
+        XCTAssertEqual(
+            LauncherLayout.settingsPresenceFadeFromOpacity(
+                appearing: true,
+                presentedOpacity: 0.4,
+                modelOpacity: 0.4
+            ),
+            0
+        )
+        XCTAssertEqual(
+            LauncherLayout.settingsPresenceFadeFromOpacity(
+                appearing: false,
+                presentedOpacity: 0.35,
+                modelOpacity: 0
+            ),
+            0.35
+        )
+        XCTAssertEqual(
+            LauncherLayout.settingsPresenceFadeDuration,
+            LauncherLayout.searchTransitionDuration
+        )
+    }
+
+    func testSettingsMessageRestoresInterruptedFadeWhenAlreadyShown() {
+        XCTAssertTrue(
+            LauncherLayout.settingsMessageShouldRestoreOpacityWhenAlreadyShown(
+                currentlyHidden: false,
+                currentOpacity: 0.12
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.settingsMessageShouldRestoreOpacityWhenAlreadyShown(
+                currentlyHidden: false,
+                currentOpacity: 0.98
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.settingsMessageShouldRestoreOpacityWhenAlreadyShown(
+                currentlyHidden: false,
+                currentOpacity: 0.99
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.settingsMessageShouldRestoreOpacityWhenAlreadyShown(
+                currentlyHidden: true,
+                currentOpacity: 0.0
+            )
+        )
+        // Parity with status chrome restore gate.
+        XCTAssertEqual(
+            LauncherLayout.settingsMessageShouldRestoreOpacityWhenAlreadyShown(
+                currentlyHidden: false,
+                currentOpacity: 0.4
+            ),
+            LauncherLayout.statusChromeShouldRestoreOpacityWhenAlreadyShown(
+                currentlyHidden: false,
+                currentOpacity: 0.4
+            )
+        )
+    }
+
+    func testSettingsMessageRevealClearsOpacityBeforeUnhide() {
+        XCTAssertTrue(LauncherLayout.settingsMessageShouldShow(text: "重新扫描完成"))
+        XCTAssertFalse(LauncherLayout.settingsMessageShouldShow(text: ""))
+        XCTAssertTrue(
+            LauncherLayout.settingsMessageShouldClearOpacityBeforeUnhide(
+                willShow: true,
+                currentlyHidden: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.settingsMessageShouldClearOpacityBeforeUnhide(
+                willShow: true,
+                currentlyHidden: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.settingsMessageShouldClearOpacityBeforeUnhide(
+                willShow: false,
+                currentlyHidden: true
+            )
+        )
+        XCTAssertEqual(
+            LauncherLayout.settingsMessageFadeDuration,
+            LauncherLayout.searchTransitionDuration,
+            accuracy: 0.0001
+        )
+        XCTAssertFalse(LauncherLayout.settingsMessageFadeAnimationKey.isEmpty)
+        XCTAssertTrue(
+            LauncherLayout.settingsMessageFadeShouldApply(generation: 3, expected: 3)
+        )
+        XCTAssertFalse(
+            LauncherLayout.settingsMessageFadeShouldApply(generation: 4, expected: 3)
+        )
+    }
+
+
+    func testSearchAdjacentChromeQuietWhileFolderChrome() {
+        XCTAssertTrue(
+            LauncherLayout.searchAdjacentChromeShouldShow(
+                folderOpen: false,
+                folderClosing: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.searchAdjacentChromeShouldShow(
+                folderOpen: true,
+                folderClosing: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.searchAdjacentChromeShouldShow(
+                folderOpen: false,
+                folderClosing: true
+            )
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchCountLabelKind(
+                isSearching: true,
+                folderOpen: false,
+                folderClosing: false
+            ),
+            .results
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchCountLabelKind(
+                isSearching: false,
+                folderOpen: false,
+                folderClosing: false
+            ),
+            .items
+        )
+        XCTAssertNil(
+            LauncherLayout.searchCountLabelKind(
+                isSearching: true,
+                folderOpen: true,
+                folderClosing: false
+            )
+        )
+        XCTAssertNil(
+            LauncherLayout.searchCountLabelKind(
+                isSearching: false,
+                folderOpen: false,
+                folderClosing: true
+            )
+        )
+    }
+
+    func testStatusChromeCrossfadesTextWhenAlreadyVisible() {
+        XCTAssertTrue(
+            LauncherLayout.statusChromeShouldCrossfadeText(
+                willShow: true,
+                currentlyHidden: false,
+                textChanging: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.statusChromeShouldCrossfadeText(
+                willShow: true,
+                currentlyHidden: true,
+                textChanging: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.statusChromeShouldCrossfadeText(
+                willShow: true,
+                currentlyHidden: false,
+                textChanging: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.statusChromeShouldCrossfadeText(
+                willShow: false,
+                currentlyHidden: false,
+                textChanging: true
+            )
+        )
+        // Reduced motion / dismiss / snappy: snap copy, do not crossfade.
+        XCTAssertFalse(
+            LauncherLayout.statusChromeShouldCrossfadeText(
+                willShow: true,
+                currentlyHidden: false,
+                textChanging: true,
+                animated: false
+            )
+        )
+        XCTAssertEqual(
+            LauncherLayout.statusChromeLabeledTextToShow(show: true, text: "只读说明"),
+            "只读说明"
+        )
+        XCTAssertNil(LauncherLayout.statusChromeLabeledTextToShow(show: true, text: "   "))
+        XCTAssertNil(LauncherLayout.statusChromeLabeledTextToShow(show: false, text: "只读说明"))
+    }
+
+    func testHideApplicationToastAndFocusHandoff() {
+        XCTAssertEqual(
+            LauncherLayout.hideApplicationToastMessage(displayName: "计算器"),
+            "已隐藏“计算器”"
+        )
+        XCTAssertTrue(LauncherLayout.hideApplicationToastHelpKey.contains("隐藏的应用"))
+        let a = UUID()
+        let b = UUID()
+        let c = UUID()
+        XCTAssertEqual(
+            LauncherLayout.focusItemIDAfterHiding(
+                hiddenID: b,
+                remainingIDs: [a, c],
+                previousOrderedIDs: [a, b, c]
+            ),
+            c
+        )
+        XCTAssertEqual(
+            LauncherLayout.focusItemIDAfterHiding(
+                hiddenID: c,
+                remainingIDs: [a, b],
+                previousOrderedIDs: [a, b, c]
+            ),
+            b
+        )
+        XCTAssertNil(
+            LauncherLayout.focusItemIDAfterHiding(
+                hiddenID: a,
+                remainingIDs: [],
+                previousOrderedIDs: [a]
+            )
+        )
+    }
+
+    func testToastAnnouncementDedupesRepeatsAndQuitProgressKeys() {
+        XCTAssertTrue(
+            LauncherLayout.toastShouldAnnounce(
+                message: "正在退出应用…",
+                previousAnnounced: "",
+                toastWasHidden: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.toastShouldAnnounce(
+                message: "正在退出应用…",
+                previousAnnounced: "正在退出应用…",
+                toastWasHidden: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.toastShouldAnnounce(
+                message: "正在退出应用…",
+                previousAnnounced: "正在退出应用…",
+                toastWasHidden: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.toastShouldAnnounce(
+                message: "   ",
+                previousAnnounced: "",
+                toastWasHidden: true
+            )
+        )
+        XCTAssertTrue(LauncherLayout.toastAnnouncementPriority(autoDismiss: true))
+        XCTAssertFalse(LauncherLayout.toastAnnouncementPriority(autoDismiss: false))
+        XCTAssertEqual(AppUninstallQuitProgress.quittingMessageKey, "正在退出应用…")
+        XCTAssertFalse(AppUninstallQuitProgress.quittingAccessibilityHelpKey.isEmpty)
+    }
+
+    func testUninstallForceQuitAlertCancelFirstAndAccessibilityKeys() {
+        XCTAssertTrue(AppUninstallForceQuitAlert.cancelIsFirstButton)
+        XCTAssertTrue(AppUninstallForceQuitAlert.restoresLauncherFocusAfterSheet)
+        XCTAssertEqual(AppUninstallForceQuitAlert.messageTextKey, "应用仍在运行")
+        XCTAssertEqual(AppUninstallForceQuitAlert.confirmButtonTitleKey, "强制退出并卸载")
+        XCTAssertFalse(AppUninstallForceQuitAlert.confirmAccessibilityHelpKey.isEmpty)
+        XCTAssertFalse(AppUninstallForceQuitAlert.cancelAccessibilityHelpKey.isEmpty)
+        XCTAssertTrue(
+            AppUninstallForceQuitAlert.informativeTextKey.contains("强制退出")
+        )
+    }
+
+    func testSettingsAccessibilityAndKeyboardPolicy() {
+        XCTAssertTrue(LauncherLayout.settingsMessageShouldAnnounce(text: "重新扫描完成", previous: ""))
+        XCTAssertFalse(LauncherLayout.settingsMessageShouldAnnounce(text: "重新扫描完成", previous: "重新扫描完成"))
+        XCTAssertFalse(LauncherLayout.settingsMessageShouldAnnounce(text: "", previous: "旧"))
+        XCTAssertTrue(LauncherLayout.settingsShouldMoveFocusAfterRestore(remainingHidden: 0))
+        XCTAssertFalse(LauncherLayout.settingsShouldMoveFocusAfterRestore(remainingHidden: 2))
+        XCTAssertTrue(LauncherLayout.settingsEscapeClosesWindow)
+    }
+
+    func testStatusChromeClearsOpacityBeforeUnhideAndRestoresWhenInterrupted() {
+        XCTAssertTrue(
+            LauncherLayout.statusChromeShouldClearOpacityBeforeUnhide(
+                willShow: true,
+                currentlyHidden: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.statusChromeShouldClearOpacityBeforeUnhide(
+                willShow: true,
+                currentlyHidden: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.statusChromeShouldClearOpacityBeforeUnhide(
+                willShow: false,
+                currentlyHidden: true
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.statusChromeShouldRestoreOpacityWhenAlreadyShown(
+                currentlyHidden: false,
+                currentOpacity: 0.2
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.statusChromeShouldRestoreOpacityWhenAlreadyShown(
+                currentlyHidden: false,
+                currentOpacity: 1
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.statusChromeShouldRestoreOpacityWhenAlreadyShown(
+                currentlyHidden: true,
+                currentOpacity: 0
+            )
+        )
+    }
+
+    func testFooterNavigationClearsOpacityBeforeUnhide() {
+        XCTAssertTrue(
+            LauncherLayout.footerNavigationShouldClearOpacityBeforeUnhide(
+                isHidden: true,
+                textChanging: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.footerNavigationShouldClearOpacityBeforeUnhide(
+                isHidden: false,
+                textChanging: true
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.footerNavigationShouldSnapUnhide(
+                isHidden: true,
+                textChanging: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.footerNavigationShouldRestoreOpacityWhenTextUnchanged(
+                isHidden: false, textChanging: false, currentOpacity: 0
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.footerNavigationShouldRestoreOpacityWhenTextUnchanged(
+                isHidden: false, textChanging: false, currentOpacity: 1
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.footerNavigationShouldRestoreOpacityWhenTextUnchanged(
+                isHidden: false, textChanging: true, currentOpacity: 0
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.footerNavigationShouldRestoreOpacityWhenTextUnchanged(
+                isHidden: true, textChanging: false, currentOpacity: 0
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.footerNavigationShouldSnapUnhide(
+                isHidden: true,
+                textChanging: true
+            )
+        )
+    }
+
+    func testFooterHintVisibilityFollowsSearchAndFolder() {
+        XCTAssertTrue(
+            LauncherLayout.footerDragHintShouldShow(
+                isSearching: false,
+                folderOpen: false,
+                isLayoutEditingEnabled: true,
+                hasEntries: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.footerDragHintShouldShow(
+                isSearching: true,
+                folderOpen: false,
+                isLayoutEditingEnabled: true,
+                hasEntries: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.footerDragHintShouldShow(
+                isSearching: false,
+                folderOpen: true,
+                isLayoutEditingEnabled: true,
+                hasEntries: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.footerDragHintShouldShow(
+                isSearching: false,
+                folderOpen: false,
+                isLayoutEditingEnabled: false,
+                hasEntries: true
+            )
+        )
+        XCTAssertTrue(LauncherLayout.footerChromeShouldShow(folderOpen: false))
+        XCTAssertFalse(LauncherLayout.footerChromeShouldShow(folderOpen: true))
+        XCTAssertEqual(LauncherLayout.footerHintFadeAnimationKey, "footer-hint-fade")
+    }
+
+    func testPageArrowVisibilityFadesWithSearchChromeClock() {
+        XCTAssertTrue(
+            LauncherLayout.pageArrowShouldShow(hasMultiplePages: true, atUnavailableEdge: false)
+        )
+        XCTAssertFalse(
+            LauncherLayout.pageArrowShouldShow(hasMultiplePages: true, atUnavailableEdge: true)
+        )
+        XCTAssertFalse(
+            LauncherLayout.pageArrowShouldShow(hasMultiplePages: false, atUnavailableEdge: false)
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldAnimatePageArrowVisibility(
+                shouldShow: false,
+                currentlyShown: true,
+                reducesMotion: false,
+                holdsForLauncherFade: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldAnimatePageArrowVisibility(
+                shouldShow: false,
+                currentlyShown: true,
+                reducesMotion: true,
+                holdsForLauncherFade: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldAnimatePageArrowVisibility(
+                shouldShow: true,
+                currentlyShown: true,
+                reducesMotion: false,
+                holdsForLauncherFade: false
+            )
+        )
+        XCTAssertEqual(LauncherLayout.pageArrowPresenceAnimationKey, "page-arrow-presence")
+        // Shared gate matches indicator policy.
+        XCTAssertEqual(
+            LauncherLayout.shouldAnimatePagingChromeVisibility(
+                shouldShow: false,
+                currentlyShown: true,
+                reducesMotion: false,
+                holdsForLauncherFade: false
+            ),
+            LauncherLayout.shouldAnimatePageIndicatorVisibility(
+                pageCount: 0,
+                currentlyShown: true,
+                reducesMotion: false,
+                holdsForLauncherFade: false
+            )
+        )
+    }
+
+    func testPageIndicatorVisibilityFadesWithSearchChromeClock() {
+        XCTAssertTrue(LauncherLayout.pageIndicatorShouldShow(pageCount: 2))
+        XCTAssertTrue(LauncherLayout.pageIndicatorShouldShow(pageCount: 9))
+        XCTAssertFalse(LauncherLayout.pageIndicatorShouldShow(pageCount: 1))
+        XCTAssertFalse(LauncherLayout.pageIndicatorShouldShow(pageCount: 0))
+        // Entering search (0 pages) while dots are shown animates.
+        XCTAssertTrue(
+            LauncherLayout.shouldAnimatePageIndicatorVisibility(
+                pageCount: 0,
+                currentlyShown: true,
+                reducesMotion: false,
+                holdsForLauncherFade: false
+            )
+        )
+        // Leaving search back to multiple pages animates.
+        XCTAssertTrue(
+            LauncherLayout.shouldAnimatePageIndicatorVisibility(
+                pageCount: 3,
+                currentlyShown: false,
+                reducesMotion: false,
+                holdsForLauncherFade: false
+            )
+        )
+        // Reduced motion and launcher-fade hold snap.
+        XCTAssertFalse(
+            LauncherLayout.shouldAnimatePageIndicatorVisibility(
+                pageCount: 0,
+                currentlyShown: true,
+                reducesMotion: true,
+                holdsForLauncherFade: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldAnimatePageIndicatorVisibility(
+                pageCount: 0,
+                currentlyShown: true,
+                reducesMotion: false,
+                holdsForLauncherFade: true
+            )
+        )
+        // No-op when visibility is already correct.
+        XCTAssertFalse(
+            LauncherLayout.shouldAnimatePageIndicatorVisibility(
+                pageCount: 3,
+                currentlyShown: true,
+                reducesMotion: false,
+                holdsForLauncherFade: false
+            )
+        )
+        XCTAssertEqual(LauncherLayout.pageIndicatorFadeAnimationKey, "page-indicator-fade")
+        XCTAssertEqual(LauncherLayout.searchTransitionDuration, 0.12, accuracy: 0.0001)
+    }
+
+    func testSearchSectionHorizontalInsetCentersShortRows() {
+        let itemWidth: CGFloat = 100
+        let spacing: CGFloat = 12
+        let viewport: CGFloat = 800
+        // One result: centered under the search field.
+        let one = LauncherLayout.searchSectionHorizontalInset(
+            itemCount: 1,
+            itemWidth: itemWidth,
+            interitemSpacing: spacing,
+            viewportWidth: viewport
+        )
+        XCTAssertEqual(one, floor((viewport - itemWidth) / 2), accuracy: 0.001)
+        // Four of seven: same centering math.
+        let fourWidth = 4 * itemWidth + 3 * spacing
+        let four = LauncherLayout.searchSectionHorizontalInset(
+            itemCount: 4,
+            itemWidth: itemWidth,
+            interitemSpacing: spacing,
+            viewportWidth: viewport
+        )
+        XCTAssertEqual(four, floor((viewport - fourWidth) / 2), accuracy: 0.001)
+        // Full row and denser lists keep the minimum inset.
+        XCTAssertEqual(
+            LauncherLayout.searchSectionHorizontalInset(
+                itemCount: LauncherLayout.pageColumns,
+                itemWidth: itemWidth,
+                interitemSpacing: spacing,
+                viewportWidth: viewport
+            ),
+            8,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchSectionHorizontalInset(
+                itemCount: 0,
+                itemWidth: itemWidth,
+                interitemSpacing: spacing,
+                viewportWidth: viewport
+            ),
+            8,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchSectionHorizontalInset(
+                itemCount: 8,
+                itemWidth: itemWidth,
+                interitemSpacing: spacing,
+                viewportWidth: viewport
+            ),
+            8,
+            accuracy: 0.001
+        )
+    }
+
     func testClampedScrollOffsetStaysInsideAShorterDocument() {
         XCTAssertEqual(LauncherLayout.clampedScrollOffset(500, documentLength: 400, viewportLength: 100), 300)
         XCTAssertEqual(LauncherLayout.clampedScrollOffset(40, documentLength: 400, viewportLength: 100), 40)
@@ -4613,6 +7488,83 @@ final class LaunchIconCoreTests: XCTestCase {
         )
     }
 
+    func testFolderCloseGridFocusPrefersFolderThenDissolvedNeighbor() {
+        let folderID = UUID()
+        let kept = UUID()
+        let neighbor = UUID()
+        // Esc / dimmer: folder still present → folder tile.
+        XCTAssertEqual(
+            LauncherLayout.folderCloseGridFocusID(
+                pendingFolderID: folderID,
+                previousEntries: [.app(neighbor), .folder(folderID)],
+                currentEntries: [.app(neighbor), .folder(folderID)]
+            ),
+            folderID
+        )
+        // Dissolved empty folder (nothing took the slot) → previous neighbor.
+        XCTAssertEqual(
+            LauncherLayout.folderCloseGridFocusID(
+                pendingFolderID: folderID,
+                previousEntries: [.app(neighbor), .folder(folderID)],
+                currentEntries: [.app(neighbor)]
+            ),
+            neighbor
+        )
+        // Dissolved with member keeping the slot.
+        XCTAssertEqual(
+            LauncherLayout.folderCloseGridFocusID(
+                pendingFolderID: folderID,
+                previousEntries: [.app(neighbor), .folder(folderID)],
+                currentEntries: [.app(neighbor), .app(kept)]
+            ),
+            kept
+        )
+        // Empty grid after dissolve → nil.
+        XCTAssertNil(
+            LauncherLayout.folderCloseGridFocusID(
+                pendingFolderID: folderID,
+                previousEntries: [.folder(folderID)],
+                currentEntries: []
+            )
+        )
+    }
+
+
+    func testFolderMemberFocusFillMatchesTitleChromeFlightGate() {
+        // In flight: focused member paints idle (title also blocks pointer/AX).
+        XCTAssertEqual(
+            LauncherLayout.folderMemberFocusFillAlpha(
+                focused: true,
+                panelChromeInFlight: true
+            ),
+            LauncherLayout.tileChromeIdleAlpha
+        )
+        // Landed: focused member paints 8% focus fill.
+        XCTAssertEqual(
+            LauncherLayout.folderMemberFocusFillAlpha(
+                focused: true,
+                panelChromeInFlight: false
+            ),
+            LauncherLayout.tileChromeFocusAlpha
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderMemberFocusFillAlpha(
+                focused: false,
+                panelChromeInFlight: false
+            ),
+            LauncherLayout.tileChromeIdleAlpha
+        )
+        // Flight begin / land both use the shared search-chrome fade clock.
+        XCTAssertEqual(
+            LauncherLayout.tileChromeFillFadeDuration,
+            LauncherLayout.folderTitleEditUnderlineFadeDuration
+        )
+        XCTAssertEqual(
+            LauncherLayout.tileChromeFillFadeDuration,
+            LauncherLayout.searchTransitionDuration
+        )
+    }
+
     func testSearchTransitionUsesTheFastMotionToken() {
         XCTAssertEqual(LauncherLayout.searchTransitionDuration, 0.12, accuracy: 0.001)
         let fade = LauncherLayout.searchChromeFade(
@@ -4650,8 +7602,482 @@ final class LaunchIconCoreTests: XCTestCase {
         )
     }
 
+    func testSearchGridCrossfadeSnapsUnderReducedMotion() {
+        XCTAssertTrue(
+            LauncherLayout.shouldSnapSearchChromeForReducedMotion(reducesMotion: true)
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldSnapSearchChromeForReducedMotion(reducesMotion: false)
+        )
+        let snap = LauncherLayout.searchChromeFade(
+            reducesMotion: true,
+            holdsForLauncherFade: false,
+            incomingIsFolderBackdrop: false
+        )
+        XCTAssertFalse(snap.keepsOutgoingVisible)
+        XCTAssertEqual(snap.duration, 0, accuracy: 0.0001)
+        XCTAssertEqual(snap.incomingOpacity, 1, accuracy: 0.0001)
+        XCTAssertEqual(snap.outgoingOpacity, 1, accuracy: 0.0001)
+        let full = LauncherLayout.searchChromeFade(
+            reducesMotion: false,
+            holdsForLauncherFade: false,
+            incomingIsFolderBackdrop: false
+        )
+        XCTAssertTrue(full.keepsOutgoingVisible)
+        XCTAssertEqual(full.duration, LauncherLayout.searchTransitionDuration, accuracy: 0.0001)
+    }
+
+    func testDissolvedGridFadeSnapsUnderReducedMotion() {
+        XCTAssertTrue(
+            LauncherLayout.shouldSnapDissolvedGridFadeForReducedMotion(reducesMotion: true)
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldSnapDissolvedGridFadeForReducedMotion(reducesMotion: false)
+        )
+        XCTAssertEqual(
+            LauncherLayout.dissolvedGridFadeDuration(reducesMotion: true),
+            0
+        )
+        XCTAssertEqual(
+            LauncherLayout.dissolvedGridFadeDuration(reducesMotion: false),
+            0.22,
+            accuracy: 0.0001
+        )
+    }
+
+    func testFolderBackdropSnapsUnderReducedMotion() {
+        XCTAssertTrue(
+            LauncherLayout.shouldSnapFolderBackdropForReducedMotion(reducesMotion: true)
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldSnapFolderBackdropForReducedMotion(reducesMotion: false)
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderBackdropFadeDuration(reducesMotion: true, motionDuration: 0.34),
+            0
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderBackdropFadeDuration(reducesMotion: true, motionDuration: nil),
+            0
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderBackdropFadeDuration(reducesMotion: false, motionDuration: 0.34),
+            0.34,
+            accuracy: 0.0001
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderBackdropFadeDuration(reducesMotion: false, motionDuration: nil),
+            LauncherLayout.folderChromeFallbackDuration,
+            accuracy: 0.0001
+        )
+        // Reduced open style stays opacity-only (no scale/blur) — snap lands here.
+        let reducedOpen = LauncherLayout.folderBackdropStyle(open: true, reducesMotion: true)
+        XCTAssertEqual(reducedOpen.opacity, LauncherLayout.folderBackdropOpenOpacity, accuracy: 0.0001)
+        XCTAssertEqual(reducedOpen.scale, 1, accuracy: 0.0001)
+        XCTAssertFalse(reducedOpen.blurs)
+    }
+
     /// Open and close share this pose. The scaled panel's center is the
     /// folder preview, and the same value is the close destination.
+    func testFolderChromeSnapsUnderReducedMotion() {
+        XCTAssertTrue(
+            LauncherLayout.shouldSnapFolderChromeForReducedMotion(reducesMotion: true)
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldSnapFolderChromeForReducedMotion(reducesMotion: false)
+        )
+        XCTAssertEqual(LauncherLayout.folderChromeReducedDuration, 0, accuracy: 0.0001)
+        XCTAssertEqual(
+            LauncherLayout.folderChromeFadeDuration(reducesMotion: true),
+            0
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderChromeFadeDuration(reducesMotion: false),
+            LauncherLayout.folderChromeFallbackDuration,
+            accuracy: 0.0001
+        )
+        let collapse = LauncherLayout.folderChromeCollapse(
+            panelFrame: CGRect(x: 0, y: 0, width: 400, height: 300),
+            iconFrame: CGRect(x: 10, y: 10, width: 72, height: 72),
+            reducesMotion: true
+        )
+        XCTAssertEqual(collapse.duration, 0, accuracy: 0.0001)
+        XCTAssertFalse(collapse.animatesTransform)
+        let dissolve = LauncherLayout.folderDissolveChrome(reducesMotion: true)
+        XCTAssertEqual(dissolve.duration, 0, accuracy: 0.0001)
+    }
+
+
+    func testFolderCreatedSnapsUnderReducedMotion() {
+        XCTAssertTrue(
+            LauncherLayout.shouldSnapFolderCreatedForReducedMotion(reducesMotion: true)
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldSnapFolderCreatedForReducedMotion(reducesMotion: false)
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderCreatedFadeDuration(reducesMotion: true),
+            0
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderCreatedFadeDuration(reducesMotion: false),
+            0.12,
+            accuracy: 0.0001
+        )
+    }
+
+
+    func testMergeFlyerSnapsUnderReducedMotion() {
+        XCTAssertTrue(
+            LauncherLayout.shouldSnapMergeFlyerForReducedMotion(reducesMotion: true)
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldSnapMergeFlyerForReducedMotion(reducesMotion: false)
+        )
+        XCTAssertEqual(
+            LauncherLayout.mergeReducedFadeDuration(reducesMotion: true),
+            0
+        )
+        XCTAssertEqual(
+            LauncherLayout.mergeReducedFadeDuration(reducesMotion: false),
+            0.12,
+            accuracy: 0.0001
+        )
+    }
+
+
+    func testLaunchPressSnapsUnderReducedMotion() {
+        XCTAssertTrue(
+            LauncherLayout.shouldSnapLaunchPressForReducedMotion(reducesMotion: true)
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldSnapLaunchPressForReducedMotion(reducesMotion: false)
+        )
+        XCTAssertEqual(
+            LauncherLayout.launchPressPulseHalfDuration(reducesMotion: true),
+            0
+        )
+        XCTAssertEqual(
+            LauncherLayout.launchPressPulseHalfDuration(reducesMotion: false),
+            LauncherLayout.launchPressHalfDuration,
+            accuracy: 0.0001
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldPlayLaunchFeedback(isDismissing: false, reducesMotion: true)
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldPlayLaunchFeedback(isDismissing: false, reducesMotion: false)
+        )
+    }
+
+
+    func testPageButtonHoverSnapsUnderReducedMotion() {
+        XCTAssertTrue(
+            LauncherLayout.shouldSnapPageButtonHoverForReducedMotion(reducesMotion: true)
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldSnapPageButtonHoverForReducedMotion(reducesMotion: false)
+        )
+        XCTAssertEqual(
+            LauncherLayout.pageButtonHoverOpacityFadeDuration(reducesMotion: true),
+            0
+        )
+        XCTAssertEqual(
+            LauncherLayout.pageButtonHoverOpacityFadeDuration(reducesMotion: false),
+            LauncherLayout.pageButtonHoverFadeDuration,
+            accuracy: 0.0001
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldAnimatePageButtonHover(
+                isDismissing: false, isVisible: true, reducesMotion: true
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldAnimatePageButtonHover(
+                isDismissing: false, isVisible: true, reducesMotion: false
+            )
+        )
+    }
+
+
+    func testReorderSlideSnapsUnderReducedMotion() {
+        XCTAssertTrue(
+            LauncherLayout.shouldSnapReorderSlideForReducedMotion(reducesMotion: true)
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldSnapReorderSlideForReducedMotion(reducesMotion: false)
+        )
+        XCTAssertEqual(
+            LauncherLayout.reorderSlideSpringDuration(reducesMotion: true),
+            0
+        )
+        XCTAssertEqual(
+            LauncherLayout.reorderSlideSpringDuration(reducesMotion: false),
+            LauncherLayout.reorderSlideDuration,
+            accuracy: 0.0001
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldAnimateReorderSlide(
+                isDismissing: false, isVisible: true, reducesMotion: true
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldAnimateReorderSlide(
+                isDismissing: false, isVisible: true, reducesMotion: false
+            )
+        )
+    }
+
+
+    func testDragLiftSnapsUnderReducedMotion() {
+        XCTAssertTrue(
+            LauncherLayout.shouldSnapDragLiftForReducedMotion(reducesMotion: true)
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldSnapDragLiftForReducedMotion(reducesMotion: false)
+        )
+        let source = CGSize(width: 80, height: 96)
+        let snap = LauncherLayout.dragLiftPresentation(for: source, reducesMotion: true)
+        XCTAssertEqual(snap.scale, 1, accuracy: 0.0001)
+        XCTAssertEqual(snap.shadowOpacity, 0, accuracy: 0.0001)
+        XCTAssertEqual(snap.canvasSize, source)
+        let full = LauncherLayout.dragLiftPresentation(for: source, reducesMotion: false)
+        XCTAssertEqual(full.scale, LauncherLayout.dragLiftScale, accuracy: 0.0001)
+        XCTAssertGreaterThan(full.shadowOpacity, 0)
+    }
+
+
+    func testDropLandingSnapsUnderReducedMotion() {
+        XCTAssertTrue(
+            LauncherLayout.shouldSnapDropLandingForReducedMotion(reducesMotion: true)
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldSnapDropLandingForReducedMotion(reducesMotion: false)
+        )
+        XCTAssertEqual(
+            LauncherLayout.dropLandingTravelDuration(reducesMotion: true),
+            0
+        )
+        XCTAssertEqual(
+            LauncherLayout.dropLandingTravelDuration(reducesMotion: false),
+            LauncherLayout.dropLandingFlightDuration,
+            accuracy: 0.0001
+        )
+        let cell = CGRect(x: 10, y: 20, width: 100, height: 120)
+        let start = LauncherLayout.dropLandingStartFrame(cell: cell, reducesMotion: true)
+        XCTAssertEqual(start, cell)
+        XCTAssertNil(
+            LauncherLayout.dropLandingFlight(
+                from: cell.offsetBy(dx: 5, dy: 5),
+                to: cell,
+                reducesMotion: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldPlayDropLanding(
+                reducesMotion: true, isDismissing: false, isVisible: true
+            )
+        )
+    }
+
+
+    func testFooterChromeVisibilitySnapsUnderReducedMotion() {
+        XCTAssertTrue(
+            LauncherLayout.shouldSnapFooterChromeVisibilityForReducedMotion(reducesMotion: true)
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldSnapFooterChromeVisibilityForReducedMotion(reducesMotion: false)
+        )
+        // Presence gate: reduced motion snaps (no opacity travel).
+        XCTAssertFalse(
+            LauncherLayout.shouldAnimatePagingChromeVisibility(
+                shouldShow: false,
+                currentlyShown: true,
+                reducesMotion: true,
+                holdsForLauncherFade: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldAnimatePagingChromeVisibility(
+                shouldShow: false,
+                currentlyShown: true,
+                reducesMotion: false,
+                holdsForLauncherFade: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldAnimatePagingChromeVisibility(
+                shouldShow: false,
+                currentlyShown: true,
+                reducesMotion: false,
+                holdsForLauncherFade: true
+            )
+        )
+    }
+
+
+    func testFolderMergePreviewSnapsUnderReducedMotion() {
+        XCTAssertTrue(
+            LauncherLayout.shouldSnapFolderMergePreviewForReducedMotion(reducesMotion: true)
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldSnapFolderMergePreviewForReducedMotion(reducesMotion: false)
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderMergePreviewTravelDuration(reducesMotion: true),
+            0
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderMergePreviewTravelDuration(reducesMotion: false),
+            LauncherLayout.folderChromeTravelDuration,
+            accuracy: 0.0001
+        )
+        let resident = CGRect(x: 100, y: 200, width: 64, height: 64)
+        let incoming = CGRect(x: 280, y: 180, width: 48, height: 48)
+        let destinations = [
+            CGRect(x: 10, y: 50, width: 16, height: 16),
+            CGRect(x: 30, y: 50, width: 16, height: 16)
+        ]
+        XCTAssertTrue(
+            LauncherLayout.folderMergePreviewLandings(
+                resident: resident,
+                incoming: incoming,
+                destinations: destinations,
+                reducesMotion: true
+            ).isEmpty
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderMergePreviewLandings(
+                resident: resident,
+                incoming: incoming,
+                destinations: destinations,
+                reducesMotion: false
+            ).count,
+            2
+        )
+    }
+
+
+    func testFolderIncomingPreviewSnapsUnderReducedMotion() {
+        XCTAssertTrue(
+            LauncherLayout.shouldSnapFolderIncomingPreviewForReducedMotion(reducesMotion: true)
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldSnapFolderIncomingPreviewForReducedMotion(reducesMotion: false)
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderIncomingPreviewTravelDuration(reducesMotion: true),
+            0
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderIncomingPreviewTravelDuration(reducesMotion: false),
+            LauncherLayout.folderChromeTravelDuration,
+            accuracy: 0.0001
+        )
+        let incoming = CGRect(x: 280, y: 180, width: 48, height: 48)
+        let destination = CGRect(x: 51, y: 63, width: 16, height: 16)
+        let well = CGRect(x: 10, y: 20, width: 64, height: 64)
+        XCTAssertNil(
+            LauncherLayout.folderIncomingPreviewLanding(
+                incoming: incoming, destination: destination, reducesMotion: true
+            )
+        )
+        XCTAssertNotNil(
+            LauncherLayout.folderIncomingPreviewLanding(
+                incoming: incoming, destination: destination, reducesMotion: false
+            )
+        )
+        XCTAssertNil(
+            LauncherLayout.folderIncomingPreviewCenterLanding(
+                incoming: incoming, well: well, reducesMotion: true
+            )
+        )
+        XCTAssertNotNil(
+            LauncherLayout.folderIncomingPreviewCenterLanding(
+                incoming: incoming, well: well, reducesMotion: false
+            )
+        )
+    }
+
+
+    func testFolderPreviewGlyphSnapsUnderReducedMotion() {
+        XCTAssertTrue(
+            LauncherLayout.shouldSnapFolderPreviewGlyphForReducedMotion(reducesMotion: true)
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldSnapFolderPreviewGlyphForReducedMotion(reducesMotion: false)
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderPreviewGlyphTravelDuration(reducesMotion: true),
+            0
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderPreviewGlyphTravelDuration(reducesMotion: false),
+            LauncherLayout.folderPreviewGlyphFlightDuration,
+            accuracy: 0.0001
+        )
+        let placement = LauncherLayout.FolderPreviewGlyphPlacement(
+            itemID: UUID(),
+            source: CGRect(x: 0, y: 0, width: 16, height: 16),
+            destination: CGRect(x: 200, y: 180, width: 72, height: 72)
+        )
+        XCTAssertTrue(
+            LauncherLayout.folderPreviewGlyphFlights(placements: [placement], reducesMotion: true).isEmpty
+        )
+        XCTAssertFalse(
+            LauncherLayout.folderPreviewGlyphFlights(placements: [placement], reducesMotion: false).isEmpty
+        )
+        XCTAssertTrue(
+            LauncherLayout.folderPreviewGlyphReturnFlights(placements: [placement], reducesMotion: true).isEmpty
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldPlayFolderPreviewGlyphFlight(
+                reducesMotion: true, isDismissing: false, isVisible: true, tracksIcon: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldPlayFolderPreviewGlyphReturn(
+                reducesMotion: true, isDismissing: false, isVisible: true, tracksIcon: true
+            )
+        )
+    }
+
+
+    func testDissolveScatterSnapsUnderReducedMotion() {
+        XCTAssertTrue(
+            LauncherLayout.shouldSnapDissolveScatterForReducedMotion(reducesMotion: true)
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldSnapDissolveScatterForReducedMotion(reducesMotion: false)
+        )
+        XCTAssertEqual(
+            LauncherLayout.dissolveScatterTravelDuration(reducesMotion: true),
+            0
+        )
+        XCTAssertEqual(
+            LauncherLayout.dissolveScatterTravelDuration(reducesMotion: false),
+            LauncherLayout.folderDissolveFlightDuration,
+            accuracy: 0.0001
+        )
+        let placement = LauncherLayout.FolderDissolveIconPlacement(
+            itemID: UUID(),
+            source: CGRect(x: 0, y: 0, width: 40, height: 40),
+            destination: CGRect(x: 100, y: 80, width: 40, height: 40)
+        )
+        XCTAssertTrue(
+            LauncherLayout.folderDissolveFlights(placements: [placement], reducesMotion: true).isEmpty
+        )
+        XCTAssertFalse(
+            LauncherLayout.folderDissolveFlights(placements: [placement], reducesMotion: false).isEmpty
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldPlayFolderDissolveScatter(
+                reducesMotion: true, isDismissing: false, isVisible: true
+            )
+        )
+    }
+
+
     func testFolderChromeCollapseTracksTheFolderIcon() {
         let panel = CGRect(x: 100, y: 80, width: 500, height: 360)
         let icon = CGRect(x: 40, y: 420, width: 72, height: 72)
@@ -4705,7 +8131,8 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertEqual(reduced.translationX, 0, accuracy: 0.001)
         XCTAssertEqual(reduced.translationY, 0, accuracy: 0.001)
         XCTAssertEqual(reduced.panelOpacity, 0, accuracy: 0.001)
-        XCTAssertEqual(reduced.duration, 0.12, accuracy: 0.001)
+        XCTAssertEqual(reduced.duration, 0, accuracy: 0.001)
+        XCTAssertTrue(LauncherLayout.shouldSnapFolderChromeForReducedMotion(reducesMotion: true))
 
         let missing = LauncherLayout.folderChromeCollapse(
             panelFrame: panel,
@@ -5242,7 +8669,7 @@ final class LaunchIconCoreTests: XCTestCase {
         let reduced = LauncherLayout.folderDissolveChrome(reducesMotion: true)
         XCTAssertFalse(reduced.animatesTransform)
         XCTAssertEqual(reduced.scale, 1, accuracy: 0.001)
-        XCTAssertEqual(reduced.duration, 0.12, accuracy: 0.001)
+        XCTAssertEqual(reduced.duration, 0, accuracy: 0.001)
 
         XCTAssertTrue(LauncherLayout.shouldPlayFolderDissolveScatter(
             reducesMotion: false, isDismissing: false, isVisible: true
@@ -5498,6 +8925,81 @@ final class LaunchIconCoreTests: XCTestCase {
     /// the last frame. They fade in on the same dissolve, still hidden
     /// halfway through, and only as the folder settles. Closing does not
     /// run that fade.
+
+    func testToastClearAndRestoreOpacityParityWithStatus() {
+        XCTAssertTrue(
+            LauncherLayout.toastShouldClearOpacityBeforeUnhide(
+                willShow: true,
+                currentlyHidden: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.toastShouldClearOpacityBeforeUnhide(
+                willShow: true,
+                currentlyHidden: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.toastShouldRestoreOpacityWhenAlreadyShown(
+                currentlyHidden: false,
+                currentOpacity: 0.2
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.toastShouldRestoreOpacityWhenAlreadyShown(
+                currentlyHidden: false,
+                currentOpacity: 1.0
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.toastShouldRestoreOpacityWhenAlreadyShown(
+                currentlyHidden: true,
+                currentOpacity: 0.0
+            )
+        )
+        XCTAssertEqual(
+            LauncherLayout.toastShouldRestoreOpacityWhenAlreadyShown(
+                currentlyHidden: false,
+                currentOpacity: 0.5
+            ),
+            LauncherLayout.statusChromeShouldRestoreOpacityWhenAlreadyShown(
+                currentlyHidden: false,
+                currentOpacity: 0.5
+            )
+        )
+        XCTAssertEqual(
+            LauncherLayout.toastShouldClearOpacityBeforeUnhide(
+                willShow: true,
+                currentlyHidden: true
+            ),
+            LauncherLayout.settingsMessageShouldClearOpacityBeforeUnhide(
+                willShow: true,
+                currentlyHidden: true
+            )
+        )
+    }
+
+    func testToastFadeUsesPresentationBackedDurationAndKey() {
+        XCTAssertEqual(LauncherLayout.toastFadeDuration, 0.12, accuracy: 0.0001)
+        XCTAssertEqual(LauncherLayout.toastFadeAnimationKey, "toast-fade")
+        XCTAssertEqual(LauncherLayout.toastFadeDuration, LauncherLayout.searchTransitionDuration, accuracy: 0.0001)
+    }
+
+    func testHostCrossfadeAnimationKeysHoldPresentationPolicy() {
+        XCTAssertEqual(LauncherLayout.searchChromeFadeAnimationKey, "search-chrome-fade")
+        XCTAssertEqual(LauncherLayout.pageHostFadeAnimationKey, "page-host-fade")
+        XCTAssertEqual(LauncherLayout.dissolvedGridFadeAnimationKey, "dissolved-grid-fade")
+        // Crossfade still lands incoming at full opacity when not a folder backdrop.
+        let fade = LauncherLayout.searchChromeFade(
+            reducesMotion: false,
+            holdsForLauncherFade: false,
+            incomingIsFolderBackdrop: false
+        )
+        XCTAssertEqual(fade.incomingOpacity, 1, accuracy: 0.001)
+        XCTAssertEqual(fade.outgoingOpacity, 0, accuracy: 0.001)
+        XCTAssertGreaterThan(fade.duration, 0)
+    }
+
     func testOverflowIconsFadeInAsTheFolderSettles() {
         XCTAssertTrue(LauncherLayout.shouldFadeFolderOverflowIconsIn(opening: true))
         XCTAssertFalse(LauncherLayout.shouldFadeFolderOverflowIconsIn(opening: false))
@@ -5510,6 +9012,7 @@ final class LaunchIconCoreTests: XCTestCase {
             1 - LauncherLayout.wholeCellMergeFlightOpacity(at: 0.5),
             accuracy: 0.001
         )
+        XCTAssertEqual(LauncherLayout.folderOverflowOpenFadeAnimationKey, "overflow-open-fade")
     }
 
     /// Creating a folder lands the icon that was already there in the first
@@ -6333,6 +9836,52 @@ final class LaunchIconCoreTests: XCTestCase {
         }
     }
 
+    func testReorderHoldsPresentationUntilLayoutFramesAreUsable() {
+        XCTAssertTrue(
+            LauncherLayout.shouldHoldReorderPresentationUntilFramesReady(
+                animated: true,
+                framesUsable: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldHoldReorderPresentationUntilFramesReady(
+                animated: true,
+                framesUsable: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldHoldReorderPresentationUntilFramesReady(
+                animated: false,
+                framesUsable: false
+            )
+        )
+        let cell = CGRect(x: 0, y: 0, width: 80, height: 90)
+        let gap = CGRect(x: 100, y: 0, width: 80, height: 90)
+        XCTAssertTrue(
+            LauncherLayout.reorderFramesUsable(slot: 1, itemIndex: 0, fromFrame: cell, toFrame: gap)
+        )
+        XCTAssertFalse(
+            LauncherLayout.reorderFramesUsable(
+                slot: 1,
+                itemIndex: 0,
+                fromFrame: .zero,
+                toFrame: gap
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.reorderFramesUsable(
+                slot: 1,
+                itemIndex: 0,
+                fromFrame: cell,
+                toFrame: cell
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.reorderFramesUsable(slot: 2, itemIndex: 2, fromFrame: .zero, toFrame: .zero),
+            "Stationary slots do not need a gap frame"
+        )
+    }
+
     func testReorderSpringKeepsMotionContinuousWhenGapChanges() {
         var motion = (position: CGSize.zero, velocity: CGSize.zero)
         for _ in 0..<6 {
@@ -6526,6 +10075,44 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertEqual(state.folders[folderID]?.name, "工具")
         state = LauncherLayout.renameFolder(folderID, to: "   ", in: state)
         XCTAssertEqual(state.folders[folderID]?.name, "工具")
+        XCTAssertEqual(
+            LauncherLayout.resolvedFolderName(draft: "   ", previous: "工具"),
+            "工具"
+        )
+        XCTAssertEqual(
+            LauncherLayout.resolvedFolderName(draft: " 新名 ", previous: "工具"),
+            "新名"
+        )
+        XCTAssertTrue(LauncherLayout.folderTitleSelectsAllOnBeginEditing)
+        XCTAssertTrue(LauncherLayout.aliasSelectsAllOnBeginEditing)
+        XCTAssertFalse(
+            LauncherLayout.folderTitleShouldBeginEditingFromPointer(clickCount: 1)
+        )
+        XCTAssertTrue(
+            LauncherLayout.folderTitleShouldBeginEditingFromPointer(clickCount: 2)
+        )
+        XCTAssertTrue(
+            LauncherLayout.folderTitleShouldBeginEditingFromPointer(clickCount: 3)
+        )
+        XCTAssertTrue(
+            LauncherLayout.folderTitleShouldCancelEditingOnOutsideClick(
+                isEditing: true,
+                clickIsOnTitle: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.folderTitleShouldCancelEditingOnOutsideClick(
+                isEditing: true,
+                clickIsOnTitle: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.folderTitleShouldCancelEditingOnOutsideClick(
+                isEditing: false,
+                clickIsOnTitle: false
+            )
+        )
+        XCTAssertTrue(LauncherLayout.folderTitleFocusesFirstMemberAfterEndingEdit)
     }
 
     func testDropUsesLocalizedFolderNameProvidedByUI() throws {
@@ -6756,6 +10343,129 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertEqual(expanded.folders[fullFolder]?.itemIDs, members + [extra])
     }
 
+    func testEmptyChromeKindSearchNoMatchesUsesGridNotStatusOnly() {
+        XCTAssertEqual(
+            LauncherLayout.emptyChromeKind(
+                isSearching: true,
+                presentedIsEmpty: true,
+                catalogIsEmpty: false,
+                isCatalogLoading: false,
+                catalogScanCancelled: false
+            ),
+            .searchNoMatches
+        )
+        XCTAssertNil(
+            LauncherLayout.emptyChromeKind(
+                isSearching: true,
+                presentedIsEmpty: false,
+                catalogIsEmpty: false,
+                isCatalogLoading: false,
+                catalogScanCancelled: false
+            )
+        )
+        XCTAssertEqual(
+            LauncherLayout.emptyChromeKind(
+                isSearching: false,
+                presentedIsEmpty: true,
+                catalogIsEmpty: true,
+                isCatalogLoading: false,
+                catalogScanCancelled: false
+            ),
+            .catalogUnavailable
+        )
+        XCTAssertEqual(
+            LauncherLayout.emptyChromeKind(
+                isSearching: false,
+                presentedIsEmpty: true,
+                catalogIsEmpty: true,
+                isCatalogLoading: false,
+                catalogScanCancelled: true
+            ),
+            .catalogCancelled
+        )
+        XCTAssertNil(
+            LauncherLayout.emptyChromeKind(
+                isSearching: false,
+                presentedIsEmpty: true,
+                catalogIsEmpty: true,
+                isCatalogLoading: true,
+                catalogScanCancelled: false
+            ),
+            "loading uses skeleton/status, not empty chrome"
+        )
+        // Searching with empty catalog still prefers catalog empty chrome.
+        XCTAssertEqual(
+            LauncherLayout.emptyChromeKind(
+                isSearching: true,
+                presentedIsEmpty: true,
+                catalogIsEmpty: true,
+                isCatalogLoading: false,
+                catalogScanCancelled: false
+            ),
+            .catalogUnavailable
+        )
+    }
+
+    func testSearchFolderMemberHitShowsContainingFolderChrome() {
+        let memberID = UUID()
+        let topID = UUID()
+        let folderID = UUID()
+        let member = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Member.app"),
+            bundleIdentifier: "com.example.member",
+            displayName: "Member",
+            sourcePriority: 0,
+            discoveredAt: .now
+        )
+        let top = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Top.app"),
+            bundleIdentifier: "com.example.top",
+            displayName: "Top",
+            sourcePriority: 0,
+            discoveredAt: .now
+        )
+        let state = LayoutState(
+            orderedEntries: [.folder(folderID), .app(topID)],
+            folders: [
+                folderID: LauncherFolder(id: folderID, name: "工具", itemIDs: [memberID])
+            ],
+            appKeys: [
+                memberID: member.deduplicationKey,
+                topID: top.deduplicationKey
+            ]
+        )
+        XCTAssertEqual(
+            LauncherLayout.containingFolderName(forAppID: memberID, in: state),
+            "工具"
+        )
+        XCTAssertNil(LauncherLayout.containingFolderName(forAppID: topID, in: state))
+        XCTAssertEqual(
+            LauncherLayout.searchHitTitle(displayName: "Member", containingFolderName: "工具"),
+            "Member\n工具"
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchHitTitle(displayName: "Top", containingFolderName: nil),
+            "Top"
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchHitTitle(displayName: "Top", containingFolderName: "  "),
+            "Top"
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchHitAccessibilityLabel(
+                displayName: "Member",
+                containingFolderName: "工具"
+            ),
+            "Member，工具"
+        )
+        // Still discoverable via searchHits / filter
+        let hits = AppSearchIndex(candidates: [member, top]).filter(
+            LauncherLayout.searchHits(in: state, catalog: [member, top]),
+            query: "mem"
+        )
+        XCTAssertEqual(hits, [.app(member)])
+    }
+
     func testSearchMatchesAppsInsideFolders() {
         let cafeID = UUID()
         let calendarID = UUID()
@@ -6784,6 +10494,58 @@ final class LaunchIconCoreTests: XCTestCase {
         let searchable = LauncherLayout.searchableApps(in: state, catalog: [cafe, calendar])
         XCTAssertEqual(AppSearch.filter(searchable, query: "CAFE"), [cafe])
         XCTAssertEqual(AppSearch.filter(searchable, query: "ical"), [calendar])
+    }
+
+    func testSearchPrefersTopLevelAppsOverFolderMembersAtEqualRank() {
+        let topID = UUID()
+        let memberID = UUID()
+        let folderID = UUID()
+        // Member listed before top-level in hits (folder comes first in layout).
+        let alpine = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Alpine.app"),
+            bundleIdentifier: "com.example.alpine",
+            displayName: "Alpine",
+            sourcePriority: 0,
+            discoveredAt: .now
+        )
+        let alpha = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Alpha.app"),
+            bundleIdentifier: "com.example.alpha",
+            displayName: "Alpha",
+            sourcePriority: 0,
+            discoveredAt: .now
+        )
+        let state = LayoutState(
+            orderedEntries: [.folder(folderID), .app(topID)],
+            folders: [
+                folderID: LauncherFolder(id: folderID, name: "Misc", itemIDs: [memberID])
+            ],
+            appKeys: [
+                memberID: alpine.deduplicationKey,
+                topID: alpha.deduplicationKey
+            ]
+        )
+        let catalog = [alpine, alpha]
+        let hits = LauncherLayout.searchHits(in: state, catalog: catalog)
+        XCTAssertEqual(hits, [
+            .folder(folderID, "Misc"),
+            .app(alpine),
+            .app(alpha)
+        ])
+        let topKeys = LauncherLayout.topLevelAppDeduplicationKeys(in: state)
+        XCTAssertEqual(topKeys, [alpha.deduplicationKey])
+        let index = AppSearchIndex(candidates: catalog)
+        // Both prefix-match "al" at the same rank; without preference Alpine
+        // (earlier in hits) would win — with preference Alpha (top-level) wins.
+        XCTAssertEqual(
+            index.filter(hits, query: "al", topLevelKeys: topKeys),
+            [.app(alpha), .app(alpine)]
+        )
+        // Empty topLevelKeys keeps hit order (regression for callers).
+        XCTAssertEqual(
+            index.filter(hits, query: "al", topLevelKeys: []),
+            [.app(alpine), .app(alpha)]
+        )
     }
 
     func testSearchHitsMatchFolderNamesWithTheSameRanks() {
@@ -7616,6 +11378,568 @@ final class LaunchIconCoreTests: XCTestCase {
             system.deduplicationKey
         ])
     }
+
+
+
+
+
+    func testRearrangeTopLevelByNameAndKindPreservesFolderMembership() {
+        let sysA = UUID()
+        let sysB = UUID()
+        let third = UUID()
+        let folderID = UUID()
+        let member = UUID()
+        let calendar = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/System/Applications/Calendar.app"),
+            bundleIdentifier: "com.apple.iCal",
+            displayName: "日历",
+            sourcePriority: 0,
+            discoveredAt: .now
+        )
+        let notes = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/System/Applications/Notes.app"),
+            bundleIdentifier: "com.apple.Notes",
+            displayName: "备忘录",
+            sourcePriority: 0,
+            discoveredAt: .now
+        )
+        let zebra = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Zebra.app"),
+            bundleIdentifier: "com.example.Zebra",
+            displayName: "Zebra",
+            sourcePriority: 1,
+            discoveredAt: .now
+        )
+        let memberApp = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Member.app"),
+            bundleIdentifier: "com.example.Member",
+            displayName: "Member",
+            sourcePriority: 1,
+            discoveredAt: .now
+        )
+        let catalog = [calendar, notes, zebra, memberApp]
+        var state = LayoutState(
+            orderedEntries: [.app(third), .folder(folderID), .app(sysB), .app(sysA)],
+            folders: [
+                folderID: LauncherFolder(id: folderID, name: "工具", itemIDs: [member])
+            ],
+            appKeys: [
+                sysA: calendar.deduplicationKey,
+                sysB: notes.deduplicationKey,
+                third: zebra.deduplicationKey,
+                member: memberApp.deduplicationKey
+            ],
+            appAliases: [zebra.deduplicationKey: "阿斑马"]
+        )
+
+        let byName = LauncherLayout.rearrangeTopLevelEntries(in: state, catalog: catalog, sort: .byName)
+        XCTAssertEqual(byName.folders[folderID]?.itemIDs, [member], "folder membership must not change")
+        XCTAssertEqual(Set(byName.orderedEntries.map(\.id)), Set(state.orderedEntries.map(\.id)))
+        let names: [String] = byName.orderedEntries.map { entry in
+            switch entry {
+            case .folder(let id):
+                return byName.folders[id]?.name ?? ""
+            case .app(let id):
+                let key = byName.appKeys[id]!
+                return byName.appAliases[key] ?? catalog.first(where: { $0.deduplicationKey == key })!.displayName
+            }
+        }
+        XCTAssertEqual(
+            names,
+            names.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+        )
+
+        let byKind = LauncherLayout.rearrangeTopLevelEntries(in: state, catalog: catalog, sort: .byKind)
+        XCTAssertEqual(byKind.folders[folderID]?.itemIDs, [member])
+        guard case .app(let firstID) = byKind.orderedEntries[0],
+              case .app(let secondID) = byKind.orderedEntries[1] else {
+            return XCTFail("byKind should lead with two system apps")
+        }
+        let firstKeys = [firstID, secondID].compactMap { byKind.appKeys[$0] }
+        XCTAssertEqual(Set(firstKeys), Set([calendar.deduplicationKey, notes.deduplicationKey]))
+        XCTAssertEqual(LauncherLayout.gridRearrangeToastMessage(sort: .byName), "已按名称重新排列")
+        XCTAssertEqual(LauncherLayout.gridRearrangeToastMessage(sort: .byKind), "已按类型重新排列")
+    }
+
+
+    func testGridRearrangeConfirmAlertCancelIsFirstButton() {
+        XCTAssertTrue(LauncherLayout.GridRearrangeConfirmAlert.cancelIsFirstButton)
+        XCTAssertFalse(LauncherLayout.GridRearrangeConfirmAlert.messageTextKey.isEmpty)
+        XCTAssertFalse(
+            LauncherLayout.GridRearrangeConfirmAlert.informativeTextKey(sort: .byName).isEmpty
+        )
+        XCTAssertFalse(
+            LauncherLayout.GridRearrangeConfirmAlert.informativeTextKey(sort: .byKind).isEmpty
+        )
+        XCTAssertEqual(LauncherLayout.GridRearrangeConfirmAlert.cancelButtonTitleKey, "取消")
+        XCTAssertFalse(LauncherLayout.GridRearrangeConfirmAlert.confirmButtonTitleKey.isEmpty)
+        XCTAssertEqual(LauncherLayout.settingsFeedbackAccessibilityLabelKey, "设置反馈")
+    }
+
+    func testLayoutRestoreAndImportConfirmAlertsCancelIsFirstButton() {
+        XCTAssertTrue(LauncherLayout.LayoutRestoreBackupConfirmAlert.cancelIsFirstButton)
+        XCTAssertFalse(LauncherLayout.LayoutRestoreBackupConfirmAlert.messageTextKey.isEmpty)
+        XCTAssertFalse(LauncherLayout.LayoutRestoreBackupConfirmAlert.informativeTextKey.isEmpty)
+        XCTAssertEqual(LauncherLayout.LayoutRestoreBackupConfirmAlert.cancelButtonTitleKey, "取消")
+        XCTAssertFalse(LauncherLayout.LayoutRestoreBackupConfirmAlert.confirmButtonTitleKey.isEmpty)
+
+        XCTAssertTrue(LauncherLayout.LayoutImportConfirmAlert.cancelIsFirstButton)
+        XCTAssertFalse(LauncherLayout.LayoutImportConfirmAlert.messageTextKey.isEmpty)
+        XCTAssertFalse(LauncherLayout.LayoutImportConfirmAlert.informativeTextKey.isEmpty)
+        XCTAssertEqual(LauncherLayout.LayoutImportConfirmAlert.cancelButtonTitleKey, "取消")
+        XCTAssertFalse(LauncherLayout.LayoutImportConfirmAlert.confirmButtonTitleKey.isEmpty)
+    }
+
+
+    func testTileAccessibilityHelpExplainsIncompleteScanReadonly() {
+        XCTAssertEqual(
+            LauncherLayout.tileAccessibilityHelp(
+                isFolder: false,
+                layoutEditingEnabled: true,
+                layoutEditingExplanation: nil
+            ),
+            "按下以打开应用"
+        )
+        XCTAssertEqual(
+            LauncherLayout.tileAccessibilityHelp(
+                isFolder: true,
+                layoutEditingEnabled: true,
+                layoutEditingExplanation: "ignored"
+            ),
+            "按下以打开文件夹"
+        )
+        let blocked = LauncherLayout.tileAccessibilityHelp(
+            isFolder: false,
+            layoutEditingEnabled: false,
+            layoutEditingExplanation: "应用扫描不完整，暂时无法整理；请重新扫描"
+        )
+        XCTAssertTrue(blocked.contains("按下以打开应用"))
+        XCTAssertTrue(blocked.contains("应用扫描不完整"))
+        XCTAssertEqual(
+            LauncherLayout.layoutCollectionAccessibilityHelp(
+                layoutEditingEnabled: false,
+                layoutEditingExplanation: "应用扫描不完整，暂时无法整理；请重新扫描",
+                editableHelp: "拖动应用以整理布局"
+            ),
+            "应用扫描不完整，暂时无法整理；请重新扫描"
+        )
+        XCTAssertEqual(
+            LauncherLayout.layoutCollectionAccessibilityHelp(
+                layoutEditingEnabled: true,
+                layoutEditingExplanation: nil,
+                editableHelp: "拖动应用以整理布局"
+            ),
+            "拖动应用以整理布局"
+        )
+        XCTAssertEqual(LauncherLayout.readOnlyStatusAccessibilityLabelKey, "整理状态")
+    }
+
+    func testSelectAllOnCurrentPageOnlyDoesNotIncludeOtherPages() {
+        let page0 = (0..<LauncherLayout.pageCapacity).map { _ in UUID() }
+        let page1 = (0..<3).map { _ in UUID() }
+        let entries = (page0 + page1).map { LauncherEntry.app($0) }
+        let ids = LauncherLayout.itemIDs(onPage: 0, from: entries)
+        XCTAssertEqual(ids, page0)
+        XCTAssertEqual(LauncherLayout.itemIDs(onPage: 1, from: entries), page1)
+        XCTAssertEqual(LauncherLayout.itemIDs(onPage: 2, from: entries), [])
+
+        let selected = LauncherItemSelection.selectingAll(ids: ids)
+        XCTAssertEqual(selected.orderedIDs, page0)
+        XCTAssertEqual(selected.rangeAnchorID, page0.first)
+        XCTAssertEqual(LauncherItemSelection.selectingAll(ids: []).orderedIDs, [])
+    }
+
+    func testShiftClickRangeSelectionPreservesAnchorWithoutPaging() {
+        let a = UUID()
+        let b = UUID()
+        let c = UUID()
+        let d = UUID()
+        let presented = [a, b, c, d]
+
+        var selection = LauncherItemSelection.applying(kind: .replace, itemID: b, to: .empty)
+        XCTAssertEqual(selection.orderedIDs, [b])
+        XCTAssertEqual(selection.rangeAnchorID, b)
+
+        selection = LauncherItemSelection.applyingRange(
+            to: d,
+            presentedOrder: presented,
+            current: selection
+        )
+        XCTAssertEqual(selection.orderedIDs, [b, c, d])
+        XCTAssertEqual(selection.rangeAnchorID, b, "anchor stays so a later Shift-click can retarget")
+
+        selection = LauncherItemSelection.applyingRange(
+            to: a,
+            presentedOrder: presented,
+            current: selection
+        )
+        XCTAssertEqual(selection.orderedIDs, [a, b])
+        XCTAssertEqual(selection.rangeAnchorID, b)
+
+        // Unknown id falls back to replace
+        let outsider = UUID()
+        selection = LauncherItemSelection.applyingRange(
+            to: outsider,
+            presentedOrder: presented,
+            current: selection
+        )
+        XCTAssertEqual(selection.orderedIDs, [outsider])
+        XCTAssertEqual(selection.rangeAnchorID, outsider)
+
+        // Toggle updates anchor
+        selection = LauncherItemSelection.applying(kind: .toggle, itemID: a, to: selection)
+        XCTAssertEqual(selection.rangeAnchorID, a)
+        XCTAssertTrue(selection.contains(a))
+        XCTAssertTrue(selection.contains(outsider))
+    }
+
+    func testBatchHideAndCreateFolderFromSelection() throws {
+        let a = UUID()
+        let b = UUID()
+        let c = UUID()
+        let folderID = UUID()
+        let state = LayoutState(
+            orderedEntries: [.app(a), .app(b), .folder(folderID), .app(c)],
+            folders: [
+                folderID: LauncherFolder(id: folderID, name: "F", itemIDs: [UUID()])
+            ],
+            appKeys: [
+                a: "a.bundle",
+                b: "b.bundle",
+                c: "c.bundle"
+            ]
+        )
+        let selection = LauncherItemSelection(orderedIDs: [a, folderID, b, c])
+        XCTAssertEqual(
+            LauncherLayout.appKeysForBatchHide(selection: selection, in: state),
+            ["a.bundle", "b.bundle", "c.bundle"]
+        )
+        XCTAssertEqual(
+            LauncherLayout.topLevelAppIDsForBatchFolder(selection: selection, in: state),
+            [a, b, c]
+        )
+
+        let hidden = LauncherLayout.hideApplications(withKeys: ["a.bundle", "c.bundle"], in: state)
+        XCTAssertFalse(hidden.orderedEntries.contains(.app(a)))
+        XCTAssertFalse(hidden.orderedEntries.contains(.app(c)))
+        XCTAssertTrue(hidden.orderedEntries.contains(.app(b)))
+        XCTAssertEqual(hidden.hiddenAppKeys, Set(["a.bundle", "c.bundle"]))
+
+        let folded = try LauncherLayout.createFolderFromTopLevelApps(
+            orderedAppIDs: [a, c, b],
+            in: state,
+            name: "工具"
+        ).get()
+        XCTAssertEqual(folded.state.folders[folded.folderID]?.name, "工具")
+        XCTAssertEqual(folded.state.folders[folded.folderID]?.itemIDs, [a, c, b])
+        XCTAssertFalse(folded.state.orderedEntries.contains(.app(a)))
+        XCTAssertFalse(folded.state.orderedEntries.contains(.app(b)))
+        XCTAssertFalse(folded.state.orderedEntries.contains(.app(c)))
+        XCTAssertTrue(folded.state.orderedEntries.contains(.folder(folded.folderID)))
+        // Folder lands at earliest former index (a was first).
+        XCTAssertEqual(folded.state.orderedEntries.first, .folder(folded.folderID))
+
+        XCTAssertEqual(
+            LauncherLayout.hideSelectedApplicationsToastMessage(count: 3),
+            "已隐藏 3 个应用"
+        )
+
+        // Need ≥2 apps
+        XCTAssertThrowsError(
+            try LauncherLayout.createFolderFromTopLevelApps(
+                orderedAppIDs: [a],
+                in: state,
+                name: "X"
+            ).get()
+        )
+    }
+
+    func testBatchCreateFolderFromSelectionDropOntoAppSamePageOnly() throws {
+        let a = UUID()
+        let b = UUID()
+        let c = UUID()
+        let target = UUID()
+        let otherPage = UUID()
+        var fillers: [UUID] = []
+        // page 0: a, b, c, target, fillers...; otherPage on page 1
+        while 4 + fillers.count < LauncherLayout.pageCapacity {
+            fillers.append(UUID())
+        }
+        var ordered: [LauncherEntry] = [.app(a), .app(b), .app(c), .app(target)]
+        ordered.append(contentsOf: fillers.map { .app($0) })
+        ordered.append(.app(otherPage))
+        var appKeys: [UUID: String] = [
+            a: "a.bundle",
+            b: "b.bundle",
+            c: "c.bundle",
+            target: "target.bundle",
+            otherPage: "other.bundle"
+        ]
+        for (index, id) in fillers.enumerated() {
+            appKeys[id] = "filler.\(index)"
+        }
+        let state = LayoutState(orderedEntries: ordered, appKeys: appKeys)
+
+        let selection = LauncherItemSelection(orderedIDs: [a, c, otherPage, b])
+        XCTAssertTrue(
+            LauncherLayout.shouldBatchCreateFolderFromSelection(
+                selection: selection,
+                draggedID: a,
+                targetAppID: target,
+                in: state
+            )
+        )
+        let apps = LauncherLayout.topLevelAppIDsForBatchCreateFolder(
+            selection: selection,
+            targetAppID: target,
+            in: state
+        )
+        XCTAssertEqual(apps, [target, a, c, b], "target first; same-page selection; skip other page")
+        XCTAssertFalse(apps.contains(otherPage))
+
+        let created = try LauncherLayout.createFolderFromTopLevelApps(
+            orderedAppIDs: apps,
+            in: state,
+            name: "新建文件夹"
+        ).get()
+        XCTAssertEqual(created.state.folders[created.folderID]?.itemIDs, [target, a, c, b])
+        XCTAssertTrue(created.state.orderedEntries.contains(.folder(created.folderID)))
+        XCTAssertFalse(created.state.orderedEntries.contains(.app(a)))
+        XCTAssertFalse(created.state.orderedEntries.contains(.app(target)))
+        XCTAssertTrue(created.state.orderedEntries.contains(.app(otherPage)))
+
+        // Single selected app → must NOT batch (preserve single-item merge-to-folder).
+        let single = LauncherItemSelection(orderedIDs: [a])
+        XCTAssertFalse(
+            LauncherLayout.shouldBatchCreateFolderFromSelection(
+                selection: single,
+                draggedID: a,
+                targetAppID: target,
+                in: state
+            )
+        )
+        let singleMerge = try LauncherLayout.applyDrop(
+            LayoutDrop(source: .topLevel(a), destination: .merge(.topLevel(target))),
+            to: state
+        ).get()
+        let newFolderID = singleMerge.folders.keys.first { state.folders[$0] == nil }!
+        XCTAssertEqual(Set(singleMerge.folders[newFolderID]!.itemIDs), Set([target, a]))
+        XCTAssertTrue(singleMerge.orderedEntries.contains(.app(b)))
+
+        // Drop onto existing folder must not take create-folder batch path.
+        let folderID = UUID()
+        let withFolder = LayoutState(
+            orderedEntries: [.app(a), .app(b), .folder(folderID)],
+            folders: [folderID: LauncherFolder(id: folderID, name: "F", itemIDs: [UUID()])],
+            appKeys: [a: "a.bundle", b: "b.bundle"]
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldBatchCreateFolderFromSelection(
+                selection: LauncherItemSelection(orderedIDs: [a, b]),
+                draggedID: a,
+                targetAppID: folderID,
+                in: withFolder
+            )
+        )
+    }
+
+    func testBatchMoveSelectionIntoExistingFolderSamePageOnly() throws {
+        let folderID = UUID()
+        let a = UUID()
+        let b = UUID()
+        let c = UUID()
+        let otherPage = UUID()
+        var fillers: [UUID] = []
+        // page 0: a, b, c, folder, then fillers to fill the page
+        while 4 + fillers.count < LauncherLayout.pageCapacity {
+            fillers.append(UUID())
+        }
+        var ordered: [LauncherEntry] = [.app(a), .app(b), .app(c), .folder(folderID)]
+        ordered.append(contentsOf: fillers.map { .app($0) })
+        ordered.append(.app(otherPage))
+        var appKeys: [UUID: String] = [
+            a: "a.bundle",
+            b: "b.bundle",
+            c: "c.bundle",
+            otherPage: "other.bundle"
+        ]
+        for (index, id) in fillers.enumerated() {
+            appKeys[id] = "filler.\(index)"
+        }
+        let member = UUID()
+        appKeys[member] = "member.bundle"
+
+        let state = LayoutState(
+            orderedEntries: ordered,
+            folders: [
+                folderID: LauncherFolder(id: folderID, name: "工具", itemIDs: [member])
+            ],
+            appKeys: appKeys
+        )
+
+        let selection = LauncherItemSelection(orderedIDs: [a, c, otherPage, b])
+        XCTAssertTrue(
+            LauncherLayout.shouldBatchMoveSelectionIntoFolder(
+                selection: selection,
+                draggedID: a,
+                folderID: folderID,
+                in: state
+            )
+        )
+        let samePage = LauncherLayout.topLevelAppIDsForBatchMoveIntoFolder(
+            selection: selection,
+            folderID: folderID,
+            in: state
+        )
+        XCTAssertEqual(samePage, [a, c, b], "other-page selection must not batch-move")
+        XCTAssertFalse(samePage.contains(otherPage))
+
+        let moved = try LauncherLayout.moveTopLevelApps(
+            samePage,
+            intoFolder: folderID,
+            in: state
+        ).get()
+        XCTAssertEqual(Array(moved.folders[folderID]!.itemIDs.suffix(3)), [a, c, b])
+        XCTAssertFalse(moved.orderedEntries.contains(.app(a)))
+        XCTAssertFalse(moved.orderedEntries.contains(.app(b)))
+        XCTAssertFalse(moved.orderedEntries.contains(.app(c)))
+        XCTAssertTrue(moved.orderedEntries.contains(.folder(folderID)))
+        XCTAssertTrue(moved.orderedEntries.contains(.app(otherPage)), "off-page app stays")
+
+        // Single-item selection must not take the batch path (preserve single drag).
+        let single = LauncherItemSelection(orderedIDs: [a])
+        XCTAssertFalse(
+            LauncherLayout.shouldBatchMoveSelectionIntoFolder(
+                selection: single,
+                draggedID: a,
+                folderID: folderID,
+                in: state
+            )
+        )
+        // Dragging an unselected icon while others are selected → no batch.
+        let others = LauncherItemSelection(orderedIDs: [b, c])
+        XCTAssertFalse(
+            LauncherLayout.shouldBatchMoveSelectionIntoFolder(
+                selection: others,
+                draggedID: a,
+                folderID: folderID,
+                in: state
+            )
+        )
+
+        // Single applyDrop onto existing folder still works (regression).
+        let addOne = try LauncherLayout.applyDrop(
+            LayoutDrop(source: .topLevel(a), destination: .merge(.topLevel(folderID))),
+            to: state
+        ).get()
+        XCTAssertTrue(addOne.folders[folderID]?.itemIDs.contains(a) == true)
+        XCTAssertFalse(addOne.orderedEntries.contains(.app(a)))
+        XCTAssertTrue(addOne.orderedEntries.contains(.app(b)))
+    }
+
+    func testPrunedItemSelectionAfterHideUninstallAndFolderDissolve() {
+        let appA = UUID()
+        let appB = UUID()
+        let appC = UUID()
+        let appD = UUID()
+        let folderID = UUID()
+        // Folder must start with 2+ members: dissolveIfNeeded runs whenever
+        // itemIDs.count <= 1, including after an unrelated hide.
+        var state = LayoutState(
+            orderedEntries: [.app(appA), .folder(folderID), .app(appC)],
+            folders: [
+                folderID: LauncherFolder(id: folderID, name: "Utilities", itemIDs: [appB, appD])
+            ],
+            appKeys: [
+                appA: "a.bundle",
+                appB: "b.bundle",
+                appC: "c.bundle",
+                appD: "d.bundle"
+            ]
+        )
+
+        let present = LauncherLayout.presentSelectableItemIDs(in: state)
+        XCTAssertEqual(present, Set([appA, folderID, appC, appB, appD]))
+
+        var selection = LauncherItemSelection(orderedIDs: [appA, folderID, appB, appC, appD])
+        selection = LauncherLayout.prunedItemSelection(selection, in: state)
+        XCTAssertEqual(Set(selection.orderedIDs), Set([appA, folderID, appB, appC, appD]))
+
+        // Hide top-level A — folder keeps 2 members, so it stays.
+        state = LauncherLayout.hideApplication(withKey: "a.bundle", in: state)
+        selection = LauncherLayout.prunedItemSelection(
+            LauncherItemSelection(orderedIDs: [appA, folderID, appB, appC, appD]),
+            in: state
+        )
+        XCTAssertFalse(selection.contains(appA))
+        XCTAssertTrue(selection.contains(folderID))
+        XCTAssertTrue(selection.contains(appB))
+        XCTAssertTrue(selection.contains(appD))
+        XCTAssertTrue(selection.contains(appC))
+        XCTAssertTrue(state.folders[folderID] != nil)
+
+        // Forget B — folder drops to one member and dissolves into D.
+        state = LauncherLayout.forgetUninstalledApplication(withKey: "b.bundle", in: state)
+        XCTAssertNil(state.folders[folderID], "folder with one remaining member must dissolve")
+        XCTAssertTrue(
+            state.orderedEntries.contains(.app(appD)),
+            "remaining member becomes top-level after dissolve"
+        )
+        let afterForget = LauncherLayout.prunedItemSelection(
+            LauncherItemSelection(orderedIDs: [folderID, appB, appC, appD]),
+            in: state
+        )
+        XCTAssertFalse(afterForget.contains(appB))
+        XCTAssertFalse(afterForget.contains(folderID), "dissolved folder id must leave selection")
+        XCTAssertTrue(afterForget.contains(appC))
+        XCTAssertTrue(afterForget.contains(appD), "dissolved remaining member stays selectable")
+        XCTAssertEqual(
+            LauncherLayout.presentSelectableItemIDs(in: state),
+            Set([appC, appD])
+        )
+    }
+
+    func testLauncherItemSelectionReplaceToggleAndPrune() {
+        let a = UUID()
+        let b = UUID()
+        let c = UUID()
+
+        var selection = LauncherItemSelection.empty
+        XCTAssertTrue(selection.isEmpty)
+        XCTAssertEqual(selection.count, 0)
+
+        selection = LauncherItemSelection.applying(kind: .replace, itemID: a, to: selection)
+        XCTAssertEqual(selection.orderedIDs, [a])
+        XCTAssertTrue(selection.contains(a))
+
+        selection = LauncherItemSelection.applying(kind: .toggle, itemID: b, to: selection)
+        XCTAssertEqual(selection.orderedIDs, [a, b])
+
+        selection = LauncherItemSelection.applying(kind: .toggle, itemID: a, to: selection)
+        XCTAssertEqual(selection.orderedIDs, [b])
+        XCTAssertFalse(selection.contains(a))
+
+        selection = LauncherItemSelection.applying(kind: .toggle, itemID: a, to: selection)
+        XCTAssertEqual(selection.orderedIDs, [b, a])
+
+        selection = LauncherItemSelection.applying(kind: .replace, itemID: c, to: selection)
+        XCTAssertEqual(selection.orderedIDs, [c])
+
+        selection.toggle(a)
+        selection.toggle(b)
+        XCTAssertEqual(Set(selection.orderedIDs), Set([c, a, b]))
+        selection.removeAbsent(from: Set([a, b]))
+        XCTAssertEqual(Set(selection.orderedIDs), Set([a, b]))
+        XCTAssertFalse(selection.contains(c))
+
+        selection.clear()
+        XCTAssertTrue(selection.isEmpty)
+
+        // Dedupes on init
+        let duped = LauncherItemSelection(orderedIDs: [a, a, b, a])
+        XCTAssertEqual(duped.orderedIDs, [a, b])
+    }
+
 }
 
 private func XCTAssertThrowsErrorAsync<T>(

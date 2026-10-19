@@ -86,6 +86,22 @@ final class LauncherDragUITests: XCTestCase {
             folder.click()
             XCTAssertTrue(app.buttons["计算器"].waitForExistence(timeout: 5))
             XCTAssertTrue(app.buttons["时钟"].exists)
+
+            let diagnosticLog = layout.deletingLastPathComponent().appendingPathComponent("diagnostics.log")
+            app.typeKey(.escape, modifierFlags: [])
+            // Reduced motion still routes through commitFolderPreviewGlyphFlight; assert end-state.
+            let glyphCleaned = expectation(
+                for: NSPredicate { _, _ in
+                    let text = (try? String(contentsOf: diagnosticLog, encoding: .utf8)) ?? ""
+                    return text.contains("Folder glyph cleanup:")
+                        && text.contains("remaining=0")
+                        && text.contains("detached=true")
+                },
+                evaluatedWith: diagnosticLog,
+                handler: nil
+            )
+            wait(for: [glyphCleaned], timeout: 5)
+            XCTAssertTrue(folder.exists, "Folder tile should remain after open/close")
         }
     }
 
@@ -248,7 +264,7 @@ final class LauncherDragUITests: XCTestCase {
 
     @MainActor
     func testDraggingOutOfTwoItemFolderDissolvesIt() throws {
-        try withFixture { app, layout in
+        try withFixture(mergeDiagnostics: true) { app, layout in
             dragCalculatorOntoClock(in: app)
             let created = expectation(for: NSPredicate(format: "isTrue == YES"), evaluatedWith: LayoutHasFolder(layout), handler: nil)
             wait(for: [created], timeout: 5)
@@ -285,6 +301,20 @@ final class LauncherDragUITests: XCTestCase {
             XCTAssertTrue(clock.waitForExistence(timeout: 5))
             XCTAssertTrue(clock.isHittable)
 
+            let diagnosticLog = layout.deletingLastPathComponent().appendingPathComponent("diagnostics.log")
+            let scatterCleaned = expectation(
+                for: NSPredicate { _, _ in
+                    let text = (try? String(contentsOf: diagnosticLog, encoding: .utf8)) ?? ""
+                    return text.contains("Scatter cleanup:")
+                        && text.contains("remaining=0")
+                        && text.contains("detached=true")
+                        && text.contains("destinationsReady=true")
+                },
+                evaluatedWith: diagnosticLog,
+                handler: nil
+            )
+            wait(for: [scatterCleaned], timeout: 5)
+
             app.terminate()
             app.launch()
             XCTAssertTrue(app.buttons["计算器"].waitForExistence(timeout: 15))
@@ -295,7 +325,7 @@ final class LauncherDragUITests: XCTestCase {
 
     @MainActor
     func testDraggingToTileEdgeReordersApps() throws {
-        try withFixture { app, layout in
+        try withFixture(mergeDiagnostics: true) { app, layout in
             let calculator = app.buttons["计算器"]
             let clock = app.buttons["时钟"]
             XCTAssertTrue(calculator.waitForExistence(timeout: 15))
@@ -319,6 +349,19 @@ final class LauncherDragUITests: XCTestCase {
             wait(for: [reordered], timeout: 5)
             XCTAssertTrue(calculator.isHittable)
             XCTAssertTrue(clock.isHittable)
+
+            let diagnosticLog = layout.deletingLastPathComponent().appendingPathComponent("diagnostics.log")
+            let dropCleaned = expectation(
+                for: NSPredicate { _, _ in
+                    let text = (try? String(contentsOf: diagnosticLog, encoding: .utf8)) ?? ""
+                    return text.contains("Drop cleanup: flyerDetached=true")
+                        && text.contains("pendingCleared=true")
+                        && text.contains("itemCleared=true")
+                },
+                evaluatedWith: diagnosticLog,
+                handler: nil
+            )
+            wait(for: [dropCleaned], timeout: 5)
         }
     }
 
@@ -470,6 +513,53 @@ final class LauncherDragUITests: XCTestCase {
             XCTAssertFalse(app.buttons["文件夹 新建文件夹"].exists)
             app.terminate()
             XCTAssertEqual(try Data(contentsOf: layout), original)
+        }
+    }
+
+    @MainActor
+    func testUninstallMenuDisablesForSystemProtectedApp() throws {
+        // Fixture Calculator.app is a symlink into /System/Applications, so
+        // eligibility disables uninstall while still offering hide/alias.
+        try withFixture { app, layout in
+            let calculator = app.buttons["计算器"]
+            XCTAssertTrue(calculator.waitForExistence(timeout: 15))
+            calculator.rightClick()
+            let uninstall = app.menuItems["卸载应用…"]
+            XCTAssertTrue(uninstall.waitForExistence(timeout: 5), "Uninstall item should appear while editing")
+            XCTAssertFalse(uninstall.isEnabled, "System-protected apps must not enable uninstall")
+            let hide = app.menuItems["隐藏应用"]
+            XCTAssertTrue(hide.exists)
+            XCTAssertTrue(hide.isEnabled)
+            // Dismiss menu without choosing an item.
+            app.typeKey(.escape, modifierFlags: [])
+        }
+    }
+
+    @MainActor
+    func testUninstallMenuHiddenWhenScanIncomplete() throws {
+        try withFixture { app, layout in
+            app.terminate()
+            let brokenApp = layout.deletingLastPathComponent()
+                .appendingPathComponent("Applications/Broken.app")
+            try FileManager.default.createSymbolicLink(
+                at: brokenApp,
+                withDestinationURL: layout.deletingLastPathComponent()
+                    .appendingPathComponent("Applications/Missing.app")
+            )
+            app.launch()
+
+            XCTAssertTrue(
+                app.staticTexts["应用扫描不完整，暂时无法整理；请重新扫描"].waitForExistence(timeout: 15)
+            )
+            let calculator = app.buttons["计算器"]
+            XCTAssertTrue(calculator.waitForExistence(timeout: 15))
+            calculator.rightClick()
+            XCTAssertFalse(
+                app.menuItems["卸载应用…"].waitForExistence(timeout: 1),
+                "Read-only incomplete scan must hide uninstall"
+            )
+            XCTAssertFalse(app.menuItems["设置别名…"].exists)
+            XCTAssertFalse(app.menuItems["隐藏应用"].exists)
         }
     }
 
@@ -1213,13 +1303,14 @@ final class LauncherDragUITests: XCTestCase {
             let aliasField = alert.textFields["计算器 的别名"]
             XCTAssertGreaterThanOrEqual(aliasField.frame.width, 200)
             aliasField.click()
-            aliasField.typeText("我的计算器")
+            pasteText("我的计算器", into: aliasField)
             alert.buttons["保存"].click()
             XCTAssertTrue(app.buttons["我的计算器"].waitForExistence(timeout: 5))
 
             let search = app.searchFields["搜索应用"]
             search.click()
-            search.typeText("我的")
+            pasteText("我的", into: search)
+            XCTAssertEqual(search.value as? String, "我的")
             XCTAssertTrue(app.buttons["我的计算器"].waitForExistence(timeout: 5))
             XCTAssertFalse(app.buttons["时钟"].exists)
 
@@ -1227,8 +1318,21 @@ final class LauncherDragUITests: XCTestCase {
             XCTAssertTrue(try String(contentsOf: layout, encoding: .utf8).contains("我的计算器"))
             app.launch()
             XCTAssertTrue(app.buttons["我的计算器"].waitForExistence(timeout: 15))
-            app.searchFields["搜索应用"].click()
-            app.typeText("我的")
+            let searchAfterRestart = app.searchFields["搜索应用"]
+            XCTAssertTrue(searchAfterRestart.waitForExistence(timeout: 15))
+            searchAfterRestart.click()
+            pasteText("我的", into: searchAfterRestart)
+            let searchValueAfterRestart = (searchAfterRestart.value as? String) ?? "<missing>"
+            let searchProbe = XCTAttachment(string: """
+            searchValue=\(searchValueAfterRestart)
+            searchExists=\(searchAfterRestart.exists)
+            aliasButtonExists=\(app.buttons["我的计算器"].exists)
+            clockExists=\(app.buttons["时钟"].exists)
+            """)
+            searchProbe.name = "Alias restart search probe"
+            searchProbe.lifetime = .keepAlways
+            add(searchProbe)
+            XCTAssertEqual(searchValueAfterRestart, "我的")
             XCTAssertTrue(app.buttons["我的计算器"].waitForExistence(timeout: 5))
             let clockExistsAfterRestart = app.buttons["时钟"].exists
             if clockExistsAfterRestart {
@@ -1256,7 +1360,7 @@ final class LauncherDragUITests: XCTestCase {
             XCTAssertTrue(alert.waitForExistence(timeout: 5))
             let aliasField = alert.textFields["计算器 的别名"]
             aliasField.click()
-            aliasField.typeText("我的计算器")
+            pasteText("我的计算器", into: aliasField)
             alert.buttons["保存"].click()
             XCTAssertTrue(app.buttons["我的计算器"].waitForExistence(timeout: 5))
             app.terminate()
@@ -1499,7 +1603,7 @@ final class LauncherDragUITests: XCTestCase {
             XCTAssertTrue(alert.waitForExistence(timeout: 5))
             let aliasField = alert.textFields["Fixture 01 的别名"]
             aliasField.click()
-            aliasField.typeText("我的常用应用")
+            pasteText("我的常用应用", into: aliasField)
             alert.buttons["保存"].click()
 
             let renamed = app.buttons["我的常用应用"]
@@ -1691,6 +1795,24 @@ final class LauncherDragUITests: XCTestCase {
     }
 
     @MainActor
+    private func pasteText(_ text: String, into element: XCUIElement) {
+        let pasteboard = NSPasteboard.general
+        let previousItems = pasteboard.pasteboardItems?.map { item in
+            let copy = NSPasteboardItem()
+            for type in item.types {
+                if let data = item.data(forType: type) { copy.setData(data, forType: type) }
+            }
+            return copy
+        }
+        defer {
+            pasteboard.clearContents()
+            if let previousItems { _ = pasteboard.writeObjects(previousItems) }
+        }
+        pasteboard.clearContents()
+        XCTAssertTrue(pasteboard.setString(text, forType: .string))
+        element.typeKey("v", modifierFlags: .command)
+    }
+
     private func withFixture(
         systemApps: [String] = ["Calculator", "Clock"],
         additionalApps: Int = 0,

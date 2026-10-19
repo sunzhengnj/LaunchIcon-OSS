@@ -1,3 +1,7 @@
+# 2026-10-19 preview.82 public sync (WIP)
+
+Public checkout `./script/validate_background.sh` passed on macOS/Xcode 27: all static guards, Core 309/309, Direct/StoreSpike Release `analyze`, and UI target `build-for-testing`. No app or UI Runner was launched. Package identity and remote asset verification will be recorded on the Release page after publication. Full UI suite and physical paging input were not run for this public sync. Ad-hoc signing only; no notarization. See [source snapshot](SOURCE_SNAPSHOT_2026-10-19.md).
+
 # 2026-10-14 preview.78 public sync (WIP)
 
 Current public checkout: `./script/validate_background.sh` passed on macOS/Xcode27; Core194/194, windowless cleanup33/33, folder title readiness and landing checks, explicit-network guard, Direct/StoreSpike Release analyze, and UI build-for-testing. No App/UI Runner was launched.

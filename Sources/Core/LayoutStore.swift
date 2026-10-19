@@ -22,7 +22,8 @@ public actor JSONLayoutStore: LayoutStoring {
     }
 
     public nonisolated let fileURL: URL
-    public let backupURL: URL
+    /// Sibling of `fileURL`; nonisolated so Settings can probe existence without hopping the actor.
+    public nonisolated let backupURL: URL
     private let fileManager: FileManager
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
@@ -94,6 +95,34 @@ public actor JSONLayoutStore: LayoutStoring {
             try fileManager.moveItem(at: temporaryURL, to: fileURL)
         }
         recoveredCorruptPrimary = nil
+    }
+
+    /// True when the automatic previous-layout backup file exists on disk.
+    public nonisolated var hasBackupFile: Bool {
+        FileManager.default.fileExists(atPath: backupURL.path)
+    }
+
+    /// Decode the automatic backup written by the last successful `save` that changed state.
+    public func loadBackup() throws -> LayoutState? {
+        try Task.checkCancellation()
+        guard fileManager.fileExists(atPath: backupURL.path) else { return nil }
+        return try decode(at: backupURL)
+    }
+
+    /// Write `state` to a user-chosen URL without touching the live primary/backup pair.
+    public func export(_ state: LayoutState, to url: URL) throws {
+        try Task.checkCancellation()
+        guard state.schemaVersion == LayoutState.currentSchemaVersion else {
+            throw LayoutStoreIssue.unsupportedSchema(state.schemaVersion)
+        }
+        let data = try encoder.encode(state)
+        try data.write(to: url, options: .atomic)
+    }
+
+    /// Decode a user-chosen layout file (export or backup copy). Does not write the live store.
+    public func importLayout(from url: URL) throws -> LayoutState {
+        try Task.checkCancellation()
+        return try decode(at: url)
     }
 
     private func decode(at url: URL) throws -> LayoutState {
