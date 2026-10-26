@@ -1,3 +1,7 @@
+# 2026-10-26 preview.84 public sync (WIP)
+
+Public checkout background validation passed on Mac mini; GitHub Actions macOS validation on PR #9 passed. Public `v1.0.0-preview.84` DMG built from commit `de7ab2bdb9f69d6245dc1d88c37c485967a3aa83`; local and redownloaded DMG/checksum were byte-identical. SHA-256: `7f87ba539d0092070111b812793ec112f7439ff7bb5f5d75b19c119b3f9c2a14`. See the [Release](https://github.com/sunzhengnj/LaunchIcon-OSS/releases/tag/v1.0.0-preview.84). Full UI suite and physical paging input were not run for this public sync. Ad-hoc signing only; no notarization. See [source snapshot](SOURCE_SNAPSHOT_2026-10-26.md).
+
 # 2026-10-19 preview.82 public sync (WIP)
 
 Public checkout `./script/validate_background.sh` passed on macOS/Xcode 27: all static guards, Core 309/309, Direct/StoreSpike Release `analyze`, and UI target `build-for-testing`. No app or UI Runner was launched. The public `v1.0.0-preview.82` DMG was built from tagged commit `499ef93668e6b81eb12fc27b6349ee06852bd978`; local and redownloaded DMG/checksum were byte-identical. SHA-256: `bbbfd793e1b49c58bb1d00ee743ce39532c0b19e3926fcc4eb2632139e5e23ae`. See the [Release](https://github.com/sunzhengnj/LaunchIcon-OSS/releases/tag/v1.0.0-preview.82). Full UI suite and physical paging input were not run for this public sync. Ad-hoc signing only; no notarization. See [source snapshot](SOURCE_SNAPSHOT_2026-10-19.md).
