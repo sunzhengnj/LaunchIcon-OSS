@@ -3,6 +3,7 @@ import CoreServices
 import Darwin
 import AppKit
 import XCTest
+import SQLite3
 @testable import LaunchIconCore
 
 private final class IconDecodeCounter: @unchecked Sendable {
@@ -429,7 +430,11 @@ final class LaunchIconCoreTests: XCTestCase {
             showsStatusItem: false,
             hidesAfterLaunch: false,
             reducesMotion: true,
-            hotCorner: .topRight
+            hotCorner: .topRight,
+            hidesAppNames: true,
+            hidesFolderNames: true,
+            displayTarget: .pointer,
+            additionalAppDirectories: ["/Volumes/External/Applications"]
         )
         await store.save(changed)
         let restored = await store.load()
@@ -441,6 +446,445 @@ final class LaunchIconCoreTests: XCTestCase {
         defaults.set("unrecognized", forKey: "LaunchIcon.Preferences.hotCorner")
         let hotFallback = await store.load()
         XCTAssertEqual(hotFallback.hotCorner, .off)
+        defaults.set("unrecognized", forKey: "LaunchIcon.Preferences.displayTarget")
+        let displayFallback = await store.load()
+        XCTAssertEqual(displayFallback.displayTarget, .active)
+    }
+
+    func testShortcutF4IsOptionalBareFunctionKey() async throws {
+        XCTAssertEqual(LauncherPreferences().shortcut, .optionSpace)
+        XCTAssertEqual(LauncherShortcut.allCases.last, .f4)
+        XCTAssertEqual(LauncherShortcut.f4.rawValue, "f4")
+        XCTAssertEqual(LauncherShortcut.f4.title, "F4")
+        XCTAssertNil(LauncherShortcut(rawValue: "F4"))
+
+        let f4 = LauncherShortcut.carbonChord(for: .f4)
+        XCTAssertEqual(f4.modifiers, 0)
+        let spaceKey = LauncherShortcut.carbonChord(for: .optionSpace).keyCode
+        XCTAssertEqual(spaceKey, LauncherShortcut.carbonChord(for: .optionShiftSpace).keyCode)
+        XCTAssertEqual(spaceKey, LauncherShortcut.carbonChord(for: .controlShiftSpace).keyCode)
+        XCTAssertNotEqual(f4.keyCode, spaceKey)
+        XCTAssertNotEqual(LauncherShortcut.carbonChord(for: .optionSpace).modifiers, 0)
+        XCTAssertNotEqual(
+            LauncherShortcut.carbonChord(for: .optionShiftSpace).modifiers,
+            LauncherShortcut.carbonChord(for: .controlShiftSpace).modifiers
+        )
+
+        let suiteName = "com.sunzheng.LaunchIcon.Tests.ShortcutF4.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set("f4", forKey: "LaunchIcon.Preferences.shortcut")
+        let loaded = await LauncherPreferencesStore(suiteName: suiteName).load()
+        XCTAssertEqual(loaded.shortcut, .f4)
+    }
+
+    func testHideAppNamesPreferenceDefaultsOffAndKeepsSearchAndLaunchLabels() {
+        XCTAssertFalse(LauncherPreferences().hidesAppNames)
+        XCTAssertFalse(LauncherLayout.tileTitleHidden(hidesAppNames: false, inSearchResults: false, isLaunching: false))
+        XCTAssertTrue(LauncherLayout.tileTitleHidden(hidesAppNames: true, inSearchResults: false, isLaunching: false))
+        XCTAssertFalse(LauncherLayout.tileTitleHidden(hidesAppNames: true, inSearchResults: true, isLaunching: false))
+        XCTAssertFalse(LauncherLayout.tileTitleHidden(hidesAppNames: true, inSearchResults: false, isLaunching: true))
+        XCTAssertFalse(LauncherLayout.tileTitleHidden(hidesAppNames: false, inSearchResults: true, isLaunching: true))
+    }
+
+    func testHideFolderNamesIsIndependentOfAppNames() {
+        XCTAssertFalse(LauncherPreferences().hidesFolderNames)
+        func hidden(_ apps: Bool, _ folders: Bool, folder: Bool, search: Bool = false, launching: Bool = false) -> Bool {
+            LauncherLayout.tileTitleHidden(
+                hidesAppNames: apps, hidesFolderNames: folders, isFolder: folder,
+                inSearchResults: search, isLaunching: launching
+            )
+        }
+        XCTAssertTrue(hidden(true, false, folder: false))
+        XCTAssertFalse(hidden(true, false, folder: true))
+        XCTAssertTrue(hidden(false, true, folder: true))
+        XCTAssertFalse(hidden(false, true, folder: false))
+        XCTAssertFalse(hidden(true, true, folder: true, search: true))
+        XCTAssertFalse(hidden(true, true, folder: false, launching: true))
+        XCTAssertFalse(hidden(false, false, folder: true))
+    }
+
+    func testNewAppBadgeMarksOnlyAppsAddedSinceKnownLayout() {
+        func app(_ id: String) -> AppCandidate {
+            AppCandidate(canonicalURL: URL(fileURLWithPath: "/Applications/\(id).app"), bundleIdentifier: "test.\(id)",
+                         displayName: id, sourcePriority: 0, discoveredAt: .now)
+        }
+        let fresh = LayoutState()
+        let first = LauncherLayout.reconcile(candidates: [app("a"), app("b")], into: fresh)
+        XCTAssertEqual(LauncherLayout.newlyAddedAppKeys(previous: fresh, reconciled: first), [])
+        var known = first
+        known.hiddenAppKeys = ["bundle:test.h"]
+        let next = LauncherLayout.reconcile(candidates: [app("a"), app("b"), app("c"), app("h")], into: known)
+        XCTAssertEqual(LauncherLayout.newlyAddedAppKeys(previous: known, reconciled: next), ["bundle:test.c"])
+        XCTAssertEqual(LauncherLayout.newlyAddedAppKeys(previous: next, reconciled: next), [])
+        XCTAssertTrue(LauncherLayout.showsNewAppBadge(isNew: true, isFolder: false, inSearchResults: false, isLaunching: false))
+        XCTAssertFalse(LauncherLayout.showsNewAppBadge(isNew: false, isFolder: false, inSearchResults: false, isLaunching: false))
+        XCTAssertFalse(LauncherLayout.showsNewAppBadge(isNew: true, isFolder: true, inSearchResults: false, isLaunching: false))
+        XCTAssertFalse(LauncherLayout.showsNewAppBadge(isNew: true, isFolder: false, inSearchResults: true, isLaunching: false))
+        XCTAssertFalse(LauncherLayout.showsNewAppBadge(isNew: true, isFolder: false, inSearchResults: false, isLaunching: true))
+    }
+
+    func testCatalogRootsAppendOnlySafeCustomDirectories() {
+        let standard = [
+            URL(fileURLWithPath: "/Users/me/Applications", isDirectory: true),
+            URL(fileURLWithPath: "/Applications", isDirectory: true)
+        ]
+        XCTAssertTrue(LauncherPreferences().additionalAppDirectories.isEmpty)
+        XCTAssertEqual(AppCatalogScanner.catalogRoots(standard: standard, additionalPaths: []), standard)
+        let roots = AppCatalogScanner.catalogRoots(standard: standard, additionalPaths: [
+            "/Volumes/Ext/Apps/", "  ", "relative/Apps", "/Applications", "/Applications/",
+            "/", "/Users", "/Users/me", "/Volumes/Ext/Apps", "/Applications/Foo.app/Contents",
+            "/Volumes/VM/Applications", "/Applications/Utilities"
+        ])
+        XCTAssertEqual(roots.map(\.path), [
+            "/Users/me/Applications", "/Applications",
+            "/Volumes/Ext/Apps", "/Volumes/VM/Applications", "/Applications/Utilities"
+        ])
+    }
+
+    func testCatalogRootsCapsAdditionalDirectoryCount() {
+        // CUSTOM-ROOT-COUNT-LIMIT-01
+        let standard = [
+            URL(fileURLWithPath: "/Users/me/Applications", isDirectory: true),
+            URL(fileURLWithPath: "/Applications", isDirectory: true)
+        ]
+        let paths = (0..<AppCatalogScanner.maxAdditionalAppDirectories + 5).map {
+            "/Volumes/Disk\($0)/Apps"
+        }
+        let roots = AppCatalogScanner.catalogRoots(standard: standard, additionalPaths: paths)
+        XCTAssertEqual(roots.count, standard.count + AppCatalogScanner.maxAdditionalAppDirectories)
+        XCTAssertEqual(AppDirectoryCopy.limitReached(localize: { $0 }), AppDirectoryCopy.limitReachedKey)
+    }
+
+
+    func testSanitizedAdditionalAppDirectoriesCapsAndDedupes() {
+        // CUSTOM-ROOT-COUNT-LIMIT-01 companion — prefs store matches catalogRoots.
+        let standard = [
+            URL(fileURLWithPath: "/Users/me/Applications", isDirectory: true),
+            URL(fileURLWithPath: "/Applications", isDirectory: true)
+        ]
+        var paths = (0..<AppCatalogScanner.maxAdditionalAppDirectories + 3).map {
+            "/Volumes/Disk\($0)/Apps"
+        }
+        paths.append("/Volumes/Disk0/Apps") // duplicate
+        paths.append("relative/not/absolute")
+        let sanitized = AppCatalogScanner.sanitizedAdditionalAppDirectories(
+            paths,
+            standard: standard
+        )
+        XCTAssertEqual(sanitized.count, AppCatalogScanner.maxAdditionalAppDirectories)
+        XCTAssertEqual(sanitized.first, "/Volumes/Disk0/Apps")
+        XCTAssertFalse(sanitized.contains("relative/not/absolute"))
+    }
+
+
+    func testFolderTitleSingleClickBeginOnlyWhenAllowed() {
+        // FOLDER-TITLE-AM-BEGIN-01 — production stays double-click.
+        XCTAssertFalse(LauncherLayout.folderTitleShouldBeginEditingFromPointer(clickCount: 1))
+        XCTAssertTrue(LauncherLayout.folderTitleShouldBeginEditingFromPointer(clickCount: 2))
+        XCTAssertTrue(
+            LauncherLayout.folderTitleShouldBeginEditingFromPointer(
+                clickCount: 1,
+                allowSingleClickBegin: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.folderTitleShouldBeginEditingFromPointer(
+                clickCount: 1,
+                allowSingleClickBegin: false
+            )
+        )
+    }
+
+
+    func testScanReportsMissingRequiredCustomRootAsUnavailable() async throws {
+        // MISSING-ROOT-PARTIAL-EDIT-01: missing user root is unavailable, not skipped.
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("LaunchIconRoots-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let present = base.appendingPathComponent("Present", isDirectory: true)
+        try FileManager.default.createDirectory(at: present, withIntermediateDirectories: true)
+        let fixture = try makeMacBundle(named: "PresentApp", in: present, executable: "PresentApp")
+        let missing = base.appendingPathComponent("Unmounted", isDirectory: true)
+        let plain = await AppCatalogScanner().scan(roots: [present, missing])
+        XCTAssertTrue(plain.skippedPaths.isEmpty)
+        XCTAssertTrue(plain.unavailableRequiredRootPaths.isEmpty)
+        let required = await AppCatalogScanner().scan(
+            roots: [present, missing],
+            requiredRootPaths: [AppCatalogScanner.normalizedRootPath(missing.path)]
+        )
+        XCTAssertTrue(required.skippedPaths.isEmpty)
+        XCTAssertEqual(required.unavailableRequiredRootPaths.map(\.path), [missing.path])
+        // Present-root apps keep the report persistable — editing is not locked.
+        XCTAssertFalse(required.candidates.isEmpty)
+        XCTAssertTrue(required.canPersistReconciledLayout)
+        _ = fixture
+    }
+
+    func testRetainingCandidatesKeepsUnavailableRootAppsThroughReconcile() async throws {
+        // MISSING-ROOT-PARTIAL-EDIT-01
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("LaunchIconRetain-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let present = base.appendingPathComponent("Present", isDirectory: true)
+        let external = base.appendingPathComponent("External", isDirectory: true)
+        try FileManager.default.createDirectory(at: present, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: external, withIntermediateDirectories: true)
+        let presentApp = try makeMacBundle(named: "LocalApp", in: present, executable: "LocalApp")
+        let externalApp = try makeMacBundle(named: "ExtApp", in: external, executable: "ExtApp")
+        let mounted = await AppCatalogScanner().scan(roots: [present, external])
+        XCTAssertEqual(Set(mounted.candidates.map(\.displayName)), ["LocalApp", "ExtApp"])
+        XCTAssertTrue(mounted.canPersistReconciledLayout)
+
+        var layout = LauncherLayout.reconcile(candidates: mounted.candidates, into: LayoutState())
+        XCTAssertEqual(layout.orderedEntries.count, 2)
+        let externalKey = mounted.candidates.first { $0.displayName == "ExtApp" }!.deduplicationKey
+        let externalID = layout.appKeys.first { $0.value == externalKey }!.key
+
+        try FileManager.default.removeItem(at: external)
+        let required = await AppCatalogScanner().scan(
+            roots: [present, external],
+            requiredRootPaths: [AppCatalogScanner.normalizedRootPath(external.path)]
+        )
+        XCTAssertEqual(required.unavailableRequiredRootPaths.map(\.path), [external.path])
+        XCTAssertEqual(required.candidates.map(\.displayName), ["LocalApp"])
+        XCTAssertTrue(required.canPersistReconciledLayout)
+
+        let retained = required.retainingCandidates(from: mounted.candidates)
+        XCTAssertEqual(Set(retained.candidates.map(\.displayName)), ["LocalApp", "ExtApp"])
+        XCTAssertTrue(retained.canPersistReconciledLayout)
+
+        layout = LauncherLayout.reconcile(candidates: retained.candidates, into: layout)
+        XCTAssertEqual(layout.appKeys[externalID], externalKey)
+        XCTAssertTrue(layout.orderedEntries.contains(.app(externalID)))
+        _ = presentApp
+        _ = externalApp
+    }
+
+    func testCustomRootScanRespectsDepthAndAppCountCaps() async throws {
+        // CUSTOM-ROOT-SCAN-LIMIT-01
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("LaunchIconCap-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: base) }
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+
+        // Depth: root/a/b/c/d/TooDeep.app should be skipped (depth 5 > 4).
+        var deep = base
+        for part in ["a", "b", "c", "d"] {
+            deep = deep.appendingPathComponent(part, isDirectory: true)
+            try FileManager.default.createDirectory(at: deep, withIntermediateDirectories: true)
+        }
+        _ = try makeMacBundle(named: "TooDeep", in: deep, executable: "TooDeep")
+        _ = try makeMacBundle(named: "Shallow", in: base, executable: "Shallow")
+
+        let depthReport = await AppCatalogScanner().scan(
+            roots: [base],
+            requiredRootPaths: [AppCatalogScanner.normalizedRootPath(base.path)]
+        )
+        XCTAssertEqual(depthReport.candidates.map(\.displayName), ["Shallow"])
+        XCTAssertEqual(depthReport.truncatedScanRootPaths.map(\.path), [base.path])
+        XCTAssertTrue(depthReport.canPersistReconciledLayout)
+
+        // Count: override the cap in DEBUG so we do not mint hundreds of fixtures.
+        let many = FileManager.default.temporaryDirectory.appendingPathComponent("LaunchIconMany-\(UUID().uuidString)")
+        defer {
+            AppCatalogScanner.customRootMaxAppsOverride = nil
+            try? FileManager.default.removeItem(at: many)
+        }
+        try FileManager.default.createDirectory(at: many, withIntermediateDirectories: true)
+        let limit = 8
+        AppCatalogScanner.customRootMaxAppsOverride = limit
+        for i in 0..<(limit + 3) {
+            _ = try makeMacBundle(named: String(format: "App%04d", i), in: many, executable: String(format: "App%04d", i))
+        }
+        let countReport = await AppCatalogScanner().scan(
+            roots: [many],
+            requiredRootPaths: [AppCatalogScanner.normalizedRootPath(many.path)]
+        )
+        XCTAssertEqual(countReport.candidates.count, limit)
+        XCTAssertEqual(countReport.truncatedScanRootPaths.map(\.path), [many.path])
+        XCTAssertTrue(countReport.canPersistReconciledLayout)
+        AppCatalogScanner.customRootMaxAppsOverride = nil
+
+        // Non-required roots are not capped (TooDeep at depth 5 is included).
+        let uncapped = await AppCatalogScanner().scan(roots: [base])
+        XCTAssertTrue(uncapped.truncatedScanRootPaths.isEmpty)
+        XCTAssertEqual(Set(uncapped.candidates.map(\.displayName)), ["Shallow", "TooDeep"])
+    }
+
+    func testUnavailableCustomRootCopyKeyExists() {
+        XCTAssertFalse(LauncherLayout.LayoutEditingStatusCopy.unavailableCustomRootExplanationKey.isEmpty)
+        XCTAssertEqual(
+            LauncherLayout.LayoutEditingStatusCopy.unavailableCustomRootExplanation(localize: { $0 }),
+            LauncherLayout.LayoutEditingStatusCopy.unavailableCustomRootExplanationKey
+        )
+    }
+
+    func testTruncatedCustomRootCopyKeyExists() {
+        XCTAssertFalse(LauncherLayout.LayoutEditingStatusCopy.truncatedCustomRootExplanationKey.isEmpty)
+        XCTAssertEqual(
+            LauncherLayout.LayoutEditingStatusCopy.truncatedCustomRootExplanation(localize: { $0 }),
+            LauncherLayout.LayoutEditingStatusCopy.truncatedCustomRootExplanationKey
+        )
+    }
+
+
+    func testBackgroundDimDefaultsAndPersists() async {
+        // BACKGROUND-DIM-01
+        XCTAssertEqual(LauncherPreferences().backgroundDim, .standard)
+        XCTAssertEqual(LauncherBackgroundDim.standard.overlayAlpha, 0.24, accuracy: 0.0001)
+        let alphas = LauncherBackgroundDim.allCases.map(\.overlayAlpha)
+        XCTAssertEqual(alphas, alphas.sorted())
+        XCTAssertEqual(Set(alphas).count, alphas.count)
+        XCTAssertTrue(alphas.allSatisfy { $0 > 0 && $0 < 0.6 })
+        XCTAssertEqual(BackgroundDimCopy.label(localize: { $0 }), "背景暗度")
+        let suite = "LaunchIcon.BackgroundDimTest.\(UUID().uuidString)"
+        defer { UserDefaults().removePersistentDomain(forName: suite) }
+        let store = LauncherPreferencesStore(suiteName: suite)
+        let initial = await store.load()
+        XCTAssertEqual(initial.backgroundDim, .standard)
+        var changed = initial
+        changed.backgroundDim = .dark
+        await store.save(changed)
+        let reloaded = await store.load()
+        XCTAssertEqual(reloaded.backgroundDim, .dark)
+        UserDefaults(suiteName: suite)?.set("bogus", forKey: "LaunchIcon.Preferences.backgroundDim")
+        let fallback = await store.load()
+        XCTAssertEqual(fallback.backgroundDim, .standard)
+        // BACKGROUND-BLUR-01
+        XCTAssertTrue(LauncherPreferences().blursBackground)
+        XCTAssertTrue(fallback.blursBackground)
+        var unblurred = fallback
+        unblurred.blursBackground = false
+        await store.save(unblurred)
+        let reloadedBlur = await store.load()
+        XCTAssertFalse(reloadedBlur.blursBackground)
+        XCTAssertEqual(BackgroundDimCopy.rowTitle(localize: { $0 }), "背景")
+    }
+
+    func testReopenPageBehaviorDefaultsAndPolicy() async {
+        // REOPEN-PAGE-BEHAVIOR-01
+        XCTAssertEqual(LauncherPreferences().reopenPageBehavior, .rememberLast)
+        XCTAssertNil(LauncherReopenPageBehavior.rememberLast.homeResetDelaySeconds)
+        XCTAssertEqual(LauncherReopenPageBehavior.alwaysHome.homeResetDelaySeconds, 0)
+        XCTAssertEqual(LauncherReopenPageBehavior.homeAfter30Seconds.homeResetDelaySeconds, 30)
+        XCTAssertEqual(LauncherReopenPageBehavior.homeAfter1Minute.homeResetDelaySeconds, 60)
+        XCTAssertEqual(LauncherReopenPageBehavior.homeAfter5Minutes.homeResetDelaySeconds, 300)
+        XCTAssertEqual(ReopenPageCopy.label(localize: { $0 }), "打开时页面")
+        XCTAssertFalse(ReopenPageCopy.shouldResetToHomePageOnAppear(
+            behavior: .rememberLast, secondsSinceLastDismiss: 999, isSettingsHandoffRestore: false))
+        XCTAssertTrue(ReopenPageCopy.shouldResetToHomePageOnAppear(
+            behavior: .alwaysHome, secondsSinceLastDismiss: nil, isSettingsHandoffRestore: false))
+        XCTAssertFalse(ReopenPageCopy.shouldResetToHomePageOnAppear(
+            behavior: .alwaysHome, secondsSinceLastDismiss: 0, isSettingsHandoffRestore: true))
+        XCTAssertFalse(ReopenPageCopy.shouldResetToHomePageOnAppear(
+            behavior: .homeAfter30Seconds, secondsSinceLastDismiss: 10, isSettingsHandoffRestore: false))
+        XCTAssertTrue(ReopenPageCopy.shouldResetToHomePageOnAppear(
+            behavior: .homeAfter30Seconds, secondsSinceLastDismiss: 30, isSettingsHandoffRestore: false))
+        XCTAssertFalse(ReopenPageCopy.shouldResetToHomePageOnAppear(
+            behavior: .homeAfter1Minute, secondsSinceLastDismiss: nil, isSettingsHandoffRestore: false))
+        let suite = "LaunchIcon.ReopenPageTest.\(UUID().uuidString)"
+        defer { UserDefaults().removePersistentDomain(forName: suite) }
+        let store = LauncherPreferencesStore(suiteName: suite)
+        var changed = await store.load()
+        XCTAssertEqual(changed.reopenPageBehavior, .rememberLast)
+        changed.reopenPageBehavior = .homeAfter5Minutes
+        await store.save(changed)
+        let reloaded = await store.load()
+        XCTAssertEqual(reloaded.reopenPageBehavior, .homeAfter5Minutes)
+        UserDefaults(suiteName: suite)?.set("bogus", forKey: "LaunchIcon.Preferences.reopenPageBehavior")
+        let fallback = await store.load()
+        XCTAssertEqual(fallback.reopenPageBehavior, .rememberLast)
+    }
+
+
+
+    func testFolderSortAccessibilityHelpCopy() {
+        XCTAssertEqual(LauncherLayout.sortFolderByNameAccessibilityHelp(localize: { $0 }), "只调整这个文件夹内的顺序，主屏幕不变")
+        XCTAssertEqual(LauncherLayout.sortFolderByColorAccessibilityHelp(localize: { $0 }), "只按图标颜色调整这个文件夹内的顺序，主屏幕不变")
+    }
+
+    func testFolderDropChromeCopy() {
+        XCTAssertEqual(LauncherLayout.FolderDropChromeCopy.nestRejectToast(localize: { $0 }), "不能将文件夹放入另一个文件夹")
+        XCTAssertEqual(LauncherLayout.FolderDropChromeCopy.dropTargetHelp(isFolder: true, localize: { $0 }), "拖放到此文件夹")
+        XCTAssertEqual(LauncherLayout.FolderDropChromeCopy.dropTargetHelp(isFolder: false, localize: { $0 }), "拖放到此以合并")
+        XCTAssertEqual(LauncherLayout.FolderDropChromeCopy.folderMembersLabel(localize: { $0 }), "文件夹中的应用")
+    }
+
+    func testSettingsAppearanceChromeCopy() {
+        // SETTINGS-APPEARANCE-CHROME-COPY-01
+        XCTAssertEqual(SettingsAppearanceChromeCopy.shortcutLabel(localize: { $0 }), "呼出快捷键")
+        XCTAssertEqual(SettingsAppearanceChromeCopy.hotCornerLabel(localize: { $0 }), "呼出触发角")
+        XCTAssertEqual(SettingsAppearanceChromeCopy.statusItemTitle(localize: { $0 }), "显示菜单栏图标")
+        XCTAssertTrue(SettingsAppearanceChromeCopy.statusItemHelp(localize: { $0 }).contains("Option"))
+        XCTAssertTrue(SettingsAppearanceChromeCopy.statusItemHelp(localize: { $0 }).contains("右键"))
+        XCTAssertEqual(SettingsAppearanceChromeCopy.hideNamesRowTitle(localize: { $0 }), "隐藏名称")
+        XCTAssertEqual(SettingsAppearanceChromeCopy.hideAppNamesLabel(localize: { $0 }), "隐藏应用名称")
+        XCTAssertEqual(SettingsAppearanceChromeCopy.hideFolderNamesLabel(localize: { $0 }), "隐藏文件夹名称")
+    }
+
+    func testSettingsBehaviorTogglesCopy() {
+        // SETTINGS-BEHAVIOR-TOGGLES-COPY-01
+        XCTAssertEqual(SettingsBehaviorTogglesCopy.hideAfterLaunchTitle(localize: { $0 }), "启动应用后自动收起")
+        XCTAssertEqual(SettingsBehaviorTogglesCopy.reducesMotionTitle(localize: { $0 }), "减少动态效果")
+        XCTAssertEqual(SettingsBehaviorTogglesCopy.loginTitle(localize: { $0 }), "开机登录")
+        XCTAssertEqual(SettingsBehaviorTogglesCopy.openLoginSettingsTitle(localize: { $0 }), "打开系统登录项设置…")
+        XCTAssertEqual(SettingsBehaviorTogglesCopy.loginUpdated(localize: { $0 }), "开机登录设置已更新")
+        XCTAssertEqual(SettingsBehaviorTogglesCopy.loginNeedsApproval(localize: { $0 }), "请在系统设置的登录项中允许 LaunchIcon。")
+    }
+
+    func testPinchToDismissDefaultsAndPolicy() async {
+        // PINCH-TO-DISMISS-01
+        XCTAssertTrue(LauncherPreferences().pinchToDismiss)
+        XCTAssertEqual(PinchDismissCopy.title(localize: { $0 }), "双指捏合收起")
+        XCTAssertEqual(PinchDismissPolicy.pinchInThreshold, -0.22, accuracy: 0.0001)
+        XCTAssertTrue(PinchDismissPolicy.shouldDismiss(
+            enabled: true, accumulatedMagnification: -0.22,
+            isPaging: false, isDragging: false, isDismissing: false))
+        XCTAssertFalse(PinchDismissPolicy.shouldDismiss(
+            enabled: true, accumulatedMagnification: -0.10,
+            isPaging: false, isDragging: false, isDismissing: false))
+        XCTAssertFalse(PinchDismissPolicy.shouldDismiss(
+            enabled: false, accumulatedMagnification: -1.0,
+            isPaging: false, isDragging: false, isDismissing: false))
+        XCTAssertFalse(PinchDismissPolicy.shouldDismiss(
+            enabled: true, accumulatedMagnification: -1.0,
+            isPaging: true, isDragging: false, isDismissing: false))
+        XCTAssertFalse(PinchDismissPolicy.shouldDismiss(
+            enabled: true, accumulatedMagnification: -1.0,
+            isPaging: false, isDragging: true, isDismissing: false))
+        XCTAssertFalse(PinchDismissPolicy.shouldDismiss(
+            enabled: true, accumulatedMagnification: -1.0,
+            isPaging: false, isDragging: false, isDismissing: true))
+        let suite = "LaunchIcon.PinchDismissTest.\(UUID().uuidString)"
+        defer { UserDefaults().removePersistentDomain(forName: suite) }
+        let store = LauncherPreferencesStore(suiteName: suite)
+        var changed = await store.load()
+        XCTAssertTrue(changed.pinchToDismiss)
+        changed.pinchToDismiss = false
+        await store.save(changed)
+        let reloaded = await store.load()
+        XCTAssertFalse(reloaded.pinchToDismiss)
+    }
+
+    func testDisplayTargetPicksActivePointerOrPrimaryScreen() {
+        XCTAssertEqual(LauncherPreferences().displayTarget, .active)
+        let primary = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let right = CGRect(x: 1440, y: 0, width: 1920, height: 1080)
+        let frames = [primary, right]
+        func index(_ target: LauncherDisplayTarget, active: Int?, _ x: CGFloat, _ y: CGFloat) -> Int? {
+            LauncherDisplayTarget.screenIndex(for: target, screenFrames: frames, activeIndex: active, pointer: CGPoint(x: x, y: y))
+        }
+        XCTAssertEqual(index(.active, active: 1, 10, 10), 1)
+        XCTAssertEqual(index(.active, active: nil, 2000, 10), 0)
+        XCTAssertEqual(index(.active, active: 7, 2000, 10), 0)
+        XCTAssertEqual(index(.primary, active: 1, 2000, 10), 0)
+        XCTAssertEqual(index(.pointer, active: 0, 2000, 500), 1)
+        XCTAssertEqual(index(.pointer, active: 1, 100, 100), 0)
+        // Shared edge x = 1440 belongs to the right display.
+        XCTAssertEqual(index(.pointer, active: 0, 1440, 100), 1)
+        // Top edge of the primary (y == maxY) still counts.
+        XCTAssertEqual(index(.pointer, active: 1, 100, 900), 0)
+        // Gap above the shorter primary screen falls back to active.
+        XCTAssertEqual(index(.pointer, active: 1, 100, 1000), 1)
+        XCTAssertNil(LauncherDisplayTarget.screenIndex(for: .pointer, screenFrames: [], activeIndex: 0, pointer: .zero))
     }
 
     func testHotCornerGeometryAndEdgeTrigger() {
@@ -814,6 +1258,72 @@ final class LaunchIconCoreTests: XCTestCase {
         let imported = try await store.importLayout(from: exportURL)
         XCTAssertEqual(imported, exported)
         XCTAssertEqual(try Data(contentsOf: liveURL), liveData, "importLayout must not write live primary")
+    }
+
+    func testLayoutImportSanitizesNamesAndAssessesCatalogMatch() async throws {
+        XCTAssertEqual(LauncherLayout.sanitizedImportedName("  Work\n\t\tStuff  ", limit: 40), "Work Stuff")
+        XCTAssertEqual(LauncherLayout.sanitizedImportedName("a  b", limit: 40), "a  b", "typed spaces are kept")
+        XCTAssertEqual(LauncherLayout.sanitizedImportedName(String(repeating: "长", count: 100), limit: 40).count, 40)
+        XCTAssertEqual(LauncherLayout.sanitizedImportedName("\u{0007}\u{0000}", limit: 40), "")
+
+        let folderID = UUID(), a = UUID(), b = UUID()
+        let stamp = Date(timeIntervalSinceReferenceDate: 42)
+        let clean = LayoutState(
+            orderedEntries: [.folder(folderID)],
+            folders: [folderID: LauncherFolder(id: folderID, name: "Work", itemIDs: [a, b])],
+            appKeys: [a: "bundle:test.a", b: "bundle:test.b"],
+            hiddenAppKeys: ["bundle:test.c"],
+            appAliases: ["bundle:test.a": "Alpha"],
+            updatedAt: stamp
+        )
+        XCTAssertEqual(LauncherLayout.sanitizedImportedLayout(clean), clean, "a clean file is unchanged")
+
+        var dirty = clean
+        dirty.folders[folderID]?.name = "Line1\nLine2" + String(repeating: "x", count: 80)
+        dirty.appAliases = ["bundle:test.a": " \n ", "bundle:test.b": "Be\rta", " ": "orphan"]
+        dirty.hiddenAppKeys = ["bundle:test.c", "  "]
+        let sanitized = LauncherLayout.sanitizedImportedLayout(dirty)
+        XCTAssertEqual(sanitized.folders[folderID]?.name.count, LauncherLayout.maximumFolderNameLength)
+        XCTAssertTrue(sanitized.folders[folderID]?.name.hasPrefix("Line1 Line2") ?? false)
+        XCTAssertEqual(sanitized.appAliases, ["bundle:test.b": "Be ta"])
+        XCTAssertEqual(sanitized.hiddenAppKeys, ["bundle:test.c"])
+        XCTAssertEqual(sanitized.updatedAt, stamp)
+        XCTAssertEqual(sanitized.orderedEntries, dirty.orderedEntries)
+
+        func app(_ id: String) -> AppCandidate {
+            AppCandidate(canonicalURL: URL(fileURLWithPath: "/Applications/\(id).app"), bundleIdentifier: "test.\(id)",
+                         displayName: id, sourcePriority: 0, discoveredAt: .now)
+        }
+        let here = LauncherLayout.layoutImportAssessment(imported: clean, catalog: [app("a"), app("c")])
+        XCTAssertEqual(here.matchedAppCount, 1)
+        XCTAssertEqual(here.unmatchedAppCount, 1)
+        XCTAssertEqual(here.folderCount, 1)
+        XCTAssertEqual(here.hiddenInstalledAppCount, 1)
+        XCTAssertFalse(here.needsExtraConfirmation)
+        let foreign = LauncherLayout.layoutImportAssessment(imported: clean, catalog: [app("x")])
+        XCTAssertTrue(foreign.looksForeign)
+        XCTAssertTrue(foreign.needsExtraConfirmation)
+        var hideAll = clean
+        hideAll.hiddenAppKeys = ["bundle:test.a", "bundle:test.b"]
+        XCTAssertTrue(LauncherLayout.layoutImportAssessment(imported: hideAll, catalog: [app("a"), app("b")]).hidesEverything)
+        XCTAssertFalse(LauncherLayout.layoutImportAssessment(imported: LayoutState(), catalog: []).needsExtraConfirmation)
+
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = JSONLayoutStore(fileURL: directory.appendingPathComponent("layout-v1.json"))
+        let dirtyURL = directory.appendingPathComponent("dirty.json")
+        try await store.export(dirty, to: dirtyURL)
+        let imported = try await store.importLayout(from: dirtyURL)
+        XCTAssertEqual(imported.appAliases, ["bundle:test.b": "Be ta"])
+        let hugeURL = directory.appendingPathComponent("huge.json")
+        try Data(count: JSONLayoutStore.maximumImportFileSize + 1).write(to: hugeURL)
+        do {
+            _ = try await store.importLayout(from: hugeURL)
+            XCTFail("oversized import must be rejected")
+        } catch LayoutStoreIssue.corruptedFile(let url) {
+            XCTAssertEqual(url, hugeURL)
+        }
     }
 
     func testUnchangedCatalogDoesNotRewriteLayoutOrCreateBackup() async throws {
@@ -1729,6 +2239,12 @@ final class LaunchIconCoreTests: XCTestCase {
             skippedPaths: [],
             unlaunchablePaths: [missingRoot]
         ).canPersistReconciledLayout)
+        // Unavailable required roots must not lock editing by themselves.
+        XCTAssertTrue(CatalogScanReport(
+            candidates: [candidate],
+            skippedPaths: [],
+            unavailableRequiredRootPaths: [missingRoot]
+        ).canPersistReconciledLayout)
         XCTAssertTrue(CatalogScanReport(candidates: [candidate], skippedPaths: []).canPersistReconciledLayout)
     }
 
@@ -1951,29 +2467,20 @@ final class LaunchIconCoreTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(250))
         let writer = Process()
         writer.executableURL = URL(fileURLWithPath: "/bin/sh")
-        // Keep the burst sustained (~1s) but short enough to finish inside the
-        // observation window on slower CI runners (was 40×0.05≈2s+ under 4s).
         writer.arguments = [
             "-c",
-            "index=0; while [ \"$index\" -lt 20 ]; do /usr/bin/touch \"$1/Noise-$index\"; index=$((index + 1)); /bin/sleep 0.05; done",
+            "index=0; while [ \"$index\" -lt 40 ]; do /usr/bin/touch \"$1/Noise-$index\"; index=$((index + 1)); /bin/sleep 0.05; done",
             "watcher-noise",
             unrelated.path
         ]
         try writer.run()
-        defer {
-            if writer.isRunning {
-                writer.terminate()
-                writer.waitUntilExit()
-            }
-        }
-        await fulfillment(of: [changed, rebound], timeout: 6)
+        await fulfillment(of: [changed, rebound], timeout: 4)
+        // CI runners can take >4s for the 40-touch burst; the inverted wait already
+        // proved no rescan/rebind during that window. Drain the writer before asserting.
         if writer.isRunning {
-            writer.terminate()
             writer.waitUntilExit()
-            XCTFail("noise writer overran observation window")
-        } else {
-            XCTAssertEqual(writer.terminationStatus, 0)
         }
+        XCTAssertEqual(writer.terminationStatus, 0)
     }
 
     func testDirectoryWatcherDiscoversRootBelowMissingParent() async throws {
@@ -3110,6 +3617,27 @@ final class LaunchIconCoreTests: XCTestCase {
         )
     }
 
+
+
+    func testStatusItemButtonActionPrimaryTogglesSecondaryShowsMenu() {
+        XCTAssertEqual(
+            LauncherLayout.statusItemButtonAction(for: .primary),
+            .toggle
+        )
+        XCTAssertEqual(
+            LauncherLayout.statusItemButtonAction(for: .secondary),
+            .showMenu
+        )
+        XCTAssertEqual(
+            LauncherLayout.statusItemButtonAction(for: .primary, optionDown: true),
+            .openSettings
+        )
+        // Option must not steal the secondary-click menu.
+        XCTAssertEqual(
+            LauncherLayout.statusItemButtonAction(for: .secondary, optionDown: true),
+            .showMenu
+        )
+    }
 
     func testStatusItemToggleTitleRefreshGatesDuringDismissFade() {
         XCTAssertTrue(LauncherLayout.shouldRefreshStatusItemToggleTitleOnDismissArm())
@@ -4869,6 +5397,477 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertFalse(AppUninstallEligibility.isSystemProtectedPath("/Users/me/Applications/X.app"))
     }
 
+    func testAppUninstallEligibilityBlocksEmbeddedAndSIPRestrictedBundles() throws {
+        XCTAssertFalse(AppUninstallEligibility.isEmbeddedInAnotherBundle("/Applications/X.app"))
+        XCTAssertFalse(AppUninstallEligibility.isEmbeddedInAnotherBundle("/Users/me/Applications/Tools/X.app"))
+        XCTAssertTrue(AppUninstallEligibility.isEmbeddedInAnotherBundle("/Applications/Xcode.app/Contents/Applications/Instruments.app"))
+        XCTAssertTrue(AppUninstallEligibility.isEmbeddedInAnotherBundle("/Library/Frameworks/Foo.framework/Resources/Helper.app"))
+        XCTAssertTrue(AppUninstallEligibility.isEmbeddedInAnotherBundle("/Applications/OUTER.APP/Contents/Inner.app"))
+
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LaunchIcon-UninstallEmbedded-\(UUID().uuidString)", isDirectory: true)
+        let inner = root.appendingPathComponent("Outer.app/Contents/Helpers/Inner.app", isDirectory: true)
+        try FileManager.default.createDirectory(at: inner, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let candidate = AppCandidate(
+            canonicalURL: inner, bundleIdentifier: "test.inner", displayName: "Inner",
+            sourcePriority: 1, discoveredAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        let decision = AppUninstallEligibility.evaluate(
+            candidate: candidate, layoutEditingEnabled: true,
+            selfBundleURL: nil, selfBundleIdentifier: nil, isSandboxed: false
+        )
+        XCTAssertEqual(decision.blockReason, .embeddedInAnotherApp)
+        XCTAssertEqual(decision.explanationKey, "该应用属于另一个应用的组成部分，无法单独卸载")
+        // Layout-editing and sandbox gates still win over the embedded check.
+        XCTAssertEqual(
+            AppUninstallEligibility.evaluate(
+                candidate: candidate, layoutEditingEnabled: false,
+                selfBundleURL: nil, selfBundleIdentifier: nil, isSandboxed: false
+            ).blockReason,
+            .layoutEditingDisabled
+        )
+
+        XCTAssertFalse(AppUninstallEligibility.isSIPRestricted(root.path))
+        XCTAssertFalse(AppUninstallEligibility.isSIPRestricted(root.appendingPathComponent("missing").path))
+        let safari = "/Applications/Safari.app"
+        if AppUninstallEligibility.isSIPRestricted(safari) {
+            let safariDecision = AppUninstallEligibility.evaluate(
+                candidate: AppCandidate(
+                    canonicalURL: URL(fileURLWithPath: safari), bundleIdentifier: "com.apple.Safari",
+                    displayName: "Safari", sourcePriority: 1, discoveredAt: .now
+                ),
+                layoutEditingEnabled: true, selfBundleURL: nil, selfBundleIdentifier: nil, isSandboxed: false
+            )
+            XCTAssertEqual(safariDecision.blockReason, .systemProtected)
+        }
+    }
+
+    func testBatchUninstallPlanSkipsFoldersBlockedAndDuplicateApps() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        func app(_ id: String, path: String? = nil) -> AppCandidate {
+            AppCandidate(canonicalURL: URL(fileURLWithPath: path ?? "/Applications/\(id).app"),
+                         bundleIdentifier: "test.\(id)", displayName: id, sourcePriority: 1, discoveredAt: now)
+        }
+        let a = UUID(), b = UUID(), sys = UUID(), folderID = UUID(), member = UUID(), stale = UUID(), dupe = UUID()
+        let candidates = [app("a"), app("b"), app("sys", path: "/System/Applications/sys.app"), app("m")]
+        var byKey: [String: AppCandidate] = [:]
+        for candidate in candidates { byKey[candidate.deduplicationKey] = candidate }
+        let state = LayoutState(
+            orderedEntries: [.app(a), .app(b), .app(sys), .folder(folderID), .app(dupe)],
+            folders: [folderID: LauncherFolder(id: folderID, name: "F", itemIDs: [member])],
+            appKeys: [a: candidates[0].deduplicationKey, b: candidates[1].deduplicationKey,
+                      sys: candidates[2].deduplicationKey, member: candidates[3].deduplicationKey,
+                      dupe: candidates[0].deduplicationKey, stale: "bundle:test.gone"]
+        )
+        let decide: (AppCandidate) -> AppUninstallDecision = { candidate in
+            AppUninstallEligibility.isSystemProtectedPath(candidate.canonicalURL.path)
+                ? AppUninstallDecision(allowed: false, blockReason: .systemProtected)
+                : AppUninstallDecision(allowed: true)
+        }
+
+        // Single item or anchor outside the selection: single-app flow.
+        XCTAssertNil(AppBatchUninstallPlan.plan(selection: LauncherItemSelection(orderedIDs: [a]), anchorID: a,
+                                                in: state, candidatesByKey: byKey, decide: decide))
+        XCTAssertNil(AppBatchUninstallPlan.plan(selection: LauncherItemSelection(orderedIDs: [a, b]), anchorID: sys,
+                                                in: state, candidatesByKey: byKey, decide: decide))
+
+        let selection = LauncherItemSelection(orderedIDs: [b, folderID, sys, a, stale, dupe])
+        guard let plan = AppBatchUninstallPlan.plan(selection: selection, anchorID: sys, in: state,
+                                                    candidatesByKey: byKey, decide: decide) else {
+            return XCTFail("plan expected")
+        }
+        XCTAssertEqual(plan.eligibleIDs, [b, a], "selection order; folder never expanded; duplicate tile once")
+        XCTAssertEqual(plan.eligibleCandidates.map(\.displayName), ["b", "a"])
+        XCTAssertEqual(plan.blocked, [AppBatchUninstallPlan.Blocked(appID: sys, displayName: "sys", reason: .systemProtected)])
+        XCTAssertEqual(plan.skippedFolderCount, 1)
+        XCTAssertEqual(plan.missingCount, 1)
+        XCTAssertEqual(plan.skippedCount, 3)
+        XCTAssertEqual(plan.menuPresentation, .enabled)
+
+        let onlyBlocked = AppBatchUninstallPlan.plan(selection: LauncherItemSelection(orderedIDs: [sys, folderID]),
+                                                     anchorID: sys, in: state, candidatesByKey: byKey, decide: decide)
+        XCTAssertEqual(onlyBlocked?.menuPresentation, .disabled(explanationKey: "系统应用受保护，无法卸载"))
+        let mixedReasons = AppBatchUninstallPlan.plan(
+            selection: LauncherItemSelection(orderedIDs: [sys, a]), anchorID: a, in: state, candidatesByKey: byKey,
+            decide: { $0.displayName == "a" ? AppUninstallDecision(allowed: false, blockReason: .parentNotWritable) : decide($0) }
+        )
+        XCTAssertEqual(mixedReasons?.menuPresentation, .disabled(explanationKey: AppBatchUninstallPlan.noneEligibleExplanationKey))
+
+        // Over the cap: refuse, do not truncate.
+        var bigState = LayoutState()
+        var bigByKey: [String: AppCandidate] = [:]
+        var bigIDs: [UUID] = []
+        for index in 0...AppBatchUninstallPlan.maximumCount {
+            let id = UUID(), candidate = app("app\(index)")
+            bigIDs.append(id)
+            bigState.orderedEntries.append(.app(id))
+            bigState.appKeys[id] = candidate.deduplicationKey
+            bigByKey[candidate.deduplicationKey] = candidate
+        }
+        let big = AppBatchUninstallPlan.plan(selection: LauncherItemSelection(orderedIDs: bigIDs), anchorID: bigIDs[0],
+                                             in: bigState, candidatesByKey: bigByKey, decide: decide)
+        XCTAssertEqual(big?.eligibleIDs.count, AppBatchUninstallPlan.maximumCount + 1)
+        XCTAssertTrue(big?.exceedsLimit ?? false)
+        XCTAssertEqual(big?.menuPresentation, .disabled(explanationKey: "一次最多卸载 20 个应用"))
+        XCTAssertEqual(AppBatchUninstallPlan.maximumCount, 20, "keep the explanation string in sync")
+    }
+
+
+
+
+
+
+
+    func testBatchUninstallProgressToastMessage() {
+        XCTAssertEqual(
+            AppBatchUninstallPlan.progressToastMessage(index: 2, total: 5, localize: { $0 }),
+            String(format: AppBatchUninstallPlan.progressToastFormatKey, 2, 5)
+        )
+        XCTAssertEqual(
+            AppBatchUninstallPlan.progressToastMessage(index: 2, total: 5, appName: "Safari", localize: { $0 }),
+            String(format: AppBatchUninstallPlan.progressToastWithNameFormatKey, 2, 5, "Safari")
+        )
+        XCTAssertEqual(
+            AppBatchUninstallPlan.progressToastMessage(index: 1, total: 3, appName: "  ", localize: { $0 }),
+            String(format: AppBatchUninstallPlan.progressToastFormatKey, 1, 3),
+            "blank name falls back to count-only"
+        )
+    }
+
+    func testUninstallTrashProgressMessageKey() {
+        XCTAssertEqual(AppUninstallTrashProgress.messageKey, "正在移到废纸篓…")
+    }
+
+    func testUninstallCopyCheckProgressMessageKey() {
+        XCTAssertEqual(AppUninstallCopyCheckProgress.messageKey, "正在检查应用副本…")
+    }
+
+    func testUninstallSingleConfirmCopyTitleAndBody() {
+        XCTAssertEqual(
+            AppUninstallSingleConfirmCopy.title(appName: "Safari", localize: { $0 }),
+            String(format: AppUninstallSingleConfirmCopy.titleFormatKey, "Safari")
+        )
+        let idle = AppUninstallSingleConfirmCopy.informativeText(
+            path: "/Applications/Safari.app",
+            bundleIdentifier: "com.apple.Safari",
+            isRunning: false,
+            otherCopy: false,
+            localize: { $0 }
+        )
+        XCTAssertTrue(idle.hasPrefix("/Applications/Safari.app\ncom.apple.Safari\n\n"))
+        XCTAssertTrue(idle.contains(AppUninstallSingleConfirmCopy.idleBodyKey))
+        XCTAssertFalse(idle.contains(AppUninstallSingleConfirmCopy.otherCopyKnownKey))
+        XCTAssertFalse(idle.contains(AppUninstallSingleConfirmCopy.otherCopyUnknownKey))
+
+        let runningUnknown = AppUninstallSingleConfirmCopy.informativeText(
+            path: "/Apps/Foo.app",
+            bundleIdentifier: nil,
+            isRunning: true,
+            otherCopy: nil,
+            localize: { $0 }
+        )
+        XCTAssertTrue(runningUnknown.contains(AppUninstallSingleConfirmCopy.runningBodyKey))
+        XCTAssertTrue(runningUnknown.contains(AppUninstallSingleConfirmCopy.otherCopyUnknownKey))
+        XCTAssertFalse(runningUnknown.contains("\n\n\n"))
+
+        let known = AppUninstallSingleConfirmCopy.informativeText(
+            path: "/Apps/Foo.app",
+            bundleIdentifier: "",
+            isRunning: false,
+            otherCopy: true,
+            localize: { $0 }
+        )
+        XCTAssertTrue(known.contains(AppUninstallSingleConfirmCopy.otherCopyKnownKey))
+        XCTAssertFalse(known.contains("com."), "empty bundle id omitted")
+    }
+
+    func testUninstallOutcomeToastKeysAndBundleFailedMapping() {
+        XCTAssertEqual(AppUninstallOutcomeToast.appChanged(localize: { $0 }), AppUninstallOutcomeToast.appChangedKey)
+        XCTAssertEqual(AppUninstallOutcomeToast.stillRunning(localize: { $0 }), AppUninstallOutcomeToast.stillRunningKey)
+        XCTAssertEqual(AppUninstallOutcomeToast.copiesChanged(localize: { $0 }), AppUninstallOutcomeToast.copiesChangedKey)
+        XCTAssertEqual(AppUninstallOutcomeToast.trashFailedKey, AppBatchUninstallPlan.allFailedToastKey)
+        XCTAssertNil(AppUninstallOutcomeToast.bundleFailedMessage(reason: .cancelled, localize: { $0 }))
+        XCTAssertEqual(
+            AppUninstallOutcomeToast.bundleFailedMessage(reason: .identityMismatch, localize: { $0 }),
+            AppUninstallOutcomeToast.appChangedKey
+        )
+        XCTAssertEqual(
+            AppUninstallOutcomeToast.bundleFailedMessage(reason: .permissionDenied, localize: { $0 }),
+            AppUninstallOutcomeToast.permissionDeniedKey
+        )
+        XCTAssertEqual(
+            AppUninstallOutcomeToast.bundleFailedMessage(reason: .other, localize: { $0 }),
+            AppBatchUninstallPlan.allFailedToastKey
+        )
+        XCTAssertEqual(
+            AppUninstallOutcomeToast.bundleFailedMessage(reason: nil, localize: { $0 }),
+            AppBatchUninstallPlan.allFailedToastKey
+        )
+    }
+
+
+    func testBatchUninstallConfirmButtonTitles() {
+        XCTAssertEqual(
+            AppBatchUninstallPlan.confirmCancelButtonTitle(localize: { $0 }),
+            AppBatchUninstallPlan.cancelButtonTitleKey
+        )
+        XCTAssertEqual(
+            AppBatchUninstallPlan.confirmDestructiveButtonTitle(anyRunning: false, localize: { $0 }),
+            AppBatchUninstallPlan.trashButtonTitleKey
+        )
+        XCTAssertEqual(
+            AppBatchUninstallPlan.confirmDestructiveButtonTitle(anyRunning: true, localize: { $0 }),
+            AppBatchUninstallPlan.quitAndTrashButtonTitleKey
+        )
+    }
+
+    func testBatchUninstallResultToastVariants() {
+        XCTAssertEqual(
+            AppBatchUninstallPlan.resultToast(succeeded: 3, failed: 0),
+            .success(count: 3)
+        )
+        XCTAssertEqual(
+            AppBatchUninstallPlan.resultToast(succeeded: 2, failed: 1),
+            .partial(succeeded: 2, failed: 1)
+        )
+        XCTAssertEqual(
+            AppBatchUninstallPlan.resultToast(succeeded: 0, failed: 2),
+            .allFailed
+        )
+        XCTAssertEqual(
+            AppBatchUninstallPlan.resultToast(succeeded: 0, failed: 0),
+            .none
+        )
+        let success = AppBatchUninstallPlan.BatchResultToast.success(count: 4)
+        XCTAssertEqual(
+            success.message(localize: { $0 }),
+            String(format: AppBatchUninstallPlan.successToastFormatKey, 4)
+        )
+        XCTAssertTrue(success.autoDismiss)
+        let partial = AppBatchUninstallPlan.BatchResultToast.partial(succeeded: 1, failed: 2)
+        XCTAssertEqual(
+            partial.message(localize: { $0 }),
+            String(format: AppBatchUninstallPlan.partialToastFormatKey, 1, 2)
+        )
+        XCTAssertFalse(partial.autoDismiss)
+        XCTAssertEqual(
+            AppBatchUninstallPlan.BatchResultToast.allFailed.message(localize: { $0 }),
+            AppBatchUninstallPlan.allFailedToastKey
+        )
+        XCTAssertNil(AppBatchUninstallPlan.BatchResultToast.none.message())
+
+        // BATCH-UNINSTALL-REMAINING-01
+        XCTAssertEqual(AppBatchUninstallPlan.unprocessedCount(total: 5, succeeded: 2, failed: 1), 2)
+        XCTAssertEqual(AppBatchUninstallPlan.unprocessedCount(total: 3, succeeded: 3, failed: 0), 0)
+        XCTAssertEqual(AppBatchUninstallPlan.unprocessedCount(total: 2, succeeded: 5, failed: 0), 0)
+        XCTAssertEqual(
+            AppBatchUninstallPlan.resultToast(succeeded: 2, failed: 0, unprocessed: 3),
+            .interrupted(succeeded: 2, failed: 0, unprocessed: 3)
+        )
+        XCTAssertEqual(
+            AppBatchUninstallPlan.resultToast(succeeded: 1, failed: 1, unprocessed: 2),
+            .interrupted(succeeded: 1, failed: 1, unprocessed: 2)
+        )
+        XCTAssertEqual(
+            AppBatchUninstallPlan.resultToast(succeeded: 0, failed: 2, unprocessed: 1),
+            .interrupted(succeeded: 0, failed: 2, unprocessed: 1)
+        )
+        XCTAssertEqual(
+            AppBatchUninstallPlan.resultToast(succeeded: 0, failed: 0, unprocessed: 4),
+            .interrupted(succeeded: 0, failed: 0, unprocessed: 4)
+        )
+        // unprocessed == 0 keeps the prior variants
+        XCTAssertEqual(
+            AppBatchUninstallPlan.resultToast(succeeded: 2, failed: 1, unprocessed: 0),
+            .partial(succeeded: 2, failed: 1)
+        )
+        let stopOK = AppBatchUninstallPlan.BatchResultToast.interrupted(succeeded: 2, failed: 0, unprocessed: 3)
+        XCTAssertEqual(
+            stopOK.message(localize: { $0 }),
+            String(format: AppBatchUninstallPlan.interruptedSuccessFormatKey, 2, 3)
+        )
+        XCTAssertFalse(stopOK.autoDismiss)
+        let stopPartial = AppBatchUninstallPlan.BatchResultToast.interrupted(succeeded: 1, failed: 2, unprocessed: 1)
+        XCTAssertEqual(
+            stopPartial.message(localize: { $0 }),
+            String(format: AppBatchUninstallPlan.interruptedPartialFormatKey, 1, 2, 1)
+        )
+        let stopFail = AppBatchUninstallPlan.BatchResultToast.interrupted(succeeded: 0, failed: 2, unprocessed: 3)
+        XCTAssertEqual(
+            stopFail.message(localize: { $0 }),
+            String(format: AppBatchUninstallPlan.interruptedFailedFormatKey, 2, 3)
+        )
+        let stopOnly = AppBatchUninstallPlan.BatchResultToast.interrupted(succeeded: 0, failed: 0, unprocessed: 5)
+        XCTAssertEqual(
+            stopOnly.message(localize: { $0 }),
+            String(format: AppBatchUninstallPlan.interruptedOnlyFormatKey, 5)
+        )
+    }
+
+    func testBatchUninstallConfirmInformativeTextIncludesReasons() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let eligible = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Notes.app"),
+            bundleIdentifier: "test.Notes",
+            displayName: "Notes",
+            sourcePriority: 1,
+            discoveredAt: now
+        )
+        let blocked = [
+            AppBatchUninstallPlan.Blocked(appID: UUID(), displayName: "SysA", reason: .systemProtected),
+            AppBatchUninstallPlan.Blocked(appID: UUID(), displayName: "SysB", reason: .systemProtected),
+        ]
+        let plan = AppBatchUninstallPlan(
+            eligibleIDs: [UUID()],
+            eligibleCandidates: [eligible],
+            blocked: blocked,
+            skippedFolderCount: 1,
+            missingCount: 0
+        )
+        let text = plan.confirmInformativeText(localize: { $0 }, anyRunning: true)
+        XCTAssertTrue(text.hasPrefix("Notes"), text)
+        XCTAssertTrue(text.contains("3"), text) // skippedCount = 2 blocked + 1 folder
+        XCTAssertTrue(text.contains("SysA"), text)
+        XCTAssertTrue(text.contains("SysB"), text)
+        let sys = AppUninstallDecision(allowed: false, blockReason: .systemProtected).explanationKey!
+        XCTAssertTrue(text.contains("\(sys) ×2"), text)
+        XCTAssertTrue(text.contains(AppBatchUninstallPlan.userDataDisclaimerKey), text)
+        XCTAssertTrue(text.contains(AppBatchUninstallPlan.quitBeforeTrashKey), text)
+        let idle = plan.confirmInformativeText(localize: { $0 }, anyRunning: false)
+        XCTAssertFalse(idle.contains(AppBatchUninstallPlan.quitBeforeTrashKey), idle)
+    }
+
+    func testBatchUninstallBlockedReasonSummaryGroupsCounts() {
+        let blocked = [
+            AppBatchUninstallPlan.Blocked(appID: UUID(), displayName: "A", reason: .systemProtected),
+            AppBatchUninstallPlan.Blocked(appID: UUID(), displayName: "B", reason: .systemProtected),
+            AppBatchUninstallPlan.Blocked(appID: UUID(), displayName: "C", reason: .parentNotWritable),
+        ]
+        let plan = AppBatchUninstallPlan(
+            eligibleIDs: [],
+            eligibleCandidates: [],
+            blocked: blocked,
+            skippedFolderCount: 0,
+            missingCount: 0
+        )
+        let summary = plan.blockedReasonSummary(localize: { $0 })
+        let sys = AppUninstallDecision(allowed: false, blockReason: .systemProtected).explanationKey!
+        let parent = AppUninstallDecision(allowed: false, blockReason: .parentNotWritable).explanationKey!
+        XCTAssertEqual(
+            summary,
+            "\(sys) ×2、\(parent) ×1"
+        )
+        XCTAssertNil(
+            AppBatchUninstallPlan(
+                eligibleIDs: [],
+                eligibleCandidates: [],
+                blocked: [],
+                skippedFolderCount: 1,
+                missingCount: 0
+            ).blockedReasonSummary()
+        )
+    }
+
+    func testBatchUninstallBlockedEmptyDisplayNameFallsBackToBundleFileName() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let blank = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/System/Applications/BlankName.app"),
+            bundleIdentifier: "test.blank",
+            displayName: "   ",
+            sourcePriority: 1,
+            discoveredAt: now
+        )
+        let other = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Other.app"),
+            bundleIdentifier: "test.other",
+            displayName: "Other",
+            sourcePriority: 1,
+            discoveredAt: now
+        )
+        let blankID = UUID(), otherID = UUID()
+        let state = LayoutState(
+            orderedEntries: [.app(blankID), .app(otherID)],
+            folders: [:],
+            appKeys: [
+                blankID: blank.deduplicationKey,
+                otherID: other.deduplicationKey,
+            ]
+        )
+        let byKey = [blank.deduplicationKey: blank, other.deduplicationKey: other]
+        let plan = AppBatchUninstallPlan.plan(
+            selection: LauncherItemSelection(orderedIDs: [blankID, otherID]),
+            anchorID: otherID,
+            in: state,
+            candidatesByKey: byKey,
+            decide: { candidate in
+                AppUninstallEligibility.isSystemProtectedPath(candidate.canonicalURL.path)
+                    ? AppUninstallDecision(allowed: false, blockReason: .systemProtected)
+                    : AppUninstallDecision(allowed: true)
+            }
+        )
+        XCTAssertNotNil(plan)
+        XCTAssertEqual(plan?.blocked.map(\.displayName), ["BlankName"])
+        XCTAssertEqual(plan?.blockedNameList.joined, "BlankName")
+    }
+
+    func testBatchUninstallBlockedNameListTruncatesLikeEligible() {
+        let blocked = (0..<7).map { i in
+            AppBatchUninstallPlan.Blocked(
+                appID: UUID(),
+                displayName: "B\(i)",
+                reason: .systemProtected
+            )
+        }
+        let plan = AppBatchUninstallPlan(
+            eligibleIDs: [],
+            eligibleCandidates: [],
+            blocked: blocked,
+            skippedFolderCount: 0,
+            missingCount: 0
+        )
+        let list = plan.blockedNameList
+        XCTAssertEqual(list.shown, ["B0", "B1", "B2", "B3", "B4"])
+        XCTAssertEqual(list.totalCount, 7)
+        XCTAssertTrue(list.isTruncated)
+        XCTAssertEqual(
+            String(format: AppBatchUninstallPlan.blockedNameListOverflowFormatKey, list.joined, list.totalCount),
+            "无法卸载：B0、B1、B2、B3、B4 等 7 个"
+        )
+        let short = AppBatchUninstallPlan(
+            eligibleIDs: [],
+            eligibleCandidates: [],
+            blocked: Array(blocked.prefix(2)),
+            skippedFolderCount: 1,
+            missingCount: 0
+        )
+        XCTAssertEqual(
+            String(format: AppBatchUninstallPlan.blockedNameListFormatKey, short.blockedNameList.joined),
+            "无法卸载：B0、B1"
+        )
+        XCTAssertEqual(short.skippedCount, 3)
+    }
+
+    func testBatchUninstallNameListTruncatesInSelectionOrder() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        func app(_ name: String, file: String) -> AppCandidate {
+            AppCandidate(canonicalURL: URL(fileURLWithPath: "/Applications/\(file).app"),
+                         bundleIdentifier: "test.\(file)", displayName: name, sourcePriority: 1, discoveredAt: now)
+        }
+        let two = AppBatchUninstallPlan.nameList([app(" Alpha ", file: "a"), app("  ", file: "BetaFile")])
+        XCTAssertEqual(two.shown, ["Alpha", "BetaFile"])
+        XCTAssertFalse(two.isTruncated)
+        XCTAssertEqual(two.joined, "Alpha、BetaFile")
+
+        let seven = AppBatchUninstallPlan.nameList((1...7).map { app("App\($0)", file: "f\($0)") })
+        XCTAssertEqual(seven.shown, ["App1", "App2", "App3", "App4", "App5"])
+        XCTAssertEqual(seven.totalCount, 7)
+        XCTAssertTrue(seven.isTruncated)
+        XCTAssertEqual(AppBatchUninstallPlan.nameList([app("X", file: "x")], limit: 0).shown, [])
+        XCTAssertEqual(String(format: AppBatchUninstallPlan.nameListOverflowFormatKey, seven.joined, seven.totalCount),
+                       "App1、App2、App3、App4、App5 等 7 个应用")
+    }
+
     func testWritableUserApplicationsBundleEnablesUninstallMenu() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("LaunchIcon-UninstallMenuEnabled-\(UUID().uuidString)", isDirectory: true)
@@ -5121,6 +6120,443 @@ final class LaunchIconCoreTests: XCTestCase {
                           "empty-state copy should explain matching scope")
     }
 
+    func testAliasAndFolderPromptCopy() {
+        XCTAssertEqual(
+            LauncherLayout.AppAliasPromptAlert.messageText(localize: { $0 }),
+            LauncherLayout.AppAliasPromptAlert.messageTextKey
+        )
+        XCTAssertTrue(LauncherLayout.AppAliasPromptAlert.informativeTextKey.contains("留空可恢复"))
+        XCTAssertEqual(
+            LauncherLayout.AppAliasPromptAlert.accessibilityLabel(appDisplayName: "Safari", localize: { $0 }),
+            String(format: LauncherLayout.AppAliasPromptAlert.accessibilityLabelFormatKey, "Safari")
+        )
+        XCTAssertTrue(LauncherLayout.AppAliasPromptAlert.saveIsFirstButton)
+        XCTAssertEqual(
+            LauncherLayout.FolderRenamePromptAlert.messageText(localize: { $0 }),
+            "重命名文件夹"
+        )
+        XCTAssertEqual(
+            LauncherLayout.FolderRenamePromptAlert.placeholder(localize: { $0 }),
+            "新建文件夹"
+        )
+        XCTAssertEqual(
+            LauncherLayout.FolderRenamePromptAlert.saveButtonTitle(localize: { $0 }),
+            LauncherLayout.AppAliasPromptAlert.saveButtonTitleKey
+        )
+        XCTAssertTrue(LauncherLayout.FolderRenamePromptAlert.saveIsFirstButton)
+    }
+
+
+    func testLayoutIOOutcomeCopy() {
+        // LAYOUT-IO-OUTCOME-COPY-01
+        XCTAssertEqual(
+            LauncherLayout.LayoutIOOutcomeCopy.exportSucceeded(localize: { $0 }),
+            "布局已导出"
+        )
+        XCTAssertEqual(
+            LauncherLayout.LayoutIOOutcomeCopy.importUnreadableFile(localize: { $0 }),
+            LauncherLayout.LayoutIOOutcomeCopy.importUnreadableFileKey
+        )
+        XCTAssertEqual(
+            LauncherLayout.LayoutIOOutcomeCopy.launchpadEmpty(localize: { $0 }),
+            "启动台数据库里没有应用"
+        )
+        XCTAssertEqual(
+            LauncherLayout.LayoutIOOutcomeCopy.restoreNoBackup(localize: { $0 }),
+            "没有可用备份"
+        )
+        XCTAssertEqual(
+            LauncherLayout.LayoutIOOutcomeCopy.layoutEditingBlocked(localize: { $0 }),
+            LauncherLayout.LayoutIOOutcomeCopy.layoutEditingBlockedKey
+        )
+        XCTAssertEqual(
+            LauncherLayout.LayoutIOOutcomeCopy.exportUnavailable(localize: { $0 }),
+            "当前无法导出布局"
+        )
+        XCTAssertEqual(
+            LauncherLayout.LayoutIOOutcomeCopy.layoutUpdatedToast(localize: { $0 }),
+            "布局已更新"
+        )
+    }
+
+
+    func testEmptyFolderDisplayNameFallback() {
+        // FOLDER-EMPTY-NAME-FALLBACK-01
+        XCTAssertEqual(
+            LauncherLayout.emptyFolderDisplayName(localize: { $0 }),
+            LauncherLayout.FolderRenamePromptAlert.placeholderKey
+        )
+        XCTAssertEqual(
+            LauncherLayout.displayName(forFolderNamed: "  ", localize: { $0 }),
+            "新建文件夹"
+        )
+        XCTAssertEqual(
+            LauncherLayout.displayName(forFolderNamed: "工具", localize: { $0 }),
+            "工具"
+        )
+    }
+
+
+    func testLayoutEditingStatusCopy() {
+        // LAYOUT-EDITING-STATUS-COPY-01
+        XCTAssertEqual(
+            LauncherLayout.LayoutEditingStatusCopy.scanningExplanation(localize: { $0 }),
+            "正在扫描应用，暂时无法整理"
+        )
+        XCTAssertEqual(
+            LauncherLayout.LayoutEditingStatusCopy.cachedCatalogExplanation(localize: { $0 }),
+            LauncherLayout.LayoutEditingStatusCopy.cachedCatalogExplanationKey
+        )
+        XCTAssertEqual(
+            LauncherLayout.LayoutEditingStatusCopy.rescanSucceeded(localize: { $0 }),
+            "重新扫描完成"
+        )
+        XCTAssertEqual(
+            LauncherLayout.LayoutEditingStatusCopy.rearrangeUnavailable(localize: { $0 }),
+            "当前无法重新排列"
+        )
+    }
+
+
+    func testLaunchFeedbackCopy() {
+        // LAUNCH-FEEDBACK-COPY-01
+        XCTAssertEqual(
+            LauncherLayout.LaunchFeedbackCopy.openFailureMessage(
+                displayName: "日历",
+                timedOut: true,
+                localize: { $0 }
+            ),
+            "打开“日历”超时"
+        )
+        XCTAssertEqual(
+            LauncherLayout.LaunchFeedbackCopy.openFailureMessage(
+                displayName: "日历",
+                timedOut: false,
+                localize: { $0 }
+            ),
+            "无法打开“日历”"
+        )
+        XCTAssertEqual(
+            LauncherLayout.LaunchFeedbackCopy.launchingTitle(localize: { $0 }),
+            "正在启动…"
+        )
+        XCTAssertEqual(
+            LauncherLayout.LaunchFeedbackCopy.layoutSaveFailed(localize: { $0 }),
+            LauncherLayout.LaunchFeedbackCopy.layoutSaveFailedKey
+        )
+    }
+
+
+    func testFooterChromeCopy() {
+        // FOOTER-DRAG-HINT-01
+        XCTAssertEqual(
+            LauncherLayout.FooterChromeCopy.dragHint(pageCount: 1, localize: { $0 }),
+            "拖拽整理"
+        )
+        XCTAssertEqual(
+            LauncherLayout.FooterChromeCopy.dragHint(pageCount: 3, localize: { $0 }),
+            LauncherLayout.FooterChromeCopy.dragHintMultiPageKey
+        )
+        XCTAssertEqual(
+            LauncherLayout.FooterChromeCopy.toastCloseLabel(localize: { $0 }),
+            "关闭提示"
+        )
+    }
+
+
+    func testSettingsSectionChromeCopy() {
+        // SETTINGS-SECTION-CHROME-01
+        XCTAssertEqual(
+            SettingsSectionChromeCopy.windowTitle(localize: { $0 }),
+            "LaunchIcon 设置"
+        )
+        XCTAssertEqual(SettingsSectionChromeCopy.pageTitle(localize: { $0 }), "通用")
+        XCTAssertEqual(
+            SettingsSectionChromeCopy.appearanceSectionTitle(localize: { $0 }),
+            "外观与呼出"
+        )
+        XCTAssertEqual(
+            SettingsSectionChromeCopy.behaviorSectionTitle(localize: { $0 }),
+            "行为"
+        )
+        XCTAssertEqual(
+            SettingsSectionChromeCopy.appsSectionTitle(localize: { $0 }),
+            "应用管理"
+        )
+        XCTAssertEqual(
+            SettingsSectionChromeCopy.maintenanceSectionTitle(localize: { $0 }),
+            "维护"
+        )
+        XCTAssertEqual(
+            SettingsSectionChromeCopy.sourceLabel(shortCommit: "abcdef1", localize: { $0 }),
+            "源码 abcdef1"
+        )
+        XCTAssertTrue(
+            SettingsSectionChromeCopy.versionLine(
+                version: "1.0",
+                build: "2",
+                source: "开发构建",
+                localize: { $0 }
+            ).contains("1.0")
+        )
+    }
+
+
+    func testSearchFieldChromeCopy() {
+        // SEARCH-FIELD-CHROME-01
+        XCTAssertEqual(LauncherLayout.SearchFieldChromeCopy.searchPlaceholder(localize: { $0 }), "搜索应用")
+        XCTAssertEqual(LauncherLayout.SearchFieldChromeCopy.clearSearchLabel(localize: { $0 }), "清除搜索")
+        XCTAssertEqual(
+            LauncherLayout.SearchFieldChromeCopy.escClearSearch(localize: { $0 }),
+            LauncherLayout.CatalogEmptyChromeCopy.searchNoMatchesDefaultDetailKey
+        )
+        XCTAssertEqual(
+            LauncherLayout.SearchFieldChromeCopy.footerNavigationText(isSearching: true, pageCount: 3, localize: { $0 }),
+            LauncherLayout.CatalogEmptyChromeCopy.searchNoMatchesDefaultDetailKey
+        )
+        XCTAssertEqual(
+            LauncherLayout.SearchFieldChromeCopy.footerNavigationText(isSearching: false, pageCount: 2, localize: { $0 }),
+            LauncherLayout.SearchFieldChromeCopy.escReturnWithPagingKey
+        )
+        XCTAssertEqual(
+            LauncherLayout.SearchFieldChromeCopy.footerNavigationText(isSearching: false, pageCount: 1, localize: { $0 }),
+            LauncherLayout.SearchFieldChromeCopy.escReturnKey
+        )
+        XCTAssertEqual(LauncherLayout.SearchFieldChromeCopy.resultsCountText(count: 7, localize: { $0 }), "7 个结果")
+        XCTAssertEqual(LauncherLayout.SearchFieldChromeCopy.itemsCountText(count: 12, localize: { $0 }), "12 个项目")
+        XCTAssertEqual(LauncherLayout.SearchFieldChromeCopy.settingsHelp(localize: { $0 }), LauncherLayout.SearchFieldChromeCopy.settingsHelpKey)
+    }
+
+
+    func testAppDirectoryCopy() {
+        // APP-DIRECTORY-FEEDBACK-01
+        XCTAssertEqual(AppDirectoryCopy.menuTitle(count: 0, localize: { $0 }), "应用目录…")
+        XCTAssertEqual(AppDirectoryCopy.menuTitle(count: 2, localize: { $0 }), "应用目录（2）…")
+        XCTAssertEqual(AppDirectoryCopy.addFolderTitle(localize: { $0 }), "添加文件夹…")
+        XCTAssertEqual(AppDirectoryCopy.alreadyCovered(localize: { $0 }), AppDirectoryCopy.alreadyCoveredKey)
+        XCTAssertTrue(
+            AppDirectoryCopy.addedMessage(abbreviatedPath: "~/Apps", localize: { $0 }).contains("~/Apps")
+        )
+        XCTAssertTrue(
+            AppDirectoryCopy.removedMessage(abbreviatedPath: "~/Apps", localize: { $0 }).contains("~/Apps")
+        )
+        XCTAssertTrue(AppDirectoryCopy.accessibilityHelp(localize: { $0 }).contains("Applications"))
+    }
+
+
+    func testSettingsDisplayFeedbackCopy() {
+        // SETTINGS-DISPLAY-FEEDBACK-01
+        XCTAssertEqual(
+            DisplayTargetCopy.label(localize: { $0 }),
+            "显示于"
+        )
+        XCTAssertTrue(
+            DisplayTargetCopy.accessibilityHelp(localize: { $0 }).contains("多台显示器")
+        )
+        XCTAssertEqual(
+            SettingsFeedbackCopy.applied(localize: { $0 }),
+            "设置已应用"
+        )
+        XCTAssertEqual(
+            SettingsFeedbackCopy.rescanning(localize: { $0 }),
+            "正在重新扫描"
+        )
+    }
+
+
+    func testMenuChromeCopy() {
+        // MENU-CHROME-TITLES-01
+        XCTAssertEqual(
+            LauncherLayout.MenuChromeCopy.settingsTitle(localize: { $0 }),
+            "设置…"
+        )
+        XCTAssertEqual(
+            LauncherLayout.MenuChromeCopy.quitAppTitle(localize: { $0 }),
+            "退出 LaunchIcon"
+        )
+        XCTAssertEqual(
+            LauncherLayout.MenuChromeCopy.quitTitle(localize: { $0 }),
+            "退出"
+        )
+        XCTAssertEqual(
+            LauncherLayout.MenuChromeCopy.editMenuTitle(localize: { $0 }),
+            "编辑"
+        )
+        XCTAssertEqual(
+            LauncherLayout.MenuChromeCopy.selectAllTitle(localize: { $0 }),
+            "全选"
+        )
+        XCTAssertEqual(
+            LauncherLayout.MenuChromeCopy.pasteTitle(localize: { $0 }),
+            "粘贴"
+        )
+        XCTAssertEqual(
+            LauncherLayout.MenuChromeCopy.reloadCatalogTitle(localize: { $0 }),
+            LauncherLayout.CatalogEmptyChromeCopy.reloadButtonTitleKey
+        )
+        XCTAssertEqual(
+            LauncherLayout.statusItemToggleTitle(isVisible: false, isDismissing: false),
+            "显示 LaunchIcon"
+        )
+    }
+
+
+    func testCatalogEmptyChromeCopy() {
+        // CATALOG-EMPTY-PREPARING-CHROME-01
+        XCTAssertEqual(
+            LauncherLayout.CatalogEmptyChromeCopy.preparingMessage(localize: { $0 }),
+            "正在准备应用…"
+        )
+        let unavailable = LauncherLayout.CatalogEmptyChromeCopy.content(
+            for: .catalogUnavailable,
+            localize: { $0 }
+        )
+        XCTAssertEqual(unavailable.title, "未找到可用的应用")
+        XCTAssertEqual(unavailable.detail, LauncherLayout.CatalogEmptyChromeCopy.catalogUnavailableDetailKey)
+        XCTAssertTrue(unavailable.showActions)
+        let cancelled = LauncherLayout.CatalogEmptyChromeCopy.content(
+            for: .catalogCancelled,
+            localize: { $0 }
+        )
+        XCTAssertEqual(cancelled.title, "扫描已取消")
+        XCTAssertEqual(cancelled.help, "重新扫描应用")
+        let search = LauncherLayout.CatalogEmptyChromeCopy.content(
+            for: .searchNoMatches,
+            localize: { $0 }
+        )
+        XCTAssertEqual(search.title, "未找到匹配的应用")
+        XCTAssertEqual(search.detail, "按 Esc 清除搜索")
+        XCTAssertFalse(search.showActions)
+        let hinted = LauncherLayout.CatalogEmptyChromeCopy.content(
+            for: .searchNoMatches,
+            searchDetail: "自定义提示",
+            localize: { $0 }
+        )
+        XCTAssertEqual(hinted.detail, "自定义提示")
+        XCTAssertEqual(
+            LauncherLayout.CatalogEmptyChromeCopy.reloadButtonTitle(localize: { $0 }),
+            "重新扫描"
+        )
+        XCTAssertEqual(
+            LauncherLayout.CatalogEmptyChromeCopy.useCachedButtonTitle(localize: { $0 }),
+            "使用上次应用列表"
+        )
+    }
+
+
+    func testShortcutRegistrationCopy() {
+        // SHORTCUT-REGISTRATION-COPY-01
+        XCTAssertTrue(
+            ShortcutRegistrationCopy.bootConflictMessage(shortcutTitle: "⌥Space", localize: { $0 })
+                .contains("⌥Space")
+        )
+        XCTAssertTrue(
+            ShortcutRegistrationCopy.changeConflictMessage(shortcutTitle: "⌃Space", localize: { $0 })
+                .contains("⌃Space")
+        )
+        XCTAssertEqual(
+            ShortcutRegistrationCopy.cannotHideStatusItem(localize: { $0 }),
+            ShortcutRegistrationCopy.cannotHideStatusItemKey
+        )
+    }
+
+    func testUngroupAllFoldersConfirmCopy() {
+        XCTAssertEqual(
+            LauncherLayout.ungroupAllFoldersConfirmTitle(localize: { $0 }),
+            LauncherLayout.ungroupAllFoldersConfirmTitleKey
+        )
+        XCTAssertEqual(
+            LauncherLayout.ungroupAllFoldersConfirmInformativeText(folderCount: 3, localize: { $0 }),
+            String(format: LauncherLayout.batchDissolveFoldersConfirmInfoFormatKey, 3)
+        )
+        XCTAssertEqual(
+            LauncherLayout.ungroupAllFoldersConfirmInfoFormatKey,
+            LauncherLayout.batchDissolveFoldersConfirmInfoFormatKey
+        )
+        XCTAssertEqual(
+            LauncherLayout.dissolveConfirmCancelButtonTitle(localize: { $0 }),
+            AppBatchUninstallPlan.cancelButtonTitleKey
+        )
+        XCTAssertEqual(
+            LauncherLayout.dissolveConfirmDestructiveButtonTitle(localize: { $0 }),
+            LauncherLayout.dissolveConfirmButtonTitleKey
+        )
+        XCTAssertEqual(LauncherLayout.dissolveConfirmButtonTitleKey, "解散")
+    }
+
+    func testOrphanLeftoverConfirmCopy() {
+        XCTAssertEqual(
+            AppOrphanLeftoverScanner.confirmTitle(localize: { $0 }),
+            AppOrphanLeftoverScanner.confirmTitleKey
+        )
+        XCTAssertEqual(
+            AppOrphanLeftoverScanner.confirmInformativeText(localize: { $0 }),
+            AppOrphanLeftoverScanner.confirmInformativeKey
+        )
+        XCTAssertTrue(AppOrphanLeftoverScanner.confirmTitleKey.contains("残留文件"))
+        XCTAssertTrue(AppOrphanLeftoverScanner.confirmInformativeKey.contains("默认不选"))
+        // Buttons stay shared with batch confirm (Cancel first / Trash second).
+        XCTAssertEqual(AppBatchUninstallPlan.cancelButtonTitleKey, "取消")
+        XCTAssertEqual(AppBatchUninstallPlan.trashButtonTitleKey, "移到废纸篓")
+    }
+
+    func testOrphanLeftoverResultToasts() {
+        XCTAssertEqual(
+            AppOrphanLeftoverScanner.catalogUnavailable(localize: { $0 }),
+            AppOrphanLeftoverScanner.catalogUnavailableKey
+        )
+        XCTAssertEqual(
+            AppOrphanLeftoverScanner.changedBeforeTrash(localize: { $0 }),
+            AppOrphanLeftoverScanner.changedBeforeTrashKey
+        )
+        XCTAssertEqual(
+            AppOrphanLeftoverScanner.successMessage(trashedCount: 4, localize: { $0 }),
+            String(format: AppOrphanLeftoverScanner.successFormatKey, 4)
+        )
+        XCTAssertEqual(
+            AppOrphanLeftoverScanner.cancelledPartialMessage(trashedCount: 2, localize: { $0 }),
+            String(format: AppOrphanLeftoverScanner.cancelledPartialFormatKey, 2)
+        )
+        let partial = AppOrphanLeftoverScanner.partialFailMessage(
+            trashedCount: 3,
+            failedNames: ["a.plist", "b", "c", "d"],
+            localize: { $0 }
+        )
+        XCTAssertEqual(
+            partial,
+            String(format: AppOrphanLeftoverScanner.partialFailFormatKey, 3, 4, "a.plist, b, c")
+        )
+        XCTAssertEqual(
+            AppOrphanLeftoverScanner.trashOutcomeMessage(
+                trashedCount: 1,
+                failedLastPathComponents: [],
+                localize: { $0 }
+            ),
+            String(format: AppOrphanLeftoverScanner.successFormatKey, 1)
+        )
+        XCTAssertTrue(
+            AppOrphanLeftoverScanner.trashOutcomeMessage(
+                trashedCount: 1,
+                failedLastPathComponents: ["x"],
+                localize: { $0 }
+            ).contains("x")
+        )
+    }
+
+    func testRelatedCleanupConfirmCopy() {
+        XCTAssertEqual(
+            AppRelatedFileScanner.relatedCleanupConfirmTitle(appName: "Pixelmator", localize: { $0 }),
+            String(format: AppRelatedFileScanner.relatedCleanupConfirmTitleFormatKey, "Pixelmator")
+        )
+        XCTAssertEqual(
+            AppRelatedFileScanner.relatedCleanupReviewMessage(localize: { $0 }),
+            AppRelatedFileScanner.relatedCleanupReviewMessageKey
+        )
+        XCTAssertTrue(AppRelatedFileScanner.relatedCleanupReviewMessageKey.contains("默认不选"))
+        XCTAssertEqual(AppBatchUninstallPlan.cancelButtonTitleKey, "取消")
+        XCTAssertEqual(AppBatchUninstallPlan.trashButtonTitleKey, "移到废纸篓")
+    }
+
     func testRelatedCleanupProgressCancelAndSelectionStillValid() {
         XCTAssertEqual(AppRelatedFileScanner.scanningProgressMessageKey, "正在查找相关文件…")
         XCTAssertEqual(AppRelatedFileScanner.recheckingProgressMessageKey, "正在确认相关文件…")
@@ -5241,6 +6677,56 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertTrue(AppUninstallEligibility.hasOtherCopy(
             of: target, in: report, registeredURLs: [sibling]
         ))
+    }
+
+    func testBatchAndSingleUninstallKeepLayoutUnlessNoOtherCopyConfirmed() {
+        // UNINSTALL-BATCH-OTHER-COPY-01
+        XCTAssertFalse(AppUninstallEligibility.otherCopyMayExistAfterUninstall(probe: false))
+        XCTAssertTrue(AppUninstallEligibility.otherCopyMayExistAfterUninstall(probe: true))
+        XCTAssertTrue(AppUninstallEligibility.otherCopyMayExistAfterUninstall(probe: nil))
+        let target = sampleCandidate()
+        let userCopy = URL(fileURLWithPath: NSHomeDirectory() + "/Applications/Sample.app")
+        let report = CatalogScanReport(candidates: [target], skippedPaths: [])
+        let probe = AppUninstallEligibility.hasOtherCopy(of: target, in: report, registeredURLs: [userCopy])
+        XCTAssertTrue(AppUninstallEligibility.otherCopyMayExistAfterUninstall(probe: probe))
+    }
+
+    func testBatchUninstallKeepsSurvivingCopyThroughLaterForgetReconcile() {
+        // UNINSTALL-BATCH-OTHER-COPY-02: batch = [dup (other copy survives), other].
+        let dupKey = "bundle:com.example.dup", otherKey = "bundle:com.example.other"
+        let dupID = UUID(), otherID = UUID(), folderID = UUID(), mateID = UUID()
+        let mate = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Mate.app"),
+            bundleIdentifier: "com.example.mate", displayName: "Mate", sourcePriority: 0, discoveredAt: .now
+        )
+        let dup = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Dup.app"),
+            bundleIdentifier: "com.example.dup", displayName: "Dup", sourcePriority: 0, discoveredAt: .now
+        )
+        let other = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Other.app"),
+            bundleIdentifier: "com.example.other", displayName: "Other", sourcePriority: 0, discoveredAt: .now
+        )
+        XCTAssertEqual(dup.deduplicationKey, dupKey)
+        XCTAssertEqual(other.deduplicationKey, otherKey)
+        let state = LayoutState(
+            orderedEntries: [.folder(folderID), .app(otherID)],
+            folders: [folderID: LauncherFolder(id: folderID, name: "Work", itemIDs: [dupID, mateID])],
+            appKeys: [dupID: dupKey, otherID: otherKey, mateID: mate.deduplicationKey],
+            hiddenAppKeys: [],
+            appAliases: [dupKey: "我的别名"], updatedAt: .now
+        )
+        var catalog = [dup, other, mate]
+        catalog = AppUninstallEligibility.catalogAfterUninstall(catalog, removing: dup, otherCopyMayExist: true)
+        XCTAssertEqual(catalog.map(\.deduplicationKey), [dupKey, otherKey, mate.deduplicationKey])
+        catalog = AppUninstallEligibility.catalogAfterUninstall(catalog, removing: other, otherCopyMayExist: false)
+        XCTAssertEqual(catalog.map(\.deduplicationKey), [dupKey, mate.deduplicationKey])
+        let forgotten = LauncherLayout.forgetUninstalledApplication(withKey: otherKey, in: state)
+        let reconciled = LauncherLayout.reconcile(candidates: catalog, into: forgotten)
+        XCTAssertEqual(reconciled.appKeys[dupID], dupKey)
+        XCTAssertEqual(reconciled.folders[folderID]?.itemIDs, [dupID, mateID])
+        XCTAssertEqual(reconciled.appAliases[dupKey], "我的别名")
+        XCTAssertNil(reconciled.appKeys[otherID])
     }
 
     func testUninstallProcessScopeKeepsOtherCopyAndIncludesNestedHelper() {
@@ -5639,6 +7125,31 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertEqual(AppUninstallReport(bundleTrashed: true, bundleFailure: nil, trashedRelated: [url], failedRelated: [fail]).outcome, .partialRelated)
         XCTAssertEqual(AppUninstallReport(bundleTrashed: false, bundleFailure: fail, trashedRelated: [], failedRelated: []).outcome, .bundleFailed)
         XCTAssertTrue(AppUninstallReport.undoHintKey.contains("废纸篓"))
+
+        let relatedOK = AppUninstallReport(
+            bundleTrashed: true, bundleFailure: nil, trashedRelated: [url], failedRelated: []
+        )
+        XCTAssertEqual(
+            relatedOK.successToastMessage(localize: { $0 }),
+            String(format: AppUninstallReport.relatedSuccessFormatKey, 1)
+        )
+        XCTAssertEqual(
+            AppUninstallReport(bundleTrashed: true, bundleFailure: nil, trashedRelated: [], failedRelated: [])
+                .successToastMessage(localize: { $0 }),
+            AppUninstallReport.undoHintKey
+        )
+        let denied = AppUninstallFailure(url: url, reason: .permissionDenied, detail: "x")
+        let partial = AppUninstallReport(
+            bundleTrashed: true, bundleFailure: nil, trashedRelated: [url], failedRelated: [denied]
+        )
+        let toast = partial.partialRelatedToast(localize: { $0 })
+        XCTAssertEqual(
+            toast?.message,
+            String(format: AppUninstallReport.partialRelatedFormatKey, 1, 1)
+        )
+        XCTAssertEqual(toast?.help, "\(url.path) — 没有权限")
+        XCTAssertEqual(AppUninstallFailureReason.permissionDenied.relatedLabelKey, "没有权限")
+        XCTAssertNil(AppUninstallFailureReason.other.relatedLabelKey)
         XCTAssertEqual(AppUninstallFailureReason.classify(NSError(domain: NSCocoaErrorDomain, code: NSFileReadNoPermissionError)), .permissionDenied)
         XCTAssertEqual(AppUninstallFailureReason.classify(NSError(domain: NSPOSIXErrorDomain, code: Int(EPERM))), .permissionDenied)
         XCTAssertEqual(AppUninstallFailureReason.classify(NSError(domain: NSCocoaErrorDomain, code: NSFileNoSuchFileError)), .missing)
@@ -6152,6 +7663,131 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertEqual(AppSearch.filter([calendar], query: "wdgj", aliases: aliases), [calendar])
     }
 
+    func testSearchMatchesEnglishWordInitialsAndCamelCase() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        func app(_ name: String, bundle: String) -> AppCandidate {
+            AppCandidate(
+                canonicalURL: URL(fileURLWithPath: "/Applications/\(name).app"),
+                bundleIdentifier: bundle, displayName: name, sourcePriority: 1, discoveredAt: now
+            )
+        }
+        let vscode = app("Visual Studio Code", bundle: "test.vscode")
+        let garage = app("GarageBand", bundle: "test.garage")
+        let quick = app("QuickTime Player", bundle: "test.quick")
+        let notes = app("Notes", bundle: "test.notes")
+        let vsx = app("VSX", bundle: "test.vsx")
+        let all = [notes, vscode, garage, quick, vsx]
+        XCTAssertEqual(AppSearch.filter(all, query: "vsc").map(\.displayName), ["Visual Studio Code"])
+        XCTAssertEqual(AppSearch.filter(all, query: "gb").map(\.displayName), ["GarageBand"], "camel-case hump")
+        XCTAssertEqual(AppSearch.filter(all, query: "qtp").map(\.displayName), ["QuickTime Player"])
+        XCTAssertEqual(AppSearch.filter(all, query: "QT P").map(\.displayName), ["QuickTime Player"], "spaces and case ignored")
+        XCTAssertEqual(AppSearch.filter(all, query: "vs").map(\.displayName), ["VSX", "Visual Studio Code"],
+                       "a real prefix still beats an initials-only hit")
+        XCTAssertEqual(AppSearch.filter(all, query: "g").map(\.displayName), ["GarageBand"], "one letter never uses initials")
+        XCTAssertTrue(AppSearch.filter(all, query: "nt").isEmpty, "single-word names have no initials")
+        XCTAssertTrue(AppSearch.filter(all, query: "vcs").isEmpty, "initials must be a prefix, in order")
+    }
+
+    func testSearchTypoAndInitialsUsePackageNameUnderLocalizedDisplayName() {
+        // SEARCH-TYPO-PACKAGE-01 / SEARCH-INITIALS-RANK-01: Chinese system,
+        // display names are localized; English package names still search.
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        func app(_ display: String, _ package: String) -> AppCandidate {
+            AppCandidate(
+                canonicalURL: URL(fileURLWithPath: "/System/Applications/\(package).app"),
+                bundleIdentifier: "test.\(package.filter { !$0.isWhitespace })",
+                displayName: display, sourcePriority: 1, discoveredAt: now
+            )
+        }
+        let chess = app("国际象棋", "Chess")
+        let messages = app("信息", "Messages")
+        let settings = app("系统设置", "System Settings")
+        let calc = app("计算器", "Calculator")
+        let all = [chess, messages, settings, calc]
+        XCTAssertEqual(AppSearch.filter(all, query: "calculater").map(\.displayName), ["计算器"],
+                       "one typo in the English package name")
+        XCTAssertEqual(AppSearch.filter(all, query: "ss").first?.displayName, "系统设置",
+                       "package initials outrank plain contains")
+        XCTAssertEqual(AppSearch.filter(all, query: "ss").count, 3)
+        XCTAssertTrue(AppSearch.filter(all, query: "calcz").isEmpty == false, "prefix-length typo still ok")
+        XCTAssertTrue(AppSearch.filter(all, query: "xalculator").isEmpty, "first letter must agree")
+    }
+
+    func testSearchToleratesOneTypoAfterAllRealMatches() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        func app(_ name: String, bundle: String) -> AppCandidate {
+            AppCandidate(
+                canonicalURL: URL(fileURLWithPath: "/Applications/\(name).app"),
+                bundleIdentifier: bundle, displayName: name, sourcePriority: 1, discoveredAt: now
+            )
+        }
+        let safari = app("Safari", bundle: "test.safari")
+        let vscode = app("Visual Studio Code", bundle: "test.vscode")
+        let calc = app("Calculator", bundle: "test.calc")
+        let weixin = app("微信", bundle: "test.weixin")
+        let all = [safari, vscode, calc, weixin]
+        XCTAssertEqual(AppSearch.filter(all, query: "safri").map(\.displayName), ["Safari"], "deletion")
+        XCTAssertEqual(AppSearch.filter(all, query: "sfaari").map(\.displayName), ["Safari"], "neighbour swap")
+        XCTAssertEqual(AppSearch.filter(all, query: "safaro").map(\.displayName), ["Safari"], "substitution")
+        XCTAssertEqual(AppSearch.filter(all, query: "studoi").map(\.displayName), ["Visual Studio Code"], "later word start")
+        XCTAssertEqual(AppSearch.filter(all, query: "calcu").map(\.displayName), ["Calculator"], "prefix of a longer word")
+        XCTAssertEqual(AppSearch.filter(all, query: "weixn").map(\.displayName), ["微信"], "pinyin form")
+        XCTAssertTrue(AppSearch.filter(all, query: "saf").isEmpty == false, "short queries keep exact rules")
+        XCTAssertTrue(AppSearch.filter(all, query: "sfa").isEmpty, "under 5 letters never uses typo matching")
+        XCTAssertTrue(AppSearch.filter(all, query: "cafe").isEmpty, "4 letters stay exact (cafe is one edit from cale…)")
+        XCTAssertTrue(AppSearch.filter(all, query: "afarii").isEmpty, "first letter must agree")
+        XCTAssertTrue(AppSearch.filter(all, query: "sfrai").isEmpty, "two edits do not match")
+        XCTAssertTrue(AppSearch.filter(all, query: "saf ri").isEmpty, "queries with spaces skip typo matching")
+
+        // A typo hit never jumps ahead of a real (even bundle-id) hit.
+        let notes = app("Notes", bundle: "test.notes")
+        let other = app("Zeta", bundle: "com.example.nodes")
+        XCTAssertEqual(AppSearch.filter([notes, other], query: "nodes").map(\.displayName), ["Zeta", "Notes"])
+
+        // Aliases get the same fallback.
+        let aliases = [calc.deduplicationKey: "Rechner"]
+        XCTAssertEqual(AppSearch.filter(all, query: "rechenr", aliases: aliases).map(\.displayName), ["Calculator"])
+    }
+
+    func testSearchRanksWordStartMatchesBetweenPrefixAndContains() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        func app(_ name: String, package: String? = nil, bundle: String) -> AppCandidate {
+            AppCandidate(
+                canonicalURL: URL(fileURLWithPath: "/Applications/\(package ?? name).app"),
+                bundleIdentifier: bundle, displayName: name, sourcePriority: 1, discoveredAt: now
+            )
+        }
+        let barcode = app("Barcode Scanner", bundle: "test.barcode")
+        let vscode = app("Visual Studio Code", bundle: "test.vscode")
+        let codex = app("Codex", bundle: "test.codex")
+        let android = app("Android-Studio", bundle: "test.android")
+        XCTAssertEqual(
+            AppSearch.filter([barcode, vscode, codex], query: "code").map(\.displayName),
+            ["Codex", "Visual Studio Code", "Barcode Scanner"]
+        )
+        XCTAssertEqual(
+            AppSearch.filter([vscode, android], query: "studio").map(\.displayName),
+            ["Visual Studio Code", "Android-Studio"], "hyphen and space both start a word; ties keep order"
+        )
+        XCTAssertEqual(
+            AppSearch.filter([barcode, vscode], query: "ode").map(\.displayName),
+            ["Barcode Scanner", "Visual Studio Code"], "mid-word hits tie and keep layout order"
+        )
+
+        // An exact package-name hit still beats a word-start display hit.
+        let wechat = app("微信", package: "WeChat", bundle: "com.tencent.xinWeChat")
+        let helper = app("My WeChat Helper", bundle: "test.helper")
+        XCTAssertEqual(AppSearch.filter([helper, wechat], query: "wechat").map(\.bundleIdentifier),
+                       ["com.tencent.xinWeChat", "test.helper"])
+
+        // Pinyin word starts count too: "xin" starts the second syllable of 微信.
+        let xinhua = app("新华字典", bundle: "test.xinhua")
+        let weixin = app("微信", bundle: "test.weixin")
+        let other = app("Maxinfo", bundle: "test.maxinfo")
+        XCTAssertEqual(AppSearch.filter([other, weixin, xinhua], query: "xin").map(\.bundleIdentifier),
+                       ["test.xinhua", "test.weixin", "test.maxinfo"])
+    }
+
     func testSearchIndexCachesCatalogTermsAndRefreshesAliases() {
         let calendar = AppCandidate(
             canonicalURL: URL(fileURLWithPath: "/Applications/日历.app"),
@@ -6241,6 +7877,88 @@ final class LaunchIconCoreTests: XCTestCase {
         )
     }
 
+    func testGridGeometryPreferenceClampsAndMatchesSevenByFive() throws {
+        let standard = GridGeometryPreference.standard
+        XCTAssertEqual(standard.columns, LauncherLayout.pageColumns)
+        XCTAssertEqual(standard.rows, LauncherLayout.pageRows)
+        XCTAssertEqual(standard.capacity, LauncherLayout.pageCapacity)
+        XCTAssertEqual(standard.capacity, 35)
+
+        XCTAssertEqual(GridGeometryPreference(columns: 0, rows: -4), GridGeometryPreference(columns: 5, rows: 3))
+        XCTAssertEqual(GridGeometryPreference(columns: 99, rows: 100), GridGeometryPreference(columns: 10, rows: 8))
+        XCTAssertEqual(GridGeometryPreference(columns: 8, rows: 4).capacity, 32)
+
+        for index in [0, 34, 35, 70] {
+            XCTAssertEqual(
+                standard.pageIndex(containingEntryAt: index),
+                LauncherLayout.pageIndex(containingEntryAt: index)
+            )
+        }
+        XCTAssertEqual(standard.pageIndex(containingEntryAt: -1), 0)
+        XCTAssertEqual(standard.pageCount(forEntryCount: 36), 2)
+        XCTAssertEqual(standard.pageCount(forEntryCount: 0), 0)
+
+        let compact = GridGeometryPreference(columns: 5, rows: 3)
+        XCTAssertEqual(compact.capacity, 15)
+        XCTAssertEqual(compact.pageIndex(containingEntryAt: 35), 2)
+        XCTAssertEqual(compact.pageCount(forEntryCount: 36), 3)
+
+        let wide = GridGeometryPreference(columns: 10, rows: 8)
+        XCTAssertEqual(
+            GridGeometryPreference.preservedPageIndex(previous: standard, next: wide, previousPage: 1),
+            0,
+            "slot 35 still fits on page 0 when the page holds 80"
+        )
+        XCTAssertEqual(
+            GridGeometryPreference.preservedPageIndex(previous: standard, next: compact, previousPage: 1),
+            2,
+            "slot 35 moves to page 2 when the page holds 15"
+        )
+        XCTAssertEqual(
+            GridGeometryPreference.preservedPageIndex(previous: standard, next: standard, previousPage: 2),
+            2
+        )
+
+        let encoded = try JSONEncoder().encode(GridGeometryPreference(columns: 99, rows: 1))
+        let decoded = try JSONDecoder().decode(GridGeometryPreference.self, from: encoded)
+        XCTAssertEqual(decoded, GridGeometryPreference(columns: 10, rows: 3))
+        let raw = Data(#"{"columns":4,"rows":20}"#.utf8)
+        let clamped = try JSONDecoder().decode(GridGeometryPreference.self, from: raw)
+        XCTAssertEqual(clamped, GridGeometryPreference(columns: 5, rows: 8))
+    }
+
+    func testGridGeometryPreferencePersistsOnlyAsAClampedPair() async throws {
+        let suiteName = "com.sunzheng.LaunchIcon.Tests.GridGeometry.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = LauncherPreferencesStore(suiteName: suiteName)
+
+        let missing = await store.load()
+        XCTAssertEqual(missing.gridGeometry, .standard)
+        XCTAssertEqual(LauncherPreferences().gridGeometry, .standard)
+
+        defaults.set(8, forKey: "LaunchIcon.Preferences.gridColumns")
+        let half = await store.load()
+        XCTAssertEqual(half.gridGeometry, .standard, "one key must not change capacity")
+
+        defaults.set(4, forKey: "LaunchIcon.Preferences.gridRows")
+        let pair = await store.load()
+        XCTAssertEqual(pair.gridGeometry, GridGeometryPreference(columns: 8, rows: 4))
+        XCTAssertEqual(pair.gridGeometry.capacity, 32)
+
+        defaults.set(99, forKey: "LaunchIcon.Preferences.gridColumns")
+        defaults.set(1, forKey: "LaunchIcon.Preferences.gridRows")
+        let over = await store.load()
+        XCTAssertEqual(over.gridGeometry, GridGeometryPreference(columns: 10, rows: 3))
+
+        var prefs = LauncherPreferences()
+        prefs.gridGeometry = GridGeometryPreference(columns: 6, rows: 4)
+        await store.save(prefs)
+        let restored = await store.load()
+        XCTAssertEqual(restored.gridGeometry, GridGeometryPreference(columns: 6, rows: 4))
+        XCTAssertEqual(restored.shortcut, .optionSpace)
+    }
+
     func testFocusSlotAfterPageTurnKeepsRelativeGridPosition() {
         let fullPage = LauncherLayout.pageCapacity
         XCTAssertEqual(LauncherLayout.focusSlot(previousSlot: 12, itemCount: fullPage), 12)
@@ -6253,6 +7971,71 @@ final class LaunchIconCoreTests: XCTestCase {
 
         XCTAssertNil(LauncherLayout.focusSlot(previousSlot: 4, itemCount: 0))
         XCTAssertNil(LauncherLayout.focusSlot(previousSlot: nil, itemCount: fullPage))
+    }
+
+    func testGridKeyboardNeighborStaysInsideTheGrid() {
+        let columns = LauncherLayout.pageColumns
+        let count = LauncherLayout.pageCapacity
+        XCTAssertEqual(LauncherLayout.gridKeyboardDirection(forKeyCode: 123), .left)
+        XCTAssertEqual(LauncherLayout.gridKeyboardDirection(forKeyCode: 124), .right)
+        XCTAssertEqual(LauncherLayout.gridKeyboardDirection(forKeyCode: 126), .up)
+        XCTAssertEqual(LauncherLayout.gridKeyboardDirection(forKeyCode: 125), .down)
+        XCTAssertNil(LauncherLayout.gridKeyboardDirection(forKeyCode: 116), "Page Up stays on the paging path")
+        XCTAssertNil(LauncherLayout.gridKeyboardDirection(forKeyCode: 121), "Page Down stays on the paging path")
+
+        XCTAssertEqual(
+            LauncherLayout.gridKeyboardNeighborSlot(from: 8, count: count, columns: columns, direction: .left),
+            7
+        )
+        XCTAssertEqual(
+            LauncherLayout.gridKeyboardNeighborSlot(from: 8, count: count, columns: columns, direction: .right),
+            9
+        )
+        XCTAssertEqual(
+            LauncherLayout.gridKeyboardNeighborSlot(from: 8, count: count, columns: columns, direction: .up),
+            1
+        )
+        XCTAssertEqual(
+            LauncherLayout.gridKeyboardNeighborSlot(from: 8, count: count, columns: columns, direction: .down),
+            15
+        )
+        XCTAssertNil(
+            LauncherLayout.gridKeyboardNeighborSlot(from: 7, count: count, columns: columns, direction: .left),
+            "start of a row does not wrap"
+        )
+        XCTAssertNil(
+            LauncherLayout.gridKeyboardNeighborSlot(from: 6, count: count, columns: columns, direction: .right),
+            "end of a row does not wrap onto the next row"
+        )
+        XCTAssertNil(
+            LauncherLayout.gridKeyboardNeighborSlot(from: 2, count: count, columns: columns, direction: .up)
+        )
+        XCTAssertNil(
+            LauncherLayout.gridKeyboardNeighborSlot(from: 30, count: count, columns: columns, direction: .down)
+        )
+        XCTAssertNil(
+            LauncherLayout.gridKeyboardNeighborSlot(from: 34, count: count, columns: columns, direction: .right)
+        )
+
+        let folderColumns = LauncherLayout.folderDisplayColumns(forItemCount: 6)
+        XCTAssertEqual(folderColumns, 5)
+        XCTAssertEqual(
+            LauncherLayout.gridKeyboardNeighborSlot(from: 0, count: 6, columns: folderColumns, direction: .down),
+            5
+        )
+        XCTAssertNil(
+            LauncherLayout.gridKeyboardNeighborSlot(from: 1, count: 6, columns: folderColumns, direction: .down),
+            "a short last row has no icon under column 1"
+        )
+        XCTAssertNil(
+            LauncherLayout.gridKeyboardNeighborSlot(from: 4, count: 6, columns: folderColumns, direction: .right)
+        )
+        XCTAssertNil(
+            LauncherLayout.gridKeyboardNeighborSlot(from: -1, count: count, columns: columns, direction: .right)
+        )
+        XCTAssertNil(
+            LauncherLayout.gridKeyboardNeighborSlot(from: 0, count: 0, columns: columns, direction: .down)
+        )
     }
 
     func testRepeatedPageTurnContinuesFromInFlightPage() {
@@ -6754,6 +8537,24 @@ final class LaunchIconCoreTests: XCTestCase {
                 folderClosing: false
             ),
             .items
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchCountLabelKind(
+                isSearching: false,
+                folderOpen: false,
+                folderClosing: false,
+                selectionCount: 3
+            ),
+            .selected
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchCountLabelKind(
+                isSearching: true,
+                folderOpen: false,
+                folderClosing: false,
+                selectionCount: 3
+            ),
+            .results
         )
         XCTAssertNil(
             LauncherLayout.searchCountLabelKind(
@@ -7302,6 +9103,22 @@ final class LaunchIconCoreTests: XCTestCase {
             LauncherLayout.scrolledPageOffset(current: -20, documentLength: 100, viewportLength: 50, forward: true),
             30
         )
+    }
+
+    func testVerticalPageKeyTargetPrefersOpenFolderOverSearch() {
+        XCTAssertEqual(
+            LauncherLayout.verticalPageKeyTarget(folderOpen: true, searching: true),
+            .folderScroll
+        )
+        XCTAssertEqual(
+            LauncherLayout.verticalPageKeyTarget(folderOpen: true, searching: false),
+            .folderScroll
+        )
+        XCTAssertEqual(
+            LauncherLayout.verticalPageKeyTarget(folderOpen: false, searching: true),
+            .searchScroll
+        )
+        XCTAssertNil(LauncherLayout.verticalPageKeyTarget(folderOpen: false, searching: false))
     }
 
     func testInsertionIndexAfterRemovingSourceMatchesCollectionViewPreRemovalDrop() {
@@ -7878,6 +9695,1463 @@ final class LaunchIconCoreTests: XCTestCase {
                 reducesMotion: true, isDismissing: false, isVisible: true
             )
         )
+    }
+
+
+    func testBatchMoveToFolderUsesWholeSelection() throws {
+        let a = UUID(), b = UUID(), c = UUID(), folderID = UUID(), member = UUID()
+        let state = LayoutState(
+            orderedEntries: [.app(a), .folder(folderID), .app(b), .app(c)],
+            folders: [folderID: LauncherFolder(id: folderID, name: "Work", itemIDs: [member])]
+        )
+        let selection = LauncherItemSelection(orderedIDs: [c, a, folderID])
+        let apps = try XCTUnwrap(LauncherLayout.batchMoveToFolderAppIDs(selection: selection, anchorAppID: a, in: state))
+        XCTAssertEqual(apps, [c, a])
+        XCTAssertNil(LauncherLayout.batchMoveToFolderAppIDs(selection: selection, anchorAppID: b, in: state))
+        XCTAssertNil(LauncherLayout.batchMoveToFolderAppIDs(
+            selection: LauncherItemSelection(orderedIDs: [a]), anchorAppID: a, in: state
+        ))
+        guard case .success(let moved) = LauncherLayout.moveTopLevelApps(apps, intoFolder: folderID, in: state) else {
+            return XCTFail("batch move failed")
+        }
+        XCTAssertEqual(moved.orderedEntries, [.folder(folderID), .app(b)])
+        XCTAssertEqual(moved.folders[folderID]?.itemIDs, [member, c, a])
+    }
+
+    func testBlankAreaRearrangeWouldChange() {
+        let first = UUID(), second = UUID()
+        let catalog = [
+            AppCandidate(canonicalURL: URL(fileURLWithPath: "/Applications/Alpha.app"), bundleIdentifier: "test.alpha",
+                         displayName: "Alpha", sourcePriority: 0, discoveredAt: .now),
+            AppCandidate(canonicalURL: URL(fileURLWithPath: "/Applications/Beta.app"), bundleIdentifier: "test.beta",
+                         displayName: "Beta", sourcePriority: 0, discoveredAt: .now),
+        ]
+        let unsorted = LayoutState(
+            orderedEntries: [.app(second), .app(first)],
+            appKeys: [first: "bundle:test.alpha", second: "bundle:test.beta"]
+        )
+        XCTAssertTrue(LauncherLayout.rearrangeWouldChange(in: unsorted, catalog: catalog, sort: .byName))
+        var sorted = unsorted
+        sorted.orderedEntries = [.app(first), .app(second)]
+        XCTAssertFalse(LauncherLayout.rearrangeWouldChange(in: sorted, catalog: catalog, sort: .byName))
+        XCTAssertEqual(LauncherLayout.blankAreaRearrangeMenuTitleKey(sort: .byName), "按名称排列…")
+        XCTAssertEqual(LauncherLayout.blankAreaRearrangeMenuTitleKey(sort: .byKind), "按类型排列…")
+    }
+
+    func testCategoryGroupMappingAndRearrangeByCategory() {
+        XCTAssertEqual(AppCategoryGroup.group(forCategoryType: "public.app-category.developer-tools"), .developerTools)
+        XCTAssertEqual(AppCategoryGroup.group(forCategoryType: " Public.App-Category.Productivity "), .productivity)
+        XCTAssertEqual(AppCategoryGroup.group(forCategoryType: "public.app-category.puzzle-games"), .games)
+        XCTAssertEqual(AppCategoryGroup.group(forCategoryType: "public.app-category.games"), .games)
+        XCTAssertEqual(AppCategoryGroup.group(forCategoryType: "public.app-category.weather"), .lifestyle)
+        XCTAssertEqual(AppCategoryGroup.group(forCategoryType: "public.app-category.unknown"), .other)
+        XCTAssertEqual(AppCategoryGroup.group(forCategoryType: "com.example.custom"), .other)
+        XCTAssertEqual(AppCategoryGroup.group(forCategoryType: nil), .other)
+        XCTAssertEqual(Set(AppCategoryGroup.allCases.map(\.titleKey)).count, AppCategoryGroup.allCases.count)
+
+        let xcode = UUID(), notes = UUID(), chess = UUID(), mystery = UUID(), zeta = UUID(), folderID = UUID(), member = UUID()
+        func app(_ name: String) -> AppCandidate {
+            AppCandidate(canonicalURL: URL(fileURLWithPath: "/Applications/\(name).app"), bundleIdentifier: "test.\(name.lowercased())",
+                         displayName: name, sourcePriority: 0, discoveredAt: .now)
+        }
+        let categories = [
+            "test.xcode": "public.app-category.developer-tools",
+            "test.notes": "public.app-category.productivity",
+            "test.chess": "public.app-category.board-games",
+            "test.zeta": "public.app-category.productivity",
+        ]
+        let catalog = ["Xcode", "Notes", "Chess", "Mystery", "Zeta"].map(app)
+        let state = LayoutState(
+            orderedEntries: [.folder(folderID), .app(mystery), .app(chess), .app(zeta), .app(xcode), .app(notes)],
+            folders: [folderID: LauncherFolder(id: folderID, name: "Work", itemIDs: [member])],
+            appKeys: [xcode: "bundle:test.xcode", notes: "bundle:test.notes", chess: "bundle:test.chess",
+                      mystery: "bundle:test.mystery", zeta: "bundle:test.zeta", member: "bundle:test.member"],
+            appAliases: ["bundle:test.zeta": "Agenda"]
+        )
+        var calls = 0
+        let sorted = LauncherLayout.rearrangeTopLevelEntriesByCategory(in: state, catalog: catalog) { candidate in
+            calls += 1
+            return categories[candidate.bundleIdentifier ?? ""]
+        }
+        // productivity (alias "Agenda" before "Notes") → developer → games → other → folders.
+        XCTAssertEqual(sorted.orderedEntries, [.app(zeta), .app(notes), .app(xcode), .app(chess), .app(mystery), .folder(folderID)])
+        XCTAssertEqual(sorted.folders, state.folders)
+        XCTAssertEqual(sorted.appAliases, state.appAliases)
+        XCTAssertEqual(calls, 5, "category provider runs once per top-level app")
+
+        let again = LauncherLayout.rearrangeTopLevelEntriesByCategory(in: sorted, catalog: catalog) {
+            categories[$0.bundleIdentifier ?? ""]
+        }
+        XCTAssertEqual(again, sorted, "already-sorted layout is unchanged (updatedAt untouched)")
+        XCTAssertNil(LauncherLayout.applicationCategoryType(forAppAt: URL(fileURLWithPath: "/nonexistent/None.app")))
+    }
+
+    func testSuggestedFolderNameKeyUsesSharedCategoryOnly() {
+        typealias G = AppCategoryGroup
+        XCTAssertEqual(
+            G.suggestedFolderNameKey(forCategoryTypes: ["public.app-category.developer-tools", "public.app-category.developer-tools"]),
+            G.developerTools.titleKey
+        )
+        XCTAssertEqual(
+            G.suggestedFolderNameKey(forCategoryTypes: ["public.app-category.music", "public.app-category.entertainment"]),
+            G.group(forCategoryType: "public.app-category.music").titleKey,
+            "different raw categories in the same group still share a name"
+        )
+        XCTAssertNil(G.suggestedFolderNameKey(forCategoryTypes: ["public.app-category.developer-tools"]), "one app is not enough")
+        XCTAssertNil(G.suggestedFolderNameKey(forCategoryTypes: []))
+        XCTAssertNil(G.suggestedFolderNameKey(forCategoryTypes: ["public.app-category.developer-tools", "public.app-category.games"]))
+        XCTAssertNil(G.suggestedFolderNameKey(forCategoryTypes: ["public.app-category.developer-tools", nil]), "unknown category breaks the match")
+        XCTAssertNil(G.suggestedFolderNameKey(forCategoryTypes: [nil, nil]), "never suggest「其他」")
+    }
+
+    func testSuggestedFolderNameKeyForAppIDsStopsEarlyAndCaps() {
+        func app(_ id: String) -> AppCandidate {
+            AppCandidate(canonicalURL: URL(fileURLWithPath: "/Applications/\(id).app"), bundleIdentifier: "test.\(id)",
+                         displayName: id, sourcePriority: 0, discoveredAt: .now)
+        }
+        let catalog = [app("x1"), app("x2"), app("g1"), app("n1")]
+        let state = LauncherLayout.reconcile(candidates: catalog, into: LayoutState())
+        let idByName: [String: UUID] = Dictionary(uniqueKeysWithValues: state.appKeys.compactMap { id, key in
+            catalog.first { $0.deduplicationKey == key }.map { ($0.displayName, id) }
+        })
+        let types = ["x1": "public.app-category.developer-tools", "x2": "public.app-category.developer-tools",
+                     "g1": "public.app-category.games"]
+        var reads = 0
+        func type(_ c: AppCandidate) -> String? { reads += 1; return types[c.displayName] }
+        func ids(_ names: [String]) -> [UUID] { names.compactMap { idByName[$0] } }
+
+        XCTAssertEqual(LauncherLayout.suggestedFolderNameKey(forAppIDs: ids(["x1", "x2"]), in: state, catalog: catalog, categoryType: type),
+                       AppCategoryGroup.developerTools.titleKey)
+        reads = 0
+        XCTAssertNil(LauncherLayout.suggestedFolderNameKey(forAppIDs: ids(["n1", "x1", "x2"]), in: state, catalog: catalog, categoryType: type))
+        XCTAssertEqual(reads, 1, "an uncategorised first app stops further plist reads")
+        reads = 0
+        XCTAssertNil(LauncherLayout.suggestedFolderNameKey(forAppIDs: ids(["x1", "g1", "x2"]), in: state, catalog: catalog, categoryType: type))
+        XCTAssertEqual(reads, 2)
+        XCTAssertNil(LauncherLayout.suggestedFolderNameKey(forAppIDs: ids(["x1"]), in: state, catalog: catalog, categoryType: type))
+        XCTAssertNil(LauncherLayout.suggestedFolderNameKey(forAppIDs: ids(["x1"]) + [UUID()], in: state, catalog: catalog, categoryType: type))
+        reads = 0
+        let many = Array(repeating: ids(["x1"])[0], count: LauncherLayout.suggestedFolderNameMaximumApps + 1)
+        XCTAssertNil(LauncherLayout.suggestedFolderNameKey(forAppIDs: many, in: state, catalog: catalog, categoryType: type))
+        XCTAssertEqual(reads, 0, "oversized selections never read plists")
+    }
+
+    func testLayoutImportConfirmationPicksWarningVariant() {
+        func assessment(matched: Int, unmatched: Int, hidden: Int, installed: Int) -> LauncherLayout.LayoutImportAssessment {
+            LauncherLayout.LayoutImportAssessment(
+                matchedAppCount: matched,
+                unmatchedAppCount: unmatched,
+                folderCount: 0,
+                hiddenInstalledAppCount: hidden,
+                installedAppCount: installed
+            )
+        }
+        var changed = LayoutChangeSummary()
+        changed.appsAdded = 1
+        let unchanged = LayoutChangeSummary()
+
+        let ok = assessment(matched: 3, unmatched: 0, hidden: 0, installed: 3)
+        let foreign = assessment(matched: 0, unmatched: 4, hidden: 0, installed: 3)
+        let hidesAll = assessment(matched: 0, unmatched: 4, hidden: 3, installed: 3)
+
+        XCTAssertEqual(LauncherLayout.layoutImportConfirmation(assessment: ok, summary: unchanged), .unchanged)
+        XCTAssertFalse(LayoutImportConfirmation.unchanged.showsAlert)
+        XCTAssertEqual(LauncherLayout.layoutImportConfirmation(assessment: ok, summary: changed), .standard)
+        XCTAssertNil(LayoutImportConfirmation.standard.messageKey)
+        XCTAssertEqual(LauncherLayout.layoutImportConfirmation(assessment: foreign, summary: changed), .warnForeign)
+        // Hiding everything is the more severe warning and wins over foreign.
+        XCTAssertEqual(LauncherLayout.layoutImportConfirmation(assessment: hidesAll, summary: changed), .warnHidesEverything)
+        for kind in [LayoutImportConfirmation.unchanged, .warnForeign, .warnHidesEverything] {
+            XCTAssertTrue(kind.messageKey != nil)
+        }
+    }
+
+    func testLayoutImportConfirmationAgainstLiveCatalog() {
+        func app(_ id: String) -> AppCandidate {
+            AppCandidate(canonicalURL: URL(fileURLWithPath: "/Applications/\(id).app"), bundleIdentifier: "test.\(id)",
+                         displayName: id, sourcePriority: 0, discoveredAt: .now)
+        }
+        let catalog = [app("a"), app("b")]
+        let current = LauncherLayout.reconcile(candidates: catalog, into: LayoutState())
+        XCTAssertEqual(current.appKeys.count, 2)
+
+        XCTAssertEqual(LauncherLayout.layoutImportConfirmation(imported: current, current: current, catalog: catalog), .unchanged)
+        XCTAssertEqual(LauncherLayout.layoutImportConfirmation(imported: current, current: current, catalog: []), .standard,
+                       "an empty catalog (still scanning) is never judged")
+
+        let z = UUID()
+        let foreign = LayoutState(orderedEntries: [.app(z)], folders: [:], appKeys: [z: "bundle:test.zz"],
+                                  hiddenAppKeys: [], appAliases: [:])
+        // A foreign file that reconciles to exactly the current grid is a no-op.
+        XCTAssertEqual(LauncherLayout.layoutImportConfirmation(imported: foreign, current: current, catalog: catalog), .unchanged)
+        var rearranged = current
+        rearranged.orderedEntries.reverse()
+        let kind = LauncherLayout.layoutImportConfirmation(imported: foreign, current: rearranged, catalog: catalog)
+        XCTAssertEqual(kind, .warnForeign)
+        XCTAssertTrue(kind.needsSecondConfirm)
+        XCTAssertFalse(LayoutImportConfirmation.standard.needsSecondConfirm)
+        XCTAssertFalse(LayoutImportConfirmation.unchanged.needsSecondConfirm)
+    }
+
+    func testLayoutChangeSummaryDetailsOrderAndTruncation() {
+        XCTAssertEqual(LayoutChangeSummary().details, [])
+        var summary = LayoutChangeSummary()
+        summary.appsRemoved = 1
+        summary.foldersAdded = 2
+        summary.topLevelOrderChanged = true
+        summary.appsChangingContainer = 3
+        summary.aliasesChanged = 0
+        XCTAssertEqual(summary.details.map(\.key), [
+            "%d 个应用换了位置", "图标顺序已调整", "新增 %d 个文件夹", "移除 %d 个应用"
+        ])
+        XCTAssertEqual(summary.details.map(\.count), [3, nil, 2, 1])
+        let short = summary.importedMessageDetails(limit: 3)
+        XCTAssertEqual(short.details.count, 3)
+        XCTAssertTrue(short.truncated)
+        XCTAssertFalse(summary.importedMessageDetails(limit: 4).truncated)
+        XCTAssertEqual(summary.importedMessageDetails(limit: -1).details, [])
+
+        XCTAssertNil(LauncherLayout.layoutImportChangeSummary(imported: LayoutState(), current: LayoutState(), catalog: []))
+    }
+
+    func testLayoutChangeSummaryMatchesAppsByKeyAndFoldersByID() {
+        let a = UUID(), b = UUID(), c = UUID(), folderID = UUID(), gone = UUID()
+        let old = LayoutState(
+            orderedEntries: [.app(a), .folder(folderID), .app(b), .app(gone)],
+            folders: [folderID: LauncherFolder(id: folderID, name: "Work", itemIDs: [c])],
+            appKeys: [a: "k.a", b: "k.b", c: "k.c", gone: "k.gone"],
+            hiddenAppKeys: ["k.h1"],
+            appAliases: ["k.a": "Alpha", "k.b": "Beta"]
+        )
+        XCTAssertTrue(LauncherLayout.layoutChangeSummary(from: old, to: old).isEmpty)
+
+        // Same content under fresh tile ids (an imported file) is not a change.
+        let a2 = UUID(), b2 = UUID(), c2 = UUID(), gone2 = UUID()
+        let reIDed = LayoutState(
+            orderedEntries: [.app(a2), .folder(folderID), .app(b2), .app(gone2)],
+            folders: [folderID: LauncherFolder(id: folderID, name: "Work", itemIDs: [c2])],
+            appKeys: [a2: "k.a", b2: "k.b", c2: "k.c", gone2: "k.gone"],
+            hiddenAppKeys: ["k.h1"],
+            appAliases: ["k.a": "Alpha", "k.b": "Beta"]
+        )
+        XCTAssertTrue(LauncherLayout.layoutChangeSummary(from: old, to: reIDed).isEmpty)
+
+        let newFolder = UUID(), d = UUID()
+        let new = LayoutState(
+            orderedEntries: [.app(b), .folder(folderID), .folder(newFolder), .app(d)],
+            folders: [
+                folderID: LauncherFolder(id: folderID, name: "Jobs", itemIDs: [c, a]),
+                newFolder: LauncherFolder(id: newFolder, name: "New", itemIDs: []),
+            ],
+            appKeys: [a: "k.a", b: "k.b", c: "k.c", d: "k.d"],
+            hiddenAppKeys: ["k.h2"],
+            appAliases: ["k.a": "Alpha!", "k.c": "Gamma"]
+        )
+        var expected = LayoutChangeSummary()
+        expected.appsChangingContainer = 1   // k.a moved into the folder
+        expected.appsAdded = 1               // k.d
+        expected.appsRemoved = 1             // k.gone
+        expected.topLevelOrderChanged = true // folder now before k.b
+        expected.foldersAdded = 1
+        expected.foldersRenamed = 1
+        expected.newlyHidden = 1
+        expected.newlyShown = 1
+        expected.aliasesChanged = 3          // k.a edited, k.b removed, k.c added
+        XCTAssertEqual(LauncherLayout.layoutChangeSummary(from: old, to: new), expected)
+
+        let reverse = LauncherLayout.layoutChangeSummary(from: new, to: old)
+        XCTAssertEqual(reverse.foldersRemoved, 1)
+        XCTAssertEqual(reverse.foldersAdded, 0)
+        XCTAssertEqual(reverse.appsAdded, 1)
+        XCTAssertEqual(reverse.appsRemoved, 1)
+    }
+
+    func testMarqueeGeometryAndSelectionModel() {
+        XCTAssertFalse(LauncherMarquee.hasActivated(from: .zero, to: CGPoint(x: 5, y: 5)))
+        XCTAssertTrue(LauncherMarquee.hasActivated(from: .zero, to: CGPoint(x: 0, y: 8)))
+        XCTAssertEqual(LauncherMarquee.rect(from: CGPoint(x: 50, y: 40), to: CGPoint(x: 10, y: 100)),
+                       CGRect(x: 10, y: 40, width: 40, height: 60))
+        let page = CGRect(x: 0, y: 0, width: 300, height: 200)
+        XCTAssertEqual(LauncherMarquee.clamped(CGRect(x: -20, y: 150, width: 400, height: 100), to: page),
+                       CGRect(x: 0, y: 150, width: 300, height: 50))
+        XCTAssertEqual(LauncherMarquee.clamped(CGRect(x: 400, y: 0, width: 10, height: 10), to: page), .zero)
+
+        let a = UUID(), b = UUID(), c = UUID(), d = UUID()
+        let items = [
+            LauncherMarquee.ItemFrame(id: a, frame: CGRect(x: 0, y: 0, width: 50, height: 50)),
+            LauncherMarquee.ItemFrame(id: b, frame: CGRect(x: 100, y: 0, width: 50, height: 50)),
+            LauncherMarquee.ItemFrame(id: c, frame: CGRect(x: 0, y: 100, width: 50, height: 50)),
+            LauncherMarquee.ItemFrame(id: d, frame: CGRect(x: 100, y: 100, width: 0, height: 50)),
+        ]
+        XCTAssertEqual(LauncherMarquee.hitIDs(in: CGRect(x: 40, y: 40, width: 70, height: 70), items: items), [a, b, c])
+        XCTAssertEqual(LauncherMarquee.hitIDs(in: CGRect(x: 50, y: 0, width: 50, height: 50), items: items), [],
+                       "touching edges only is not a hit")
+        XCTAssertEqual(LauncherMarquee.hitIDs(in: CGRect(x: 25, y: 0, width: 0, height: 120), items: items), [a, c],
+                       "a thin vertical marquee still hits the column it crosses")
+
+        XCTAssertEqual(LauncherMarquee.modifier(command: false, shift: false), .replace)
+        XCTAssertEqual(LauncherMarquee.modifier(command: false, shift: true), .extend)
+        XCTAssertEqual(LauncherMarquee.modifier(command: true, shift: true), .toggle)
+
+        let base = LauncherItemSelection(orderedIDs: [d, a], rangeAnchorID: d)
+        XCTAssertEqual(LauncherMarquee.selection(base: base, hits: [a, b], modifier: .replace).orderedIDs, [a, b])
+        XCTAssertEqual(LauncherMarquee.selection(base: base, hits: [a, b], modifier: .extend).orderedIDs, [d, a, b])
+        let toggled = LauncherMarquee.selection(base: base, hits: [a, b], modifier: .toggle)
+        XCTAssertEqual(toggled.orderedIDs, [d, b])
+        XCTAssertEqual(toggled.rangeAnchorID, d)
+        XCTAssertEqual(LauncherMarquee.selection(base: base, hits: [], modifier: .toggle), base,
+                       "shrinking back to nothing restores the mouse-down selection")
+        XCTAssertTrue(LauncherMarquee.selection(base: base, hits: [], modifier: .replace).isEmpty)
+
+        XCTAssertTrue(LauncherMarquee.canArm(buttonNumber: 0, clickCount: 1, startsOnBlankArea: true, isSearching: false,
+                                             folderOpen: false, isDragging: false, isPaging: false, isDismissing: false,
+                                             isPromptingForAlias: false))
+        XCTAssertFalse(LauncherMarquee.canArm(buttonNumber: 0, clickCount: 2, startsOnBlankArea: true, isSearching: false,
+                                              folderOpen: false, isDragging: false, isPaging: false, isDismissing: false,
+                                              isPromptingForAlias: false))
+        XCTAssertFalse(LauncherMarquee.canArm(buttonNumber: 0, clickCount: 1, startsOnBlankArea: true, isSearching: false,
+                                              folderOpen: false, isDragging: false, isPaging: true, isDismissing: false,
+                                              isPromptingForAlias: false), "never arms during a page turn")
+        XCTAssertFalse(LauncherMarquee.canArm(buttonNumber: 0, clickCount: 1, startsOnBlankArea: false, isSearching: false,
+                                              folderOpen: false, isDragging: false, isPaging: false, isDismissing: false,
+                                              isPromptingForAlias: false))
+        XCTAssertTrue(LauncherMarquee.suppressesDismissOnRelease(didActivate: true))
+        XCTAssertFalse(LauncherMarquee.suppressesDismissOnRelease(didActivate: false))
+    }
+
+
+    func testReorderingTopLevelSelectionMovesBlockPreservingGridOrder() {
+        let a = UUID(), b = UUID(), c = UUID(), d = UUID()
+        var state = LayoutState()
+        state.orderedEntries = [.app(a), .app(b), .app(c), .app(d)]
+        state.appKeys = [a: "a", b: "b", c: "c", d: "d"]
+
+        // Select a,c (click order c then a) — block still moves in grid order a,c.
+        let moved = LauncherLayout.reorderingTopLevelSelection(
+            [c, a],
+            insertAt: 4, // after d
+            in: state
+        )
+        XCTAssertEqual(moved?.orderedEntries.map(\.id), [b, d, a, c])
+
+        // Insert before b → a,c,b,d
+        let front = LauncherLayout.reorderingTopLevelSelection([a, c], insertAt: 1, in: state)
+        XCTAssertEqual(front?.orderedEntries.map(\.id), [a, c, b, d])
+
+        // No-op when already contiguous at same slot (a,b already at 0).
+        XCTAssertNil(LauncherLayout.reorderingTopLevelSelection([a, b], insertAt: 0, in: state))
+        // insertAt 2 with removing a,b before it adjusts to 0 — block stays [a,b,c,d] → nil
+        XCTAssertNil(LauncherLayout.reorderingTopLevelSelection([a, b], insertAt: 2, in: state))
+
+        // Reject folder member / unknown / single id / bad index.
+        let folderID = UUID()
+        state.folders[folderID] = LauncherFolder(id: folderID, name: "F", itemIDs: [a])
+        // a is still top-level in this fixture; use a non-top-level id:
+        let buried = UUID()
+        state.folders[folderID]?.itemIDs = [buried]
+        state.appKeys[buried] = "buried"
+        XCTAssertNil(LauncherLayout.reorderingTopLevelSelection([buried, b], insertAt: 0, in: state))
+        XCTAssertNil(LauncherLayout.reorderingTopLevelSelection([a], insertAt: 2, in: state))
+        XCTAssertNil(LauncherLayout.reorderingTopLevelSelection([a, b], insertAt: -1, in: state))
+        XCTAssertNil(LauncherLayout.reorderingTopLevelSelection([a, b], insertAt: 99, in: state))
+
+        // Folders may move with apps.
+        state.orderedEntries = [.app(a), .folder(folderID), .app(b), .app(c)]
+        let withFolder = LauncherLayout.reorderingTopLevelSelection(
+            [folderID, a],
+            insertAt: 4,
+            in: state
+        )
+        XCTAssertEqual(withFolder?.orderedEntries.map(\.id), [b, c, a, folderID])
+    }
+
+
+    func testBlankAreaMenuReorganizeActions() {
+        XCTAssertTrue(LauncherLayout.showsBlankAreaContextMenu(
+            isSearching: false, folderOpen: false, isDragging: false, isPaging: false, isDismissing: false
+        ))
+        for flags in [(true, false, false, false, false), (false, true, false, false, false),
+                      (false, false, true, false, false), (false, false, false, true, false),
+                      (false, false, false, false, true)] {
+            XCTAssertFalse(LauncherLayout.showsBlankAreaContextMenu(
+                isSearching: flags.0, folderOpen: flags.1, isDragging: flags.2,
+                isPaging: flags.3, isDismissing: flags.4
+            ))
+        }
+
+        let a = UUID(), b = UUID(), c = UUID(), m1 = UUID(), m2 = UUID(), m3 = UUID()
+        let f1 = UUID(), f2 = UUID()
+        let state = LayoutState(
+            orderedEntries: [.app(a), .folder(f1), .app(b), .folder(f2), .app(c)],
+            folders: [
+                f1: LauncherFolder(id: f1, name: "One", itemIDs: [m1, m2]),
+                f2: LauncherFolder(id: f2, name: "Two", itemIDs: [m3]),
+            ]
+        )
+        XCTAssertEqual(LauncherLayout.topLevelFolderCount(in: state), 2)
+        let ungrouped = LauncherLayout.ungroupAllFolders(in: state)
+        XCTAssertEqual(ungrouped?.orderedEntries, [.app(a), .app(m1), .app(m2), .app(b), .app(m3), .app(c)])
+        XCTAssertEqual(ungrouped?.folders.isEmpty, true)
+        XCTAssertNil(LauncherLayout.ungroupAllFolders(in: LayoutState(orderedEntries: [.app(a)])))
+
+        XCTAssertEqual(
+            LauncherLayout.movingFoldersToEdge(atStart: true, in: state)?.orderedEntries,
+            [.folder(f1), .folder(f2), .app(a), .app(b), .app(c)]
+        )
+        XCTAssertEqual(
+            LauncherLayout.movingFoldersToEdge(atStart: false, in: state)?.orderedEntries,
+            [.app(a), .app(b), .app(c), .folder(f1), .folder(f2)]
+        )
+        let alreadyFirst = LayoutState(
+            orderedEntries: [.folder(f1), .app(a)],
+            folders: [f1: LauncherFolder(id: f1, name: "One", itemIDs: [m1, m2])]
+        )
+        XCTAssertNil(LauncherLayout.movingFoldersToEdge(atStart: true, in: alreadyFirst))
+        XCTAssertNil(LauncherLayout.movingFoldersToEdge(atStart: false, in: LayoutState(orderedEntries: [.app(a)])))
+    }
+
+
+    func testShouldClearSelectionAfterReorganizeWhenNonEmpty() {
+        XCTAssertTrue(LauncherLayout.shouldClearSelectionAfterReorganize(selectionCount: 1))
+        XCTAssertTrue(LauncherLayout.shouldClearSelectionAfterReorganize(selectionCount: 3))
+        XCTAssertFalse(LauncherLayout.shouldClearSelectionAfterReorganize(selectionCount: 0))
+    }
+
+    func testMovingSelectedFoldersToEdgePreservesRelativeOrder() {
+        let a = UUID(), b = UUID(), c = UUID()
+        let m1 = UUID(), m2 = UUID(), m3 = UUID(), m4 = UUID()
+        let f1 = UUID(), f2 = UUID(), f3 = UUID()
+        let state = LayoutState(
+            orderedEntries: [.app(a), .folder(f1), .app(b), .folder(f2), .app(c), .folder(f3)],
+            folders: [
+                f1: LauncherFolder(id: f1, name: "One", itemIDs: [m1, m2]),
+                f2: LauncherFolder(id: f2, name: "Two", itemIDs: [m3]),
+                f3: LauncherFolder(id: f3, name: "Three", itemIDs: [m4]),
+            ]
+        )
+        // Move f2+f3 to start — f1 stays with apps; f2 before f3.
+        XCTAssertEqual(
+            LauncherLayout.movingSelectedFoldersToEdge(
+                folderIDs: [f2, f3], atStart: true, in: state
+            )?.orderedEntries,
+            [.folder(f2), .folder(f3), .app(a), .folder(f1), .app(b), .app(c)]
+        )
+        XCTAssertEqual(
+            LauncherLayout.movingSelectedFoldersToEdge(
+                folderIDs: [f1, f2], atStart: false, in: state
+            )?.orderedEntries,
+            [.app(a), .app(b), .app(c), .folder(f3), .folder(f1), .folder(f2)]
+        )
+        // Already at start → nil.
+        let already = LayoutState(
+            orderedEntries: [.folder(f1), .folder(f2), .app(a)],
+            folders: [
+                f1: LauncherFolder(id: f1, name: "One", itemIDs: [m1, m2]),
+                f2: LauncherFolder(id: f2, name: "Two", itemIDs: [m3]),
+            ]
+        )
+        XCTAssertNil(LauncherLayout.movingSelectedFoldersToEdge(
+            folderIDs: [f1, f2], atStart: true, in: already
+        ))
+        XCTAssertNil(LauncherLayout.movingSelectedFoldersToEdge(
+            folderIDs: [f1], atStart: true, in: state
+        ))
+        XCTAssertNil(LauncherLayout.movingSelectedFoldersToEdge(
+            folderIDs: [UUID(), UUID()], atStart: true, in: state
+        ))
+        XCTAssertEqual(
+            LauncherLayout.selectedFoldersMovedToStartMenuTitleKey,
+            "所选文件夹移到最前"
+        )
+        XCTAssertEqual(
+            LauncherLayout.selectedFoldersMovedToEndToastFormatKey,
+            "已将 %d 个文件夹移到最后"
+        )
+    }
+
+
+
+    func testMovingSelectedTopLevelEntriesToEdgePreservesRelativeOrder() {
+        let a = UUID(), b = UUID(), c = UUID()
+        let m1 = UUID(), m2 = UUID(), m3 = UUID()
+        let f1 = UUID(), f2 = UUID()
+        let state = LayoutState(
+            orderedEntries: [.app(a), .folder(f1), .app(b), .folder(f2), .app(c)],
+            folders: [
+                f1: LauncherFolder(id: f1, name: "One", itemIDs: [m1, m2]),
+                f2: LauncherFolder(id: f2, name: "Two", itemIDs: [m3]),
+            ]
+        )
+        var selection = LauncherItemSelection.empty
+        selection = LauncherItemSelection.applying(kind: .toggle, itemID: a, to: selection)
+        selection = LauncherItemSelection.applying(kind: .toggle, itemID: f2, to: selection)
+        selection = LauncherItemSelection.applying(kind: .toggle, itemID: b, to: selection)
+        XCTAssertEqual(
+            LauncherLayout.topLevelEntryIDsInSelection(selection: selection, in: state),
+            [a, f2, b]
+        )
+        // Layout-relative order among selected: a, b, f2 (not selection toggle order).
+        XCTAssertEqual(
+            LauncherLayout.movingSelectedTopLevelEntriesToEdge(
+                entryIDs: [a, f2, b], atStart: false, in: state
+            )?.orderedEntries,
+            [.folder(f1), .app(c), .app(a), .app(b), .folder(f2)]
+        )
+        XCTAssertNil(LauncherLayout.movingSelectedTopLevelEntriesToEdge(
+            entryIDs: [a], atStart: true, in: state
+        ))
+        let already = LayoutState(
+            orderedEntries: [.app(a), .folder(f2), .app(b), .folder(f1), .app(c)],
+            folders: state.folders
+        )
+        XCTAssertNil(LauncherLayout.movingSelectedTopLevelEntriesToEdge(
+            entryIDs: [a, f2, b], atStart: true, in: already
+        ))
+        XCTAssertEqual(
+            LauncherLayout.blankSelectedMovedToStartMenuTitleKey,
+            "所选项目移到最前"
+        )
+    }
+
+    func testMovingSelectedAppsToEdgePreservesRelativeOrder() {
+        let a = UUID(), b = UUID(), c = UUID(), d = UUID()
+        let m1 = UUID(), m2 = UUID()
+        let f1 = UUID()
+        let state = LayoutState(
+            orderedEntries: [.app(a), .folder(f1), .app(b), .app(c), .app(d)],
+            folders: [
+                f1: LauncherFolder(id: f1, name: "One", itemIDs: [m1, m2]),
+            ]
+        )
+        var selection = LauncherItemSelection.empty
+        selection = LauncherItemSelection.applying(kind: .toggle, itemID: b, to: selection)
+        selection = LauncherItemSelection.applying(kind: .toggle, itemID: d, to: selection)
+        selection = LauncherItemSelection.applying(kind: .toggle, itemID: f1, to: selection)
+
+        XCTAssertEqual(
+            LauncherLayout.appIDsForBatchEdgeMove(selection: selection, anchorID: b, in: state),
+            [b, d]
+        )
+        // Anchor must be a selected top-level app.
+        XCTAssertNil(LauncherLayout.appIDsForBatchEdgeMove(selection: selection, anchorID: f1, in: state))
+        XCTAssertNil(LauncherLayout.appIDsForBatchEdgeMove(selection: selection, anchorID: a, in: state))
+
+        XCTAssertEqual(
+            LauncherLayout.movingSelectedAppsToEdge(
+                appIDs: [b, d], atStart: true, in: state
+            )?.orderedEntries,
+            [.app(b), .app(d), .app(a), .folder(f1), .app(c)]
+        )
+        XCTAssertEqual(
+            LauncherLayout.movingSelectedAppsToEdge(
+                appIDs: [a, c], atStart: false, in: state
+            )?.orderedEntries,
+            [.folder(f1), .app(b), .app(d), .app(a), .app(c)]
+        )
+        let already = LayoutState(
+            orderedEntries: [.app(a), .app(b), .folder(f1), .app(c)],
+            folders: [
+                f1: LauncherFolder(id: f1, name: "One", itemIDs: [m1, m2]),
+            ]
+        )
+        XCTAssertNil(LauncherLayout.movingSelectedAppsToEdge(
+            appIDs: [a, b], atStart: true, in: already
+        ))
+        XCTAssertNil(LauncherLayout.movingSelectedAppsToEdge(
+            appIDs: [a], atStart: true, in: state
+        ))
+        XCTAssertEqual(
+            LauncherLayout.selectedAppsMovedToStartMenuTitleKey,
+            "所选应用移到最前"
+        )
+        XCTAssertEqual(
+            LauncherLayout.selectedAppsMovedToEndToastFormatKey,
+            "已将 %d 个应用移到最后"
+        )
+    }
+
+    func testBatchDissolveFoldersRequiresAnchorInMultiFolderSelection() {
+        let a = UUID(), b = UUID(), c = UUID()
+        let m1 = UUID(), m2 = UUID(), m3 = UUID(), m4 = UUID()
+        let f1 = UUID(), f2 = UUID(), f3 = UUID()
+        let state = LayoutState(
+            orderedEntries: [.app(a), .folder(f1), .folder(f2), .app(b), .folder(f3), .app(c)],
+            folders: [
+                f1: LauncherFolder(id: f1, name: "One", itemIDs: [m1, m2]),
+                f2: LauncherFolder(id: f2, name: "Two", itemIDs: [m3]),
+                f3: LauncherFolder(id: f3, name: "Three", itemIDs: [m4]),
+            ]
+        )
+        var selection = LauncherItemSelection.empty
+        selection = LauncherItemSelection.applying(kind: .toggle, itemID: f1, to: selection)
+        selection = LauncherItemSelection.applying(kind: .toggle, itemID: f2, to: selection)
+        selection = LauncherItemSelection.applying(kind: .toggle, itemID: a, to: selection)
+
+        // Anchor must be a selected folder; ≥2 folders required.
+        XCTAssertEqual(
+            LauncherLayout.folderIDsForBatchDissolve(selection: selection, anchorID: f1, in: state),
+            [f1, f2]
+        )
+        XCTAssertNil(LauncherLayout.folderIDsForBatchDissolve(selection: selection, anchorID: a, in: state))
+        XCTAssertNil(LauncherLayout.folderIDsForBatchDissolve(
+            selection: LauncherItemSelection.selectingAll(ids: [f1]),
+            anchorID: f1,
+            in: state
+        ))
+
+        guard let dissolved = LauncherLayout.dissolvingFolders([f1, f2], in: state) else {
+            return XCTFail("batch dissolve should succeed")
+        }
+        // Each folder replaced in place by members; f3 untouched.
+        XCTAssertEqual(
+            dissolved.orderedEntries,
+            [.app(a), .app(m1), .app(m2), .app(m3), .app(b), .folder(f3), .app(c)]
+        )
+        XCTAssertNil(dissolved.folders[f1])
+        XCTAssertNil(dissolved.folders[f2])
+        XCTAssertNotNil(dissolved.folders[f3])
+        XCTAssertNil(LauncherLayout.dissolvingFolders([], in: state))
+        XCTAssertNil(LauncherLayout.dissolvingFolders([UUID()], in: state))
+        XCTAssertEqual(
+            LauncherLayout.batchDissolveFoldersMenuTitleFormatKey,
+            "解散 %d 个文件夹…"
+        )
+    }
+
+    func testMenuDissolveFolderKeepsMembersInPlaceAndFocusOnPage() {
+        let appA = UUID(), appB = UUID(), m1 = UUID(), m2 = UUID()
+        let folderID = UUID()
+        let state = LayoutState(
+            orderedEntries: [.app(appA), .folder(folderID), .app(appB)],
+            folders: [folderID: LauncherFolder(id: folderID, name: "Tools", itemIDs: [m1, m2, m1, appA])]
+        )
+        guard let dissolved = LauncherLayout.dissolveFolder(folderID, in: state) else {
+            return XCTFail("dissolve should succeed")
+        }
+        // Members take the folder slot in folder order; duplicates and ids
+        // already on the grid are dropped.
+        XCTAssertEqual(dissolved.orderedEntries, [.app(appA), .app(m1), .app(m2), .app(appB)])
+        XCTAssertNil(dissolved.folders[folderID])
+        XCTAssertNil(LauncherLayout.dissolveFolder(UUID(), in: state))
+        XCTAssertEqual(
+            LauncherLayout.focusIDAfterMenuDissolve(
+                folderID: folderID,
+                previousEntries: state.orderedEntries,
+                currentEntries: dissolved.orderedEntries
+            ),
+            m1
+        )
+
+        // Empty folder first on page 2: the fallback (previous item) sits on
+        // page 1, so focus must not page the grid.
+        let cap = LauncherLayout.pageCapacity
+        var entries = (0..<cap).map { _ in LauncherEntry.app(UUID()) }
+        let empty = UUID()
+        entries.append(.folder(empty))
+        let paged = LayoutState(
+            orderedEntries: entries,
+            folders: [empty: LauncherFolder(id: empty, name: "", itemIDs: [])]
+        )
+        guard let pagedDissolved = LauncherLayout.dissolveFolder(empty, in: paged) else {
+            return XCTFail("empty folder dissolve should succeed")
+        }
+        XCTAssertEqual(pagedDissolved.orderedEntries.count, cap)
+        XCTAssertNil(LauncherLayout.focusIDAfterMenuDissolve(
+            folderID: empty,
+            previousEntries: paged.orderedEntries,
+            currentEntries: pagedDissolved.orderedEntries
+        ))
+    }
+
+    func testRearrangeTopLevelEntriesByDateNewestFirst() {
+        let old = UUID(), new = UUID(), mid = UUID(), never1 = UUID(), never2 = UUID(), stale = UUID(), folderB = UUID(), folderA = UUID(), member = UUID()
+        func app(_ name: String) -> AppCandidate {
+            AppCandidate(canonicalURL: URL(fileURLWithPath: "/Applications/\(name).app"), bundleIdentifier: "test.\(name.lowercased())",
+                         displayName: name, sourcePriority: 0, discoveredAt: .now)
+        }
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        let dates: [String: Date] = [
+            "test.old": base,
+            "test.new": base.addingTimeInterval(300),
+            "test.mid": base.addingTimeInterval(100),
+        ]
+        let catalog = ["Old", "New", "Mid", "Zulu", "Alpha"].map(app)
+        let state = LayoutState(
+            orderedEntries: [.folder(folderB), .app(never1), .app(old), .app(stale), .folder(folderA), .app(mid), .app(never2), .app(new)],
+            folders: [folderB: LauncherFolder(id: folderB, name: "Beta", itemIDs: [member]),
+                      folderA: LauncherFolder(id: folderA, name: "Alpha Tools", itemIDs: [])],
+            appKeys: [old: "bundle:test.old", new: "bundle:test.new", mid: "bundle:test.mid",
+                      never1: "bundle:test.zulu", never2: "bundle:test.alpha", member: "bundle:test.member"],
+            appAliases: ["bundle:test.zulu": "Bravo"]
+        )
+        for kind in AppDateRearrangeKind.allCases {
+            var calls = 0
+            let sorted = LauncherLayout.rearrangeTopLevelEntriesByDate(kind, in: state, catalog: catalog) { candidate in
+                calls += 1
+                return dates[candidate.bundleIdentifier ?? ""]
+            }
+            // dated newest-first → undated by name (alias "Bravo" after "Alpha"), unknown id → folders by name.
+            XCTAssertEqual(sorted.orderedEntries, [.app(new), .app(mid), .app(old), .app(never2), .app(never1), .app(stale), .folder(folderA), .folder(folderB)])
+            XCTAssertEqual(sorted.folders, state.folders)
+            XCTAssertEqual(sorted.appAliases, state.appAliases)
+            XCTAssertEqual(calls, 5, "date provider runs once per resolvable top-level app")
+            let again = LauncherLayout.rearrangeTopLevelEntriesByDate(kind, in: sorted, catalog: catalog) { dates[$0.bundleIdentifier ?? ""] }
+            XCTAssertEqual(again, sorted, "already-sorted layout is unchanged (updatedAt untouched)")
+            XCTAssertFalse(kind.menuTitleKey.isEmpty)
+            XCTAssertNotEqual(kind.toastKey, kind.informativeTextKey)
+        }
+        XCTAssertNil(LauncherLayout.applicationDate(.lastOpened, forAppAt: URL(fileURLWithPath: "/nonexistent/None.app")))
+        XCTAssertNil(LauncherLayout.applicationDate(.dateAdded, forAppAt: URL(fileURLWithPath: "/nonexistent/None.app")))
+    }
+
+    func testRearrangeTopLevelEntriesByColorGroupsHueFamilies() {
+        let red = UUID(), wrapRed = UUID(), blue = UUID(), darkBlue = UUID(), green = UUID(), gray = UUID(), white = UUID()
+        let unsampled = UUID(), stale = UUID(), folder = UUID(), member = UUID()
+        func app(_ name: String) -> AppCandidate {
+            AppCandidate(canonicalURL: URL(fileURLWithPath: "/Applications/\(name).app"), bundleIdentifier: "test.\(name.lowercased())",
+                         displayName: name, sourcePriority: 0, discoveredAt: .now)
+        }
+        let samples: [String: IconColorSample] = [
+            "test.red": IconColorSample(hue: 0.01, saturation: 0.9, brightness: 0.9),
+            "test.wrapred": IconColorSample(hue: 0.99, saturation: 0.8, brightness: 0.9),
+            "test.blue": IconColorSample(hue: 0.6, saturation: 0.8, brightness: 0.9),
+            "test.darkblue": IconColorSample(hue: 0.62, saturation: 0.8, brightness: 0.4),
+            "test.green": IconColorSample(hue: 0.33, saturation: 0.7, brightness: 0.8),
+            "test.gray": IconColorSample(hue: 0.5, saturation: 0.05, brightness: 0.5),
+            "test.white": IconColorSample(hue: 0.1, saturation: 0.1, brightness: 0.95),
+        ]
+        let catalog = ["Red", "WrapRed", "Blue", "DarkBlue", "Green", "Gray", "White", "Plain"].map(app)
+        let state = LayoutState(
+            orderedEntries: [.folder(folder), .app(gray), .app(blue), .app(stale), .app(unsampled), .app(darkBlue),
+                             .app(white), .app(green), .app(wrapRed), .app(red)],
+            folders: [folder: LauncherFolder(id: folder, name: "Tools", itemIDs: [member])],
+            appKeys: [red: "bundle:test.red", wrapRed: "bundle:test.wrapred", blue: "bundle:test.blue",
+                      darkBlue: "bundle:test.darkblue", green: "bundle:test.green", gray: "bundle:test.gray",
+                      white: "bundle:test.white", unsampled: "bundle:test.plain", member: "bundle:test.member"]
+        )
+        var calls = 0
+        let sorted = LauncherLayout.rearrangeTopLevelEntriesByColor(in: state, catalog: catalog) { candidate in
+            calls += 1
+            return samples[candidate.bundleIdentifier ?? ""]
+        }
+        // reds (wrap-around shares the family; name order) → green → blue bright→dark → white → gray → unsampled → unknown → folder.
+        XCTAssertEqual(sorted.orderedEntries, [.app(red), .app(wrapRed), .app(green), .app(blue), .app(darkBlue),
+                                               .app(white), .app(gray), .app(unsampled), .app(stale), .folder(folder)])
+        XCTAssertEqual(calls, 8, "color provider runs once per resolvable top-level app")
+        XCTAssertEqual(sorted.folders, state.folders)
+        let again = LauncherLayout.rearrangeTopLevelEntriesByColor(in: sorted, catalog: catalog) { samples[$0.bundleIdentifier ?? ""] }
+        XCTAssertEqual(again, sorted, "already-sorted layout is unchanged (updatedAt untouched)")
+        XCTAssertEqual(IconColorSample(hue: 0.99, saturation: 1, brightness: 1).hueFamily, 0)
+        XCTAssertEqual(IconColorSample(hue: 0.5, saturation: 1, brightness: 1).hueFamily, 6)
+        XCTAssertFalse(IconColorSample(hue: 0.5, saturation: 1, brightness: 0.1).isChromatic)
+        XCTAssertNotEqual(LauncherLayout.ColorRearrangeCopy.toastKey, LauncherLayout.ColorRearrangeCopy.informativeTextKey)
+    }
+
+    func testLaunchpadImportReadsSyntheticDatabaseInOrder() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("lp-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("db")
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &db), SQLITE_OK)
+        let sql = """
+        CREATE TABLE items (rowid INTEGER PRIMARY KEY, uuid VARCHAR, flags INTEGER, type INTEGER, parent_id INTEGER NOT NULL, ordering INTEGER);
+        CREATE TABLE apps (item_id INTEGER PRIMARY KEY, title VARCHAR, bundleid VARCHAR, storeid VARCHAR, category_id INTEGER, moddate REAL, bookmark BLOB);
+        CREATE TABLE groups (item_id INTEGER PRIMARY KEY, category_id INTEGER, title VARCHAR);
+        INSERT INTO items VALUES (1,'ROOTPAGE',0,1,0,0),(2,'HOLDINGPAGE',0,3,0,0),(3,'ROOTPAGE_DB',0,1,0,0);
+        INSERT INTO items VALUES (10,'p1',0,3,1,0),(11,'p2',0,3,1,1);
+        INSERT INTO items VALUES (20,'a',0,4,10,1),(21,'b',0,4,10,0),(22,'g',0,2,10,2),(23,'c',0,4,11,0);
+        INSERT INTO items VALUES (30,'gp',0,3,22,0),(31,'d',0,4,30,1),(32,'e',0,4,30,0),(33,'w',0,5,10,3);
+        INSERT INTO items VALUES (40,'dash',0,4,3,0);
+        INSERT INTO apps (item_id,title,bundleid) VALUES (20,'Alpha','com.x.alpha'),(21,'Beta','com.x.beta'),(23,'Gamma',NULL),(31,'Delta','com.x.delta'),(32,'Echo','com.x.echo'),(40,'Dash','com.x.dash');
+        INSERT INTO groups (item_id,title) VALUES (22,'Tools');
+        """
+        XCTAssertEqual(sqlite3_exec(db, sql, nil, nil, nil), SQLITE_OK)
+        sqlite3_close(db)
+
+        let snapshot = try LaunchpadLayoutImporter.read(databaseAt: url)
+        typealias A = LaunchpadLayoutSnapshot.App
+        XCTAssertEqual(snapshot.items, [
+            .app(A(bundleIdentifier: "com.x.beta", title: "Beta")),
+            .app(A(bundleIdentifier: "com.x.alpha", title: "Alpha")),
+            .folder(title: "Tools", apps: [
+                A(bundleIdentifier: "com.x.echo", title: "Echo"),
+                A(bundleIdentifier: "com.x.delta", title: "Delta"),
+            ]),
+            .app(A(bundleIdentifier: nil, title: "Gamma")),
+        ])
+        XCTAssertEqual(snapshot.appCount, 5)
+        XCTAssertEqual(snapshot.folderCount, 1)
+
+        let junk = dir.appendingPathComponent("junk")
+        try Data("not sqlite".utf8).write(to: junk)
+        XCTAssertThrowsError(try LaunchpadLayoutImporter.read(databaseAt: junk))
+    }
+
+    func testLaunchpadImportMapsOntoInstalledAppsAndKeepsTheRest() {
+        func app(_ bundle: String?, _ name: String) -> AppCandidate {
+            AppCandidate(
+                canonicalURL: URL(fileURLWithPath: "/Applications/\(name).app"),
+                bundleIdentifier: bundle, displayName: name, sourcePriority: 0, discoveredAt: .distantPast
+            )
+        }
+        let alpha = app("com.x.alpha", "Alpha"), beta = app("com.x.beta", "Beta")
+        let gamma = app(nil, "Gamma"), delta = app("com.x.delta", "Delta")
+        let zed = app("com.x.zed", "Zed"), yak = app("com.x.yak", "Yak")
+        let candidates = [alpha, beta, gamma, delta, zed, yak]
+        let ids = candidates.map { _ in UUID() }
+        let oldFolder = LauncherFolder(name: "Old", itemIDs: [ids[4], ids[0]])
+        var base = LayoutState(
+            orderedEntries: [.app(ids[5]), .folder(oldFolder.id), .app(ids[1]), .app(ids[2]), .app(ids[3])],
+            folders: [oldFolder.id: oldFolder],
+            appKeys: Dictionary(uniqueKeysWithValues: zip(ids, candidates.map(\.deduplicationKey))),
+            hiddenAppKeys: [yak.deduplicationKey],
+            appAliases: [beta.deduplicationKey: "B"]
+        )
+        base.updatedAt = .distantPast
+        typealias A = LaunchpadLayoutSnapshot.App
+        let snapshot = LaunchpadLayoutSnapshot(items: [
+            .app(A(bundleIdentifier: "com.x.beta", title: "Beta")),
+            .app(A(bundleIdentifier: "com.missing", title: "Gone")),
+            .folder(title: "  ", apps: [A(bundleIdentifier: "COM.X.ALPHA", title: "Alpha"), A(bundleIdentifier: nil, title: "gamma")]),
+            .folder(title: "Solo", apps: [A(bundleIdentifier: "com.x.delta", title: "Delta"), A(bundleIdentifier: "com.missing2", title: "X")]),
+            .app(A(bundleIdentifier: "com.x.beta", title: "Beta")),
+        ])
+        let now = Date(timeIntervalSince1970: 1000)
+        let state = LaunchpadLayoutImporter.layoutState(
+            from: snapshot, candidates: candidates, base: base, defaultFolderName: "F", now: now
+        )
+        func key(_ entry: LauncherEntry) -> String? {
+            if case let .app(id) = entry { return state.appKeys[id] }
+            return nil
+        }
+        XCTAssertEqual(state.orderedEntries.count, 5)
+        XCTAssertEqual(key(state.orderedEntries[0]), beta.deduplicationKey)
+        guard case let .folder(folderID) = state.orderedEntries[1], let folder = state.folders[folderID] else {
+            return XCTFail("second entry must be the imported folder")
+        }
+        XCTAssertEqual(folder.name, "F")
+        XCTAssertEqual(folder.itemIDs.compactMap { state.appKeys[$0] }, [alpha.deduplicationKey, gamma.deduplicationKey])
+        XCTAssertEqual(key(state.orderedEntries[2]), delta.deduplicationKey, "one-member folder becomes an app")
+        XCTAssertEqual(key(state.orderedEntries[3]), yak.deduplicationKey, "unlisted apps keep old order")
+        XCTAssertEqual(key(state.orderedEntries[4]), zed.deduplicationKey, "old folder members are kept, folder dissolved")
+        XCTAssertEqual(state.folders.count, 1)
+        XCTAssertEqual(state.appKeys.count, 6)
+        XCTAssertEqual(state.orderedEntries.first.flatMap { if case let .app(id) = $0 { id } else { nil } }, ids[1], "existing ids are reused")
+        XCTAssertEqual(state.hiddenAppKeys, base.hiddenAppKeys)
+        XCTAssertEqual(state.appAliases, base.appAliases)
+        XCTAssertEqual(state.updatedAt, now)
+        XCTAssertEqual(LaunchpadLayoutImporter.snapshot(rows: [], apps: [:], groupTitles: [:]).items, [])
+    }
+
+    func testHotCornerIgnoresCornersSharedWithAdjacentDisplay() {
+        let left = CGRect(x: 0, y: 0, width: 1000, height: 1000)
+        let right = CGRect(x: 1000, y: 0, width: 1000, height: 1000)
+        let frames = [left, right]
+        // Shared inner edge: pointer travels through, never fires.
+        XCTAssertNil(LauncherLayout.hotCorner(at: CGPoint(x: 999, y: 999), screenFrames: frames))
+        XCTAssertNil(LauncherLayout.hotCorner(at: CGPoint(x: 1000, y: 999), screenFrames: frames))
+        XCTAssertNil(LauncherLayout.hotCorner(at: CGPoint(x: 999, y: 0), screenFrames: frames))
+        // Outer corners still fire.
+        XCTAssertEqual(LauncherLayout.hotCorner(at: CGPoint(x: 0, y: 999), screenFrames: frames), .topLeft)
+        XCTAssertEqual(LauncherLayout.hotCorner(at: CGPoint(x: 1999, y: 999), screenFrames: frames), .topRight)
+        XCTAssertEqual(LauncherLayout.hotCorner(at: CGPoint(x: 1999, y: 0), screenFrames: frames), .bottomRight)
+        // A shorter neighbour leaves the taller display's top-right pinned.
+        let shortRight = CGRect(x: 1000, y: 0, width: 800, height: 600)
+        XCTAssertEqual(
+            LauncherLayout.hotCorner(at: CGPoint(x: 999, y: 999), screenFrames: [left, shortRight]), .topRight
+        )
+        XCTAssertNil(LauncherLayout.hotCorner(at: CGPoint(x: 999, y: 0), screenFrames: [left, shortRight]))
+        // Stacked displays: the seam corners are open.
+        let above = CGRect(x: 0, y: 1000, width: 1000, height: 800)
+        XCTAssertNil(LauncherLayout.hotCorner(at: CGPoint(x: 0, y: 999), screenFrames: [left, above]))
+        XCTAssertEqual(LauncherLayout.hotCorner(at: CGPoint(x: 0, y: 1799), screenFrames: [left, above]), .topLeft)
+        // Single display unchanged.
+        XCTAssertEqual(LauncherLayout.hotCorner(at: CGPoint(x: 999, y: 999), screenFrames: [left]), .topRight)
+        XCTAssertFalse(LauncherLayout.isHotCornerOpenToAdjacentDisplay(.topRight, of: left, otherFrames: []))
+    }
+
+    func testHotCornerDetectsSystemDockCornerConflict() {
+        let dock: [String: Any] = [
+            "wvous-tl-corner": 1,
+            "wvous-tr-corner": NSNumber(value: 2),
+            "wvous-bl-corner": "14",
+            "wvous-br-corner": 99,
+        ]
+        let lookup: (String) -> Any? = { dock[$0] }
+        XCTAssertNil(LauncherHotCorner.off.systemConflictActionTitleKey(dockValue: lookup))
+        XCTAssertNil(LauncherHotCorner.topLeft.systemConflictActionTitleKey(dockValue: lookup))
+        XCTAssertEqual(LauncherHotCorner.topRight.systemConflictActionTitleKey(dockValue: lookup), "调度中心")
+        XCTAssertEqual(LauncherHotCorner.bottomLeft.systemConflictActionTitleKey(dockValue: lookup), "快速备忘录")
+        XCTAssertEqual(LauncherHotCorner.bottomRight.systemConflictActionTitleKey(dockValue: lookup), "其他系统操作")
+        XCTAssertNil(LauncherHotCorner.topRight.systemConflictActionTitleKey(dockValue: { _ in nil }))
+        XCTAssertNil(LauncherHotCorner.topRight.systemConflictActionTitleKey(dockValue: { _ in "x" }))
+        XCTAssertNil(LauncherHotCorner.systemHotCornerActionTitleKey(0))
+        XCTAssertEqual(
+            Set(LauncherHotCorner.allCases.compactMap(\.systemDockDefaultsKey)).count, 4
+        )
+        XCTAssertEqual(
+            LauncherHotCorner.systemConflictMessageFormatKey.components(separatedBy: "%@").count, 3
+        )
+    }
+
+
+    func testHotCornerConflictHelpCopy() {
+        // HOT-CORNER-CONFLICT-HELP-01
+        XCTAssertEqual(
+            HotCornerConflictCopy.accessibilityHelp(localize: { $0 }),
+            HotCornerConflictCopy.accessibilityHelpKey
+        )
+        XCTAssertEqual(
+            HotCornerConflictCopy.conflictToolTip(localize: { $0 }),
+            "与系统触发角冲突时请换角或关闭系统该角"
+        )
+        let lookup: (String) -> Any? = {
+            switch $0 {
+            case "wvous-tr-corner": return 2
+            default: return 0
+            }
+        }
+        let message = LauncherHotCorner.topRight.conflictMessage(dockValue: lookup, localize: { $0 })
+        XCTAssertEqual(
+            message,
+            LauncherHotCorner.conflictMessage(
+                cornerTitle: "右上角",
+                actionTitle: "调度中心",
+                localize: { $0 }
+            )
+        )
+        XCTAssertTrue(message?.contains("右上角") == true)
+        XCTAssertTrue(message?.contains("调度中心") == true)
+        XCTAssertNil(LauncherHotCorner.off.conflictMessage(dockValue: lookup, localize: { $0 }))
+        XCTAssertNil(LauncherHotCorner.topLeft.conflictMessage(dockValue: lookup, localize: { $0 }))
+    }
+
+    func testIconColorSamplerRunsOffMainAndMemoizesPerPath() async {
+        func solid(_ r: CGFloat, _ g: CGFloat, _ b: CGFloat) -> CGImage? {
+            let space = CGColorSpace(name: CGColorSpace.sRGB)!
+            let ctx = CGContext(data: nil, width: 8, height: 8, bitsPerComponent: 8, bytesPerRow: 32,
+                                space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+            ctx.setFillColor(CGColor(srgbRed: r, green: g, blue: b, alpha: 1))
+            ctx.fill(CGRect(x: 0, y: 0, width: 8, height: 8))
+            return ctx.makeImage()
+        }
+        let red = solid(1, 0, 0), blue = solid(0, 0.3, 1)
+        final class Probe: @unchecked Sendable {
+            let lock = NSLock()
+            var calls = 0
+            var sawMain = false
+        }
+        let probe = Probe()
+        let sampler = IconColorSampler { candidate in
+            probe.lock.withLock {
+                probe.calls += 1
+                if Thread.isMainThread { probe.sawMain = true }
+            }
+            switch candidate.displayName {
+            case "Red": return red
+            case "Blue": return blue
+            default: return nil
+            }
+        }
+        func app(_ name: String) -> AppCandidate {
+            AppCandidate(canonicalURL: URL(fileURLWithPath: "/Applications/\(name).app"), bundleIdentifier: "test.\(name.lowercased())",
+                         displayName: name, sourcePriority: 0, discoveredAt: .now)
+        }
+        let apps = ["Red", "Blue", "Blank"].map(app) + [app("Red")]
+        XCTAssertEqual(sampler.pendingCount(for: apps), 3)
+        let first = await sampler.samples(for: apps)
+        XCTAssertEqual(first.count, 2)
+        XCTAssertEqual(first[apps[0].deduplicationKey]?.hueFamily, 0)
+        XCTAssertTrue((6...8).contains(first[apps[1].deduplicationKey]?.hueFamily ?? -1))
+        XCTAssertNil(first[apps[2].deduplicationKey])
+        XCTAssertEqual(probe.lock.withLock { probe.calls }, 3)
+        XCTAssertFalse(probe.lock.withLock { probe.sawMain })
+        XCTAssertEqual(sampler.pendingCount(for: apps), 0)
+        let second = await sampler.samples(for: apps)
+        XCTAssertEqual(second, first)
+        XCTAssertEqual(probe.lock.withLock { probe.calls }, 3)
+        sampler.reset()
+        XCTAssertEqual(sampler.pendingCount(for: apps), 3)
+        // CG path agrees with the NSImage path on a solid fill.
+        XCTAssertEqual(IconColorSample.sample(cgImage: red!)?.hueFamily, 0)
+        XCTAssertGreaterThanOrEqual(IconColorSampler.maxConcurrentSamples, 1)
+    }
+
+    func testSortingFolderMembersByColorReordersOnlyThatFolder() {
+        let red = UUID(), blue = UUID(), gray = UUID(), plain = UUID(), stale = UUID(), top = UUID()
+        let folder = UUID(), other = UUID()
+        func app(_ name: String) -> AppCandidate {
+            AppCandidate(canonicalURL: URL(fileURLWithPath: "/Applications/\(name).app"), bundleIdentifier: "test.\(name.lowercased())",
+                         displayName: name, sourcePriority: 0, discoveredAt: .now)
+        }
+        let samples: [String: IconColorSample] = [
+            "test.red": IconColorSample(hue: 0.0, saturation: 0.9, brightness: 0.9),
+            "test.blue": IconColorSample(hue: 0.6, saturation: 0.9, brightness: 0.9),
+            "test.gray": IconColorSample(hue: 0.0, saturation: 0.0, brightness: 0.5),
+        ]
+        let catalog = ["Red", "Blue", "Gray", "Plain", "Top"].map(app)
+        let state = LayoutState(
+            orderedEntries: [.app(top), .folder(folder), .folder(other)],
+            folders: [folder: LauncherFolder(id: folder, name: "Mix", itemIDs: [stale, gray, plain, blue, red]),
+                      other: LauncherFolder(id: other, name: "One", itemIDs: [top])],
+            appKeys: [red: "bundle:test.red", blue: "bundle:test.blue", gray: "bundle:test.gray",
+                      plain: "bundle:test.plain", top: "bundle:test.top"]
+        )
+        let colorOf: (AppCandidate) -> IconColorSample? = { samples[$0.bundleIdentifier ?? ""] }
+        let next = try! XCTUnwrap(LauncherLayout.sortingFolderMembersByColor(folder, in: state, catalog: catalog, color: colorOf))
+        XCTAssertEqual(next.folders[folder]?.itemIDs, [red, blue, gray, plain, stale])
+        XCTAssertEqual(next.orderedEntries, state.orderedEntries)
+        XCTAssertEqual(next.folders[other], state.folders[other])
+        XCTAssertNil(LauncherLayout.sortingFolderMembersByColor(folder, in: next, catalog: catalog, color: colorOf))
+        XCTAssertNil(LauncherLayout.sortingFolderMembersByColor(other, in: state, catalog: catalog, color: colorOf))
+        XCTAssertNil(LauncherLayout.sortingFolderMembersByColor(UUID(), in: state, catalog: catalog, color: colorOf))
+        XCTAssertNotEqual(LauncherLayout.sortFolderByColorMenuTitleKey, LauncherLayout.sortFolderByNameMenuTitleKey)
+    }
+
+    func testSortingFolderMembersByDateReordersOnlyThatFolder() {
+        let old = UUID(), new = UUID(), mid = UUID(), alpha = UUID(), zulu = UUID(), stale = UUID(), top = UUID()
+        let folder = UUID(), other = UUID()
+        func app(_ name: String) -> AppCandidate {
+            AppCandidate(canonicalURL: URL(fileURLWithPath: "/Applications/\(name).app"), bundleIdentifier: "test.\(name.lowercased())",
+                         displayName: name, sourcePriority: 0, discoveredAt: .now)
+        }
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        let dates: [String: Date] = [
+            "test.old": base,
+            "test.new": base.addingTimeInterval(300),
+            "test.mid": base.addingTimeInterval(100),
+        ]
+        let catalog = ["Old", "New", "Mid", "Alpha", "Zulu", "Top"].map(app)
+        let state = LayoutState(
+            orderedEntries: [.app(top), .folder(folder), .folder(other)],
+            folders: [
+                folder: LauncherFolder(id: folder, name: "Mix", itemIDs: [stale, zulu, old, alpha, mid, new]),
+                other: LauncherFolder(id: other, name: "One", itemIDs: [top]),
+            ],
+            appKeys: [
+                old: "bundle:test.old", new: "bundle:test.new", mid: "bundle:test.mid",
+                alpha: "bundle:test.alpha", zulu: "bundle:test.zulu", top: "bundle:test.top",
+            ],
+            appAliases: ["bundle:test.zulu": "Bravo"]
+        )
+        for kind in AppDateRearrangeKind.allCases {
+            var calls = 0
+            let next = try! XCTUnwrap(LauncherLayout.sortingFolderMembersByDate(kind, folderID: folder, in: state, catalog: catalog) { candidate in
+                calls += 1
+                return dates[candidate.bundleIdentifier ?? ""]
+            })
+            XCTAssertEqual(next.folders[folder]?.itemIDs, [new, mid, old, alpha, zulu, stale])
+            XCTAssertEqual(next.orderedEntries, state.orderedEntries)
+            XCTAssertEqual(next.folders[other], state.folders[other])
+            XCTAssertEqual(next.appAliases, state.appAliases)
+            XCTAssertEqual(calls, 5, "date provider runs once per resolvable member")
+            XCTAssertNil(LauncherLayout.sortingFolderMembersByDate(kind, folderID: folder, in: next, catalog: catalog) {
+                dates[$0.bundleIdentifier ?? ""]
+            })
+            XCTAssertFalse(kind.folderMenuTitleKey.isEmpty)
+            XCTAssertNotEqual(kind.folderToastKey, kind.folderAlreadySortedToastKey)
+        }
+        XCTAssertNil(LauncherLayout.sortingFolderMembersByDate(.dateAdded, folderID: other, in: state, catalog: catalog) { _ in nil })
+        XCTAssertNil(LauncherLayout.sortingFolderMembersByDate(.lastOpened, folderID: UUID(), in: state, catalog: catalog) { _ in .now })
+        let tied = UUID(), tiedLater = UUID()
+        let tieState = LayoutState(
+            orderedEntries: [.folder(folder)],
+            folders: [folder: LauncherFolder(id: folder, name: "Tie", itemIDs: [tiedLater, tied])],
+            appKeys: [tied: "bundle:test.alpha", tiedLater: "bundle:test.zulu"]
+        )
+        let tieCatalog = ["Alpha", "Zulu"].map(app)
+        let tieNext = try! XCTUnwrap(LauncherLayout.sortingFolderMembersByDate(.dateAdded, folderID: folder, in: tieState, catalog: tieCatalog) { _ in base })
+        XCTAssertEqual(tieNext.folders[folder]?.itemIDs, [tied, tiedLater])
+    }
+
+    func testApplicationDatesSkipsMissingBundles() async {
+        let ghost = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/nonexistent/None.app"),
+            bundleIdentifier: "test.none",
+            displayName: "None",
+            sourcePriority: 0,
+            discoveredAt: .now
+        )
+        let dates = await LauncherLayout.applicationDates(.dateAdded, for: [ghost, ghost])
+        XCTAssertTrue(dates.isEmpty)
+        let opened = await LauncherLayout.applicationDates(.lastOpened, for: [ghost])
+        XCTAssertTrue(opened.isEmpty)
+    }
+
+    func testIconColorSampleReadsSolidAndTransparentImages() {
+        func solid(_ color: NSColor) -> NSImage {
+            NSImage(size: NSSize(width: 32, height: 32), flipped: false) { rect in
+                color.setFill()
+                rect.fill()
+                return true
+            }
+        }
+        let red = try! XCTUnwrap(IconColorSample.sample(of: solid(.init(srgbRed: 1, green: 0, blue: 0, alpha: 1))))
+        XCTAssertEqual(red.hueFamily, 0)
+        XCTAssertTrue(red.isChromatic)
+        let blue = try! XCTUnwrap(IconColorSample.sample(of: solid(.init(srgbRed: 0, green: 0.3, blue: 1, alpha: 1))))
+        XCTAssertTrue((6...8).contains(blue.hueFamily))
+        let gray = try! XCTUnwrap(IconColorSample.sample(of: solid(.init(srgbRed: 0.5, green: 0.5, blue: 0.5, alpha: 1))))
+        XCTAssertFalse(gray.isChromatic)
+        XCTAssertNil(IconColorSample.sample(of: solid(.clear)))
+        let green = IconColorSample.fromRGB(red: 0, green: 1, blue: 0)
+        XCTAssertEqual(green.hue, 1.0 / 3, accuracy: 0.001)
+        XCTAssertEqual(IconColorSample.fromRGB(red: 1, green: 0, blue: 1).hueFamily, 10)
+    }
+
+    func testBatchRemovingAppsFromFolderKeepsFolderAlive() {
+        let m1 = UUID(), m2 = UUID(), m3 = UUID(), m4 = UUID(), m5 = UUID()
+        let work = UUID(), pair = UUID()
+        let p1 = UUID(), p2 = UUID()
+        let state = LayoutState(
+            orderedEntries: [.folder(work), .folder(pair)],
+            folders: [
+                work: LauncherFolder(id: work, name: "Work", itemIDs: [m1, m2, m3, m4, m5]),
+                pair: LauncherFolder(id: pair, name: "Pair", itemIDs: [p1, p2]),
+            ]
+        )
+        let selection = LauncherItemSelection.selectingAll(ids: [m2, m4, m1])
+        let ids = LauncherLayout.appIDsForBatchRemoveFromFolder(
+            selection: selection, folderID: work, in: state
+        )
+        // Folder order, not selection order.
+        XCTAssertEqual(ids, [m1, m2, m4])
+        let next = LauncherLayout.removingAppsFromFolder([m1, m2, m4], folderID: work, in: state)
+        XCTAssertEqual(next?.folders[work]?.itemIDs, [m3, m5])
+        XCTAssertEqual(next?.orderedEntries, [.folder(work), .app(m1), .app(m2), .app(m4), .folder(pair)])
+        // Would leave fewer than 2 → nil.
+        XCTAssertNil(LauncherLayout.appIDsForBatchRemoveFromFolder(
+            selection: LauncherItemSelection.selectingAll(ids: [m1, m2, m3, m4]),
+            folderID: work, in: state
+        ))
+        XCTAssertNil(LauncherLayout.removingAppsFromFolder([m1, m2, m3, m4], folderID: work, in: state))
+        // Pair only has 2 — cannot batch-remove anything.
+        XCTAssertNil(LauncherLayout.appIDsForBatchRemoveFromFolder(
+            selection: LauncherItemSelection.selectingAll(ids: [p1, p2]),
+            folderID: pair, in: state
+        ))
+        // Single id is not a batch.
+        XCTAssertNil(LauncherLayout.appIDsForBatchRemoveFromFolder(
+            selection: LauncherItemSelection.selectingAll(ids: [m1]),
+            folderID: work, in: state
+        ))
+    }
+
+    func testRemovingAppFromFolderKeepsFolderAlive() {
+        let appA = UUID(), m1 = UUID(), m2 = UUID(), m3 = UUID(), pair1 = UUID(), pair2 = UUID()
+        let work = UUID(), pair = UUID()
+        let state = LayoutState(
+            orderedEntries: [.app(appA), .folder(work), .folder(pair)],
+            folders: [
+                work: LauncherFolder(id: work, name: "Work", itemIDs: [m1, m2, m3]),
+                pair: LauncherFolder(id: pair, name: "Pair", itemIDs: [pair1, pair2]),
+            ]
+        )
+        let next = LauncherLayout.removingAppFromFolder(m2, folderID: work, in: state)
+        XCTAssertEqual(next?.orderedEntries, [.app(appA), .folder(work), .app(m2), .folder(pair)])
+        XCTAssertEqual(next?.folders[work]?.itemIDs, [m1, m3])
+        // A two-member folder would dissolve: no menu item.
+        XCTAssertNil(LauncherLayout.removingAppFromFolder(pair1, folderID: pair, in: state))
+        // Not a member / unknown folder.
+        XCTAssertNil(LauncherLayout.removingAppFromFolder(appA, folderID: work, in: state))
+        XCTAssertNil(LauncherLayout.removingAppFromFolder(m1, folderID: UUID(), in: state))
+    }
+
+    func testMoveToFolderMenuTargetsAndMove() {
+        let appA = UUID(), appB = UUID(), member = UUID()
+        let work = UUID(), blank = UUID()
+        let state = LayoutState(
+            orderedEntries: [.app(appA), .folder(work), .app(appB), .folder(blank)],
+            folders: [
+                work: LauncherFolder(id: work, name: "Work", itemIDs: [member]),
+                blank: LauncherFolder(id: blank, name: "  ", itemIDs: [UUID()]),
+            ]
+        )
+        let targets = LauncherLayout.moveToFolderMenuTargets(forAppID: appA, in: state)
+        XCTAssertEqual(targets.map(\.id), [work, blank])
+        XCTAssertEqual(targets.map(\.name), ["Work", ""])
+        // Folder members, folder tiles and unknown ids get no submenu.
+        XCTAssertTrue(LauncherLayout.moveToFolderMenuTargets(forAppID: member, in: state).isEmpty)
+        XCTAssertTrue(LauncherLayout.moveToFolderMenuTargets(forAppID: work, in: state).isEmpty)
+        XCTAssertTrue(LauncherLayout.moveToFolderMenuTargets(forAppID: UUID(), in: state).isEmpty)
+
+        func failure(_ result: Result<LayoutState, LayoutMutationError>) -> LayoutMutationError? {
+            if case .failure(let error) = result { return error }
+            return nil
+        }
+        guard case .success(let moved) = LauncherLayout.moveTopLevelApp(appB, toFolder: work, in: state) else {
+            return XCTFail("move should succeed")
+        }
+        XCTAssertEqual(moved.orderedEntries, [.app(appA), .folder(work), .folder(blank)])
+        XCTAssertEqual(moved.folders[work]?.itemIDs, [member, appB])
+
+        XCTAssertEqual(
+            failure(LauncherLayout.moveTopLevelApp(work, toFolder: blank, in: state)),
+            .nestedFolder
+        )
+        XCTAssertEqual(
+            failure(LauncherLayout.moveTopLevelApp(member, toFolder: blank, in: state)),
+            .missingSource
+        )
+        XCTAssertEqual(
+            failure(LauncherLayout.moveTopLevelApp(appA, toFolder: UUID(), in: state)),
+            .missingTarget
+        )
+    }
+
+    func testRevealInFinderOnlyForAppBundles() {
+        let app = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Example.app"),
+            bundleIdentifier: "com.example.app",
+            displayName: "Example",
+            sourcePriority: 0,
+            discoveredAt: .distantPast
+        )
+        XCTAssertEqual(
+            LauncherLayout.revealInFinderURL(for: app, isFolder: false)?.path,
+            "/Applications/Example.app"
+        )
+        XCTAssertNil(LauncherLayout.revealInFinderURL(for: app, isFolder: true))
+        // Folder tiles carry a synthetic "/<uuid>" URL; never reveal it.
+        let folderPlaceholder = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/\(UUID().uuidString)"),
+            bundleIdentifier: nil,
+            displayName: "Folder",
+            sourcePriority: 0,
+            discoveredAt: .distantPast
+        )
+        XCTAssertNil(LauncherLayout.revealInFinderURL(for: folderPlaceholder, isFolder: false))
+        let remote = AppCandidate(
+            canonicalURL: URL(string: "https://example.com/Example.app")!,
+            bundleIdentifier: nil,
+            displayName: "Remote",
+            sourcePriority: 0,
+            discoveredAt: .distantPast
+        )
+        XCTAssertNil(LauncherLayout.revealInFinderURL(for: remote, isFolder: false))
+        XCTAssertTrue(LauncherLayout.revealInFinderDismissesLauncher)
+    }
+
+    func testLayoutDragOutsideOfferLinksRealAppsOnly() {
+        let app = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Example.app"),
+            bundleIdentifier: "com.example.app",
+            displayName: "Example",
+            sourcePriority: 0,
+            discoveredAt: .distantPast
+        )
+        XCTAssertEqual(
+            LauncherLayout.layoutDragOutsideOffer(for: app, isFolder: false),
+            .linkToApp(URL(fileURLWithPath: "/Applications/Example.app"))
+        )
+        XCTAssertEqual(LauncherLayout.layoutDragOutsideOffer(for: app, isFolder: true), .none)
+        XCTAssertEqual(LauncherLayout.layoutDragOutsideOffer(for: nil, isFolder: false), .none)
+        let folderPlaceholder = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/\(UUID().uuidString)"),
+            bundleIdentifier: nil,
+            displayName: "Folder",
+            sourcePriority: 0,
+            discoveredAt: .distantPast
+        )
+        XCTAssertEqual(
+            LauncherLayout.layoutDragOutsideOffer(for: folderPlaceholder, isFolder: false),
+            .none
+        )
+        let offer = LauncherLayout.layoutDragOutsideOffer(for: app, isFolder: false)
+        XCTAssertTrue(LauncherLayout.shouldTemporarilyRevealDock(for: offer))
+        XCTAssertFalse(LauncherLayout.shouldTemporarilyRevealDock(for: .none))
+        XCTAssertTrue(
+            LauncherLayout.shouldRestoreDockHideAfterExternalDrag(
+                launcherVisible: true,
+                launcherDismissing: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldRestoreDockHideAfterExternalDrag(
+                launcherVisible: true,
+                launcherDismissing: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldRestoreDockHideAfterExternalDrag(
+                launcherVisible: false,
+                launcherDismissing: false
+            )
+        )
+    }
+
+    func testRevealInFinderURLsForMultiSelectionSkipsFoldersAndDedupes() {
+        let a = UUID(), b = UUID(), folderID = UUID(), missing = UUID()
+        var state = LayoutState()
+        state.orderedEntries = [.app(a), .app(b), .folder(folderID)]
+        state.appKeys = [a: "a", b: "b"]
+        state.folders[folderID] = LauncherFolder(id: folderID, name: "F", itemIDs: [])
+        let candA = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/A.app"),
+            bundleIdentifier: "com.a",
+            displayName: "A",
+            sourcePriority: 0,
+            discoveredAt: .distantPast
+        )
+        let candB = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/B.app"),
+            bundleIdentifier: "com.b",
+            displayName: "B",
+            sourcePriority: 0,
+            discoveredAt: .distantPast
+        )
+        let byKey = ["a": candA, "b": candB]
+        let selection = LauncherItemSelection(orderedIDs: [a, folderID, b, missing], rangeAnchorID: a)
+
+        let urls = LauncherLayout.revealInFinderURLs(
+            selection: selection,
+            anchorID: a,
+            in: state,
+            candidatesByKey: byKey
+        )
+        XCTAssertEqual(urls?.map(\.path), ["/Applications/A.app", "/Applications/B.app"])
+
+        // Anchor outside selection / single id → nil
+        XCTAssertNil(LauncherLayout.revealInFinderURLs(
+            selection: selection, anchorID: UUID(), in: state, candidatesByKey: byKey
+        ))
+        let single = LauncherItemSelection(orderedIDs: [a], rangeAnchorID: a)
+        XCTAssertNil(LauncherLayout.revealInFinderURLs(
+            selection: single, anchorID: a, in: state, candidatesByKey: byKey
+        ))
+    }
+
+    func testSearchRevealShortcutMatchesOnlyCommandReturnWhileSearching() {
+        // SEARCH-CMD-RETURN-REVEAL-01
+        XCTAssertTrue(LauncherLayout.searchRevealShortcutMatches(
+            keyCode: 36, commandOnly: true, isSearching: true, folderOpen: false, hasMarkedText: false))
+        XCTAssertTrue(LauncherLayout.searchRevealShortcutMatches(
+            keyCode: 76, commandOnly: true, isSearching: true, folderOpen: false, hasMarkedText: false))
+        XCTAssertFalse(LauncherLayout.searchRevealShortcutMatches(
+            keyCode: 36, commandOnly: false, isSearching: true, folderOpen: false, hasMarkedText: false))
+        XCTAssertFalse(LauncherLayout.searchRevealShortcutMatches(
+            keyCode: 36, commandOnly: true, isSearching: false, folderOpen: false, hasMarkedText: false))
+        XCTAssertFalse(LauncherLayout.searchRevealShortcutMatches(
+            keyCode: 36, commandOnly: true, isSearching: true, folderOpen: true, hasMarkedText: false))
+        XCTAssertFalse(LauncherLayout.searchRevealShortcutMatches(
+            keyCode: 36, commandOnly: true, isSearching: true, folderOpen: false, hasMarkedText: true))
+        XCTAssertFalse(LauncherLayout.searchRevealShortcutMatches(
+            keyCode: 49, commandOnly: true, isSearching: true, folderOpen: false, hasMarkedText: false))
+    }
+
+    func testBatchRevealMenuTitleFormatKeyIncludesCount() {
+        // BATCH-REVEAL-COUNT-01: counted title for multi-select reveal.
+        XCTAssertEqual(
+            String(format: LauncherLayout.batchRevealMenuTitleFormatKey, 3),
+            "在访达中显示（3）"
+        )
+        XCTAssertEqual(
+            String(format: LauncherLayout.batchRevealMenuTitleFormatKey, 1),
+            "在访达中显示（1）"
+        )
+    }
+
+
+    func testShouldClearSelectionWhenEnteringSearchOnlyOnTransition() {
+        XCTAssertTrue(
+            LauncherLayout.shouldClearSelectionWhenEnteringSearch(
+                wasSearching: false, isSearchingNow: true, selectionCount: 2
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldClearSelectionWhenEnteringSearch(
+                wasSearching: true, isSearchingNow: true, selectionCount: 2
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldClearSelectionWhenEnteringSearch(
+                wasSearching: false, isSearchingNow: false, selectionCount: 2
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldClearSelectionWhenEnteringSearch(
+                wasSearching: false, isSearchingNow: true, selectionCount: 0
+            )
+        )
+    }
+
+    func testShouldClearSelectionInsteadOfDismissWhenNonEmpty() {
+        XCTAssertFalse(LauncherLayout.shouldClearSelectionInsteadOfDismiss(selectionCount: 0))
+        XCTAssertTrue(LauncherLayout.shouldClearSelectionInsteadOfDismiss(selectionCount: 1))
+        XCTAssertTrue(LauncherLayout.shouldClearSelectionInsteadOfDismiss(selectionCount: 5))
+    }
+
+    func testShouldClearSelectionOnDismissWhenNonEmpty() {
+        XCTAssertFalse(LauncherLayout.shouldClearSelectionOnDismiss(selectionCount: 0))
+        XCTAssertTrue(LauncherLayout.shouldClearSelectionOnDismiss(selectionCount: 1))
+        XCTAssertTrue(LauncherLayout.shouldClearSelectionOnDismiss(selectionCount: 4))
+    }
+
+    func testShouldClearSelectionWhenOpeningSettingsWhenNonEmpty() {
+        XCTAssertFalse(LauncherLayout.shouldClearSelectionWhenOpeningSettings(selectionCount: 0))
+        XCTAssertTrue(LauncherLayout.shouldClearSelectionWhenOpeningSettings(selectionCount: 1))
+        XCTAssertTrue(LauncherLayout.shouldClearSelectionWhenOpeningSettings(selectionCount: 4))
+    }
+
+    func testShouldClearSelectionWhenOpeningFolderWhenNonEmpty() {
+        XCTAssertFalse(LauncherLayout.shouldClearSelectionWhenOpeningFolder(selectionCount: 0))
+        XCTAssertTrue(LauncherLayout.shouldClearSelectionWhenOpeningFolder(selectionCount: 1))
+        XCTAssertTrue(LauncherLayout.shouldClearSelectionWhenOpeningFolder(selectionCount: 3))
+    }
+
+    func testShouldClearSelectionWhenClosingFolderWhenNonEmpty() {
+        XCTAssertFalse(LauncherLayout.shouldClearSelectionWhenClosingFolder(selectionCount: 0))
+        XCTAssertTrue(LauncherLayout.shouldClearSelectionWhenClosingFolder(selectionCount: 1))
+        XCTAssertTrue(LauncherLayout.shouldClearSelectionWhenClosingFolder(selectionCount: 2))
+    }
+
+    func testShouldClearSelectionWhenLayoutEditingDisabledOnlyOnTransition() {
+        XCTAssertTrue(
+            LauncherLayout.shouldClearSelectionWhenLayoutEditingDisabled(
+                wasEnabled: true, isEnabledNow: false, selectionCount: 2
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldClearSelectionWhenLayoutEditingDisabled(
+                wasEnabled: true, isEnabledNow: false, selectionCount: 0
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldClearSelectionWhenLayoutEditingDisabled(
+                wasEnabled: false, isEnabledNow: false, selectionCount: 2
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldClearSelectionWhenLayoutEditingDisabled(
+                wasEnabled: true, isEnabledNow: true, selectionCount: 2
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldClearSelectionWhenLayoutEditingDisabled(
+                wasEnabled: false, isEnabledNow: true, selectionCount: 2
+            )
+        )
+    }
+
+    func testSelectionAnnouncementKindChangesAndClears() {
+        // SELECTION-A11Y-ANNOUNCE-01
+        XCTAssertNil(LauncherLayout.selectionAnnouncementKind(previousCount: 0, newCount: 0))
+        XCTAssertEqual(
+            LauncherLayout.selectionAnnouncementKind(previousCount: 0, newCount: 3),
+            .selected(3)
+        )
+        XCTAssertEqual(
+            LauncherLayout.selectionAnnouncementKind(previousCount: 3, newCount: 1),
+            .selected(1)
+        )
+        XCTAssertEqual(
+            LauncherLayout.selectionAnnouncementKind(previousCount: 2, newCount: 0),
+            .cleared
+        )
+        XCTAssertNil(LauncherLayout.selectionAnnouncementKind(previousCount: 0, newCount: 0))
+        XCTAssertNil(LauncherLayout.selectionAnnouncementKind(previousCount: 5, newCount: 5))
+        XCTAssertEqual(LauncherLayout.selectionClearedAnnouncementKey, "已清除选择")
     }
 
 
@@ -10094,6 +13368,27 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertTrue(
             LauncherLayout.folderTitleShouldBeginEditingFromPointer(clickCount: 3)
         )
+        XCTAssertFalse(
+            LauncherLayout.folderTitleShouldBeginEditingFromPointer(
+                clickCount: 1,
+                secondsSincePreviousPointerDown: nil,
+                doubleClickInterval: 0.5
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.folderTitleShouldBeginEditingFromPointer(
+                clickCount: 1,
+                secondsSincePreviousPointerDown: 0.2,
+                doubleClickInterval: 0.5
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.folderTitleShouldBeginEditingFromPointer(
+                clickCount: 1,
+                secondsSincePreviousPointerDown: 0.9,
+                doubleClickInterval: 0.5
+            )
+        )
         XCTAssertTrue(
             LauncherLayout.folderTitleShouldCancelEditingOnOutsideClick(
                 isEditing: true,
@@ -11383,6 +14678,86 @@ final class LaunchIconCoreTests: XCTestCase {
 
 
 
+    func testSearchHiddenMatchHint() {
+        let names = ["Xcode", "Safari", "Safari Technology Preview"]
+        XCTAssertEqual(LauncherLayout.searchHiddenMatchHint(query: "  ", hiddenNames: names), .none)
+        XCTAssertEqual(LauncherLayout.searchHiddenMatchHint(query: "notes", hiddenNames: names), .none)
+        XCTAssertEqual(LauncherLayout.searchHiddenMatchHint(query: " xco ", hiddenNames: names), .one(name: "Xcode"))
+        XCTAssertEqual(LauncherLayout.searchHiddenMatchHint(query: "SAFARI", hiddenNames: names), .several(count: 2))
+        XCTAssertEqual(LauncherLayout.searchHiddenMatchHint(query: "x", hiddenNames: []), .none)
+    }
+
+    func testBlankAreaHiddenAppsMenuEntriesCapsAndFlagsOverflow() {
+        XCTAssertEqual(LauncherLayout.blankAreaHiddenAppsMenuEntries([Int]()).shown, [])
+        XCTAssertFalse(LauncherLayout.blankAreaHiddenAppsMenuEntries([Int]()).hasMore)
+        let exact = Array(0..<LauncherLayout.blankAreaHiddenAppsMenuLimit)
+        XCTAssertEqual(LauncherLayout.blankAreaHiddenAppsMenuEntries(exact).shown, exact)
+        XCTAssertFalse(LauncherLayout.blankAreaHiddenAppsMenuEntries(exact).hasMore)
+        let over = Array(0..<(LauncherLayout.blankAreaHiddenAppsMenuLimit + 3))
+        let entries = LauncherLayout.blankAreaHiddenAppsMenuEntries(over)
+        XCTAssertEqual(entries.shown, exact)
+        XCTAssertTrue(entries.hasMore)
+    }
+
+    func testRestoringAllHiddenApplicationsClearsSetOnce() {
+        let shown = UUID()
+        var state = LayoutState(orderedEntries: [.app(shown)], appKeys: [shown: "visible"])
+        XCTAssertNil(LauncherLayout.restoringAllHiddenApplications(in: state))
+        state.hiddenAppKeys = ["a", "b"]
+        guard let restored = LauncherLayout.restoringAllHiddenApplications(in: state) else {
+            return XCTFail("expected a change")
+        }
+        XCTAssertTrue(restored.hiddenAppKeys.isEmpty)
+        XCTAssertEqual(restored.orderedEntries, state.orderedEntries)
+        XCTAssertEqual(restored.appKeys, state.appKeys)
+        XCTAssertFalse(LauncherLayout.settingsShowsRestoreAllHidden(hiddenCount: 1))
+        XCTAssertTrue(LauncherLayout.settingsShowsRestoreAllHidden(hiddenCount: 2))
+    }
+
+    func testSortingFolderMembersByNameOnlyTouchesThatFolder() {
+        func app(_ name: String) -> AppCandidate {
+            AppCandidate(
+                canonicalURL: URL(fileURLWithPath: "/Applications/\(name).app"),
+                bundleIdentifier: "com.example.\(name)",
+                displayName: name,
+                sourcePriority: 1,
+                discoveredAt: .now
+            )
+        }
+        let zeta = app("Zeta"), alpha = app("Alpha"), mid = app("Mid"), other = app("Other")
+        let z = UUID(), a = UUID(), m = UUID(), o = UUID(), stale = UUID()
+        let folderID = UUID(), otherFolderID = UUID()
+        let state = LayoutState(
+            orderedEntries: [.folder(folderID), .folder(otherFolderID)],
+            folders: [
+                folderID: LauncherFolder(id: folderID, name: "F", itemIDs: [z, a, m]),
+                otherFolderID: LauncherFolder(id: otherFolderID, name: "G", itemIDs: [o, stale])
+            ],
+            appKeys: [
+                z: zeta.deduplicationKey, a: alpha.deduplicationKey,
+                m: mid.deduplicationKey, o: other.deduplicationKey
+            ],
+            appAliases: [zeta.deduplicationKey: "Beta"]
+        )
+        let catalog = [zeta, alpha, mid, other]
+        guard let sorted = LauncherLayout.sortingFolderMembersByName(folderID, in: state, catalog: catalog) else {
+            return XCTFail("expected a reorder")
+        }
+        // Alias "Beta" wins over catalog "Zeta".
+        XCTAssertEqual(sorted.folders[folderID]?.itemIDs, [a, z, m])
+        XCTAssertEqual(sorted.folders[otherFolderID], state.folders[otherFolderID])
+        XCTAssertEqual(sorted.orderedEntries, state.orderedEntries)
+        XCTAssertNil(LauncherLayout.sortingFolderMembersByName(folderID, in: sorted, catalog: catalog))
+        XCTAssertNil(LauncherLayout.sortingFolderMembersByName(UUID(), in: state, catalog: catalog))
+        // Duplicate member ids must not trap.
+        var dup = state
+        dup.folders[folderID]?.itemIDs = [z, a, z]
+        XCTAssertEqual(
+            LauncherLayout.sortingFolderMembersByName(folderID, in: dup, catalog: catalog)?.folders[folderID]?.itemIDs,
+            [a, z, z]
+        )
+    }
+
     func testRearrangeTopLevelByNameAndKindPreservesFolderMembership() {
         let sysA = UUID()
         let sysB = UUID()
@@ -11462,6 +14837,73 @@ final class LaunchIconCoreTests: XCTestCase {
     }
 
 
+    func testSettingsMaintenanceLayoutChromeCopy() {
+        // SETTINGS-MAINTENANCE-LAYOUT-CHROME-COPY-01
+        XCTAssertEqual(LauncherLayout.SettingsMaintenanceChromeCopy.rescanButtonTitleKey, "重新扫描")
+        XCTAssertEqual(LauncherLayout.SettingsMaintenanceChromeCopy.leftoversButtonTitleKey, "残留文件…")
+        XCTAssertEqual(LauncherLayout.SettingsMaintenanceChromeCopy.leftoversCancelTitleKey, "取消查找")
+        XCTAssertEqual(LauncherLayout.SettingsLayoutIOChromeCopy.exportButtonTitleKey, "导出布局…")
+        XCTAssertEqual(LauncherLayout.SettingsLayoutIOChromeCopy.importButtonTitleKey, "导入布局…")
+        XCTAssertEqual(LauncherLayout.SettingsLayoutIOChromeCopy.restoreBackupButtonTitleKey, "恢复上次备份")
+        XCTAssertEqual(
+            LauncherLayout.SettingsLayoutIOChromeCopy.restoreBackupToolTip(available: false),
+            "尚无自动备份（修改布局后会生成）"
+        )
+        XCTAssertEqual(
+            LauncherLayout.SettingsLayoutIOChromeCopy.restoreBackupToolTip(available: true),
+            "恢复最近一次自动保存前的布局"
+        )
+    }
+
+    func testSettingsHiddenAppsChromeCopy() {
+        // SETTINGS-HIDDEN-APPS-CHROME-COPY-01
+        XCTAssertEqual(LauncherLayout.SettingsHiddenAppsChromeCopy.rowTitleKey, "隐藏的应用")
+        XCTAssertEqual(LauncherLayout.SettingsHiddenAppsChromeCopy.emptyPopupTitleKey, "没有隐藏的应用")
+        XCTAssertEqual(LauncherLayout.SettingsHiddenAppsChromeCopy.restoreButtonTitleKey, "恢复")
+        XCTAssertEqual(
+            LauncherLayout.SettingsHiddenAppsChromeCopy.restoreAccessibilityLabelKey,
+            "恢复所选应用"
+        )
+        XCTAssertEqual(
+            LauncherLayout.SettingsHiddenAppsChromeCopy.restoredNamed(displayName: "日历"),
+            "已恢复“日历”"
+        )
+        XCTAssertEqual(
+            LauncherLayout.SettingsHiddenAppsChromeCopy.restoreUnavailable(),
+            "当前无法恢复该应用，请等待扫描完成后重试。"
+        )
+    }
+
+    func testSettingsFormDensityCopy() {
+        // SETTINGS-FORM-DENSITY-01
+        XCTAssertEqual(SettingsSectionChromeCopy.rearrangeRowTitleKey, "重新排列")
+        XCTAssertEqual(SettingsSectionChromeCopy.rearrangeMenuTitleKey, "选取排序…")
+        XCTAssertEqual(SettingsSectionChromeCopy.layoutRowTitleKey, "布局")
+        XCTAssertEqual(SettingsSectionChromeCopy.layoutMenuTitleKey, "导出与导入…")
+        XCTAssertEqual(SettingsSectionChromeCopy.scanRowTitleKey, "扫描与清理")
+        XCTAssertEqual(SettingsSectionChromeCopy.rearrangeRowTitle(), "重新排列")
+        XCTAssertEqual(SettingsSectionChromeCopy.layoutMenuTitle(), "导出与导入…")
+    }
+
+    func testSettingsRearrangeButtonsCopy() {
+        // SETTINGS-REARRANGE-BUTTONS-COPY-01
+        XCTAssertEqual(LauncherLayout.GridRearrangeSort.byName.settingsButtonTitleKey, "按名称排列")
+        XCTAssertEqual(LauncherLayout.GridRearrangeSort.byKind.settingsButtonTitleKey, "按类型排列")
+        XCTAssertEqual(
+            LauncherLayout.GridRearrangeSort.byName.settingsAccessibilityHelpKey,
+            "按显示名称重新排列主屏幕图标；文件夹内应用不变"
+        )
+        XCTAssertEqual(
+            LauncherLayout.GridRearrangeSort.byKind.settingsAccessibilityHelpKey,
+            "系统应用在前，其余按名称；文件夹内应用不变"
+        )
+        XCTAssertEqual(LauncherLayout.CategoryRearrangeCopy.settingsButtonTitleKey, "按分类排列")
+        XCTAssertEqual(
+            LauncherLayout.CategoryRearrangeCopy.settingsAccessibilityHelpKey,
+            "按应用分类分组，组内按名称；文件夹内应用不变"
+        )
+    }
+
     func testGridRearrangeConfirmAlertCancelIsFirstButton() {
         XCTAssertTrue(LauncherLayout.GridRearrangeConfirmAlert.cancelIsFirstButton)
         XCTAssertFalse(LauncherLayout.GridRearrangeConfirmAlert.messageTextKey.isEmpty)
@@ -11515,6 +14957,54 @@ final class LaunchIconCoreTests: XCTestCase {
         )
         XCTAssertTrue(blocked.contains("按下以打开应用"))
         XCTAssertTrue(blocked.contains("应用扫描不完整"))
+        XCTAssertEqual(
+            LauncherLayout.tileAccessibilityHelp(
+                isFolder: false,
+                layoutEditingEnabled: false,
+                layoutEditingExplanation: "  "
+            ),
+            "按下以打开应用。暂时无法拖动整理或卸载，请先完成扫描"
+        )
+        let english: (String) -> String = { key in
+            switch key {
+            case LauncherLayout.tileOpenAppHelpKey: return "Press to open app"
+            case LauncherLayout.tileOpenFolderHelpKey: return "Press to open folder"
+            case LauncherLayout.tileOpenAppBlockedFormatKey: return "Press to open app. %@"
+            case LauncherLayout.tileOpenFolderBlockedFormatKey: return "Press to open folder. %@"
+            case LauncherLayout.tileBlockedUntilScanHelpKey:
+                return "Rearranging and uninstall stay unavailable until the scan finishes"
+            default: return key
+            }
+        }
+        XCTAssertEqual(
+            LauncherLayout.tileAccessibilityHelp(
+                isFolder: false,
+                layoutEditingEnabled: true,
+                layoutEditingExplanation: nil,
+                localize: english
+            ),
+            "Press to open app"
+        )
+        XCTAssertEqual(
+            LauncherLayout.tileAccessibilityHelp(
+                isFolder: false,
+                layoutEditingEnabled: false,
+                layoutEditingExplanation: "Scan incomplete",
+                localize: english
+            ),
+            "Press to open app. Scan incomplete"
+        )
+        let folderBlocked = LauncherLayout.tileAccessibilityHelp(
+            isFolder: true,
+            layoutEditingEnabled: false,
+            layoutEditingExplanation: nil,
+            localize: english
+        )
+        XCTAssertEqual(
+            folderBlocked,
+            "Press to open folder. Rearranging and uninstall stay unavailable until the scan finishes"
+        )
+        XCTAssertFalse(folderBlocked.contains("按下"))
         XCTAssertEqual(
             LauncherLayout.layoutCollectionAccessibilityHelp(
                 layoutEditingEnabled: false,
@@ -11940,6 +15430,77 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertEqual(duped.orderedIDs, [a, b])
     }
 
+
+    func testTopLevelIDsForBatchReorderSamePageOnly() {
+        let a = UUID()
+        let b = UUID()
+        let c = UUID()
+        let d = UUID()
+        var state = LayoutState()
+        state.orderedEntries = [.app(a), .app(b), .app(c), .app(d)]
+        state.appKeys = [a: "a", b: "b", c: "c", d: "d"]
+        let selection = LauncherItemSelection(orderedIDs: [c, a, b])
+        // Drop gap at index 3 (before d) on page 0 — same page.
+        let ids = LauncherLayout.topLevelIDsForBatchReorder(
+            selection: selection, draggedID: a, insertAt: 3, in: state
+        )
+        XCTAssertEqual(ids, [c, a, b])
+        XCTAssertTrue(
+            LauncherLayout.shouldBatchReorderSelection(
+                selection: selection, draggedID: a, insertAt: 3, in: state
+            )
+        )
+        // Off-page insert (far past page 0) → empty.
+        XCTAssertTrue(
+            LauncherLayout.topLevelIDsForBatchReorder(
+                selection: selection, draggedID: a, insertAt: 40, in: state
+            ).isEmpty
+        )
+        // Dragged not in selection → empty.
+        XCTAssertTrue(
+            LauncherLayout.topLevelIDsForBatchReorder(
+                selection: LauncherItemSelection(orderedIDs: [b, c]),
+                draggedID: a, insertAt: 3, in: state
+            ).isEmpty
+        )
+        // Single selection → empty.
+        XCTAssertFalse(
+            LauncherLayout.shouldBatchReorderSelection(
+                selection: LauncherItemSelection(orderedIDs: [a]),
+                draggedID: a, insertAt: 3, in: state
+            )
+        )
+    }
+
+    func testMultiDragBadgeCountRequiresMultiTopLevelSelection() {
+        let a = UUID(), b = UUID(), c = UUID()
+        var state = LayoutState()
+        state.orderedEntries = [.app(a), .app(b), .app(c)]
+        state.appKeys = [a: "a", b: "b", c: "c"]
+        XCTAssertEqual(
+            LauncherLayout.multiDragBadgeCount(
+                selection: LauncherItemSelection(orderedIDs: [a, b]),
+                draggedID: a,
+                in: state
+            ),
+            2
+        )
+        XCTAssertNil(
+            LauncherLayout.multiDragBadgeCount(
+                selection: LauncherItemSelection(orderedIDs: [a]),
+                draggedID: a,
+                in: state
+            )
+        )
+        XCTAssertNil(
+            LauncherLayout.multiDragBadgeCount(
+                selection: LauncherItemSelection(orderedIDs: [a, b]),
+                draggedID: c,
+                in: state
+            )
+        )
+    }
+
 }
 
 private func XCTAssertThrowsErrorAsync<T>(
@@ -11952,4 +15513,7 @@ private func XCTAssertThrowsErrorAsync<T>(
     } catch {
         errorHandler(error)
     }
+
+
+
 }

@@ -13,6 +13,37 @@ public actor AppCatalogScanner: AppCataloging {
         URL(fileURLWithPath: "/System/Cryptexes/App/System/Applications", isDirectory: true)
     ]
 
+    /// CUSTOM-ROOT-SCAN-LIMIT-01 — caps for user-added roots only (not standard).
+    /// Relative path components under the root (`Foo.app` = 1).
+    public static let customRootMaxRelativeDepth = 4
+    /// Hard stop per user-added root so huge trees cannot stall the scan.
+    public static let customRootMaxAppsDefault = 500
+    /// CUSTOM-ROOT-COUNT-LIMIT-01 — how many user folders Settings may keep.
+    public static let maxAdditionalAppDirectories = 12
+
+    /// Drop invalid / duplicate / over-limit paths so persisted prefs match
+    /// what `catalogRoots` will actually scan.
+    public static func sanitizedAdditionalAppDirectories(
+        _ paths: [String],
+        standard: [URL] = AppCatalogScanner.standardRoots,
+        limit: Int = maxAdditionalAppDirectories
+    ) -> [String] {
+        let roots = catalogRoots(standard: standard, additionalPaths: paths)
+        let standardPaths = Set(standard.map { normalizedRootPath($0.path) })
+        let extras = roots.map(\.path).filter { !standardPaths.contains(normalizedRootPath($0)) }
+        return Array(extras.prefix(max(0, limit)))
+    }
+    #if DEBUG
+    /// Test-only override; production always uses `customRootMaxAppsDefault`.
+    nonisolated(unsafe) public static var customRootMaxAppsOverride: Int?
+    #endif
+    public static var customRootMaxApps: Int {
+        #if DEBUG
+        if let override = customRootMaxAppsOverride { return override }
+        #endif
+        return customRootMaxAppsDefault
+    }
+
     private let fileManager: FileManager
 
     public init(fileManager: FileManager = .default) {
@@ -23,16 +54,61 @@ public actor AppCatalogScanner: AppCataloging {
         Self.scanSynchronously(roots: roots, fileManager: fileManager, includeHiddenApplications: false)
     }
 
+    /// Like `scan(roots:)`, but a missing root listed in `requiredRootPaths`
+    /// (a user-added folder on an unmounted drive) is reported as
+    /// `unavailableRequiredRootPaths` so callers can retain prior candidates
+    /// under that root without locking the whole layout read-only.
+    public func scan(roots: [URL], requiredRootPaths: Set<String>) async -> CatalogScanReport {
+        Self.scanSynchronously(
+            roots: roots, fileManager: fileManager, includeHiddenApplications: false,
+            requiredRootPaths: requiredRootPaths
+        )
+    }
+
+    /// Standard roots first (they win deduplication), then valid user folders.
+    /// Drops blanks, relative paths, duplicates, standard roots themselves,
+    /// paths inside an app bundle, and ancestors of a standard root (`/`,
+    /// `/System`, the home folder) whose recursive scan would be enormous.
+    public nonisolated static func catalogRoots(
+        standard: [URL] = AppCatalogScanner.standardRoots,
+        additionalPaths: [String]
+    ) -> [URL] {
+        var roots = standard
+        let standardPaths = standard.map { normalizedRootPath($0.path) }
+        var seen = Set(standardPaths)
+        for raw in additionalPaths {
+            if roots.count - standard.count >= maxAdditionalAppDirectories { break }
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.hasPrefix("/") else { continue }
+            let path = normalizedRootPath(trimmed)
+            guard path != "/", !seen.contains(path),
+                  !path.split(separator: "/").contains(where: { $0.lowercased().hasSuffix(".app") }),
+                  !standardPaths.contains(where: { $0.hasPrefix(path + "/") }) else { continue }
+            seen.insert(path)
+            roots.append(URL(fileURLWithPath: path, isDirectory: true))
+        }
+        return roots
+    }
+
+    public nonisolated static func normalizedRootPath(_ path: String) -> String {
+        let standardized = URL(fileURLWithPath: path).standardizedFileURL.path
+        guard standardized.count > 1, standardized.hasSuffix("/") else { return standardized }
+        return String(standardized.dropLast())
+    }
+
     /// Uninstall safety must see copies in hidden directories that the grid omits.
     public func scanIncludingHiddenApplications(roots: [URL]) async -> CatalogScanReport {
         Self.scanSynchronously(roots: roots, fileManager: fileManager, includeHiddenApplications: true)
     }
 
     private nonisolated static func scanSynchronously(
-        roots: [URL], fileManager: FileManager, includeHiddenApplications: Bool
+        roots: [URL], fileManager: FileManager, includeHiddenApplications: Bool,
+        requiredRootPaths: Set<String> = []
     ) -> CatalogScanReport {
         var candidates: [AppCandidate] = []
         var skippedPaths: [URL] = []
+        var unavailableRequiredRootPaths: [URL] = []
+        var truncatedScanRootPaths: [URL] = []
         var unreadableMetadataPaths: [URL] = []
         var unlaunchablePaths: [URL] = []
 
@@ -42,6 +118,11 @@ public actor AppCatalogScanner: AppCataloging {
             } catch let error as NSError where error.domain == NSCocoaErrorDomain
                 && error.code == NSFileReadNoSuchFileError {
                 // A standard Applications root may simply not exist on this Mac.
+                // A missing *required* (user-added) root is unavailable, not a
+                // scan failure — editing stays open; retain prior apps under it.
+                if requiredRootPaths.contains(normalizedRootPath(root.path)) {
+                    unavailableRequiredRootPaths.append(root)
+                }
                 continue
             } catch {
                 skippedPaths.append(root)
@@ -60,6 +141,12 @@ public actor AppCatalogScanner: AppCataloging {
                 continue
             }
 
+            // CUSTOM-ROOT-SCAN-LIMIT-01: only user-added (required) roots are capped.
+            let rootNormalized = normalizedRootPath(root.path)
+            let applyCustomLimits = requiredRootPaths.contains(rootNormalized)
+            var appsUnderRoot = 0
+            var didTruncateRoot = false
+
             for case let url as URL in enumerator {
                 guard !Task.isCancelled else {
                     let selected = deduplicate(candidates)
@@ -70,8 +157,28 @@ public actor AppCatalogScanner: AppCataloging {
                         unreadableMetadataPaths: unreadableMetadataPaths,
                         unlaunchablePaths: unlaunchablePaths,
                         duplicateCandidates: candidates.filter { !selectedURLs.contains($0.canonicalURL) },
+                        unavailableRequiredRootPaths: unavailableRequiredRootPaths,
+                        truncatedScanRootPaths: truncatedScanRootPaths,
                         wasCancelled: true
                     )
+                }
+
+                if applyCustomLimits {
+                    let itemPath = normalizedRootPath(url.path)
+                    let relative: String
+                    if itemPath == rootNormalized {
+                        relative = ""
+                    } else if itemPath.hasPrefix(rootNormalized + "/") {
+                        relative = String(itemPath.dropFirst(rootNormalized.count + 1))
+                    } else {
+                        relative = ""
+                    }
+                    let depth = relative.isEmpty ? 0 : relative.split(separator: "/").count
+                    if depth > customRootMaxRelativeDepth {
+                        enumerator.skipDescendants()
+                        didTruncateRoot = true
+                        continue
+                    }
                 }
 
                 guard url.pathExtension.lowercased() == "app" else { continue }
@@ -90,6 +197,10 @@ public actor AppCatalogScanner: AppCataloging {
                         skippedPaths.append(url)
                         continue
                     }
+                    if applyCustomLimits && appsUnderRoot >= customRootMaxApps {
+                        didTruncateRoot = true
+                        break
+                    }
                     let info = bundleInfoDictionary(at: resolvedURL, fileManager: fileManager)
                     if info == nil {
                         unreadableMetadataPaths.append(resolvedURL)
@@ -104,9 +215,15 @@ public actor AppCatalogScanner: AppCataloging {
                             info: info
                         )
                     )
+                    if applyCustomLimits {
+                        appsUnderRoot += 1
+                    }
                 } catch {
                     skippedPaths.append(url)
                 }
+            }
+            if didTruncateRoot {
+                truncatedScanRootPaths.append(root)
             }
         }
 
@@ -118,6 +235,8 @@ public actor AppCatalogScanner: AppCataloging {
             unreadableMetadataPaths: unreadableMetadataPaths,
             unlaunchablePaths: unlaunchablePaths,
             duplicateCandidates: candidates.filter { !selectedURLs.contains($0.canonicalURL) },
+            unavailableRequiredRootPaths: unavailableRequiredRootPaths,
+            truncatedScanRootPaths: truncatedScanRootPaths,
             wasCancelled: Task.isCancelled
         )
     }

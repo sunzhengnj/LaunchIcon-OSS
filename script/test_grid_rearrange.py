@@ -20,11 +20,28 @@ need("rearrangeTopLevelEntries" in core, "Core missing rearrangeTopLevelEntries"
 need("gridRearrangeToastMessage" in core, "Core missing toast helper")
 need("testRearrangeTopLevelByNameAndKindPreservesFolderMembership" in tests, "Core test missing")
 need("folder membership must not change" in tests, "test should assert folder membership")
-need("按名称排列" in settings and "按类型排列" in settings, "Settings missing rearrange buttons")
+need(
+    ("按名称排列" in settings and "按类型排列" in settings)
+    or (
+        "GridRearrangeSort.byName.settingsButtonTitleKey" in settings
+        and "GridRearrangeSort.byKind.settingsButtonTitleKey" in settings
+    ),
+    "Settings missing rearrange buttons",
+)
+need("CategoryRearrangeCopy.settingsButtonTitleKey" in settings or "按分类排列" in settings,
+     "Settings missing category rearrange button title")
 need("onRearrangeTopLevel" in settings, "Settings missing callback")
 need("应用管理" in settings, "rearrange should live under 应用管理")
 need("rootView.rearrangeTopLevelGrid" in direct, "WC must forward rearrange to rootView")
 need("onRearrangeTopLevel" in delegate, "AppDelegate must wire rearrange")
+need("onRearrangeByCategory" in settings and "onRearrangeByCategory" in delegate
+     and "rootView.rearrangeTopLevelGridByCategory()" in direct, "category rearrange must be wired Settings → WC → rootView")
+need("onRearrangeByColor" in settings and "onRearrangeByColor" in delegate
+     and "rearrangeTopLevelGridByColorAwaitingCompletion" in direct,
+     "color rearrange must be wired Settings → WC await API")
+need("settings-rearrange-by-color" in settings, "Settings missing color rearrange button AX id")
+cat_btn = settings[settings.index("@objc private func rearrangeByCategory()"):settings.index("private func applyRearrange(")]
+need("cancelIsFirstButton" in cat_btn and "alertSecondButtonReturn" in cat_btn, "category rearrange confirm must be Cancel-first")
 
 # Root implementation (the one that calls Core + commitLayout)
 impl_key = "LauncherLayout.rearrangeTopLevelEntries"

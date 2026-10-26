@@ -90,12 +90,20 @@ enum UninstallCoordinator {
         )
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = String(format: L("选择要清理的“%@”相关文件"), appName)
-        alert.informativeText = L(AppRelatedFileScanner.relatedCleanupReviewMessageKey)
+        // RELATED-CLEANUP-CONFIRM-COPY-01
+        alert.messageText = AppRelatedFileScanner.relatedCleanupConfirmTitle(
+            appName: appName,
+            localize: { L($0) }
+        )
+        alert.informativeText = AppRelatedFileScanner.relatedCleanupReviewMessage(localize: { L($0) })
         alert.accessoryView = list
         // Cancel first: Return stays on Cancel; Esc dismisses without trash.
-        alert.addButton(withTitle: L("取消"))
-        let trash = alert.addButton(withTitle: L("移到废纸篓"))
+        // Share Core button titles with batch / single-app / orphan confirm.
+        alert.addButton(withTitle: AppBatchUninstallPlan.confirmCancelButtonTitle(localize: { L($0) }))
+        let trash = alert.addButton(withTitle: AppBatchUninstallPlan.confirmDestructiveButtonTitle(
+            anyRunning: false,
+            localize: { L($0) }
+        ))
         trash.hasDestructiveAction = true
         list.adoptTrashButton(trash)
         alert.layout()
@@ -141,7 +149,7 @@ enum UninstallCoordinator {
             return
         }
         guard let bundleIdentity = AppUninstallEligibility.captureBundleIdentity(of: candidate) else {
-            toast(host, L("应用已变化，请重新尝试卸载"), autoDismiss: false)
+            toast(host, AppUninstallOutcomeToast.appChanged(localize: { L($0) }), autoDismiss: false)
             return
         }
 
@@ -152,7 +160,8 @@ enum UninstallCoordinator {
                 host.restoreFocusAfterUninstallSheet()
             }
         }
-        let copyCheckMessage = L("正在检查应用副本…")
+        // UNINSTALL-COPY-CHECK-PROGRESS-01
+        let copyCheckMessage = L(AppUninstallCopyCheckProgress.messageKey)
         toast(host, copyCheckMessage, autoDismiss: false)
         let otherCopy = await hasOtherInstalledCopy(of: candidate, host: host)
         clearMatchingProgressToast(host, copyCheckMessage)
@@ -165,27 +174,24 @@ enum UninstallCoordinator {
 
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = String(format: L("卸载“%@”？"), name)
-        var info = candidate.canonicalURL.path
-        if let bundleID = candidate.bundleIdentifier, !bundleID.isEmpty {
-            info += "\n" + bundleID
-        }
-        if running.isEmpty {
-            info += "\n\n" + L("应用将被移到废纸篓。默认不删除用户数据文件。")
-        } else {
-            info += "\n\n" + L("该应用正在运行。继续前将先尝试退出，再移到废纸篓。默认不删除用户数据文件。")
-        }
-        if otherCopy == true {
-            info += "\n" + L("发现同一应用的其他副本，相关用户文件将保留。")
-        } else if otherCopy == nil {
-            info += "\n" + L("无法确认是否有其他副本，相关用户文件将保留。")
-        }
-        alert.informativeText = info
+        // UNINSTALL-SINGLE-CONFIRM-COPY-01
+        alert.messageText = AppUninstallSingleConfirmCopy.title(appName: name, localize: { L($0) })
+        alert.informativeText = AppUninstallSingleConfirmCopy.informativeText(
+            path: candidate.canonicalURL.path,
+            bundleIdentifier: candidate.bundleIdentifier,
+            isRunning: !running.isEmpty,
+            otherCopy: otherCopy,
+            localize: { L($0) }
+        )
         alert.accessoryView = relatedToggle
         precondition(AppRelatedFileScanner.relatedCleanupAlertCancelIsFirstButton)
         // Cancel is first so Return does not immediately trash; Esc → Cancel.
-        alert.addButton(withTitle: L("取消"))
-        let trashTitle = running.isEmpty ? L("移到废纸篓") : L("退出并移到废纸篓")
+        // UNINSTALL-SINGLE-CONFIRM-CHROME-01: share Core button titles with batch confirm.
+        alert.addButton(withTitle: AppBatchUninstallPlan.confirmCancelButtonTitle(localize: { L($0) }))
+        let trashTitle = AppBatchUninstallPlan.confirmDestructiveButtonTitle(
+            anyRunning: !running.isEmpty,
+            localize: { L($0) }
+        )
         let trash = alert.addButton(withTitle: trashTitle)
         trash.hasDestructiveAction = true
         alert.layout()
@@ -247,7 +253,7 @@ enum UninstallCoordinator {
                 let forceQuitOK = await forceQuitRunningApplications(currentlyRunning)
                 guard !Task.isCancelled, host.acceptsIconContextMenuAction(), host.isLayoutEditingEnabled else { return }
                 guard forceQuitOK else {
-                    toast(host, L("应用仍在运行，未移到废纸篓；请退出后重试"), autoDismiss: false)
+                    toast(host, AppUninstallOutcomeToast.stillRunning(localize: { L($0) }), autoDismiss: false)
                     return
                 }
             }
@@ -259,7 +265,7 @@ enum UninstallCoordinator {
         guard !Task.isCancelled, recheck.isAllowed,
               AppUninstallEligibility.matchesBundleIdentity(bundleIdentity, of: candidate) else {
             if let key = recheck.explanationKey { toast(host, L(key)) }
-            else if !Task.isCancelled { toast(host, L("应用已变化，请重新尝试卸载"), autoDismiss: false) }
+            else if !Task.isCancelled { toast(host, AppUninstallOutcomeToast.appChanged(localize: { L($0) }), autoDismiss: false) }
             return
         }
         let finalOtherCopy = await hasOtherInstalledCopy(of: candidate, host: host)
@@ -268,14 +274,14 @@ enum UninstallCoordinator {
         if !relatedSelection.isEmpty {
             guard finalOtherCopy == false else {
                 if !Task.isCancelled {
-                    toast(host, L("应用副本状态已变化，未移除应用或用户数据；请重新尝试"), autoDismiss: false)
+                    toast(host, AppUninstallOutcomeToast.copiesChanged(localize: { L($0) }), autoDismiss: false)
                 }
                 return
             }
         }
         guard !Task.isCancelled, host.isLayoutEditingEnabled else { return }
         guard runningApplications(matching: candidate).isEmpty else {
-            toast(host, L("应用仍在运行，未移到废纸篓；请退出后重试"), autoDismiss: false)
+            toast(host, AppUninstallOutcomeToast.stillRunning(localize: { L($0) }), autoDismiss: false)
             return
         }
 
@@ -326,7 +332,8 @@ enum UninstallCoordinator {
         // Trash I/O off the main actor: large trees / auth sheets must not freeze
         // the grid or hotkey. Bundle + related identities are rechecked again
         // inside the executor immediately before each trashItem.
-        let progressMessage = L("正在移到废纸篓…")
+        // UNINSTALL-SINGLE-CONFIRM-CHROME-01
+        let progressMessage = L(AppUninstallTrashProgress.messageKey)
         toast(host, progressMessage, autoDismiss: false)
         let home = FileManager.default.homeDirectoryForCurrentUser
         let relatedForTrash = relatedSelection
@@ -354,47 +361,31 @@ enum UninstallCoordinator {
         guard !Task.isCancelled else { return }
         switch report.outcome {
         case .bundleFailed:
+            // UNINSTALL-OUTCOME-TOASTS-01
             let detail = report.bundleFailure?.detail ?? ""
-            switch report.bundleFailure?.reason {
-            case .cancelled:
-                return
-            case .identityMismatch:
-                toast(host, L("应用已变化，请重新尝试卸载"), autoDismiss: false)
-            case .permissionDenied:
-                toast(host, L("没有权限移到废纸篓；应用和用户数据均未改动"), help: detail, autoDismiss: false)
-            default:
-                toast(host, L("无法移到废纸篓；应用和用户数据均未改动"), help: detail, autoDismiss: false)
-            }
+            guard let message = AppUninstallOutcomeToast.bundleFailedMessage(
+                reason: report.bundleFailure?.reason,
+                localize: { L($0) }
+            ) else { return }
+            toast(host, message, help: detail.isEmpty ? nil : detail, autoDismiss: false)
             return
-        case .bundleOnly:
-            host.applySuccessfulUninstall(of: candidate, otherCopyMayExist: finalOtherCopy != false)
-            toast(host, L(AppUninstallReport.undoHintKey))
-        case .bundleAndAllRelated:
-            host.applySuccessfulUninstall(of: candidate, otherCopyMayExist: finalOtherCopy != false)
-            toast(host, String(format: L("已移到废纸篓（含 %d 项相关文件），可在废纸篓中放回原处"), report.trashedRelated.count))
-        case .partialRelated:
-            host.applySuccessfulUninstall(of: candidate, otherCopyMayExist: finalOtherCopy != false)
-            let failedList = report.failedRelated.map { failure -> String in
-                let why: String
-                switch failure.reason {
-                case .permissionDenied: why = L("没有权限")
-                case .unsafePath: why = L("路径不安全，已跳过")
-                case .missing: why = L("已不存在")
-                case .identityMismatch: why = L("路径已变化")
-                case .cancelled: why = L("已取消")
-                case .other: why = failure.detail
-                }
-                return "\(failure.url.path) — \(why)"
-            }
-            toast(host, 
-                String(
-                    format: L("应用已移到废纸篓；%d 项相关文件已移走，%d 项失败（仍在原处）"),
-                    report.trashedRelated.count,
-                    report.failedRelated.count
-                ),
-                help: failedList.joined(separator: "\n"),
-                autoDismiss: false
+        case .bundleOnly, .bundleAndAllRelated:
+            // UNINSTALL-RELATED-RESULT-TOAST-01
+            host.applySuccessfulUninstall(
+                of: candidate,
+                otherCopyMayExist: AppUninstallEligibility.otherCopyMayExistAfterUninstall(probe: finalOtherCopy)
             )
+            if let message = report.successToastMessage(localize: { L($0) }) {
+                toast(host, message)
+            }
+        case .partialRelated:
+            host.applySuccessfulUninstall(
+                of: candidate,
+                otherCopyMayExist: AppUninstallEligibility.otherCopyMayExistAfterUninstall(probe: finalOtherCopy)
+            )
+            if let partial = report.partialRelatedToast(localize: { L($0) }) {
+                toast(host, partial.message, help: partial.help, autoDismiss: false)
+            }
         }
         host.requestCatalogReloadAfterUninstall()
     }
@@ -451,12 +442,17 @@ enum UninstallCoordinator {
         let list = UninstallRelatedFilesListView(files: found, defaultSelected: AppRelatedFileScanner.relatedCleanupDefaultSelected)
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = L("清理已卸载应用的残留文件")
-        alert.informativeText = L("这些项目可能属于已卸载的应用。默认不选；请确认路径并勾选要移到废纸篓的项目。")
+        // ORPHAN-LEFTOVER-CONFIRM-COPY-01
+        alert.messageText = AppOrphanLeftoverScanner.confirmTitle(localize: { L($0) })
+        alert.informativeText = AppOrphanLeftoverScanner.confirmInformativeText(localize: { L($0) })
         alert.accessoryView = list
         // Cancel first — Return/Esc never trash without an explicit second click.
-        alert.addButton(withTitle: L("取消"))
-        let trash = alert.addButton(withTitle: L("移到废纸篓"))
+        // Share Core button titles with batch / single-app confirm.
+        alert.addButton(withTitle: AppBatchUninstallPlan.confirmCancelButtonTitle(localize: { L($0) }))
+        let trash = alert.addButton(withTitle: AppBatchUninstallPlan.confirmDestructiveButtonTitle(
+            anyRunning: false,
+            localize: { L($0) }
+        ))
         trash.hasDestructiveAction = true
         list.adoptTrashButton(trash)
         alert.layout()
@@ -467,7 +463,8 @@ enum UninstallCoordinator {
         let currentCatalog = await AppCatalogScanner().scan(roots: host.uninstallCatalogRoots)
         guard !Task.isCancelled else { return L(AppOrphanLeftoverScanner.cancelledMessageKey) }
         guard host.isLayoutEditingEnabled, currentCatalog.canPersistReconciledLayout else {
-            return L("无法确认应用安装状态，请稍后重试")
+            // ORPHAN-LEFTOVER-RESULT-TOAST-01
+            return AppOrphanLeftoverScanner.catalogUnavailable(localize: { L($0) })
         }
         var currentInstalledIDs = Set(currentCatalog.candidates.compactMap { $0.bundleIdentifier })
         currentInstalledIDs.formUnion(host.uninstallCandidates.compactMap { $0.bundleIdentifier })
@@ -494,13 +491,13 @@ enum UninstallCoordinator {
         guard host.isLayoutEditingEnabled else { return "" }
         let stillOrphanPaths = Set(stillOrphan.map(\.url.path))
         guard selected.allSatisfy({ stillOrphanPaths.contains($0.url.path) }) else {
-            return L("应用或残留文件已变化，请重新查找后再清理")
+            return AppOrphanLeftoverScanner.changedBeforeTrash(localize: { L($0) })
         }
         // Capture device+inode for each selected path, then trash off the main
         // actor with a final per-item identity recheck inside the executor.
         let expectedIdentities = AppUninstallEligibility.capturePathIdentities(of: selected)
         guard expectedIdentities.count == selected.count else {
-            return L("应用或残留文件已变化，请重新查找后再清理")
+            return AppOrphanLeftoverScanner.changedBeforeTrash(localize: { L($0) })
         }
         report(AppOrphanLeftoverScanner.trashingProgressMessageKey)
         let selectedForTrash = selected
@@ -524,20 +521,17 @@ enum UninstallCoordinator {
             if moved.trashed.isEmpty {
                 return L(AppOrphanLeftoverScanner.cancelledMessageKey)
             }
-            return String(
-                format: L("已取消；已移走 %d 项，其余保留"),
-                moved.trashed.count
+            // ORPHAN-LEFTOVER-RESULT-TOAST-01
+            return AppOrphanLeftoverScanner.cancelledPartialMessage(
+                trashedCount: moved.trashed.count,
+                localize: { L($0) }
             )
         }
-        if moved.failed.isEmpty {
-            return String(format: L("已把 %d 项残留文件移到废纸篓，可在废纸篓中放回原处"), moved.trashed.count)
-        }
-        let names = moved.failed.prefix(3).map { $0.url.lastPathComponent }.joined(separator: ", ")
-        return String(
-            format: L("已移走 %d 项，%d 项失败（仍在原处）：%@"),
-            moved.trashed.count,
-            moved.failed.count,
-            names
+        // ORPHAN-LEFTOVER-RESULT-TOAST-01
+        return AppOrphanLeftoverScanner.trashOutcomeMessage(
+            trashedCount: moved.trashed.count,
+            failedLastPathComponents: moved.failed.map { $0.url.lastPathComponent },
+            localize: { L($0) }
         )
     }
 
@@ -571,5 +565,177 @@ enum UninstallCoordinator {
             in: report,
             registeredURLs: registered
         )
+    }
+
+    // MARK: - Batch uninstall (BATCH-UNINSTALL-WIRE-01)
+
+    /// One confirmation, then sequential quit + trash-only (no related-file
+    /// sheets). Must not be called while paging; host dismiss guards still apply.
+    static func promptToBatchUninstall(
+        _ plan: AppBatchUninstallPlan,
+        host: UninstallHost
+    ) async {
+        guard host.acceptsIconContextMenuAction(), !host.isPromptingForUninstall else { return }
+        guard plan.menuPresentation == .enabled, !plan.eligibleCandidates.isEmpty else {
+            if case .disabled(let key) = plan.menuPresentation, let key {
+                toast(host, L(key))
+            }
+            return
+        }
+
+        host.isPromptingForUninstall = true
+        defer {
+            host.isPromptingForUninstall = false
+            if AppRelatedFileScanner.relatedCleanupRestoresLauncherFocusAfterSheet {
+                host.restoreFocusAfterUninstallSheet()
+            }
+        }
+
+        // BATCH-UNINSTALL-CONFIRM-COPY-01: Core owns confirm informative copy.
+        let anyRunning = plan.eligibleCandidates.contains { !runningApplications(matching: $0).isEmpty }
+        let info = plan.confirmInformativeText(localize: { L($0) }, anyRunning: anyRunning)
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = String(
+            format: L(AppBatchUninstallPlan.confirmTitleFormatKey),
+            plan.eligibleIDs.count
+        )
+        alert.informativeText = info
+        // Cancel first: Return/Esc stay safe. BATCH-UNINSTALL-CONFIRM-BUTTONS-01
+        alert.addButton(withTitle: AppBatchUninstallPlan.confirmCancelButtonTitle(localize: { L($0) }))
+        let trashTitle = AppBatchUninstallPlan.confirmDestructiveButtonTitle(anyRunning: anyRunning, localize: { L($0) })
+        let trash = alert.addButton(withTitle: trashTitle)
+        trash.hasDestructiveAction = true
+        alert.layout()
+
+        guard alert.runModal() == .alertSecondButtonReturn, !Task.isCancelled else { return }
+        guard host.acceptsIconContextMenuAction(), host.isLayoutEditingEnabled else { return }
+
+        var succeeded = 0
+        var failed = 0
+        let total = plan.eligibleCandidates.count
+        for (index, candidate) in plan.eligibleCandidates.enumerated() {
+            guard !Task.isCancelled, host.acceptsIconContextMenuAction(), host.isLayoutEditingEnabled else {
+                break
+            }
+            // BATCH-UNINSTALL-PROGRESS-NAME-01
+            let progress = AppBatchUninstallPlan.progressToastMessage(
+                index: index + 1,
+                total: total,
+                appName: host.displayName(for: candidate),
+                localize: { L($0) }
+            )
+            toast(host, progress, autoDismiss: false)
+
+            let decision = uninstallDecision(for: candidate, host: host)
+            guard decision.isAllowed,
+                  let bundleIdentity = AppUninstallEligibility.captureBundleIdentity(of: candidate) else {
+                clearMatchingProgressToast(host, progress)
+                failed += 1
+                continue
+            }
+
+            let running = runningApplications(matching: candidate)
+            if !running.isEmpty {
+                let quittingMessage = L(AppUninstallQuitProgress.quittingMessageKey)
+                toast(host, quittingMessage, help: L(AppUninstallQuitProgress.quittingAccessibilityHelpKey), autoDismiss: false)
+                let quitOK = await quitRunningApplications(running)
+                clearMatchingProgressToast(host, quittingMessage)
+                guard !Task.isCancelled, host.acceptsIconContextMenuAction(), host.isLayoutEditingEnabled else {
+                    break
+                }
+                if !quitOK {
+                    guard confirmForceQuitBeforeUninstall() else {
+                        failed += 1
+                        continue
+                    }
+                    guard !Task.isCancelled, host.acceptsIconContextMenuAction(), host.isLayoutEditingEnabled else {
+                        break
+                    }
+                    let forceOK = await forceQuitRunningApplications(running)
+                    guard !Task.isCancelled, host.acceptsIconContextMenuAction(), host.isLayoutEditingEnabled else {
+                        break
+                    }
+                    guard forceOK, runningApplications(matching: candidate).isEmpty else {
+                        failed += 1
+                        continue
+                    }
+                }
+            }
+
+            let recheck = uninstallDecision(for: candidate, host: host)
+            guard recheck.isAllowed,
+                  AppUninstallEligibility.matchesBundleIdentity(bundleIdentity, of: candidate) else {
+                clearMatchingProgressToast(host, progress)
+                failed += 1
+                continue
+            }
+
+            // UNINSTALL-BATCH-OTHER-COPY-01: same other-copy probe as the single
+            // path, before trashing, so a surviving copy keeps its layout state.
+            let otherCopy = await hasOtherInstalledCopy(of: candidate, host: host)
+            guard !Task.isCancelled, host.acceptsIconContextMenuAction(), host.isLayoutEditingEnabled else {
+                clearMatchingProgressToast(host, progress)
+                break
+            }
+            guard AppUninstallEligibility.matchesBundleIdentity(bundleIdentity, of: candidate) else {
+                clearMatchingProgressToast(host, progress)
+                failed += 1
+                continue
+            }
+
+            toast(host, progress, autoDismiss: false)
+            let home = FileManager.default.homeDirectoryForCurrentUser
+            let identityForTrash = bundleIdentity
+            let candidateForTrash = candidate
+            let trashTask = Task.detached(priority: .utility) {
+                AppUninstallExecutor.perform(
+                    bundleURL: candidateForTrash.canonicalURL,
+                    related: [],
+                    homeDirectory: home,
+                    expectedIdentity: identityForTrash,
+                    expectedRelatedIdentities: [],
+                    candidate: candidateForTrash,
+                    fileManager: FileManager(),
+                    isCancelled: { Task.isCancelled }
+                )
+            }
+            let report = await withTaskCancellationHandler {
+                await trashTask.value
+            } onCancel: {
+                trashTask.cancel()
+            }
+            clearMatchingProgressToast(host, progress)
+            guard !Task.isCancelled else { break }
+            switch report.outcome {
+            case .bundleFailed:
+                failed += 1
+            case .bundleOnly, .bundleAndAllRelated, .partialRelated:
+                host.applySuccessfulUninstall(
+                    of: candidate,
+                    otherCopyMayExist: AppUninstallEligibility.otherCopyMayExistAfterUninstall(probe: otherCopy)
+                )
+                succeeded += 1
+            }
+        }
+
+        host.requestCatalogReloadAfterUninstall()
+        guard !Task.isCancelled else { return }
+        // BATCH-UNINSTALL-RESULT-TOAST-01 / BATCH-UNINSTALL-REMAINING-01
+        let unprocessed = AppBatchUninstallPlan.unprocessedCount(
+            total: total,
+            succeeded: succeeded,
+            failed: failed
+        )
+        let result = AppBatchUninstallPlan.resultToast(
+            succeeded: succeeded,
+            failed: failed,
+            unprocessed: unprocessed
+        )
+        if let message = result.message(localize: { L($0) }) {
+            let help = result == .success(count: succeeded) ? L(AppUninstallReport.undoHintKey) : nil
+            toast(host, message, help: help, autoDismiss: result.autoDismiss)
+        }
     }
 }

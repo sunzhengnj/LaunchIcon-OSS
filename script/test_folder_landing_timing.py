@@ -1463,8 +1463,13 @@ def search_count_label_fades_with_status_chrome(direct: str, core: str) -> str |
         return "adjacent chrome helper missing folderClosing source"
     if "folderOpen: folderOpen" not in helper or "folderClosing: folderClosing" not in helper:
         return "adjacent chrome helper must pass folderOpen/folderClosing into Core"
-    if "个结果" not in helper or "个项目" not in helper:
-        return "count helper missing results/items formats"
+    # SEARCH-FIELD-CHROME-01: formats live in Core SearchFieldChromeCopy.
+    if "LauncherLayout.SearchFieldChromeCopy.resultsCountText" not in helper:
+        return "count helper missing SearchFieldChromeCopy.resultsCountText"
+    if "LauncherLayout.SearchFieldChromeCopy.itemsCountText" not in helper:
+        return "count helper missing SearchFieldChromeCopy.itemsCountText"
+    if 'resultsFormatKey = "%d 个结果"' not in core or 'itemsFormatKey = "%d 个项目"' not in core:
+        return "Core SearchFieldChromeCopy missing results/items formats"
     if "case nil:" not in helper:
         return "count helper must hide when kind is nil"
     open_fn = direct[direct.index("private func openFolder(_ id: UUID)"):direct.index("private func openFolder(_ id: UUID)") + 1200]
@@ -1660,7 +1665,7 @@ def settings_a11y_keyboard(core: str) -> str | None:
     for need in ("class SettingsWindow: NSWindow", "cancelOperation", "settingsEscapeClosesWindow",
                  "initialFirstResponder", "settingsMessageShouldAnnounce", "announcementRequested",
                  "settingsShouldMoveFocusAfterRestore", "makeFirstResponder(rescanButton)",
-                 "恢复所选应用"):
+                 "SettingsHiddenAppsChromeCopy.restoreAccessibilityLabel"):
         if need not in st:
             return f"settings missing {need}"
     if "SettingsWindow(" not in st:
@@ -1686,3 +1691,4 @@ with tempfile.TemporaryDirectory(prefix="LaunchIcon-LandingTiming-") as director
                     str(harness), "-o", str(executable)], check=True)
     result = subprocess.run([str(executable)], check=False)
     sys.exit(result.returncode)
+

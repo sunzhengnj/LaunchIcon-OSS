@@ -96,7 +96,7 @@ need("testBatchCreateFolderFromSelectionDropOntoAppSamePageOnly" in tests,
      "Core batch-create-folder test missing")
 need("batchCreateFolderApps" in direct, "Direct missing batch create-folder drop branch")
 bc = direct.index("let batchCreateFolderApps")
-need("createFolderFromTopLevelApps" in direct[bc:bc + 2000],
+need("createFolderFromTopLevelApps" in direct[bc:bc + 4000],
      "Direct batch-create must call createFolderFromTopLevelApps")
 
 need("moveTopLevelApps" in core, "Core missing moveTopLevelApps into folder")
@@ -110,14 +110,19 @@ need("batchIntoFolder" in direct or "moveTopLevelApps(" in direct,
 need("pageAnimationDuration" not in direct[direct.index("batchIntoFolder"):direct.index("batchIntoFolder")+1200]
      if "batchIntoFolder" in direct else True,
      "batch-into-folder block must not touch pageAnimationDuration")
-drop_idx = direct.index("let batchIntoFolder")
-drop_chunk = direct[drop_idx:drop_idx + 7500]
+drop_idx = direct.index("let batchReorderIDs") if "let batchReorderIDs" in direct else direct.index("let batchIntoFolder")
+drop_chunk = direct[drop_idx:drop_idx + 9000]
 need("showPage" not in drop_chunk.split("commitLayout(next)")[0],
      "batch branch setup must not call showPage before commit")
 need("batchCreateFolderApps" in drop_chunk, "applyDrop must consider batch create-folder")
 need("itemSelection.clear()" in drop_chunk, "batch multi-select drop must clear selection")
-need("batchIntoFolder != nil || batchCreateFolderApps != nil" in drop_chunk,
-     "clear selection after either batch drop path")
+need(
+    "batchReorderIDs != nil || batchIntoFolder != nil || batchCreateFolderApps != nil" in drop_chunk
+    or "batchIntoFolder != nil || batchCreateFolderApps != nil" in drop_chunk,
+    "clear selection after batch drop paths (reorder/folder/create)",
+)
+need("shouldBatchReorderSelection" in drop_chunk or "batchReorderIDs" in drop_chunk,
+     "applyDrop must consider same-page batch reorder")
 
 need("selectingAll" in core, "Core missing selectingAll")
 need("itemIDs(onPage" in core, "Core missing itemIDs(onPage:)")
@@ -134,6 +139,13 @@ need("itemIDs(onPage: currentPage" in chunk, "select-all must use current page i
 esc = direct.index("func handleEscape()")
 esc_chunk = direct[esc:esc + 900]
 need("itemSelection.clear()" in esc_chunk, "Escape should clear multi-select when non-empty")
+
+
+need("onBatchUninstallSelection" in direct, "Direct tile missing batch uninstall callback")
+need("promptToBatchUninstall" in (root / "Sources/Direct/UninstallCoordinator.swift").read_text(),
+     "Coordinator missing promptToBatchUninstall")
+need("AppBatchUninstallPlan" in core or "AppBatchUninstallPlan" in (root / "Sources/Core/AppUninstallEligibility.swift").read_text(),
+     "Core missing AppBatchUninstallPlan")
 
 if failures:
     for f in failures:

@@ -33,7 +33,10 @@ need("await UninstallCoordinator.cleanUpOrphanLeftovers" in direct, "LWC must fo
 
 need("Task.detached" in prompt and "AppUninstallExecutor.perform(" in prompt, "promptToUninstall must Task.detached perform")
 need("expectedIdentity:" in prompt and "candidate:" in prompt, "promptToUninstall must pass identity into perform")
-need("正在移到废纸篓" in prompt, "promptToUninstall should show trash progress toast")
+need(
+    "AppUninstallTrashProgress" in prompt or "trashingProgressMessageKey" in prompt or "正在移到废纸篓" in prompt,
+    "promptToUninstall should show trash progress toast",
+)
 sync_hits = [line for line in prompt.splitlines() if "AppUninstallExecutor.perform(" in line]
 need(len(sync_hits) == 1, f"expected one perform call in prompt, found {len(sync_hits)}")
 need(prompt.index("Task.detached") < prompt.index("AppUninstallExecutor.perform("), "perform must follow Task.detached")

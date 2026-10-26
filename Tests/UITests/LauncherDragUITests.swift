@@ -238,9 +238,9 @@ final class LauncherDragUITests: XCTestCase {
 
             app.buttons["文件夹 新建文件夹"].click()
             let title = app.textFields["文件夹名称"]
-            XCTAssertTrue(title.waitForExistence(timeout: 5))
-            title.click()
-            app.typeKey("a", modifierFlags: .command)
+            beginFolderRename(title)
+            // Begin-edit already selects all (folderTitleSelectsAllOnBeginEditing).
+            // app.typeKey(⌘A) under UI Automation can miss the field editor.
             title.typeText("日常工具")
             title.typeKey(XCUIKeyboardKey.return, modifierFlags: [])
 
@@ -554,10 +554,12 @@ final class LauncherDragUITests: XCTestCase {
             let calculator = app.buttons["计算器"]
             XCTAssertTrue(calculator.waitForExistence(timeout: 15))
             calculator.rightClick()
-            XCTAssertFalse(
-                app.menuItems["卸载应用…"].waitForExistence(timeout: 1),
-                "Read-only incomplete scan must hide uninstall"
-            )
+            // Since 4d59235 the item stays (disabled, with the read-only
+            // reason as help) so VoiceOver can explain why it is unavailable.
+            let uninstall = app.menuItems["卸载应用…"]
+            if uninstall.waitForExistence(timeout: 1) {
+                XCTAssertFalse(uninstall.isEnabled, "Read-only incomplete scan must not enable uninstall")
+            }
             XCTAssertFalse(app.menuItems["设置别名…"].exists)
             XCTAssertFalse(app.menuItems["隐藏应用"].exists)
         }
@@ -698,9 +700,9 @@ final class LauncherDragUITests: XCTestCase {
             try FileManager.default.moveItem(at: preserved, to: layout)
             app.buttons["文件夹 新建文件夹"].click()
             let title = app.textFields["文件夹名称"]
-            XCTAssertTrue(title.waitForExistence(timeout: 5))
-            title.click()
-            app.typeKey("a", modifierFlags: .command)
+            beginFolderRename(title)
+            // Begin-edit already selects all (folderTitleSelectsAllOnBeginEditing).
+            // app.typeKey(⌘A) under UI Automation can miss the field editor.
             title.typeText("恢复测试")
             title.typeKey(XCUIKeyboardKey.return, modifierFlags: [])
             let saved = expectation(
@@ -1161,9 +1163,9 @@ final class LauncherDragUITests: XCTestCase {
 
         folder.click()
         let title = app.textFields["文件夹名称"]
-        XCTAssertTrue(title.waitForExistence(timeout: 5))
-        title.click()
-        app.typeKey("a", modifierFlags: .command)
+        beginFolderRename(title)
+        // Begin-edit already selects all (folderTitleSelectsAllOnBeginEditing).
+        // app.typeKey(⌘A) under UI Automation can miss the field editor.
         title.typeText("日常工具")
         app.typeKey(XCUIKeyboardKey.return, modifierFlags: [])
         app.buttons["关闭文件夹"].click()
@@ -1171,11 +1173,12 @@ final class LauncherDragUITests: XCTestCase {
         let renamed = app.buttons["文件夹 日常工具"]
         XCTAssertTrue(renamed.waitForExistence(timeout: 5))
         renamed.click()
-        title.click()
+        beginFolderRename(title)
         app.typeKey(XCUIKeyboardKey.tab, modifierFlags: [])
         XCTAssertEqual(title.value as? String, "日常工具")
-        title.click()
-        app.typeKey("a", modifierFlags: .command)
+        beginFolderRename(title)
+        // Begin-edit already selects all (folderTitleSelectsAllOnBeginEditing).
+        // app.typeKey(⌘A) under UI Automation can miss the field editor.
         title.typeText("DiscardReleaseDraft")
         app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
         XCTAssertEqual(title.value as? String, "日常工具")
@@ -1263,7 +1266,7 @@ final class LauncherDragUITests: XCTestCase {
 
             search.click()
             search.typeText("Calculator")
-            XCTAssertTrue(app.staticTexts["Esc 清除搜索"].waitForExistence(timeout: 5))
+            XCTAssertTrue(app.staticTexts["按 Esc 清除搜索"].waitForExistence(timeout: 5))
             XCTAssertFalse(app.staticTexts["拖拽整理 · 悬停左右边缘跨页"].exists)
             XCTAssertFalse(app.staticTexts["← → 翻页 · Esc 返回"].exists)
         }
@@ -1486,8 +1489,7 @@ final class LauncherDragUITests: XCTestCase {
 
             app.buttons["文件夹 新建文件夹"].click()
             let title = app.textFields["文件夹名称"]
-            XCTAssertTrue(title.waitForExistence(timeout: 5))
-            title.click()
+            beginFolderRename(title)
             title.typeText("草稿")
             app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
 
@@ -1508,9 +1510,9 @@ final class LauncherDragUITests: XCTestCase {
 
             app.buttons["文件夹 新建文件夹"].click()
             let title = app.textFields["文件夹名称"]
-            XCTAssertTrue(title.waitForExistence(timeout: 5))
-            title.click()
-            app.typeKey("a", modifierFlags: .command)
+            beginFolderRename(title)
+            // Begin-edit already selects all (folderTitleSelectsAllOnBeginEditing).
+            // app.typeKey(⌘A) under UI Automation can miss the field editor.
             title.typeText("日常工具")
             app.typeKey(XCUIKeyboardKey.return, modifierFlags: [])
             app.buttons["关闭文件夹"].click()
@@ -1518,7 +1520,8 @@ final class LauncherDragUITests: XCTestCase {
             let search = app.searchFields["搜索应用"]
             search.click()
             search.typeText("Calculator")
-            XCTAssertTrue(app.buttons["计算器"].waitForExistence(timeout: 5))
+            // Folder members in search results carry their folder as context.
+            XCTAssertTrue(app.buttons["计算器，文件夹 日常工具"].waitForExistence(timeout: 5))
             XCTAssertFalse(app.buttons["时钟"].exists)
             app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
             let renamed = app.buttons["文件夹 日常工具"]
@@ -1543,9 +1546,9 @@ final class LauncherDragUITests: XCTestCase {
 
             app.buttons["文件夹 新建文件夹"].click()
             let title = app.textFields["文件夹名称"]
-            XCTAssertTrue(title.waitForExistence(timeout: 5))
-            title.click()
-            app.typeKey("a", modifierFlags: .command)
+            beginFolderRename(title)
+            // Begin-edit already selects all (folderTitleSelectsAllOnBeginEditing).
+            // app.typeKey(⌘A) under UI Automation can miss the field editor.
             title.typeText("UncommittedFolderDraft")
             XCTAssertEqual(title.value as? String, "UncommittedFolderDraft")
 
@@ -1642,7 +1645,11 @@ final class LauncherDragUITests: XCTestCase {
             XCTAssertFalse(app.buttons["计算器"].exists)
             app.searchFields["搜索应用"].click()
             app.typeText("NoSuchApp")
-            XCTAssertTrue(app.staticTexts["未找到匹配的应用，按 Esc 清除搜索"].waitForExistence(timeout: 5))
+            // No-match copy now lives in the grid area (09cc55d, PRD).
+            let noMatches = app.otherElements["search.empty"]
+            XCTAssertTrue(noMatches.waitForExistence(timeout: 5))
+            XCTAssertEqual(noMatches.label, "未找到匹配的应用")
+            XCTAssertTrue(noMatches.staticTexts["按 Esc 清除搜索"].exists)
             app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
             XCTAssertTrue(app.buttons["Fixture 34"].waitForExistence(timeout: 5))
 
@@ -1780,7 +1787,7 @@ final class LauncherDragUITests: XCTestCase {
             search.typeText("Fixture 34")
             XCTAssertTrue(app.buttons["Fixture 34"].waitForExistence(timeout: 5))
             let clear = search.buttons.matching(
-                NSPredicate(format: "label IN %@", ["cancel", "Cancel", "取消"])
+                NSPredicate(format: "label IN %@", ["清除搜索", "cancel", "Cancel", "取消"])
             ).firstMatch
             XCTAssertTrue(clear.waitForExistence(timeout: 5))
             clear.click()
@@ -1938,6 +1945,48 @@ final class LauncherDragUITests: XCTestCase {
         XCTAssertTrue(calculator.waitForExistence(timeout: 15))
         XCTAssertTrue(clock.waitForExistence(timeout: 15))
         calculator.click(forDuration: 0.3, thenDragTo: clock)
+    }
+
+    /// Pointer rename requires clickCount ≥ 2 (74114f3). A single AX click
+    /// synthesizes mouseDown with clickCount 1 and never opens the field editor.
+    /// Retry until the field editor has keyboard focus — open chrome landing
+    /// and UI Automation focus handoff can miss a single double-click.
+    /// macOS XCUIElement has no `hasKeyboardFocus` Swift property; use KVC /
+    /// NSPredicate instead.
+    @MainActor
+    private func beginFolderRename(_ title: XCUIElement) {
+        XCTAssertTrue(title.waitForExistence(timeout: 5))
+        let hittable = expectation(
+            for: NSPredicate(format: "isHittable == YES"),
+            evaluatedWith: title,
+            handler: nil
+        )
+        _ = XCTWaiter.wait(for: [hittable], timeout: 3)
+        // One double-click opens the editor (product reconstructs clickCount==1
+        // pairs under UI Automation). Wait for AX keyboard focus — product
+        // publishes focus on the TextField while the field editor is up
+        // (FOLDER-TITLE-AM-BEGIN-01). One extra double-click only if the first
+        // miss left the field still unfocused (chrome lag).
+        // Fixtures enable single-click rename begin (LAUNCHICON_TEST_LAYOUT_PATH).
+        // Prefer click; fall back to doubleClick for older product builds.
+        title.click()
+        let focused = expectation(
+            for: NSPredicate(format: "hasKeyboardFocus == true"),
+            evaluatedWith: title,
+            handler: nil
+        )
+        if XCTWaiter.wait(for: [focused], timeout: 1.2) != .completed {
+            title.doubleClick()
+            let focusedRetry = expectation(
+                for: NSPredicate(format: "hasKeyboardFocus == true"),
+                evaluatedWith: title,
+                handler: nil
+            )
+            _ = XCTWaiter.wait(for: [focusedRetry], timeout: 1.2)
+        }
+        if (title.value(forKey: "hasKeyboardFocus") as? Bool) == true {
+            title.typeKey("a", modifierFlags: .command)
+        }
     }
 
     @MainActor

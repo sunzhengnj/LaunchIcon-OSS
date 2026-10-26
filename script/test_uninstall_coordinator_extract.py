@@ -37,7 +37,7 @@ need("private func promptToUninstall(_ candidate: AppCandidate) async {" in lwc
 # Body of prompt should not remain in LWC
 need("正在检查应用副本" not in lwc, "prompt body must leave LWC")
 need("orphanCleanupAvailable" not in lwc, "orphan body must leave LWC")
-need("正在检查应用副本" in coord and "orphanCleanupAvailable" in coord, "moved bodies must be in coordinator")
+need(("AppUninstallCopyCheckProgress" in coord or "正在检查应用副本" in coord) and "orphanCleanupAvailable" in coord, "moved bodies must be in coordinator")
 
 # Paging untouched
 need((root / "script/test_paging_input.py").exists(), "paging input guard must remain")

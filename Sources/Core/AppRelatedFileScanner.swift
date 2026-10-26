@@ -294,6 +294,21 @@ public enum AppRelatedFileScanner {
     /// Informative copy for the single-app related-files sheet (aligned with orphans).
     public static let relatedCleanupReviewMessageKey =
         "默认不选。请确认路径并勾选要移到废纸篓的项目；未登记且未运行的根外副本可能无法发现。"
+    /// RELATED-CLEANUP-CONFIRM-COPY-01 — checklist alert title (app name filled in).
+    public static let relatedCleanupConfirmTitleFormatKey = "选择要清理的“%@”相关文件"
+
+    public static func relatedCleanupConfirmTitle(
+        appName: String,
+        localize: (String) -> String = { $0 }
+    ) -> String {
+        String(format: localize(relatedCleanupConfirmTitleFormatKey), appName)
+    }
+
+    public static func relatedCleanupReviewMessage(
+        localize: (String) -> String = { $0 }
+    ) -> String {
+        localize(relatedCleanupReviewMessageKey)
+    }
 
     public static func relatedCleanupConfirmEnabled(selectedCount: Int) -> Bool {
         selectedCount > 0
@@ -426,6 +441,79 @@ public enum AppOrphanLeftoverScanner {
     public static let scanningProgressMessageKey = "正在查找残留文件…"
     public static let trashingProgressMessageKey = "正在移到废纸篓…"
     public static let recheckingProgressMessageKey = "正在确认安装状态…"
+    /// ORPHAN-LEFTOVER-CONFIRM-COPY-01 — checklist alert title / body.
+    public static let confirmTitleKey = "清理已卸载应用的残留文件"
+    public static let confirmInformativeKey =
+        "这些项目可能属于已卸载的应用。默认不选；请确认路径并勾选要移到废纸篓的项目。"
+
+    public static func confirmTitle(localize: (String) -> String = { $0 }) -> String {
+        localize(confirmTitleKey)
+    }
+
+    public static func confirmInformativeText(localize: (String) -> String = { $0 }) -> String {
+        localize(confirmInformativeKey)
+    }
+
+    /// ORPHAN-LEFTOVER-RESULT-TOAST-01 — post-checklist outcome copy.
+    public static let catalogUnavailableKey = "无法确认应用安装状态，请稍后重试"
+    public static let changedBeforeTrashKey = "应用或残留文件已变化，请重新查找后再清理"
+    public static let successFormatKey = "已把 %d 项残留文件移到废纸篓，可在废纸篓中放回原处"
+    public static let cancelledPartialFormatKey = "已取消；已移走 %d 项，其余保留"
+    public static let partialFailFormatKey = "已移走 %d 项，%d 项失败（仍在原处）：%@"
+    public static let failedNameListLimit = 3
+    public static let failedNameSeparator = ", "
+
+    public static func catalogUnavailable(localize: (String) -> String = { $0 }) -> String {
+        localize(catalogUnavailableKey)
+    }
+
+    public static func changedBeforeTrash(localize: (String) -> String = { $0 }) -> String {
+        localize(changedBeforeTrashKey)
+    }
+
+    public static func successMessage(
+        trashedCount: Int,
+        localize: (String) -> String = { $0 }
+    ) -> String {
+        String(format: localize(successFormatKey), trashedCount)
+    }
+
+    public static func cancelledPartialMessage(
+        trashedCount: Int,
+        localize: (String) -> String = { $0 }
+    ) -> String {
+        String(format: localize(cancelledPartialFormatKey), trashedCount)
+    }
+
+    public static func partialFailMessage(
+        trashedCount: Int,
+        failedNames: [String],
+        localize: (String) -> String = { $0 }
+    ) -> String {
+        let names = failedNames.prefix(failedNameListLimit).joined(separator: failedNameSeparator)
+        return String(
+            format: localize(partialFailFormatKey),
+            trashedCount,
+            failedNames.count,
+            names
+        )
+    }
+
+    /// Final toast after trash: empty-fail → success; otherwise partial with names.
+    public static func trashOutcomeMessage(
+        trashedCount: Int,
+        failedLastPathComponents: [String],
+        localize: (String) -> String = { $0 }
+    ) -> String {
+        if failedLastPathComponents.isEmpty {
+            return successMessage(trashedCount: trashedCount, localize: localize)
+        }
+        return partialFailMessage(
+            trashedCount: trashedCount,
+            failedNames: failedLastPathComponents,
+            localize: localize
+        )
+    }
 
     private static let categories: [(String, String, AppRelatedFileCandidate.Kind)] = [
         ("Application Support", "", .applicationSupport),

@@ -724,6 +724,30 @@ public enum HotKeyRegistrationError: Error, Equatable {
     case registrationFailed(OSStatus)
 }
 
+public struct CarbonHotKeyChord: Equatable, Sendable {
+    public let keyCode: UInt32
+    public let modifiers: UInt32
+}
+
+public extension LauncherShortcut {
+    /// Chord passed to Carbon `RegisterEventHotKey`. Space presets stay on
+    /// `kVK_Space`. F4 is virtual key `kVK_F4` with no modifiers. This does not
+    /// capture a media key: if macOS maps that key to a special feature, the
+    /// user needs standard function keys or fn.
+    static func carbonChord(for shortcut: LauncherShortcut) -> CarbonHotKeyChord {
+        switch shortcut {
+        case .optionSpace:
+            return CarbonHotKeyChord(keyCode: UInt32(kVK_Space), modifiers: UInt32(optionKey))
+        case .optionShiftSpace:
+            return CarbonHotKeyChord(keyCode: UInt32(kVK_Space), modifiers: UInt32(optionKey | shiftKey))
+        case .controlShiftSpace:
+            return CarbonHotKeyChord(keyCode: UInt32(kVK_Space), modifiers: UInt32(controlKey | shiftKey))
+        case .f4:
+            return CarbonHotKeyChord(keyCode: UInt32(kVK_F4), modifiers: 0)
+        }
+    }
+}
+
 public final class CarbonGlobalHotKeyService: GlobalHotKeyRegistering {
     private var hotKey: EventHotKeyRef?
     private var handler: EventHandlerRef?
@@ -769,15 +793,10 @@ public final class CarbonGlobalHotKeyService: GlobalHotKeyRegistering {
         let identifier = EventHotKeyID(signature: OSType(0x4C49434E), id: nextIdentifier)
         nextIdentifier &+= 1
         var replacement: EventHotKeyRef?
-        let modifiers: UInt32
-        switch shortcut {
-        case .optionSpace: modifiers = UInt32(optionKey)
-        case .optionShiftSpace: modifiers = UInt32(optionKey | shiftKey)
-        case .controlShiftSpace: modifiers = UInt32(controlKey | shiftKey)
-        }
+        let chord = LauncherShortcut.carbonChord(for: shortcut)
         let hotKeyStatus = RegisterEventHotKey(
-            UInt32(kVK_Space),
-            modifiers,
+            chord.keyCode,
+            chord.modifiers,
             identifier,
             GetApplicationEventTarget(),
             0,
@@ -800,5 +819,197 @@ public final class CarbonGlobalHotKeyService: GlobalHotKeyRegistering {
         handler = nil
         onPressed = nil
         registeredShortcut = nil
+    }
+}
+
+public extension IconColorSample {
+    /// Dominant-ish color of an icon: rendered at 16×16 in sRGB, transparent
+    /// pixels skipped, each pixel weighted by its saturation so a colorful
+    /// glyph on a white plate still reads as its color. nil when the image
+    /// has no opaque pixels or cannot be rendered.
+    static func sample(of image: NSImage) -> IconColorSample? {
+        let side = 16
+        guard let bitmap = NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: side, pixelsHigh: side,
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: side * 4, bitsPerPixel: 32
+        ), let context = NSGraphicsContext(bitmapImageRep: bitmap) else { return nil }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        image.draw(in: NSRect(x: 0, y: 0, width: side, height: side), from: .zero, operation: .copy, fraction: 1)
+        NSGraphicsContext.restoreGraphicsState()
+        guard let data = bitmap.bitmapData else { return nil }
+        var red = 0.0, green = 0.0, blue = 0.0, total = 0.0
+        for index in 0..<(side * side) {
+            let alpha = Double(data[index * 4 + 3]) / 255
+            guard alpha >= 0.5 else { continue }
+            // Un-premultiply.
+            let r = Double(data[index * 4]) / 255 / alpha
+            let g = Double(data[index * 4 + 1]) / 255 / alpha
+            let b = Double(data[index * 4 + 2]) / 255 / alpha
+            let maxC = max(r, g, b), minC = min(r, g, b)
+            let saturation = maxC > 0 ? (maxC - minC) / maxC : 0
+            let weight = 0.1 + saturation
+            red += min(r, 1) * weight
+            green += min(g, 1) * weight
+            blue += min(b, 1) * weight
+            total += weight
+        }
+        guard total > 0 else { return nil }
+        return fromRGB(red: red / total, green: green / total, blue: blue / total)
+    }
+
+    static func fromRGB(red: Double, green: Double, blue: Double) -> IconColorSample {
+        let maxC = max(red, green, blue), minC = min(red, green, blue)
+        let delta = maxC - minC
+        var hue = 0.0
+        if delta > 0 {
+            if maxC == red {
+                hue = ((green - blue) / delta).truncatingRemainder(dividingBy: 6)
+            } else if maxC == green {
+                hue = (blue - red) / delta + 2
+            } else {
+                hue = (red - green) / delta + 4
+            }
+            hue /= 6
+            if hue < 0 { hue += 1 }
+        }
+        return IconColorSample(hue: hue, saturation: maxC > 0 ? delta / maxC : 0, brightness: maxC)
+    }
+}
+
+// MARK: - Off-main icon color sampling (ICON-COLOR-SAMPLE-OFFMAIN-01)
+
+public extension IconColorSample {
+    /// Thread-safe twin of `sample(of:)`: draws into a private CGContext
+    /// (no shared NSGraphicsContext / NSImage), same 16×16 sRGB grid,
+    /// alpha cut-off, un-premultiply and saturation weighting.
+    static func sample(cgImage: CGImage) -> IconColorSample? {
+        let side = 16
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let context = CGContext(
+                  data: nil, width: side, height: side, bitsPerComponent: 8, bytesPerRow: side * 4,
+                  space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+              ) else { return nil }
+        context.clear(CGRect(x: 0, y: 0, width: side, height: side))
+        context.interpolationQuality = .medium
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: side, height: side))
+        guard let raw = context.data else { return nil }
+        let data = raw.bindMemory(to: UInt8.self, capacity: side * side * 4)
+        var red = 0.0, green = 0.0, blue = 0.0, total = 0.0
+        for index in 0..<(side * side) {
+            let alpha = Double(data[index * 4 + 3]) / 255
+            guard alpha >= 0.5 else { continue }
+            let r = Double(data[index * 4]) / 255 / alpha
+            let g = Double(data[index * 4 + 1]) / 255 / alpha
+            let b = Double(data[index * 4 + 2]) / 255 / alpha
+            let maxC = max(r, g, b), minC = min(r, g, b)
+            let saturation = maxC > 0 ? (maxC - minC) / maxC : 0
+            let weight = 0.1 + saturation
+            red += min(r, 1) * weight
+            green += min(g, 1) * weight
+            blue += min(b, 1) * weight
+            total += weight
+        }
+        guard total > 0 else { return nil }
+        return fromRGB(red: red / total, green: green / total, blue: blue / total)
+    }
+}
+
+/// Samples icon colors for the color rearrange / folder color sort without
+/// touching the main thread: each icon is fetched fresh from NSWorkspace at
+/// 32 pt (never the shared `WorkspaceIconCache` image the grid is drawing),
+/// sampled through `sample(cgImage:)` on a background task, at most
+/// `maxConcurrentSamples` at once, and memoized per bundle path for this
+/// process so a second sort is instant. Hundreds of apps no longer stall
+/// the UI; the caller applies the result on the main actor afterwards.
+public final class IconColorSampler: @unchecked Sendable {
+    public static let shared = IconColorSampler()
+    public static let maxConcurrentSamples = 4
+    /// Above this many icons still to sample, callers show a progress toast.
+    public static let progressToastThreshold = 24
+
+    private let lock = NSLock()
+    private var memo: [String: IconColorSample] = [:]
+    private var misses: Set<String> = []
+    private let imageProvider: @Sendable (AppCandidate) -> CGImage?
+
+    public convenience init() {
+        self.init { candidate in
+            autoreleasepool {
+                let image = NSWorkspace.shared.icon(forFile: candidate.canonicalURL.path)
+                var rect = NSRect(x: 0, y: 0, width: 32, height: 32)
+                return image.cgImage(forProposedRect: &rect, context: nil, hints: nil)
+            }
+        }
+    }
+
+    init(imageProvider: @escaping @Sendable (AppCandidate) -> CGImage?) {
+        self.imageProvider = imageProvider
+    }
+
+    private static func memoKey(_ candidate: AppCandidate) -> String {
+        candidate.canonicalURL.standardizedFileURL.path
+    }
+
+    /// How many of `candidates` (deduplicated) have never been sampled.
+    public func pendingCount(for candidates: [AppCandidate]) -> Int {
+        let keys = Set(candidates.map(Self.memoKey))
+        return lock.withLock { keys.filter { memo[$0] == nil && !misses.contains($0) }.count }
+    }
+
+    /// deduplicationKey → sample for every candidate that has one. Work for
+    /// unsampled icons runs in a detached task; safe to await from the main
+    /// actor (the main thread stays free while icons load).
+    public func samples(for candidates: [AppCandidate]) async -> [String: IconColorSample] {
+        var seen = Set<String>()
+        let pending: [AppCandidate] = lock.withLock {
+            candidates.filter { candidate in
+                let key = Self.memoKey(candidate)
+                guard memo[key] == nil, !misses.contains(key), seen.insert(key).inserted else { return false }
+                return true
+            }
+        }
+        if !pending.isEmpty {
+            let provider = imageProvider
+            let results: [(String, IconColorSample?)] = await Task.detached(priority: .userInitiated) {
+                await withTaskGroup(of: (String, IconColorSample?).self) { group in
+                    var collected: [(String, IconColorSample?)] = []
+                    collected.reserveCapacity(pending.count)
+                    var next = 0
+                    func enqueue() {
+                        let candidate = pending[next]
+                        next += 1
+                        group.addTask {
+                            let sample = provider(candidate).flatMap(IconColorSample.sample(cgImage:))
+                            return (Self.memoKey(candidate), sample)
+                        }
+                    }
+                    while next < min(Self.maxConcurrentSamples, pending.count) { enqueue() }
+                    while let result = await group.next() {
+                        collected.append(result)
+                        if next < pending.count { enqueue() }
+                    }
+                    return collected
+                }
+            }.value
+            lock.withLock {
+                for (key, sample) in results {
+                    if let sample { memo[key] = sample } else { misses.insert(key) }
+                }
+            }
+        }
+        return lock.withLock {
+            var out: [String: IconColorSample] = [:]
+            for candidate in candidates {
+                if let sample = memo[Self.memoKey(candidate)] { out[candidate.deduplicationKey] = sample }
+            }
+            return out
+        }
+    }
+
+    /// Forget every memoized sample (e.g. after an app update changed icons).
+    public func reset() {
+        lock.withLock { memo.removeAll(); misses.removeAll() }
     }
 }
