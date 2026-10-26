@@ -348,7 +348,7 @@ M0 不以静态原型、单元测试或单纯 build 替代真实 UI 和沙箱结
 ## 2026-10-26 preview.84 sync
 
 - Source: public PR sync from private tip `a6caf34` (build 84). Team ID stripped.
-- Background gate: run `./script/validate_background.sh` on the public checkout after this sync lands; record pass/fail below when available.
+- Background gate: `./script/validate_background.sh` **passed** on public tip `16d5440` (Core + Release analyze + UI build-for-testing + script guards; no App/UI Runner launched).
 - Full UI / physical paging / Developer ID / notarization: not claimed for this snapshot.
 - Public installer: rebuild from the public source commit after merge; do **not** reuse private DMG bytes.
 
