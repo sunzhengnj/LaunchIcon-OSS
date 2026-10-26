@@ -20,7 +20,7 @@ need("仅匹配已卸载应用" in core or "user-library" in core.lower() or "�
 need("progress:" in coord and "cleanUpOrphanLeftovers" in coord, "coordinator must accept progress")
 need("cancelledMessageKey" in coord, "coordinator must return cancelled copy")
 need("trashingProgressMessageKey" in coord, "coordinator must report trash progress")
-need("取消查找" in settings, "settings must offer cancel while running")
+need("取消查找" in settings or "SettingsMaintenanceChromeCopy.leftoversCancelTitle" in settings, "settings must offer cancel while running")
 need("running.cancel()" in settings, "settings must cancel leftoversTask on second click")
 need("AppOrphanLeftoverScanner.cancelledMessageKey" in settings, "settings must show cancelled copy")
 need("onCleanUpLeftovers" in settings and "progress" in (root / "Sources/Direct/DirectAppDelegate.swift").read_text(),

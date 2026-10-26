@@ -24,6 +24,7 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
     /// True when `showSettings` hid a visible launcher; restore on settings close.
     private var didHideLauncherToShowSettings = false
     private var statusItem: NSStatusItem?
+    private var statusMenu: NSMenu?
     private var toggleMenuItem: NSMenuItem?
 
     static func main() {
@@ -72,11 +73,19 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
         }
         launcherController = LauncherWindowController(
             catalogRoots: testRoot.map { [$0] } ?? AppCatalogScanner.standardRoots,
+            additionalAppDirectories: testRoot == nil ? preferences.additionalAppDirectories : [],
             layoutStore: layoutStore,
             testWindowSize: testWindowSize
         )
         launcherController?.hidesAfterLaunch = preferences.hidesAfterLaunch
         launcherController?.setReducesMotion(preferences.reducesMotion)
+        launcherController?.setHidesAppNames(preferences.hidesAppNames)
+        launcherController?.setHidesFolderNames(preferences.hidesFolderNames)
+        launcherController?.setDisplayTarget(preferences.displayTarget)
+        launcherController?.setBackgroundDim(preferences.backgroundDim)
+        launcherController?.setBlursBackground(preferences.blursBackground)
+        launcherController?.setReopenPageBehavior(preferences.reopenPageBehavior)
+        launcherController?.setPinchToDismissEnabled(preferences.pinchToDismiss)
         launcherController?.onSettingsRequested = { [weak self] in self?.showSettings() }
         launcherController?.onVisibilityChanged = { [weak self] in
             self?.refreshStatusItemToggleTitle()
@@ -96,6 +105,9 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
         }
         launcherController?.onCatalogReloadFinished = { [weak self] canEditLayout in
             self?.settingsController?.completeRescan(canEditLayout: canEditLayout)
+            // SETTINGS-HIDDEN-REFRESH-ON-SCAN-01: mid-scan Settings open must
+            // see hidden apps once the catalog exists (not only on becomeKey).
+            self?.settingsController?.refreshHiddenApplicationsFromLauncher()
         }
         launcherController?.onCatalogSnapshotSaveFailed = { [weak self] error in
             let nsError = error as NSError
@@ -138,8 +150,12 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
         configureHotCornerMonitor(preferences.hotCorner)
         if let shortcutError {
             showSettings()
+            // SHORTCUT-REGISTRATION-COPY-01
             settingsController?.presentShortcutRegistrationError(
-                String(format: L("无法使用呼出快捷键 %@。可能与系统或其他应用冲突，请选择其他组合；菜单栏图标仍可使用。"), preferences.shortcut.title)
+                ShortcutRegistrationCopy.bootConflictMessage(
+                    shortcutTitle: preferences.shortcut.title,
+                    localize: { L($0) }
+                )
             )
             record("Shortcut recovery shown: \(shortcutError)")
         }
@@ -206,11 +222,16 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
         let mainMenu = NSMenu()
         let appItem = NSMenuItem()
         let appMenu = NSMenu(title: "LaunchIcon")
-        let settingsItem = appMenu.addItem(withTitle: L("设置…"), action: #selector(openSettings), keyEquivalent: ",")
+        // MENU-CHROME-TITLES-01
+        let settingsItem = appMenu.addItem(
+            withTitle: LauncherLayout.MenuChromeCopy.settingsTitle(localize: { L($0) }),
+            action: #selector(openSettings),
+            keyEquivalent: ","
+        )
         settingsItem.target = self
         appMenu.addItem(.separator())
         let quitItem = appMenu.addItem(
-            withTitle: L("退出 LaunchIcon"),
+            withTitle: LauncherLayout.MenuChromeCopy.quitAppTitle(localize: { L($0) }),
             action: #selector(NSApplication.terminate(_:)),
             keyEquivalent: "q"
         )
@@ -219,9 +240,17 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
         mainMenu.addItem(appItem)
 
         let editItem = NSMenuItem()
-        let editMenu = NSMenu(title: L("编辑"))
-        editMenu.addItem(withTitle: L("全选"), action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
-        editMenu.addItem(withTitle: L("粘贴"), action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        let editMenu = NSMenu(title: LauncherLayout.MenuChromeCopy.editMenuTitle(localize: { L($0) }))
+        editMenu.addItem(
+            withTitle: LauncherLayout.MenuChromeCopy.selectAllTitle(localize: { L($0) }),
+            action: #selector(NSText.selectAll(_:)),
+            keyEquivalent: "a"
+        )
+        editMenu.addItem(
+            withTitle: LauncherLayout.MenuChromeCopy.pasteTitle(localize: { L($0) }),
+            action: #selector(NSText.paste(_:)),
+            keyEquivalent: "v"
+        )
         editItem.submenu = editMenu
         mainMenu.addItem(editItem)
         NSApplication.shared.mainMenu = mainMenu
@@ -241,29 +270,96 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
         } else {
             item.button?.title = "LI"
         }
-        item.button?.toolTip = "LaunchIcon"
+        item.button?.toolTip = L(LauncherLayout.statusItemToggleTitle(isVisible: false, isDismissing: false))
         item.button?.setAccessibilityLabel("LaunchIcon")
+        // STATUS-ITEM-CLICK-01 — left click toggles the launcher; right /
+        // Control-click opens the same menu. Do not assign `item.menu` or
+        // primary click would only open the menu.
+        item.button?.target = self
+        item.button?.action = #selector(statusItemButtonActivated(_:))
+        item.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
 
         let menu = NSMenu()
         menu.delegate = self
+        // MENU-CHROME-TITLES-01 — initial toggle title matches Core show-state.
         let toggleItem = menu.addItem(
-            withTitle: L("显示 LaunchIcon"),
+            withTitle: L(LauncherLayout.statusItemToggleTitle(isVisible: false, isDismissing: false)),
             action: #selector(toggleLauncher),
-            keyEquivalent: " "
+            keyEquivalent: menuKeyEquivalent(for: preferences.shortcut)
         )
         toggleItem.target = self
         toggleItem.keyEquivalentModifierMask = menuModifiers(for: preferences.shortcut)
-        let reloadItem = menu.addItem(withTitle: L("重新扫描"), action: #selector(reloadCatalog), keyEquivalent: "r")
+        let reloadItem = menu.addItem(
+            withTitle: LauncherLayout.MenuChromeCopy.reloadCatalogTitle(localize: { L($0) }),
+            action: #selector(reloadCatalog),
+            keyEquivalent: "r"
+        )
         reloadItem.target = self
-        let settingsItem = menu.addItem(withTitle: L("设置…"), action: #selector(openSettings), keyEquivalent: ",")
+        let settingsItem = menu.addItem(
+            withTitle: LauncherLayout.MenuChromeCopy.settingsTitle(localize: { L($0) }),
+            action: #selector(openSettings),
+            keyEquivalent: ","
+        )
         settingsItem.target = self
         menu.addItem(.separator())
-        let quitItem = menu.addItem(withTitle: L("退出"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        let quitItem = menu.addItem(
+            withTitle: LauncherLayout.MenuChromeCopy.quitTitle(localize: { L($0) }),
+            action: #selector(NSApplication.terminate(_:)),
+            keyEquivalent: "q"
+        )
         quitItem.target = NSApplication.shared
-        item.menu = menu
+        statusMenu = menu
         toggleMenuItem = toggleItem
         statusItem = item
         refreshStatusItemToggleTitle()
+    }
+
+    @MainActor
+    @objc private func statusItemButtonActivated(_ sender: Any?) {
+        let event = NSApp.currentEvent
+        let pointer = Self.statusItemPointerKind(for: event)
+        let optionDown = event?.modifierFlags.contains(.option) == true
+        switch LauncherLayout.statusItemButtonAction(for: pointer, optionDown: optionDown) {
+        case .toggle:
+            toggleLauncher()
+        case .showMenu:
+            presentStatusMenu(from: sender as? NSStatusBarButton)
+        case .openSettings:
+            openSettings()
+        }
+    }
+
+    private static func statusItemPointerKind(
+        for event: NSEvent?
+    ) -> LauncherLayout.StatusItemPointerKind {
+        guard let event else { return .primary }
+        switch event.type {
+        case .rightMouseUp, .rightMouseDown:
+            return .secondary
+        default:
+            if event.modifierFlags.contains(.control) {
+                return .secondary
+            }
+            return .primary
+        }
+    }
+
+    @MainActor
+    private func presentStatusMenu(from button: NSStatusBarButton?) {
+        guard let menu = statusMenu, let button else { return }
+        refreshStatusItemToggleTitle()
+        let point = NSPoint(x: 0, y: button.bounds.height)
+        menu.popUp(positioning: nil, at: point, in: button)
+    }
+
+    @MainActor
+    private func menuKeyEquivalent(for shortcut: LauncherShortcut) -> String {
+        switch shortcut {
+        case .optionSpace, .optionShiftSpace, .controlShiftSpace:
+            return " "
+        case .f4:
+            return String(UnicodeScalar(UInt32(NSF4FunctionKey))!)
+        }
     }
 
     @MainActor
@@ -272,6 +368,7 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
         case .optionSpace: [.option]
         case .optionShiftSpace: [.option, .shift]
         case .controlShiftSpace: [.control, .shift]
+        case .f4: []
         }
     }
 
@@ -308,22 +405,36 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
                 hotKeyRegistered = true
             case let .failure(error):
                 record("Hot key \(proposed.shortcut.title): failed: \(error)")
-                return String(format: L("无法使用快捷键 %@，可能与系统或其他应用冲突。原组合保持不变。"), proposed.shortcut.title)
+                // SHORTCUT-REGISTRATION-COPY-01
+                return ShortcutRegistrationCopy.changeConflictMessage(
+                    shortcutTitle: proposed.shortcut.title,
+                    localize: { L($0) }
+                )
             }
         }
         guard proposed.showsStatusItem || hotKeyRegistered else {
-            return L("快捷键不可用时不能隐藏菜单栏图标。")
+            return ShortcutRegistrationCopy.cannotHideStatusItem(localize: { L($0) })
         }
         preferences = proposed
         launcherController?.hidesAfterLaunch = proposed.hidesAfterLaunch
         launcherController?.setReducesMotion(proposed.reducesMotion)
+        launcherController?.setHidesAppNames(proposed.hidesAppNames)
+        launcherController?.setHidesFolderNames(proposed.hidesFolderNames)
+        launcherController?.setDisplayTarget(proposed.displayTarget)
+        launcherController?.setBackgroundDim(proposed.backgroundDim)
+        launcherController?.setBlursBackground(proposed.blursBackground)
+        launcherController?.setReopenPageBehavior(proposed.reopenPageBehavior)
+        launcherController?.setPinchToDismissEnabled(proposed.pinchToDismiss)
+        launcherController?.setAdditionalAppDirectories(proposed.additionalAppDirectories)
         configureHotCornerMonitor(proposed.hotCorner)
         if proposed.showsStatusItem {
             configureStatusItem()
+            toggleMenuItem?.keyEquivalent = menuKeyEquivalent(for: proposed.shortcut)
             toggleMenuItem?.keyEquivalentModifierMask = menuModifiers(for: proposed.shortcut)
         } else if let statusItem {
             NSStatusBar.system.removeStatusItem(statusItem)
             self.statusItem = nil
+            self.statusMenu = nil
             toggleMenuItem = nil
         }
         let previous = preferencesSaveTask
@@ -336,6 +447,8 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
 
     @MainActor
     private func showSettings() {
+        // SETTINGS-CLEAR-SELECTION-01: also covers app-menu / dock paths.
+        launcherController?.clearSelectionBeforeOpeningSettings()
         let launcherVisible = launcherController?.window?.isVisible == true
         if LauncherLayout.shouldHideLauncherToShowSettings(launcherVisible: launcherVisible) {
             launcherController?.hide(
@@ -355,6 +468,12 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
             controller.onRestoreHiddenApplication = { [weak self] key in
                 self?.launcherController?.restoreHiddenApplication(withKey: key) ?? false
             }
+            controller.hiddenApplicationsProvider = { [weak self] in
+                self?.launcherController?.hiddenApplications()
+            }
+            controller.onRestoreAllHiddenApplications = { [weak self] in
+                self?.launcherController?.restoreAllHiddenApplications()
+            }
             controller.onCleanUpLeftovers = { [weak self] progress in
                 await self?.launcherController?.cleanUpOrphanLeftovers(progress: progress)
                     ?? L(AppOrphanLeftoverScanner.incompleteScanMessageKey)
@@ -365,17 +484,37 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
             controller.onRearrangeTopLevel = { [weak self] sort in
                 self?.launcherController?.rearrangeTopLevelGrid(sort: sort) ?? false
             }
+            controller.onRearrangeByCategory = { [weak self] in
+                self?.launcherController?.rearrangeTopLevelGridByCategory() ?? false
+            }
+            controller.onRearrangeByColor = { [weak self] in
+                await self?.launcherController?.rearrangeTopLevelGridByColorAwaitingCompletion() ?? false
+            }
+            controller.onRearrangeByDate = { [weak self] kind in
+                await self?.launcherController?.rearrangeTopLevelGridByDateAwaitingCompletion(kind) ?? false
+            }
             controller.layoutBackupAvailable = { [weak self] in
                 self?.launcherController?.layoutBackupAvailable() ?? false
             }
+            controller.onAwaitLayoutPersist = { [weak self] in
+                await self?.launcherController?.awaitPendingLayoutPersist()
+            }
             controller.onExportLayout = { [weak self] url in
-                await self?.launcherController?.exportLayout(to: url) ?? L("当前无法导出布局")
+                // LAYOUT-IO-OUTCOME-COPY-01
+                await self?.launcherController?.exportLayout(to: url)
+                    ?? LauncherLayout.LayoutIOOutcomeCopy.exportUnavailable(localize: { L($0) })
             }
             controller.onImportLayout = { [weak self] url in
-                await self?.launcherController?.importLayout(from: url) ?? L("当前无法导入布局")
+                await self?.launcherController?.importLayout(from: url)
+                    ?? LauncherLayout.LayoutIOOutcomeCopy.importUnavailable(localize: { L($0) })
+            }
+            controller.onImportLaunchpadLayout = { [weak self] url in
+                await self?.launcherController?.importLaunchpadLayout(from: url)
+                    ?? LauncherLayout.LayoutIOOutcomeCopy.importUnavailable(localize: { L($0) })
             }
             controller.onRestoreLayoutBackup = { [weak self] in
-                await self?.launcherController?.restoreLastLayoutBackup() ?? L("当前无法恢复备份")
+                await self?.launcherController?.restoreLastLayoutBackup()
+                    ?? LauncherLayout.LayoutIOOutcomeCopy.restoreUnavailable(localize: { L($0) })
             }
             controller.onWindowWillClose = { [weak self] in
                 self?.settingsWindowWillClose()

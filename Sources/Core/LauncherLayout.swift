@@ -1,4 +1,5 @@
 import Foundation
+import CoreServices
 
 public enum LayoutItemRef: Hashable, Sendable {
     case topLevel(UUID)
@@ -18,6 +19,17 @@ public struct LayoutDrop: Hashable, Sendable {
     public init(source: LayoutItemRef, destination: LayoutDestination) {
         self.source = source
         self.destination = destination
+    }
+}
+
+/// One entry of the app context menu「移到文件夹」submenu.
+public struct FolderMenuTarget: Hashable, Sendable {
+    public let id: UUID
+    public let name: String
+
+    public init(id: UUID, name: String) {
+        self.id = id
+        self.name = name
     }
 }
 
@@ -540,18 +552,119 @@ public enum LauncherLayout {
 
     /// Tile accessibility help when open still works but drag/organize (and
     /// typically uninstall) is blocked by an incomplete or loading scan.
+    /// TILE-AX-HELP-L10N-01: localize each catalog key. A caller-supplied
+    /// reason is already display text and must not be looked up again.
+    public static let tileOpenAppHelpKey = "按下以打开应用"
+    public static let tileOpenFolderHelpKey = "按下以打开文件夹"
+    public static let tileOpenAppBlockedFormatKey = "按下以打开应用。%@"
+    public static let tileOpenFolderBlockedFormatKey = "按下以打开文件夹。%@"
+    public static let tileBlockedUntilScanHelpKey = "暂时无法拖动整理或卸载，请先完成扫描"
+
     public static func tileAccessibilityHelp(
         isFolder: Bool,
         layoutEditingEnabled: Bool,
-        layoutEditingExplanation: String?
+        layoutEditingExplanation: String?,
+        localize: (String) -> String = { $0 }
     ) -> String {
-        let openHelp = isFolder ? "按下以打开文件夹" : "按下以打开应用"
-        guard !layoutEditingEnabled else { return openHelp }
-        let reason = (layoutEditingExplanation ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !reason.isEmpty else {
-            return "\(openHelp)。暂时无法拖动整理或卸载，请先完成扫描"
+        if layoutEditingEnabled {
+            return localize(isFolder ? tileOpenFolderHelpKey : tileOpenAppHelpKey)
         }
-        return "\(openHelp)。\(reason)"
+        let reason = (layoutEditingExplanation ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let blocked = reason.isEmpty ? localize(tileBlockedUntilScanHelpKey) : reason
+        let format = localize(isFolder ? tileOpenFolderBlockedFormatKey : tileOpenAppBlockedFormatKey)
+        return String(format: format, blocked)
+    }
+
+    /// Context menu「在访达中显示」(LaunchOS parity: reveal the source app).
+    /// Only real on-disk `.app` bundles qualify. Folder tiles carry a synthetic
+    /// `/<uuid>` URL and must never reveal. Reveal is read-only, so it stays
+    /// available while layout editing is blocked (incomplete scan) and in search.
+    public static func revealInFinderURL(for candidate: AppCandidate, isFolder: Bool) -> URL? {
+        guard !isFolder, candidate.canonicalURL.isFileURL else { return nil }
+        let url = candidate.canonicalURL.standardizedFileURL
+        guard url.pathExtension.lowercased() == "app" else { return nil }
+        return url
+    }
+
+    /// SEARCH-CMD-RETURN-REVEAL-01 (Spotlight parity): ⌘↩ while a search is
+    /// showing reveals the highlighted (or first) **app** hit in Finder instead
+    /// of launching it. Return / Enter keypad, Command only (no Shift/Option/
+    /// Control). Folder hits and IME composition never match. Does not page.
+    public static func searchRevealShortcutMatches(
+        keyCode: UInt16,
+        commandOnly: Bool,
+        isSearching: Bool,
+        folderOpen: Bool,
+        hasMarkedText: Bool
+    ) -> Bool {
+        guard keyCode == 36 || keyCode == 76 else { return false }
+        return commandOnly && isSearching && !folderOpen && !hasMarkedText
+    }
+
+    /// Reveal hands focus to Finder; the full-screen launcher would cover the
+    /// new Finder window, so it dismisses first (same as a launch).
+    public static let revealInFinderDismissesLauncher = true
+
+    /// DOCK-DRAG-FILE-01. A layout drag of a real `.app` may also offer that
+    /// file to another app (the Dock) as a link. Folders and synthetic URLs
+    /// stay inside the launcher. This does not remove the icon or change pages.
+    public enum LayoutDragOutsideOffer: Equatable, Sendable {
+        case none
+        case linkToApp(URL)
+    }
+
+    public static func layoutDragOutsideOffer(
+        for candidate: AppCandidate?,
+        isFolder: Bool
+    ) -> LayoutDragOutsideOffer {
+        guard let candidate,
+              let url = revealInFinderURL(for: candidate, isFolder: isFolder) else {
+            return .none
+        }
+        return .linkToApp(url)
+    }
+
+    /// The Dock is hidden while the launcher is up. Reveal it only for a drag
+    /// that actually offers an app file. Menu-bar hiding stays as it is.
+    public static func shouldTemporarilyRevealDock(for offer: LayoutDragOutsideOffer) -> Bool {
+        if case .linkToApp = offer { return true }
+        return false
+    }
+
+    /// Put Dock hiding back only when the launcher is still the surface on screen.
+    public static func shouldRestoreDockHideAfterExternalDrag(
+        launcherVisible: Bool,
+        launcherDismissing: Bool
+    ) -> Bool {
+        launcherVisible && !launcherDismissing
+    }
+
+    /// Multi-select「在访达中显示」(BATCH-REVEAL-FINDER-01, Core).
+    /// Title count: BATCH-REVEAL-COUNT-01 (`batchRevealMenuTitleFormatKey`).
+    /// Returns on-disk `.app` URLs for selected **app** tiles in selection
+    /// order when `anchorID` is in a ≥2 selection. Skips folders, missing
+    /// keys, and non-qualifying candidates. Nil when selection is too small,
+    /// anchor is outside the selection, or nothing qualifies. Does not touch
+    /// layout, paging, or hidden keys.
+    public static func revealInFinderURLs(
+        selection: LauncherItemSelection,
+        anchorID: UUID,
+        in state: LayoutState,
+        candidatesByKey: [String: AppCandidate]
+    ) -> [URL]? {
+        guard selection.count >= 2, selection.contains(anchorID) else { return nil }
+        var urls: [URL] = []
+        var seen = Set<URL>()
+        for id in selection.orderedIDs {
+            guard state.folders[id] == nil,
+                  let key = state.appKeys[id],
+                  let candidate = candidatesByKey[key],
+                  let url = revealInFinderURL(for: candidate, isFolder: false),
+                  seen.insert(url).inserted
+            else { continue }
+            urls.append(url)
+        }
+        return urls.isEmpty ? nil : urls
     }
 
     /// Grid / folder collection accessibility help while editing is blocked.
@@ -689,19 +802,52 @@ public enum LauncherLayout {
     public enum SearchCountLabelKind: Equatable, Sendable {
         case results
         case items
+        /// SELECTED-COUNT-LABEL-01: multi-select non-empty on the main grid.
+        case selected
     }
 
     public static func searchCountLabelKind(
         isSearching: Bool,
         folderOpen: Bool,
-        folderClosing: Bool
+        folderClosing: Bool,
+        selectionCount: Int = 0
     ) -> SearchCountLabelKind? {
         guard searchAdjacentChromeShouldShow(
             folderOpen: folderOpen,
             folderClosing: folderClosing
         ) else { return nil }
-        return isSearching ? .results : .items
+        if isSearching { return .results }
+        // Selection chrome wins over the total-items count (main grid / folder).
+        if selectionCount > 0 { return .selected }
+        return .items
     }
+
+    /// Count-label copy for SELECTED-COUNT-LABEL-01.
+    public static let selectedCountLabelFormatKey = "已选 %d 项"
+
+    /// SELECTION-A11Y-ANNOUNCE-01: VoiceOver when multi-select count changes.
+    public static let selectionClearedAnnouncementKey = "已清除选择"
+
+    public enum SelectionAnnouncementKind: Equatable, Sendable {
+        case cleared
+        case selected(Int)
+    }
+
+    /// Returns an announcement when `newCount` differs from `previousCount`.
+    /// Clearing (→0) only announces if there was a prior selection.
+    public static func selectionAnnouncementKind(
+        previousCount: Int,
+        newCount: Int
+    ) -> SelectionAnnouncementKind? {
+        let prev = max(previousCount, 0)
+        let next = max(newCount, 0)
+        guard prev != next else { return nil }
+        if next == 0 {
+            return prev > 0 ? .cleared : nil
+        }
+        return .selected(next)
+    }
+
     public static let searchFieldHeight: CGFloat = 42
     public static let searchFieldCornerRadius: CGFloat = 21
 
@@ -1561,17 +1707,44 @@ public enum LauncherLayout {
     }
 
     /// First matching corner across displays (mouse may sit on any screen).
+    /// A corner where another display continues the desktop (the pointer
+    /// passes through it on the way to that display) is ignored, so only
+    /// real outer corners fire. A single display behaves as before.
     public static func hotCorner(
         at point: CGPoint,
         screenFrames: [CGRect],
         threshold: CGFloat = hotCornerHitThreshold
     ) -> LauncherHotCorner? {
-        for frame in screenFrames {
-            if let hit = hotCorner(at: point, screenFrame: frame, threshold: threshold) {
-                return hit
-            }
+        for (index, frame) in screenFrames.enumerated() {
+            guard let hit = hotCorner(at: point, screenFrame: frame, threshold: threshold) else { continue }
+            var others = screenFrames
+            others.remove(at: index)
+            if isHotCornerOpenToAdjacentDisplay(hit, of: frame, otherFrames: others) { continue }
+            return hit
         }
         return nil
+    }
+
+    /// True when a display touches `frame` right past `corner`, horizontally
+    /// or vertically, so the pointer is not pinned there.
+    public static func isHotCornerOpenToAdjacentDisplay(
+        _ corner: LauncherHotCorner,
+        of frame: CGRect,
+        otherFrames: [CGRect]
+    ) -> Bool {
+        guard corner.isEnabled, !otherFrames.isEmpty else { return false }
+        let probe: CGFloat = 0.5
+        let isLeft = corner == .topLeft || corner == .bottomLeft
+        let isTop = corner == .topLeft || corner == .topRight
+        let cornerX = isLeft ? frame.minX : frame.maxX
+        let cornerY = isTop ? frame.maxY : frame.minY
+        let insideX = isLeft ? cornerX + probe : cornerX - probe
+        let insideY = isTop ? cornerY - probe : cornerY + probe
+        let outsideX = isLeft ? cornerX - probe : cornerX + probe
+        let outsideY = isTop ? cornerY + probe : cornerY - probe
+        let sideways = CGPoint(x: outsideX, y: insideY)
+        let vertical = CGPoint(x: insideX, y: outsideY)
+        return otherFrames.contains { $0.contains(sideways) || $0.contains(vertical) }
     }
 
     /// Edge-trigger: fire only when the pointer newly enters `configured`.
@@ -1606,6 +1779,74 @@ public enum LauncherLayout {
     /// Menu-bar title for that same choice. The menu writes it when it opens
     /// and must write it again if show or hide happens while the menu is up.
     /// A stale「隐藏」during the fade would bring the launcher back.
+    // MARK: - Menu chrome titles (MENU-CHROME-TITLES-01)
+
+    /// App menu + status-item menu titles (not grid context menus).
+    public enum MenuChromeCopy {
+        public static let settingsTitleKey = "设置…"
+        public static let quitAppTitleKey = "退出 LaunchIcon"
+        public static let quitTitleKey = "退出"
+        public static let editMenuTitleKey = "编辑"
+        public static let selectAllTitleKey = "全选"
+        public static let pasteTitleKey = "粘贴"
+
+        public static func settingsTitle(localize: (String) -> String = { $0 }) -> String {
+            localize(settingsTitleKey)
+        }
+
+        public static func quitAppTitle(localize: (String) -> String = { $0 }) -> String {
+            localize(quitAppTitleKey)
+        }
+
+        public static func quitTitle(localize: (String) -> String = { $0 }) -> String {
+            localize(quitTitleKey)
+        }
+
+        public static func editMenuTitle(localize: (String) -> String = { $0 }) -> String {
+            localize(editMenuTitleKey)
+        }
+
+        public static func selectAllTitle(localize: (String) -> String = { $0 }) -> String {
+            localize(selectAllTitleKey)
+        }
+
+        public static func pasteTitle(localize: (String) -> String = { $0 }) -> String {
+            localize(pasteTitleKey)
+        }
+
+        /// Same label as empty-chrome / read-only rescan buttons.
+        public static func reloadCatalogTitle(localize: (String) -> String = { $0 }) -> String {
+            CatalogEmptyChromeCopy.reloadButtonTitle(localize: localize)
+        }
+    }
+
+    // STATUS-ITEM-CLICK-01 — left click toggles; right/Control-click opens menu.
+    // STATUS-ITEM-OPTION-SETTINGS-01 — Option+left click opens Settings.
+    public enum StatusItemPointerKind: Equatable, Sendable {
+        case primary
+        case secondary
+    }
+
+    public enum StatusItemButtonAction: Equatable, Sendable {
+        case toggle
+        case showMenu
+        case openSettings
+    }
+
+    public static func statusItemButtonAction(
+        for pointer: StatusItemPointerKind,
+        optionDown: Bool = false
+    ) -> StatusItemButtonAction {
+        switch pointer {
+        case .secondary:
+            return .showMenu
+        case .primary where optionDown:
+            return .openSettings
+        case .primary:
+            return .toggle
+        }
+    }
+
     public static func statusItemToggleTitle(isVisible: Bool, isDismissing: Bool) -> String {
         switch visibilityToggle(isVisible: isVisible, isDismissing: isDismissing) {
         case .show:
@@ -4021,6 +4262,50 @@ public enum LauncherLayout {
         self.entries(onPage: page, from: entries).map(\.id)
     }
 
+    public enum GridKeyboardDirection: Equatable, Sendable {
+        case left, right, up, down
+    }
+
+    /// Arrow keys only. Page Up (116) and Page Down (121) stay on the paging path.
+    public static func gridKeyboardDirection(forKeyCode keyCode: UInt16) -> GridKeyboardDirection? {
+        switch keyCode {
+        case 123: return .left
+        case 124: return .right
+        case 125: return .down
+        case 126: return .up
+        default: return nil
+        }
+    }
+
+    /// Next slot inside one grid. Nil means the edge of that grid: the caller
+    /// must not turn a page. `columns` is the row width — main grid and search
+    /// use `pageColumns`; a folder uses `folderDisplayColumns`.
+    public static func gridKeyboardNeighborSlot(
+        from slot: Int,
+        count: Int,
+        columns: Int,
+        direction: GridKeyboardDirection
+    ) -> Int? {
+        guard columns > 0, count > 0, slot >= 0, slot < count else { return nil }
+        switch direction {
+        case .left:
+            guard slot % columns != 0 else { return nil }
+            return slot - 1
+        case .right:
+            let next = slot + 1
+            guard next < count, next % columns != 0 else { return nil }
+            return next
+        case .up:
+            let next = slot - columns
+            guard next >= 0 else { return nil }
+            return next
+        case .down:
+            let next = slot + columns
+            guard next < count else { return nil }
+            return next
+        }
+    }
+
     /// Slot to focus on the destination page. `previousSlot` is nil when focus
     /// was not on a grid tile. Nil means the destination has no tile to focus.
     public static func focusSlot(previousSlot: Int?, itemCount: Int) -> Int? {
@@ -4182,6 +4467,22 @@ public enum LauncherLayout {
     ) -> CGFloat {
         let limit = max(0, documentLength - viewportLength)
         return min(max(offset, 0), limit)
+    }
+
+    /// Page Up/Down while a folder or the search list is open scrolls that list.
+    /// Nil leaves the main grid on its existing page path.
+    public enum VerticalPageKeyTarget: Equatable, Sendable {
+        case folderScroll
+        case searchScroll
+    }
+
+    public static func verticalPageKeyTarget(
+        folderOpen: Bool,
+        searching: Bool
+    ) -> VerticalPageKeyTarget? {
+        if folderOpen { return .folderScroll }
+        if searching { return .searchScroll }
+        return nil
     }
 
     /// One full viewport toward or away from the start of a scrolled list.
@@ -4463,10 +4764,112 @@ public enum LauncherLayout {
         case byName
         /// System apps first, then everything else; name within each group.
         case byKind
+
+        /// SETTINGS-REARRANGE-BUTTONS-COPY-01 — Settings button (no ellipsis).
+        public var settingsButtonTitleKey: String {
+            switch self {
+            case .byName: return "按名称排列"
+            case .byKind: return "按类型排列"
+            }
+        }
+
+        /// Short AX help on the Settings button (confirm sheet uses informativeTextKey).
+        public var settingsAccessibilityHelpKey: String {
+            switch self {
+            case .byName:
+                return "按显示名称重新排列主屏幕图标；文件夹内应用不变"
+            case .byKind:
+                return "系统应用在前，其余按名称；文件夹内应用不变"
+            }
+        }
     }
 
     /// Confirm before one-key top-level rearrange. Cancel is first so Return/Esc
     /// do not apply. Matches uninstall force-quit / related-cleanup alert policy.
+    /// ALIAS-FOLDER-PROMPT-COPY-01 — app alias sheet (Save first; Esc → Cancel).
+    public enum AppAliasPromptAlert {
+        public static let saveIsFirstButton = true
+        public static let messageTextKey = "设置应用别名"
+        public static let informativeTextKey = "别名会用于显示和搜索；留空可恢复原名称。"
+        public static let saveButtonTitleKey = "保存"
+        public static let cancelButtonTitleKey = "取消"
+        public static let accessibilityLabelFormatKey = "%@ 的别名"
+
+        public static func messageText(localize: (String) -> String = { $0 }) -> String {
+            localize(messageTextKey)
+        }
+
+        public static func informativeText(localize: (String) -> String = { $0 }) -> String {
+            localize(informativeTextKey)
+        }
+
+        public static func saveButtonTitle(localize: (String) -> String = { $0 }) -> String {
+            localize(saveButtonTitleKey)
+        }
+
+        public static func cancelButtonTitle(localize: (String) -> String = { $0 }) -> String {
+            localize(cancelButtonTitleKey)
+        }
+
+        public static func accessibilityLabel(
+            appDisplayName: String,
+            localize: (String) -> String = { $0 }
+        ) -> String {
+            String(format: localize(accessibilityLabelFormatKey), appDisplayName)
+        }
+    }
+
+    /// ALIAS-FOLDER-PROMPT-COPY-01 — folder rename sheet (Save first; Esc → Cancel).
+    public enum FolderRenamePromptAlert {
+        public static let saveIsFirstButton = true
+        public static let messageTextKey = "重命名文件夹"
+        public static let informativeTextKey = "留空会保留原名称。"
+        public static let placeholderKey = "新建文件夹"
+        public static let accessibilityLabelKey = "文件夹名称"
+        public static let saveButtonTitleKey = "保存"
+        public static let cancelButtonTitleKey = "取消"
+
+        public static func messageText(localize: (String) -> String = { $0 }) -> String {
+            localize(messageTextKey)
+        }
+
+        public static func informativeText(localize: (String) -> String = { $0 }) -> String {
+            localize(informativeTextKey)
+        }
+
+        public static func placeholder(localize: (String) -> String = { $0 }) -> String {
+            localize(placeholderKey)
+        }
+
+        public static func accessibilityLabel(localize: (String) -> String = { $0 }) -> String {
+            localize(accessibilityLabelKey)
+        }
+
+        public static func saveButtonTitle(localize: (String) -> String = { $0 }) -> String {
+            localize(saveButtonTitleKey)
+        }
+
+        public static func cancelButtonTitle(localize: (String) -> String = { $0 }) -> String {
+            localize(cancelButtonTitleKey)
+        }
+    }
+
+    /// FOLDER-EMPTY-NAME-FALLBACK-01 — blank folder titles show the same
+    /// localized「新建文件夹」as the rename placeholder (menus + toasts).
+    public static func emptyFolderDisplayName(
+        localize: (String) -> String = { $0 }
+    ) -> String {
+        FolderRenamePromptAlert.placeholder(localize: localize)
+    }
+
+    public static func displayName(
+        forFolderNamed name: String,
+        localize: (String) -> String = { $0 }
+    ) -> String {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? emptyFolderDisplayName(localize: localize) : trimmed
+    }
+
     public enum GridRearrangeConfirmAlert {
         public static let cancelIsFirstButton = true
         public static let messageTextKey = "重新排列主屏幕图标？"
@@ -4507,6 +4910,247 @@ public enum LauncherLayout {
         public static let confirmButtonTitleKey = "导入"
         public static let cancelAccessibilityHelpKey = "取消，不导入文件"
         public static let confirmAccessibilityHelpKey = "确认后导入所选布局；可用恢复上次备份撤销"
+    }
+
+    // MARK: - Launch / layout-persist feedback (LAUNCH-FEEDBACK-COPY-01)
+
+    /// Open failure toasts, in-tile launching title, and layout save failure toast.
+    public enum LaunchFeedbackCopy {
+        public static let timedOutFormatKey = "打开“%@”超时"
+        public static let cannotOpenFormatKey = "无法打开“%@”"
+        public static let launchingTitleKey = "正在启动…"
+        public static let layoutSaveFailedKey = "布局未保存，请检查磁盘空间或文件权限"
+
+        public static func timedOutMessage(displayName: String, localize: (String) -> String = { $0 }) -> String {
+            String(format: localize(timedOutFormatKey), displayName)
+        }
+
+        public static func cannotOpenMessage(displayName: String, localize: (String) -> String = { $0 }) -> String {
+            String(format: localize(cannotOpenFormatKey), displayName)
+        }
+
+        public static func openFailureMessage(
+            displayName: String,
+            timedOut: Bool,
+            localize: (String) -> String = { $0 }
+        ) -> String {
+            if timedOut {
+                return timedOutMessage(displayName: displayName, localize: localize)
+            }
+            return cannotOpenMessage(displayName: displayName, localize: localize)
+        }
+
+        public static func launchingTitle(localize: (String) -> String = { $0 }) -> String {
+            localize(launchingTitleKey)
+        }
+
+        public static func layoutSaveFailed(localize: (String) -> String = { $0 }) -> String {
+            localize(layoutSaveFailedKey)
+        }
+    }
+
+    /// SETTINGS-MAINTENANCE-LAYOUT-CHROME-COPY-01 — Settings maintenance /
+    /// layout-I/O button chrome (not Launchpad import dialogs).
+    public enum SettingsMaintenanceChromeCopy {
+        public static let rescanButtonTitleKey = "重新扫描"
+        public static let rescanAccessibilityHelpKey = "重新扫描 Applications 文件夹"
+        public static let leftoversButtonTitleKey = "残留文件…"
+        public static let leftoversAccessibilityLabelKey = "残留文件"
+        public static let leftoversAccessibilityHelpKey =
+            "查找已卸载应用留在用户资料库中的文件，确认后移到废纸篓"
+        public static let leftoversCancelTitleKey = "取消查找"
+        public static let leftoversCancelAccessibilityHelpKey =
+            "取消正在进行的残留文件查找或清理"
+
+        public static func rescanButtonTitle(localize: (String) -> String = { $0 }) -> String {
+            localize(rescanButtonTitleKey)
+        }
+        public static func rescanAccessibilityHelp(localize: (String) -> String = { $0 }) -> String {
+            localize(rescanAccessibilityHelpKey)
+        }
+        public static func leftoversButtonTitle(localize: (String) -> String = { $0 }) -> String {
+            localize(leftoversButtonTitleKey)
+        }
+        public static func leftoversAccessibilityLabel(localize: (String) -> String = { $0 }) -> String {
+            localize(leftoversAccessibilityLabelKey)
+        }
+        public static func leftoversAccessibilityHelp(localize: (String) -> String = { $0 }) -> String {
+            localize(leftoversAccessibilityHelpKey)
+        }
+        public static func leftoversCancelTitle(localize: (String) -> String = { $0 }) -> String {
+            localize(leftoversCancelTitleKey)
+        }
+        public static func leftoversCancelAccessibilityHelp(localize: (String) -> String = { $0 }) -> String {
+            localize(leftoversCancelAccessibilityHelpKey)
+        }
+    }
+
+    public enum SettingsLayoutIOChromeCopy {
+        public static let exportButtonTitleKey = "导出布局…"
+        public static let exportAccessibilityLabelKey = "导出布局"
+        public static let exportAccessibilityHelpKey = "将当前主屏幕布局导出为 JSON 文件"
+        public static let importButtonTitleKey = "导入布局…"
+        public static let importAccessibilityLabelKey = "导入布局"
+        public static let importAccessibilityHelpKey = "从 JSON 文件导入布局并与当前应用列表合并"
+        public static let restoreBackupButtonTitleKey = "恢复上次备份"
+        public static let restoreBackupAccessibilityHelpKey =
+            "恢复最近一次自动保存前的布局；再次恢复可撤销"
+        public static let restoreBackupAvailableToolTipKey = "恢复最近一次自动保存前的布局"
+        public static let restoreBackupUnavailableToolTipKey = "尚无自动备份（修改布局后会生成）"
+
+        public static func exportButtonTitle(localize: (String) -> String = { $0 }) -> String {
+            localize(exportButtonTitleKey)
+        }
+        public static func exportAccessibilityLabel(localize: (String) -> String = { $0 }) -> String {
+            localize(exportAccessibilityLabelKey)
+        }
+        public static func exportAccessibilityHelp(localize: (String) -> String = { $0 }) -> String {
+            localize(exportAccessibilityHelpKey)
+        }
+        public static func importButtonTitle(localize: (String) -> String = { $0 }) -> String {
+            localize(importButtonTitleKey)
+        }
+        public static func importAccessibilityLabel(localize: (String) -> String = { $0 }) -> String {
+            localize(importAccessibilityLabelKey)
+        }
+        public static func importAccessibilityHelp(localize: (String) -> String = { $0 }) -> String {
+            localize(importAccessibilityHelpKey)
+        }
+        public static func restoreBackupButtonTitle(localize: (String) -> String = { $0 }) -> String {
+            localize(restoreBackupButtonTitleKey)
+        }
+        public static func restoreBackupAccessibilityHelp(localize: (String) -> String = { $0 }) -> String {
+            localize(restoreBackupAccessibilityHelpKey)
+        }
+        public static func restoreBackupToolTip(
+            available: Bool,
+            localize: (String) -> String = { $0 }
+        ) -> String {
+            localize(available ? restoreBackupAvailableToolTipKey : restoreBackupUnavailableToolTipKey)
+        }
+    }
+
+    /// LAYOUT-IO-OUTCOME-COPY-01 — Settings export/import/Launchpad/restore
+    /// outcome strings (and host-unavailable fallbacks). No paging.
+    public enum LayoutIOOutcomeCopy {
+        public static let exportSucceededKey = "布局已导出"
+        public static let exportUnsupportedSchemaKey = "布局版本不受支持，无法导出"
+        public static let exportFailedKey = "导出布局失败"
+        public static let exportUnavailableKey = "当前无法导出布局"
+
+        public static let importUnsupportedSchemaKey = "布局版本不受支持，无法导入"
+        public static let importUnreadableFileKey = "无法读取布局文件"
+        public static let importUnavailableKey = "当前无法导入布局"
+        public static let layoutEditingBlockedKey = "暂时无法整理，请查看主界面提示"
+        public static let layoutUpdatedToastKey = "布局已更新"
+
+        public static let launchpadEmptyKey = "启动台数据库里没有应用"
+        public static let launchpadUnreadableKey = "无法读取启动台数据库"
+        public static let launchpadDefaultFolderNameKey = "文件夹"
+
+        public static let restoreNoBackupKey = "没有可用备份"
+        public static let restoreUnsupportedSchemaKey = "备份版本不受支持，无法恢复"
+        public static let restoreUnreadableKey = "无法读取备份"
+        public static let restoreUnavailableKey = "当前无法恢复备份"
+
+        public static func exportSucceeded(localize: (String) -> String = { $0 }) -> String {
+            localize(exportSucceededKey)
+        }
+        public static func exportUnsupportedSchema(localize: (String) -> String = { $0 }) -> String {
+            localize(exportUnsupportedSchemaKey)
+        }
+        public static func exportFailed(localize: (String) -> String = { $0 }) -> String {
+            localize(exportFailedKey)
+        }
+        public static func exportUnavailable(localize: (String) -> String = { $0 }) -> String {
+            localize(exportUnavailableKey)
+        }
+
+        public static func importUnsupportedSchema(localize: (String) -> String = { $0 }) -> String {
+            localize(importUnsupportedSchemaKey)
+        }
+        public static func importUnreadableFile(localize: (String) -> String = { $0 }) -> String {
+            localize(importUnreadableFileKey)
+        }
+        public static func importUnavailable(localize: (String) -> String = { $0 }) -> String {
+            localize(importUnavailableKey)
+        }
+        public static func layoutEditingBlocked(localize: (String) -> String = { $0 }) -> String {
+            localize(layoutEditingBlockedKey)
+        }
+        public static func layoutUpdatedToast(localize: (String) -> String = { $0 }) -> String {
+            localize(layoutUpdatedToastKey)
+        }
+
+        public static func launchpadEmpty(localize: (String) -> String = { $0 }) -> String {
+            localize(launchpadEmptyKey)
+        }
+        public static func launchpadUnreadable(localize: (String) -> String = { $0 }) -> String {
+            localize(launchpadUnreadableKey)
+        }
+        public static func launchpadDefaultFolderName(localize: (String) -> String = { $0 }) -> String {
+            localize(launchpadDefaultFolderNameKey)
+        }
+
+        public static func restoreNoBackup(localize: (String) -> String = { $0 }) -> String {
+            localize(restoreNoBackupKey)
+        }
+        public static func restoreUnsupportedSchema(localize: (String) -> String = { $0 }) -> String {
+            localize(restoreUnsupportedSchemaKey)
+        }
+        public static func restoreUnreadable(localize: (String) -> String = { $0 }) -> String {
+            localize(restoreUnreadableKey)
+        }
+        public static func restoreUnavailable(localize: (String) -> String = { $0 }) -> String {
+            localize(restoreUnavailableKey)
+        }
+    }
+
+    /// LAYOUT-EDITING-STATUS-COPY-01 — why layout editing is off / rescan feedback.
+    public enum LayoutEditingStatusCopy {
+        public static let scanningExplanationKey = "正在扫描应用，暂时无法整理"
+        public static let scanCancelledExplanationKey = "应用扫描已取消，请重新扫描"
+        public static let cachedCatalogExplanationKey = "正在显示上次应用列表；重新扫描后可整理"
+        public static let layoutUnreadableExplanationKey = "布局文件无法读取，暂时无法整理；原文件已保留"
+        public static let incompleteScanExplanationKey = "应用扫描不完整，暂时无法整理；请重新扫描"
+        /// CUSTOM-ROOT-SCAN-LIMIT-01 — soft notice; editing stays open.
+        public static let truncatedCustomRootExplanationKey = "部分应用目录过大，仅扫描了靠前的应用；可缩小目录后重新扫描"
+        /// MISSING-ROOT-NOTICE-01 — soft notice when a user root is offline; editing stays open.
+        public static let unavailableCustomRootExplanationKey = "部分应用目录当前不可用，已保留其中的应用位置；可在重新接入后扫描"
+        public static let defaultBlockedExplanationKey = "应用列表正在加载或不完整，暂时无法整理"
+        public static let rescanSucceededKey = "重新扫描完成"
+        public static let rearrangeUnavailableKey = "当前无法重新排列"
+
+        public static func scanningExplanation(localize: (String) -> String = { $0 }) -> String {
+            localize(scanningExplanationKey)
+        }
+        public static func scanCancelledExplanation(localize: (String) -> String = { $0 }) -> String {
+            localize(scanCancelledExplanationKey)
+        }
+        public static func cachedCatalogExplanation(localize: (String) -> String = { $0 }) -> String {
+            localize(cachedCatalogExplanationKey)
+        }
+        public static func layoutUnreadableExplanation(localize: (String) -> String = { $0 }) -> String {
+            localize(layoutUnreadableExplanationKey)
+        }
+        public static func incompleteScanExplanation(localize: (String) -> String = { $0 }) -> String {
+            localize(incompleteScanExplanationKey)
+        }
+        public static func truncatedCustomRootExplanation(localize: (String) -> String = { $0 }) -> String {
+            localize(truncatedCustomRootExplanationKey)
+        }
+        public static func unavailableCustomRootExplanation(localize: (String) -> String = { $0 }) -> String {
+            localize(unavailableCustomRootExplanationKey)
+        }
+        public static func defaultBlockedExplanation(localize: (String) -> String = { $0 }) -> String {
+            localize(defaultBlockedExplanationKey)
+        }
+        public static func rescanSucceeded(localize: (String) -> String = { $0 }) -> String {
+            localize(rescanSucceededKey)
+        }
+        public static func rearrangeUnavailable(localize: (String) -> String = { $0 }) -> String {
+            localize(rearrangeUnavailableKey)
+        }
     }
 
     public static func gridRearrangeToastMessage(sort: GridRearrangeSort) -> String {
@@ -4561,6 +5205,49 @@ public enum LauncherLayout {
         if next.orderedEntries != state.orderedEntries {
             next.updatedAt = .now
         }
+        return next
+    }
+
+    public static let sortFolderByNameMenuTitleKey = "按名称排列文件夹内应用"
+    public static let sortFolderByNameToastKey = "已按名称排列文件夹内应用"
+    public static let sortFolderAlreadySortedToastKey = "文件夹内应用已按名称排列"
+    // FOLDER-SORT-AX-HELP-01
+    public static let sortFolderByNameAccessibilityHelpKey = "只调整这个文件夹内的顺序，主屏幕不变"
+
+    public static func sortFolderByNameAccessibilityHelp(localize: (String) -> String = { $0 }) -> String {
+        localize(sortFolderByNameAccessibilityHelpKey)
+    }
+
+    public static func sortFolderByColorAccessibilityHelp(localize: (String) -> String = { $0 }) -> String {
+        localize(sortFolderByColorAccessibilityHelpKey)
+    }
+
+    /// Folder context menu「按名称排列文件夹内应用」. Reorders only that
+    /// folder's `itemIDs` (alias → catalog name → UUID). Returns nil when the
+    /// folder is missing or already in order. Top-level entries and paging
+    /// are untouched.
+    public static func sortingFolderMembersByName(
+        _ folderID: UUID,
+        in state: LayoutState,
+        catalog: [AppCandidate]
+    ) -> LayoutState? {
+        guard let folder = state.folders[folderID], folder.itemIDs.count > 1 else { return nil }
+        let byKey = AppCandidate.firstByDeduplicationKey(catalog)
+        func name(_ id: UUID) -> String {
+            guard let key = state.appKeys[id] else { return id.uuidString }
+            if let alias = state.appAliases[key], !alias.isEmpty { return alias }
+            return byKey[key]?.displayName ?? id.uuidString
+        }
+        let names = Dictionary(folder.itemIDs.map { ($0, name($0)) }, uniquingKeysWith: { first, _ in first })
+        let sorted = folder.itemIDs.sorted { lhs, rhs in
+            let order = names[lhs, default: ""].localizedStandardCompare(names[rhs, default: ""])
+            if order != .orderedSame { return order == .orderedAscending }
+            return lhs.uuidString < rhs.uuidString
+        }
+        guard sorted != folder.itemIDs else { return nil }
+        var next = state
+        next.folders[folderID]?.itemIDs = sorted
+        next.updatedAt = .now
         return next
     }
 
@@ -4671,6 +5358,239 @@ public enum LauncherLayout {
         return nil
     }
 
+    /// Search no-matches hint when the query names apps the user hid (P1 隐藏/恢复):
+    /// a hidden app never shows in results, so say where it went.
+    public enum SearchHiddenMatchHint: Equatable, Sendable {
+        case none
+        case one(name: String)
+        case several(count: Int)
+
+        public static let oneFormatKey = "“%@”已隐藏，可在设置中恢复"
+        public static let severalFormatKey = "%d 个匹配的应用已隐藏，可在设置中恢复"
+    }
+
+
+    // MARK: - Catalog empty / preparing chrome (CATALOG-EMPTY-PREPARING-CHROME-01)
+
+    /// User-visible copy for preparing status + centered empty chrome (catalog /
+    /// cancelled / search no-matches) and the shared rescan / cached-list buttons.
+    public enum CatalogEmptyChromeCopy {
+        public static let preparingMessageKey = "正在准备应用…"
+        public static let catalogUnavailableTitleKey = "未找到可用的应用"
+        public static let catalogUnavailableDetailKey = "请确认应用位于 Applications 文件夹，然后重新扫描。"
+        public static let catalogUnavailableHelpKey = "重新扫描标准 Applications 文件夹"
+        public static let catalogCancelledTitleKey = "扫描已取消"
+        public static let catalogCancelledDetailKey = "应用扫描已取消，请重新扫描。"
+        public static let catalogCancelledHelpKey = "重新扫描应用"
+        public static let searchNoMatchesTitleKey = "未找到匹配的应用"
+        public static let searchNoMatchesDefaultDetailKey = "按 Esc 清除搜索"
+        public static let reloadButtonTitleKey = "重新扫描"
+        public static let useCachedButtonTitleKey = "使用上次应用列表"
+        public static let useCachedHelpKey = "使用本机上次完整扫描的应用列表；整理功能暂不可用"
+        public static let rescanRestoreHelpKey = "重新扫描应用并恢复可整理的列表"
+
+        public struct Content: Equatable, Sendable {
+            public let title: String
+            public let detail: String
+            public let help: String
+            public let showActions: Bool
+        }
+
+        public static func preparingMessage(localize: (String) -> String = { $0 }) -> String {
+            localize(preparingMessageKey)
+        }
+
+        public static func reloadButtonTitle(localize: (String) -> String = { $0 }) -> String {
+            localize(reloadButtonTitleKey)
+        }
+
+        public static func useCachedButtonTitle(localize: (String) -> String = { $0 }) -> String {
+            localize(useCachedButtonTitleKey)
+        }
+
+        public static func useCachedHelp(localize: (String) -> String = { $0 }) -> String {
+            localize(useCachedHelpKey)
+        }
+
+        public static func rescanRestoreHelp(localize: (String) -> String = { $0 }) -> String {
+            localize(rescanRestoreHelpKey)
+        }
+
+        public static func defaultReloadHelp(localize: (String) -> String = { $0 }) -> String {
+            localize(catalogUnavailableHelpKey)
+        }
+
+        /// Title / detail / help / whether rescan+cache actions show for a kind.
+        /// Pass `searchDetail` for search no-matches when a hidden-match hint
+        /// replaces the default Esc line.
+        public static func content(
+            for kind: LauncherEmptyChromeKind,
+            searchDetail: String? = nil,
+            localize: (String) -> String = { $0 }
+        ) -> Content {
+            switch kind {
+            case .catalogCancelled:
+                return Content(
+                    title: localize(catalogCancelledTitleKey),
+                    detail: localize(catalogCancelledDetailKey),
+                    help: localize(catalogCancelledHelpKey),
+                    showActions: true
+                )
+            case .catalogUnavailable:
+                return Content(
+                    title: localize(catalogUnavailableTitleKey),
+                    detail: localize(catalogUnavailableDetailKey),
+                    help: localize(catalogUnavailableHelpKey),
+                    showActions: true
+                )
+            case .searchNoMatches:
+                return Content(
+                    title: localize(searchNoMatchesTitleKey),
+                    detail: searchDetail ?? localize(searchNoMatchesDefaultDetailKey),
+                    help: localize(catalogUnavailableHelpKey),
+                    showActions: false
+                )
+            }
+        }
+    }
+
+
+    // MARK: - Search / count / settings chrome (SEARCH-FIELD-CHROME-01)
+
+    /// Search field, result/item/selection count labels, footer Esc hints, and
+    /// the top-bar settings button. Esc-clear reuses CatalogEmptyChromeCopy.
+    public enum SearchFieldChromeCopy {
+        public static let searchPlaceholderKey = "搜索应用"
+        public static let searchHelpKey = "按应用名称或 Bundle ID 搜索"
+        public static let clearSearchKey = "清除搜索"
+        public static let clearSearchHelpKey = "清除搜索并返回应用网格"
+        public static let escReturnKey = "Esc 返回"
+        public static let escReturnWithPagingKey = "← → 翻页 · Esc 返回"
+        public static let resultsFormatKey = "%d 个结果"
+        public static let resultsAccessibilityKey = "搜索结果数量"
+        public static let selectedAccessibilityKey = "已选数量"
+        public static let itemsFormatKey = "%d 个项目"
+        public static let itemsAccessibilityKey = "应用数量"
+        public static let settingsKey = "设置"
+        public static let settingsHelpKey = "打开 LaunchIcon 设置"
+
+        public static func searchPlaceholder(localize: (String) -> String = { $0 }) -> String {
+            localize(searchPlaceholderKey)
+        }
+
+        public static func searchAccessibilityLabel(localize: (String) -> String = { $0 }) -> String {
+            localize(searchPlaceholderKey)
+        }
+
+        public static func searchHelp(localize: (String) -> String = { $0 }) -> String {
+            localize(searchHelpKey)
+        }
+
+        public static func clearSearchLabel(localize: (String) -> String = { $0 }) -> String {
+            localize(clearSearchKey)
+        }
+
+        public static func clearSearchHelp(localize: (String) -> String = { $0 }) -> String {
+            localize(clearSearchHelpKey)
+        }
+
+        /// Same string as empty-search detail ("按 Esc 清除搜索").
+        public static func escClearSearch(localize: (String) -> String = { $0 }) -> String {
+            localize(CatalogEmptyChromeCopy.searchNoMatchesDefaultDetailKey)
+        }
+
+        public static func footerNavigationText(
+            isSearching: Bool,
+            pageCount: Int,
+            localize: (String) -> String = { $0 }
+        ) -> String {
+            if isSearching { return escClearSearch(localize: localize) }
+            if pageCount > 1 { return localize(escReturnWithPagingKey) }
+            return localize(escReturnKey)
+        }
+
+        public static func resultsCountText(count: Int, localize: (String) -> String = { $0 }) -> String {
+            String(format: localize(resultsFormatKey), count)
+        }
+
+        public static func resultsAccessibilityLabel(localize: (String) -> String = { $0 }) -> String {
+            localize(resultsAccessibilityKey)
+        }
+
+        public static func selectedAccessibilityLabel(localize: (String) -> String = { $0 }) -> String {
+            localize(selectedAccessibilityKey)
+        }
+
+        public static func itemsCountText(count: Int, localize: (String) -> String = { $0 }) -> String {
+            String(format: localize(itemsFormatKey), count)
+        }
+
+        public static func itemsAccessibilityLabel(localize: (String) -> String = { $0 }) -> String {
+            localize(itemsAccessibilityKey)
+        }
+
+        public static func settingsLabel(localize: (String) -> String = { $0 }) -> String {
+            localize(settingsKey)
+        }
+
+        public static func settingsHelp(localize: (String) -> String = { $0 }) -> String {
+            localize(settingsHelpKey)
+        }
+    }
+
+    // MARK: - Footer / toast chrome (FOOTER-DRAG-HINT-01)
+
+    /// Footer drag-hint strings and toast dismiss chrome. Multi-page hint is
+    /// copy only — does not change paging / edge-cross behavior.
+    public enum FooterChromeCopy {
+        public static let dragHintKey = "拖拽整理"
+        public static let dragHintMultiPageKey = "拖拽整理 · 悬停左右边缘跨页"
+        public static let toastCloseKey = "关闭提示"
+
+        public static func dragHint(pageCount: Int, localize: (String) -> String = { $0 }) -> String {
+            if pageCount > 1 { return localize(dragHintMultiPageKey) }
+            return localize(dragHintKey)
+        }
+
+        public static func toastCloseLabel(localize: (String) -> String = { $0 }) -> String {
+            localize(toastCloseKey)
+        }
+    }
+
+
+    /// FOLDER-DROP-CHROME-COPY-01 — drop-target / nest-reject / open-folder grid chrome.
+    public enum FolderDropChromeCopy {
+        public static let nestRejectToastKey = "不能将文件夹放入另一个文件夹"
+        public static let dropOnFolderHelpKey = "拖放到此文件夹"
+        public static let dropToMergeHelpKey = "拖放到此以合并"
+        public static let folderMembersLabelKey = "文件夹中的应用"
+
+        public static func nestRejectToast(localize: (String) -> String = { $0 }) -> String {
+            localize(nestRejectToastKey)
+        }
+
+        public static func dropTargetHelp(isFolder: Bool, localize: (String) -> String = { $0 }) -> String {
+            localize(isFolder ? dropOnFolderHelpKey : dropToMergeHelpKey)
+        }
+
+        public static func folderMembersLabel(localize: (String) -> String = { $0 }) -> String {
+            localize(folderMembersLabelKey)
+        }
+    }
+
+    public static func searchHiddenMatchHint(query: String, hiddenNames: [String]) -> SearchHiddenMatchHint {
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !needle.isEmpty else { return .none }
+        let matches = hiddenNames.filter {
+            $0.range(of: needle, options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive]) != nil
+        }
+        switch matches.count {
+        case 0: return .none
+        case 1: return .one(name: matches[0])
+        default: return .several(count: matches.count)
+        }
+    }
+
     /// Folder that currently contains `appID` on the home grid, if any.
     /// Used by search results to show where a member hit lives.
     public static func containingFolderName(forAppID appID: UUID, in state: LayoutState) -> String? {
@@ -4740,6 +5660,38 @@ public enum LauncherLayout {
     /// field editor (avoids accidental renames). Keyboard Tab/focus still edits.
     public static func folderTitleShouldBeginEditingFromPointer(clickCount: Int) -> Bool {
         clickCount >= 2
+    }
+
+    /// UI Automation often fails to coalesce double-clicks onto NSTextField.
+    /// Test fixtures (`LAUNCHICON_TEST_LAYOUT_PATH`) may treat a single press
+    /// as rename-begin; production stays double-click only.
+    public static func folderTitleShouldBeginEditingFromPointer(
+        clickCount: Int,
+        allowSingleClickBegin: Bool
+    ) -> Bool {
+        if allowSingleClickBegin, clickCount >= 1 { return true }
+        return folderTitleShouldBeginEditingFromPointer(clickCount: clickCount)
+    }
+
+    /// UI Automation can deliver a double-click as two `mouseDown` events each
+    /// with `clickCount == 1` (no AppKit click-count coalescing). Treat a
+    /// second press inside the system double-click interval like clickCount ≥ 2.
+    public static func folderTitleShouldBeginEditingFromPointer(
+        clickCount: Int,
+        secondsSincePreviousPointerDown: TimeInterval?,
+        doubleClickInterval: TimeInterval,
+        allowSingleClickBegin: Bool = false
+    ) -> Bool {
+        if folderTitleShouldBeginEditingFromPointer(
+            clickCount: clickCount,
+            allowSingleClickBegin: allowSingleClickBegin
+        ) {
+            return true
+        }
+        guard clickCount == 1,
+              let elapsed = secondsSincePreviousPointerDown,
+              doubleClickInterval > 0 else { return false }
+        return elapsed >= 0 && elapsed <= doubleClickInterval
     }
 
     /// Pointer down outside the title while a rename is active cancels the
@@ -4831,6 +5783,12 @@ public enum LauncherLayout {
 
     /// Plural toast after hiding several selected apps from the context menu.
     public static let hideSelectedApplicationsToastMessageFormatKey = "已隐藏 %d 个应用"
+    /// BATCH-MENU-COUNTS-01: multi-select hide menu title (parity with「卸载 N 个应用…」).
+    public static let batchHideMenuTitleFormatKey = "隐藏 %d 个应用"
+    /// BATCH-MENU-COUNTS-01: multi-select「移入新建文件夹（N）」.
+    public static let batchNewFolderMenuTitleFormatKey = "移入新建文件夹（%d）"
+    /// BATCH-REVEAL-COUNT-01: multi-select「在访达中显示（N）」.
+    public static let batchRevealMenuTitleFormatKey = "在访达中显示（%d）"
 
     public static func hideSelectedApplicationsToastMessage(count: Int) -> String {
         String(format: hideSelectedApplicationsToastMessageFormatKey, max(count, 0))
@@ -4916,6 +5874,534 @@ public enum LauncherLayout {
         return .success((state, folderID))
     }
 
+
+    /// Open-folder member context menu「移出文件夹」(LaunchOS parity).
+    public static let removeFromFolderMenuTitleKey = "移出文件夹"
+    /// Toast after「移出文件夹」; %@ is the folder name.
+    public static let removeFromFolderToastFormatKey = "已移出“%@”"
+    /// The menu item only appears while the folder keeps at least two
+    /// members afterwards, so the open folder is never dissolved under the
+    /// pointer (a two-app folder uses「解散文件夹」instead).
+    public static let removeFromFolderMinimumMembers = 3
+
+    /// Moves `appID` out of `folderID` to the grid slot right after that
+    /// folder. Nil when the app is not a member or the folder would be left
+    /// with fewer than two members.
+    public static func removingAppFromFolder(
+        _ appID: UUID,
+        folderID: UUID,
+        in state: LayoutState
+    ) -> LayoutState? {
+        guard let folder = state.folders[folderID],
+              folder.itemIDs.contains(appID),
+              folder.itemIDs.count >= removeFromFolderMinimumMembers,
+              state.orderedEntries.contains(.folder(folderID)) else { return nil }
+        var next = state
+        next.folders[folderID]?.itemIDs.removeAll { $0 == appID }
+        let index = topLevelIndexAfterFolder(folderID, in: next)
+        next.orderedEntries.insert(.app(appID), at: index)
+        return next
+    }
+
+    /// BATCH-REMOVE-FROM-FOLDER-01: open-folder multi-select「移出 N 个应用」.
+    public static let batchRemoveFromFolderMenuTitleFormatKey = "移出 %d 个应用"
+    /// Toast after batch remove; %d is the count.
+    public static let batchRemoveFromFolderToastFormatKey = "已移出 %d 个应用"
+
+    /// Members of `folderID` that are in `selection`, folder order. Nil unless
+    /// ≥2 eligible **and** the folder would keep ≥2 members afterwards.
+    public static func appIDsForBatchRemoveFromFolder(
+        selection: LauncherItemSelection,
+        folderID: UUID,
+        in state: LayoutState
+    ) -> [UUID]? {
+        guard let folder = state.folders[folderID],
+              state.orderedEntries.contains(.folder(folderID)) else { return nil }
+        let ordered = folder.itemIDs.filter { selection.contains($0) }
+        guard ordered.count >= 2,
+              folder.itemIDs.count - ordered.count >= 2 else { return nil }
+        return ordered
+    }
+
+    /// Moves several members out of `folderID` to consecutive slots right
+    /// after that folder (folder member order). Nil when fewer than two ids
+    /// qualify or the folder would drop below two members.
+    public static func removingAppsFromFolder(
+        _ appIDs: [UUID],
+        folderID: UUID,
+        in state: LayoutState
+    ) -> LayoutState? {
+        guard let folder = state.folders[folderID],
+              state.orderedEntries.contains(.folder(folderID)) else { return nil }
+        let removeSet = Set(appIDs)
+        let ordered = folder.itemIDs.filter { removeSet.contains($0) }
+        guard ordered.count >= 2,
+              folder.itemIDs.count - ordered.count >= 2 else { return nil }
+        var next = state
+        next.folders[folderID]?.itemIDs.removeAll { removeSet.contains($0) }
+        var index = topLevelIndexAfterFolder(folderID, in: next)
+        for id in ordered {
+            next.orderedEntries.insert(.app(id), at: index)
+            index += 1
+        }
+        return next
+    }
+
+    /// Context menu「移到文件夹」(LaunchOS parity): existing folders in layout
+    /// order. Only a **top-level** app qualifies — folder members, folder tiles
+    /// and unknown ids get an empty list (menu hidden). A blank name stays
+    /// empty so Direct can show the localized「新建文件夹」fallback.
+    public static func moveToFolderMenuTargets(
+        forAppID appID: UUID,
+        in state: LayoutState
+    ) -> [FolderMenuTarget] {
+        guard state.folders[appID] == nil, state.orderedEntries.contains(.app(appID)) else { return [] }
+        return state.orderedEntries.compactMap { entry in
+            guard case .folder(let id) = entry, let folder = state.folders[id] else { return nil }
+            let trimmed = folder.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            return FolderMenuTarget(id: id, name: trimmed)
+        }
+    }
+
+    /// Menu move of one top-level app into an existing folder (appended last,
+    /// same as dropping onto the folder centre). Never nests folders.
+    public static func moveTopLevelApp(
+        _ appID: UUID,
+        toFolder folderID: UUID,
+        in state: LayoutState
+    ) -> Result<LayoutState, LayoutMutationError> {
+        guard state.folders[appID] == nil else { return .failure(.nestedFolder) }
+        guard state.orderedEntries.contains(.app(appID)) else { return .failure(.missingSource) }
+        guard state.folders[folderID] != nil else { return .failure(.missingTarget) }
+        return applyDrop(
+            LayoutDrop(source: .topLevel(appID), destination: .merge(.topLevel(folderID))),
+            to: state
+        )
+    }
+
+    public static let moveToFolderToastMessageFormatKey = "已移到「%@」"
+
+    /// Multi-select「移到文件夹」: when the right-clicked app belongs to a
+    /// selection of ≥2 top-level apps, the menu moves the whole selection
+    /// (selection order). Nil → single-app move. Pages are irrelevant here:
+    /// the grid does not follow the moved icons.
+    public static func batchMoveToFolderAppIDs(
+        selection: LauncherItemSelection,
+        anchorAppID: UUID,
+        in state: LayoutState
+    ) -> [UUID]? {
+        let apps = topLevelAppIDsForBatchFolder(selection: selection, in: state)
+        guard apps.count >= 2, apps.contains(anchorAppID) else { return nil }
+        return apps
+    }
+
+    public static let batchMoveToFolderToastMessageFormatKey = "已把 %d 个应用移到「%@」"
+
+    /// Folder context menu「解散文件夹」(LaunchOS "ungroup"): members replace
+    /// the folder tile in place, in folder order. Duplicates and ids already on
+    /// the grid are skipped. Nil when the folder is missing or not top-level.
+    public static func dissolveFolder(_ folderID: UUID, in state: LayoutState) -> LayoutState? {
+        guard let folder = state.folders[folderID],
+              let index = state.orderedEntries.firstIndex(of: .folder(folderID)) else { return nil }
+        var state = state
+        let onGrid = Set(state.orderedEntries.compactMap { entry -> UUID? in
+            if case .app(let id) = entry { return id }
+            return nil
+        })
+        var seen = Set<UUID>()
+        let members = folder.itemIDs.filter { !onGrid.contains($0) && seen.insert($0).inserted }
+        state.orderedEntries.replaceSubrange(index...index, with: members.map { LauncherEntry.app($0) })
+        state.folders[folderID] = nil
+        state.updatedAt = .now
+        return state
+    }
+
+    /// Focus after a menu dissolve: the entry now in the folder's slot (first
+    /// member). Nil when that would land on another page, so the menu action
+    /// never pages the grid.
+    public static func focusIDAfterMenuDissolve(
+        folderID: UUID,
+        previousEntries: [LauncherEntry],
+        currentEntries: [LauncherEntry]
+    ) -> UUID? {
+        guard let folderIndex = previousEntries.firstIndex(of: .folder(folderID)),
+              let id = entryReplacingDissolvedFolder(
+                folderID: folderID,
+                previousEntries: previousEntries,
+                currentEntries: currentEntries
+              ),
+              let index = currentEntries.firstIndex(where: { $0.id == id }),
+              pageIndex(containingEntryAt: index) == pageIndex(containingEntryAt: folderIndex) else { return nil }
+        return id
+    }
+
+    public static let dissolveFolderToastMessageFormatKey = "已解散「%@」"
+
+    // MARK: Batch dissolve selected folders (BATCH-DISSOLVE-FOLDERS-01)
+
+    /// Top-level folder ids in `selection` (selection order, de-duped).
+    /// Nil unless `anchorID` is in a ≥2 selection that contains ≥2 folders.
+    public static func folderIDsForBatchDissolve(
+        selection: LauncherItemSelection,
+        anchorID: UUID,
+        in state: LayoutState
+    ) -> [UUID]? {
+        guard selection.count > 1, selection.contains(anchorID) else { return nil }
+        var seen = Set<UUID>()
+        var ids: [UUID] = []
+        for id in selection.orderedIDs {
+            guard state.folders[id] != nil,
+                  state.orderedEntries.contains(.folder(id)),
+                  seen.insert(id).inserted else { continue }
+            ids.append(id)
+        }
+        guard ids.count >= 2, ids.contains(anchorID) else { return nil }
+        return ids
+    }
+
+    /// Dissolve each folder in order via `dissolveFolder`. Nil when nothing changes.
+    public static func dissolvingFolders(
+        _ folderIDs: [UUID],
+        in state: LayoutState
+    ) -> LayoutState? {
+        guard !folderIDs.isEmpty else { return nil }
+        var next = state
+        var changed = false
+        for id in folderIDs {
+            if let dissolved = dissolveFolder(id, in: next) {
+                next = dissolved
+                changed = true
+            }
+        }
+        return changed ? next : nil
+    }
+
+    public static let batchDissolveFoldersMenuTitleFormatKey = "解散 %d 个文件夹…"
+    public static let batchDissolveFoldersConfirmTitleKey = "解散选中的文件夹？"
+    public static let batchDissolveFoldersConfirmInfoFormatKey = "%d 个文件夹里的应用会放回各自文件夹所在的位置。"
+    /// UNGROUP-ALL-CONFIRM-COPY-01 — blank-area「解散所有文件夹」confirm.
+    public static let ungroupAllFoldersConfirmTitleKey = "解散所有文件夹？"
+    /// Same body as batch dissolve; keep one source of truth.
+    public static var ungroupAllFoldersConfirmInfoFormatKey: String {
+        batchDissolveFoldersConfirmInfoFormatKey
+    }
+    /// Destructive confirm button shared by batch dissolve / ungroup-all.
+    public static let dissolveConfirmButtonTitleKey = "解散"
+
+    public static func ungroupAllFoldersConfirmTitle(
+        localize: (String) -> String = { $0 }
+    ) -> String {
+        localize(ungroupAllFoldersConfirmTitleKey)
+    }
+
+    public static func ungroupAllFoldersConfirmInformativeText(
+        folderCount: Int,
+        localize: (String) -> String = { $0 }
+    ) -> String {
+        String(format: localize(ungroupAllFoldersConfirmInfoFormatKey), folderCount)
+    }
+
+    public static func dissolveConfirmCancelButtonTitle(
+        localize: (String) -> String = { $0 }
+    ) -> String {
+        AppBatchUninstallPlan.confirmCancelButtonTitle(localize: localize)
+    }
+
+    public static func dissolveConfirmDestructiveButtonTitle(
+        localize: (String) -> String = { $0 }
+    ) -> String {
+        localize(dissolveConfirmButtonTitleKey)
+    }
+    public static let batchDissolveFoldersAccessibilityHelpKey = "把所选文件夹里的应用放回各自位置"
+
+    // MARK: Batch move selected folders to edge (BATCH-SELECTED-FOLDERS-EDGE-01)
+
+    /// Move only the given top-level folders to the start or end of the grid,
+    /// preserving relative order among those folders and among everything else.
+    /// Nil when fewer than 2 valid top-level folders would move, or order unchanged.
+    public static func movingSelectedFoldersToEdge(
+        folderIDs: [UUID],
+        atStart: Bool,
+        in state: LayoutState
+    ) -> LayoutState? {
+        let wanted = Set(folderIDs)
+        guard wanted.count >= 2 else { return nil }
+        var selected: [LauncherEntry] = []
+        var rest: [LauncherEntry] = []
+        var seen = Set<UUID>()
+        for entry in state.orderedEntries {
+            if case .folder(let id) = entry,
+               wanted.contains(id),
+               state.folders[id] != nil,
+               seen.insert(id).inserted {
+                selected.append(entry)
+            } else {
+                rest.append(entry)
+            }
+        }
+        guard selected.count >= 2 else { return nil }
+        let reordered = atStart ? selected + rest : rest + selected
+        guard reordered != state.orderedEntries else { return nil }
+        var next = state
+        next.orderedEntries = reordered
+        next.updatedAt = .now
+        return next
+    }
+
+    public static let selectedFoldersMovedToStartMenuTitleKey = "所选文件夹移到最前"
+    public static let selectedFoldersMovedToEndMenuTitleKey = "所选文件夹移到最后"
+    public static let selectedFoldersMovedToStartToastFormatKey = "已将 %d 个文件夹移到最前"
+    public static let selectedFoldersMovedToEndToastFormatKey = "已将 %d 个文件夹移到最后"
+    public static let selectedFoldersMovedToEdgeAccessibilityHelpKey = "只移动选中的文件夹，其它图标相对顺序不变"
+
+
+    // MARK: Batch move selected apps to edge (BATCH-SELECTED-APPS-EDGE-01)
+
+    /// Top-level app ids in `selection` (selection order, de-duped).
+    /// Nil unless `anchorID` is in a ≥2 selection that contains ≥2 top-level
+    /// apps, and the anchor itself is one of those apps.
+    public static func appIDsForBatchEdgeMove(
+        selection: LauncherItemSelection,
+        anchorID: UUID,
+        in state: LayoutState
+    ) -> [UUID]? {
+        guard selection.count > 1, selection.contains(anchorID) else { return nil }
+        let topLevelApps = Set(state.orderedEntries.compactMap { entry -> UUID? in
+            if case .app(let id) = entry { return id }
+            return nil
+        })
+        var seen = Set<UUID>()
+        var ids: [UUID] = []
+        for id in selection.orderedIDs where topLevelApps.contains(id) && seen.insert(id).inserted {
+            ids.append(id)
+        }
+        guard ids.count >= 2, ids.contains(anchorID) else { return nil }
+        return ids
+    }
+
+    /// Move only the given top-level apps to the start or end of the grid,
+    /// preserving relative order among those apps and among everything else.
+    /// Nil when fewer than 2 valid top-level apps would move, or order unchanged.
+    public static func movingSelectedAppsToEdge(
+        appIDs: [UUID],
+        atStart: Bool,
+        in state: LayoutState
+    ) -> LayoutState? {
+        let wanted = Set(appIDs)
+        guard wanted.count >= 2 else { return nil }
+        var selected: [LauncherEntry] = []
+        var rest: [LauncherEntry] = []
+        var seen = Set<UUID>()
+        for entry in state.orderedEntries {
+            if case .app(let id) = entry,
+               wanted.contains(id),
+               seen.insert(id).inserted {
+                selected.append(entry)
+            } else {
+                rest.append(entry)
+            }
+        }
+        guard selected.count >= 2 else { return nil }
+        let reordered = atStart ? selected + rest : rest + selected
+        guard reordered != state.orderedEntries else { return nil }
+        var next = state
+        next.orderedEntries = reordered
+        next.updatedAt = .now
+        return next
+    }
+
+    public static let selectedAppsMovedToStartMenuTitleKey = "所选应用移到最前"
+    public static let selectedAppsMovedToEndMenuTitleKey = "所选应用移到最后"
+    public static let selectedAppsMovedToStartToastFormatKey = "已将 %d 个应用移到最前"
+    public static let selectedAppsMovedToEndToastFormatKey = "已将 %d 个应用移到最后"
+    public static let selectedAppsMovedToEdgeAccessibilityHelpKey = "只移动选中的应用，其它图标相对顺序不变"
+
+
+    // MARK: Blank-area move selected top-level entries (BATCH-BLANK-SELECTED-EDGE-01)
+
+    /// Top-level entry ids (apps + folders) in `selection`, selection order.
+    public static func topLevelEntryIDsInSelection(
+        selection: LauncherItemSelection,
+        in state: LayoutState
+    ) -> [UUID] {
+        let topLevel = Set(state.orderedEntries.map(\.id))
+        var seen = Set<UUID>()
+        var ids: [UUID] = []
+        for id in selection.orderedIDs where topLevel.contains(id) && seen.insert(id).inserted {
+            ids.append(id)
+        }
+        return ids
+    }
+
+    /// Move the given top-level entries (apps and/or folders) to the start or
+    /// end, preserving relative order among them and among the rest.
+    /// Nil when fewer than 2 valid ids would move, or order unchanged.
+    public static func movingSelectedTopLevelEntriesToEdge(
+        entryIDs: [UUID],
+        atStart: Bool,
+        in state: LayoutState
+    ) -> LayoutState? {
+        let wanted = Set(entryIDs)
+        guard wanted.count >= 2 else { return nil }
+        var selected: [LauncherEntry] = []
+        var rest: [LauncherEntry] = []
+        var seen = Set<UUID>()
+        for entry in state.orderedEntries {
+            if wanted.contains(entry.id), seen.insert(entry.id).inserted {
+                selected.append(entry)
+            } else {
+                rest.append(entry)
+            }
+        }
+        guard selected.count >= 2 else { return nil }
+        let reordered = atStart ? selected + rest : rest + selected
+        guard reordered != state.orderedEntries else { return nil }
+        var next = state
+        next.orderedEntries = reordered
+        next.updatedAt = .now
+        return next
+    }
+
+    public static let blankSelectedMovedToStartMenuTitleKey = "所选项目移到最前"
+    public static let blankSelectedMovedToEndMenuTitleKey = "所选项目移到最后"
+    public static let blankSelectedMovedToStartToastFormatKey = "已将 %d 个项目移到最前"
+    public static let blankSelectedMovedToEndToastFormatKey = "已将 %d 个项目移到最后"
+    public static let blankSelectedMovedToEdgeAccessibilityHelpKey = "只移动当前多选的图标，其它相对顺序不变"
+
+
+    /// Blank-area ungroup-all / folders-to-edge (and other `commitReorganizedLayout`
+    /// paths): drop multi-select so chrome does not keep stale folder ids.
+    public static func shouldClearSelectionAfterReorganize(selectionCount: Int) -> Bool {
+        selectionCount > 0
+    }
+
+
+    // MARK: Blank-area context menu (LaunchOS parity: settings / reorganize / quit)
+
+    /// Right-click on empty grid space. Never while searching, inside an open
+    /// folder, during a drag, while a page turn is in flight, or while the
+    /// launcher is leaving — the menu must not race paging or drop code.
+    public static func showsBlankAreaContextMenu(
+        isSearching: Bool,
+        folderOpen: Bool,
+        isDragging: Bool,
+        isPaging: Bool,
+        isDismissing: Bool
+    ) -> Bool {
+        !isSearching && !folderOpen && !isDragging && !isPaging && !isDismissing
+    }
+
+    /// Wallpaper / empty-grid left click: clear multi-select instead of
+    /// dismissing when something is selected (Escape parity; Launchpad-like).
+    /// Marquee activation, folder dimmer, and paging gates stay in Direct.
+    public static func shouldClearSelectionInsteadOfDismiss(selectionCount: Int) -> Bool {
+        selectionCount > 0
+    }
+
+    /// Entering search from the idle grid: drop multi-select so result tiles
+    /// do not keep grid-selection chrome. Leaving search / ⌘A-in-search stay
+    /// on existing Direct paths.
+    public static func shouldClearSelectionWhenEnteringSearch(
+        wasSearching: Bool,
+        isSearchingNow: Bool,
+        selectionCount: Int
+    ) -> Bool {
+        !wasSearching && isSearchingNow && selectionCount > 0
+    }
+
+    /// Hide / hotkey / launch-dismiss: drop multi-select so the next show
+    /// starts with empty chrome. Esc and blank-click already clear before
+    /// dismiss; this covers paths that hide while selection remains.
+    public static func shouldClearSelectionOnDismiss(selectionCount: Int) -> Bool {
+        selectionCount > 0
+    }
+
+    /// Opening Settings: drop multi-select so chrome does not linger under the
+    /// settings window; Esc-clear / blank-clear paths stay unchanged.
+    public static func shouldClearSelectionWhenOpeningSettings(selectionCount: Int) -> Bool {
+        selectionCount > 0
+    }
+
+    /// Opening a folder panel: drop grid multi-select so chrome does not
+    /// linger under the veil; folder members start unselected. Closing
+    /// still uses existing prune / Esc paths.
+    public static func shouldClearSelectionWhenOpeningFolder(selectionCount: Int) -> Bool {
+        selectionCount > 0
+    }
+
+    /// Closing a folder panel: drop any multi-select (often folder members)
+    /// so grid chrome does not keep orphan highlights after the veil lifts.
+    public static func shouldClearSelectionWhenClosingFolder(selectionCount: Int) -> Bool {
+        selectionCount > 0
+    }
+
+    /// Layout editing turned off (scan incomplete / read-only): drop
+    /// multi-select because batch rearrange menus are unavailable.
+    public static func shouldClearSelectionWhenLayoutEditingDisabled(
+        wasEnabled: Bool,
+        isEnabledNow: Bool,
+        selectionCount: Int
+    ) -> Bool {
+        wasEnabled && !isEnabledNow && selectionCount > 0
+    }
+
+    /// 「解散所有文件夹」: every top-level folder is replaced in place by its
+    /// members (same rule as the folder menu). Nil when there is no folder.
+    public static func ungroupAllFolders(in state: LayoutState) -> LayoutState? {
+        let folderIDs = state.orderedEntries.compactMap { entry -> UUID? in
+            if case .folder(let id) = entry, state.folders[id] != nil { return id }
+            return nil
+        }
+        guard !folderIDs.isEmpty else { return nil }
+        var next = state
+        for id in folderIDs {
+            if let dissolved = dissolveFolder(id, in: next) {
+                next = dissolved
+            }
+        }
+        return next
+    }
+
+    /// 「文件夹移到最前/最后」: stable partition of top-level entries; apps
+    /// and folders each keep their relative order. Nil when nothing moves.
+    public static func movingFoldersToEdge(atStart: Bool, in state: LayoutState) -> LayoutState? {
+        let folders = state.orderedEntries.filter { if case .folder = $0 { return true }; return false }
+        let apps = state.orderedEntries.filter { if case .folder = $0 { return false }; return true }
+        let reordered = atStart ? folders + apps : apps + folders
+        guard !folders.isEmpty, reordered != state.orderedEntries else { return nil }
+        var next = state
+        next.orderedEntries = reordered
+        next.updatedAt = .now
+        return next
+    }
+
+    public static func topLevelFolderCount(in state: LayoutState) -> Int {
+        state.orderedEntries.reduce(0) { count, entry in
+            if case .folder(let id) = entry, state.folders[id] != nil { return count + 1 }
+            return count
+        }
+    }
+
+    public static let ungroupAllFoldersToastMessageFormatKey = "已解散 %d 个文件夹"
+
+    /// Blank-area「整理布局 ▸ 按名称/按类型排列…」reuses the settings one-shot
+    /// rearrange. Disabled (false) when the sort would not move anything.
+    public static func rearrangeWouldChange(
+        in state: LayoutState,
+        catalog: [AppCandidate],
+        sort: GridRearrangeSort
+    ) -> Bool {
+        rearrangeTopLevelEntries(in: state, catalog: catalog, sort: sort).orderedEntries != state.orderedEntries
+    }
+
+    public static func blankAreaRearrangeMenuTitleKey(sort: GridRearrangeSort) -> String {
+        switch sort {
+        case .byName: return "按名称排列…"
+        case .byKind: return "按类型排列…"
+        }
+    }
+    public static let foldersMovedToStartToastKey = "文件夹已移到最前"
+    public static let foldersMovedToEndToastKey = "文件夹已移到最后"
 
     /// Top-level apps from `selection` that sit on the same page as `folderID`
     /// and can be batch-moved into that existing folder (excludes the folder id).
@@ -5053,6 +6539,117 @@ public enum LauncherLayout {
         return .success(state)
     }
 
+    /// Multi-select group reorder (MULTI-DRAG-REORDER-CORE-01 + WIRE-01).
+    /// Moves ≥2 **top-level** entries (apps and/or folders) as one contiguous
+    /// block to `insertAt` in `orderedEntries` (`0...count`, same as
+    /// `reorderGapIndex`). Block order follows current grid order among the
+    /// selected ids (not click order). Nil when any id is missing/not
+    /// top-level, `insertAt` is out of range, fewer than two distinct ids, or
+    /// the move would leave `orderedEntries` unchanged. Does not touch folder
+    /// membership, aliases, hidden keys, or paging.
+    /// MULTI-DRAG-BADGE-01: count for the drag-image badge when the drag
+    /// source is part of a multi-selection of top-level items. Nil when the
+    /// badge should stay hidden (single selection, folder-member drag, or
+    /// drag source not in the selection). Does not touch paging.
+    public static func multiDragBadgeCount(
+        selection: LauncherItemSelection,
+        draggedID: UUID,
+        in state: LayoutState
+    ) -> Int? {
+        guard selection.contains(draggedID), selection.count >= 2 else { return nil }
+        let topLevel = Set(state.orderedEntries.map(\.id))
+        let ids = selection.orderedIDs.filter { topLevel.contains($0) }
+        guard ids.count >= 2, ids.contains(draggedID) else { return nil }
+        return ids.count
+    }
+
+    /// MULTI-DRAG-REORDER-WIRE-01: same-page top-level ids (apps + folders)
+    /// eligible for group reorder. Grid membership only; Core still sorts the
+    /// moving block by current `orderedEntries` order. Empty when the drop
+    /// gap is off the dragged item's page, selection has fewer than two
+    /// same-page top-level ids, or the drag source is not in the selection.
+    public static func topLevelIDsForBatchReorder(
+        selection: LauncherItemSelection,
+        draggedID: UUID,
+        insertAt: Int,
+        in state: LayoutState
+    ) -> [UUID] {
+        guard selection.contains(draggedID) else { return [] }
+        guard let dragIndex = state.orderedEntries.firstIndex(where: { $0.id == draggedID }) else {
+            return []
+        }
+        let page = pageIndex(containingEntryAt: dragIndex)
+        let pageStart = page * pageCapacity
+        let pageEnd = min((page + 1) * pageCapacity, state.orderedEntries.count)
+        guard insertAt >= pageStart, insertAt <= pageEnd else { return [] }
+        let pageIDs = Set(itemIDs(onPage: page, from: state.orderedEntries))
+        var ids: [UUID] = []
+        var seen = Set<UUID>()
+        for id in selection.orderedIDs where pageIDs.contains(id) && seen.insert(id).inserted {
+            ids.append(id)
+        }
+        guard ids.count >= 2, ids.contains(draggedID) else { return [] }
+        return ids
+    }
+
+    /// True when a multi-select gap drop should move the whole same-page block.
+    public static func shouldBatchReorderSelection(
+        selection: LauncherItemSelection,
+        draggedID: UUID,
+        insertAt: Int,
+        in state: LayoutState
+    ) -> Bool {
+        let ids = topLevelIDsForBatchReorder(
+            selection: selection,
+            draggedID: draggedID,
+            insertAt: insertAt,
+            in: state
+        )
+        return ids.count >= 2 && ids.contains(draggedID)
+    }
+
+    /// MULTI-DRAG-REORDER-CORE-01: move ≥2 top-level entries as one block.
+    public static func reorderingTopLevelSelection(
+        _ orderedIDs: [UUID],
+        insertAt: Int,
+        in state: LayoutState
+    ) -> LayoutState? {
+        var seen = Set<UUID>()
+        var unique: [UUID] = []
+        for id in orderedIDs where seen.insert(id).inserted {
+            unique.append(id)
+        }
+        guard unique.count >= 2 else { return nil }
+        guard (0...state.orderedEntries.count).contains(insertAt) else { return nil }
+
+        var indexByID: [UUID: Int] = [:]
+        var entryByID: [UUID: LauncherEntry] = [:]
+        for (index, entry) in state.orderedEntries.enumerated() {
+            indexByID[entry.id] = index
+            entryByID[entry.id] = entry
+        }
+        for id in unique {
+            guard indexByID[id] != nil, entryByID[id] != nil else { return nil }
+        }
+
+        // Visual group: keep relative grid order inside the block.
+        let sortedIDs = unique.sorted { indexByID[$0]! < indexByID[$1]! }
+        let block = sortedIDs.map { entryByID[$0]! }
+        let removalIndices = sortedIDs.map { indexByID[$0]! }.sorted()
+
+        var next = state
+        var insert = insertAt
+        for index in removalIndices.reversed() {
+            next.orderedEntries.remove(at: index)
+            if index < insert { insert -= 1 }
+        }
+        insert = min(max(insert, 0), next.orderedEntries.count)
+        next.orderedEntries.insert(contentsOf: block, at: insert)
+        guard next.orderedEntries != state.orderedEntries else { return nil }
+        next.updatedAt = .now
+        return next
+    }
+
     /// After a tile is hidden, put keyboard on the next remaining id, else the previous.
     public static func focusItemIDAfterHiding(
         hiddenID: UUID,
@@ -5094,6 +6691,79 @@ public enum LauncherLayout {
         guard state.hiddenAppKeys.remove(key) != nil else { return state }
         state.updatedAt = .now
         return state
+    }
+
+    /// Settings「全部恢复」: un-hide every hidden app in one layout change
+    /// (one backup, one write). Nil when nothing is hidden. Callers reconcile
+    /// afterwards so the apps reappear at the end, like a single restore.
+    public static func restoringAllHiddenApplications(in state: LayoutState) -> LayoutState? {
+        guard !state.hiddenAppKeys.isEmpty else { return nil }
+        var state = state
+        state.hiddenAppKeys.removeAll()
+        state.updatedAt = .now
+        return state
+    }
+
+    public static let restoreAllHiddenButtonTitleKey = "全部恢复"
+    public static let restoreAllHiddenAccessibilityHelpKey = "把所有隐藏的应用放回启动器"
+    public static let restoredAllHiddenMessageFormatKey = "已恢复 %d 个应用"
+    /// Shown only with two or more hidden apps; one app uses the plain「恢复」.
+    public static func settingsShowsRestoreAllHidden(hiddenCount: Int) -> Bool { hiddenCount >= 2 }
+
+    /// SETTINGS-HIDDEN-APPS-CHROME-COPY-01 — Settings hidden-apps row chrome.
+    public enum SettingsHiddenAppsChromeCopy {
+        public static let rowTitleKey = "隐藏的应用"
+        public static let emptyPopupTitleKey = "没有隐藏的应用"
+        public static let restoreButtonTitleKey = "恢复"
+        public static let restoreAccessibilityLabelKey = "恢复所选应用"
+        public static let restoreAccessibilityHelpKey = "把隐藏的应用放回启动器"
+        public static let restoreUnavailableKey = "当前无法恢复该应用，请等待扫描完成后重试。"
+        public static let restoredGenericKey = "已恢复应用"
+        /// Same wording as blank-area restore toast.
+        public static let restoredNamedFormatKey = "已恢复“%@”"
+
+        public static func rowTitle(localize: (String) -> String = { $0 }) -> String {
+            localize(rowTitleKey)
+        }
+        public static func emptyPopupTitle(localize: (String) -> String = { $0 }) -> String {
+            localize(emptyPopupTitleKey)
+        }
+        public static func restoreButtonTitle(localize: (String) -> String = { $0 }) -> String {
+            localize(restoreButtonTitleKey)
+        }
+        public static func restoreAccessibilityLabel(localize: (String) -> String = { $0 }) -> String {
+            localize(restoreAccessibilityLabelKey)
+        }
+        public static func restoreAccessibilityHelp(localize: (String) -> String = { $0 }) -> String {
+            localize(restoreAccessibilityHelpKey)
+        }
+        public static func restoreUnavailable(localize: (String) -> String = { $0 }) -> String {
+            localize(restoreUnavailableKey)
+        }
+        public static func restoredGeneric(localize: (String) -> String = { $0 }) -> String {
+            localize(restoredGenericKey)
+        }
+        public static func restoredNamed(
+            displayName: String,
+            localize: (String) -> String = { $0 }
+        ) -> String {
+            String(format: localize(restoredNamedFormatKey), displayName)
+        }
+    }
+
+    /// Blank-area「隐藏的应用 ▸」: at most this many names; the rest live in Settings.
+    public static let blankAreaHiddenAppsMenuLimit = 20
+    public static let blankAreaSelectAllMenuTitleKey = "选择本页全部"
+    /// Blank-area「清除选择」when multi-select chrome is non-empty.
+    public static let blankAreaClearSelectionMenuTitleKey = "清除选择"
+    public static let blankAreaHiddenAppsMenuTitleKey = "隐藏的应用"
+    public static let blankAreaHiddenAppsMoreTitleKey = "在设置中查看全部…"
+    public static let restoredHiddenAppToastFormatKey = "已恢复“%@”"
+
+    /// Items to list (input order) and whether a「在设置中查看全部…」row is needed.
+    public static func blankAreaHiddenAppsMenuEntries<Element>(_ hidden: [Element]) -> (shown: [Element], hasMore: Bool) {
+        let limit = max(0, blankAreaHiddenAppsMenuLimit)
+        return (Array(hidden.prefix(limit)), hidden.count > limit)
     }
 
     public static func applyDrop(
@@ -5320,5 +6990,1021 @@ public enum LauncherLayout {
             id = UUID()
         }
         return id
+    }
+}
+
+// MARK: - Category sort (CATEGORY-SORT-CORE-01)
+
+/// Coarse groups for `LSApplicationCategoryType`. Raw value is the sort rank.
+public enum AppCategoryGroup: Int, CaseIterable, Comparable, Sendable {
+    case productivity
+    case developerTools
+    case creativity
+    case entertainment
+    case social
+    case utilities
+    case games
+    case education
+    case lifestyle
+    case other
+
+    public static func < (lhs: AppCategoryGroup, rhs: AppCategoryGroup) -> Bool {
+        lhs.rawValue < rhs.rawValue
+    }
+
+    /// Maps an Info.plist `LSApplicationCategoryType` value. Unknown or missing → `.other`.
+    public static func group(forCategoryType categoryType: String?) -> AppCategoryGroup {
+        let prefix = "public.app-category."
+        guard let raw = categoryType?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              raw.hasPrefix(prefix) else { return .other }
+        let name = String(raw.dropFirst(prefix.count))
+        if name == "games" || name.hasSuffix("-games") { return .games }
+        switch name {
+        case "business", "productivity", "finance":
+            return .productivity
+        case "developer-tools":
+            return .developerTools
+        case "graphics-design", "photography", "video":
+            return .creativity
+        case "entertainment", "music", "news":
+            return .entertainment
+        case "social-networking":
+            return .social
+        case "utilities":
+            return .utilities
+        case "education", "reference", "books":
+            return .education
+        case "lifestyle", "healthcare-fitness", "medical", "sports", "travel", "weather":
+            return .lifestyle
+        default:
+            return .other
+        }
+    }
+
+    /// Localization key (zh source) for a future section label / toast.
+    public var titleKey: String {
+        switch self {
+        case .productivity: return "效率与办公"
+        case .developerTools: return "开发工具"
+        case .creativity: return "创意设计"
+        case .entertainment: return "影音娱乐"
+        case .social: return "社交"
+        case .utilities: return "实用工具"
+        case .games: return "游戏"
+        case .education: return "教育与参考"
+        case .lifestyle: return "生活"
+        case .other: return "其他"
+        }
+    }
+}
+
+extension LauncherLayout {
+    /// Reads `LSApplicationCategoryType` from the bundle's Info.plist (or the
+    /// first wrapped iOS app's). Read on demand so `AppCandidate` and the catalog
+    /// cache stay unchanged.
+    public static func applicationCategoryType(forAppAt url: URL) -> String? {
+        func category(inPlist plistURL: URL) -> String? {
+            guard let info = NSDictionary(contentsOf: plistURL) as? [String: Any],
+                  let value = info["LSApplicationCategoryType"] as? String,
+                  !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+            return value
+        }
+        if let value = category(inPlist: url.appendingPathComponent("Contents/Info.plist")) {
+            return value
+        }
+        let wrapper = url.appendingPathComponent("Wrapper", isDirectory: true)
+        guard let children = try? FileManager.default.contentsOfDirectory(
+            at: wrapper, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
+        ) else { return nil }
+        for child in children.sorted(by: { $0.path < $1.path }) where child.pathExtension.lowercased() == "app" {
+            if let value = category(inPlist: child.appendingPathComponent("Info.plist")) {
+                return value
+            }
+        }
+        return nil
+    }
+
+    /// Reorders top-level entries by category group, then by display name
+    /// (alias wins), then UUID. Folders go after every app group. Like
+    /// `rearrangeTopLevelEntries`, it never touches folder contents, aliases,
+    /// or paging. `categoryType` is injected so tests avoid the filesystem.
+    public static func rearrangeTopLevelEntriesByCategory(
+        in state: LayoutState,
+        catalog: [AppCandidate],
+        categoryType: (AppCandidate) -> String? = { applicationCategoryType(forAppAt: $0.canonicalURL) }
+    ) -> LayoutState {
+        let byKey = AppCandidate.firstByDeduplicationKey(catalog)
+        var groupCache: [UUID: Int] = [:]
+        func rank(for entry: LauncherEntry) -> Int {
+            if let cached = groupCache[entry.id] { return cached }
+            let value: Int
+            switch entry {
+            case .folder:
+                value = AppCategoryGroup.allCases.count
+            case .app(let id):
+                if let key = state.appKeys[id], let candidate = byKey[key] {
+                    value = AppCategoryGroup.group(forCategoryType: categoryType(candidate)).rawValue
+                } else {
+                    value = AppCategoryGroup.other.rawValue
+                }
+            }
+            groupCache[entry.id] = value
+            return value
+        }
+        func displayName(for entry: LauncherEntry) -> String {
+            switch entry {
+            case .folder(let id):
+                return state.folders[id]?.name ?? id.uuidString
+            case .app(let id):
+                guard let key = state.appKeys[id] else { return id.uuidString }
+                if let alias = state.appAliases[key], !alias.isEmpty { return alias }
+                return byKey[key]?.displayName ?? id.uuidString
+            }
+        }
+        // Precompute ranks so the (possibly disk-reading) provider runs once per app.
+        for entry in state.orderedEntries { _ = rank(for: entry) }
+
+        var next = state
+        next.orderedEntries.sort { lhs, rhs in
+            let lr = rank(for: lhs)
+            let rr = rank(for: rhs)
+            if lr != rr { return lr < rr }
+            let nameOrder = displayName(for: lhs).localizedStandardCompare(displayName(for: rhs))
+            if nameOrder != .orderedSame { return nameOrder == .orderedAscending }
+            return lhs.id.uuidString < rhs.id.uuidString
+        }
+        if next.orderedEntries != state.orderedEntries {
+            next.updatedAt = .now
+        }
+        return next
+    }
+}
+
+// MARK: - Marquee selection model (MARQUEE-CORE-01, Core only, not wired)
+
+/// Rubber-band selection on the empty wallpaper of the *current page*.
+/// Pure geometry + policy; Direct wiring is deferred. Paging is never driven
+/// by a marquee: it is clamped to the visible page and never auto-scrolls.
+public enum LauncherMarquee {
+    /// Same threshold as the tile's item-drag start, so a plain click on the
+    /// wallpaper (which dismisses the launcher) is never stolen by a marquee.
+    public static let activationDistance: CGFloat = 8
+
+    public enum Modifier: Equatable, Sendable {
+        /// No modifier: hits replace the selection.
+        case replace
+        /// Shift: hits are added to the selection captured at mouse-down.
+        case extend
+        /// Command: hits flip membership relative to the mouse-down selection.
+        case toggle
+    }
+
+    public struct ItemFrame: Equatable, Sendable {
+        public let id: UUID
+        public let frame: CGRect
+        public init(id: UUID, frame: CGRect) {
+            self.id = id
+            self.frame = frame
+        }
+    }
+
+    /// Command wins over Shift (matches the click model: ⌘ toggles).
+    public static func modifier(command: Bool, shift: Bool) -> Modifier {
+        if command { return .toggle }
+        if shift { return .extend }
+        return .replace
+    }
+
+    /// Whether a left-button press may *arm* a marquee. It still only starts
+    /// after `hasActivated`. Main grid only (no search list, no open folder).
+    public static func canArm(
+        buttonNumber: Int,
+        clickCount: Int,
+        startsOnBlankArea: Bool,
+        isSearching: Bool,
+        folderOpen: Bool,
+        isDragging: Bool,
+        isPaging: Bool,
+        isDismissing: Bool,
+        isPromptingForAlias: Bool
+    ) -> Bool {
+        buttonNumber == 0 && clickCount == 1 && startsOnBlankArea
+            && !isSearching && !folderOpen && !isDragging && !isPaging
+            && !isDismissing && !isPromptingForAlias
+    }
+
+    public static func hasActivated(from start: CGPoint, to current: CGPoint) -> Bool {
+        hypot(current.x - start.x, current.y - start.y) >= activationDistance
+    }
+
+    /// Standardized rect between two points (any drag direction).
+    public static func rect(from start: CGPoint, to current: CGPoint) -> CGRect {
+        CGRect(
+            x: min(start.x, current.x),
+            y: min(start.y, current.y),
+            width: abs(current.x - start.x),
+            height: abs(current.y - start.y)
+        )
+    }
+
+    /// Clamps the marquee to the visible page so it can never imply paging.
+    public static func clamped(_ rect: CGRect, to pageBounds: CGRect) -> CGRect {
+        let minX = max(rect.minX, pageBounds.minX)
+        let minY = max(rect.minY, pageBounds.minY)
+        let maxX = min(rect.maxX, pageBounds.maxX)
+        let maxY = min(rect.maxY, pageBounds.maxY)
+        guard maxX >= minX, maxY >= minY else { return .zero }
+        return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+    }
+
+    /// Ids whose icon frame overlaps the marquee, in presented order. A thin
+    /// (zero-width/height) marquee still hits frames it crosses; touching an
+    /// edge only does not count.
+    public static func hitIDs(in marquee: CGRect, items: [ItemFrame]) -> [UUID] {
+        items.compactMap { item in
+            let f = item.frame
+            guard f.width > 0, f.height > 0 else { return nil }
+            let overlaps = marquee.maxX > f.minX && marquee.minX < f.maxX
+                && marquee.maxY > f.minY && marquee.minY < f.maxY
+            return overlaps ? item.id : nil
+        }
+    }
+
+    /// Live selection while dragging. Always derived from `base` (the
+    /// selection captured at mouse-down) so shrinking the rect deselects.
+    public static func selection(
+        base: LauncherItemSelection,
+        hits: [UUID],
+        modifier: Modifier
+    ) -> LauncherItemSelection {
+        switch modifier {
+        case .replace:
+            return LauncherItemSelection(orderedIDs: hits, rangeAnchorID: hits.first)
+        case .extend:
+            let added = hits.filter { !base.contains($0) }
+            return LauncherItemSelection(
+                orderedIDs: base.orderedIDs + added,
+                rangeAnchorID: base.rangeAnchorID ?? hits.first
+            )
+        case .toggle:
+            let hitSet = Set(hits)
+            let kept = base.orderedIDs.filter { !hitSet.contains($0) }
+            let added = hits.filter { !base.contains($0) }
+            let ids = kept + added
+            let anchor = base.rangeAnchorID.flatMap { ids.contains($0) ? $0 : nil } ?? added.first
+            return LauncherItemSelection(orderedIDs: ids, rangeAnchorID: anchor)
+        }
+    }
+
+    /// A release after an activated marquee must not count as a wallpaper
+    /// click (which would dismiss the launcher).
+    public static func suppressesDismissOnRelease(didActivate: Bool) -> Bool {
+        didActivate
+    }
+}
+
+// MARK: - Layout import hardening (LAYOUT-IMPORT-HARDENING-01)
+
+extension LauncherLayout {
+    /// Folder-name / alias limits used by the in-app editors.
+    public static let maximumFolderNameLength = 40
+    public static let maximumAliasLength = 60
+
+    /// Replaces each run of newlines/tabs/other control characters with one space,
+    /// trims, and clamps to `limit` characters.
+    public static func sanitizedImportedName(_ raw: String, limit: Int) -> String {
+        var scalars = String.UnicodeScalarView()
+        var lastWasControl = false
+        for scalar in raw.unicodeScalars {
+            let isControl = CharacterSet.controlCharacters.contains(scalar)
+                || CharacterSet.newlines.contains(scalar)
+            if isControl {
+                // A run of control characters becomes one space; ordinary
+                // spaces typed by the user are kept as-is.
+                if !lastWasControl { scalars.append(" ") }
+                lastWasControl = true
+            } else {
+                scalars.append(scalar)
+                lastWasControl = false
+            }
+        }
+        let trimmed = String(scalars).trimmingCharacters(in: .whitespacesAndNewlines)
+        return String(trimmed.prefix(limit))
+    }
+
+    /// Cleans user-editable strings in an imported file. Structure is left to
+    /// `reconcile`; `updatedAt` is not bumped, and a clean file is unchanged.
+    public static func sanitizedImportedLayout(_ state: LayoutState) -> LayoutState {
+        var next = state
+        for (id, folder) in state.folders {
+            let name = sanitizedImportedName(folder.name, limit: maximumFolderNameLength)
+            if name != folder.name {
+                var cleaned = folder
+                cleaned.name = name
+                next.folders[id] = cleaned
+            }
+        }
+        var aliases: [String: String] = [:]
+        for (key, alias) in state.appAliases where !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let cleaned = sanitizedImportedName(alias, limit: maximumAliasLength)
+            if !cleaned.isEmpty { aliases[key] = cleaned }
+        }
+        next.appAliases = aliases
+        next.hiddenAppKeys = state.hiddenAppKeys.filter {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        return next
+    }
+
+    /// How an imported layout lines up with the apps installed *here*. For a
+    /// later confirm/warning in Direct (not wired yet).
+    public struct LayoutImportAssessment: Equatable, Sendable {
+        /// Distinct app keys in the file that match an installed app.
+        public let matchedAppCount: Int
+        /// Distinct app keys in the file with no installed app (dropped by reconcile).
+        public let unmatchedAppCount: Int
+        public let folderCount: Int
+        /// Installed apps the file would hide.
+        public let hiddenInstalledAppCount: Int
+        public let installedAppCount: Int
+
+        /// File names apps but none are installed here (e.g. another Mac):
+        /// importing would effectively reset the grid.
+        public var looksForeign: Bool { matchedAppCount == 0 && unmatchedAppCount > 0 }
+        /// Every installed app would be hidden → empty grid.
+        public var hidesEverything: Bool { installedAppCount > 0 && hiddenInstalledAppCount >= installedAppCount }
+        public var needsExtraConfirmation: Bool { looksForeign || hidesEverything }
+    }
+
+    public static func layoutImportAssessment(
+        imported: LayoutState,
+        catalog: [AppCandidate]
+    ) -> LayoutImportAssessment {
+        let installedKeys = Set(catalog.map(\.deduplicationKey))
+        let fileKeys = Set(imported.appKeys.values)
+        let matched = fileKeys.intersection(installedKeys).count
+        return LayoutImportAssessment(
+            matchedAppCount: matched,
+            unmatchedAppCount: fileKeys.count - matched,
+            folderCount: imported.folders.count,
+            hiddenInstalledAppCount: imported.hiddenAppKeys.intersection(installedKeys).count,
+            installedAppCount: installedKeys.count
+        )
+    }
+}
+
+// MARK: - Folder name suggestion (FOLDER-NAME-SUGGEST-CORE-01, not wired)
+
+extension AppCategoryGroup {
+    /// iOS / LaunchOS style default name when a folder is created from apps:
+    /// the shared category title when at least two apps all map to the same
+    /// group other than `.other`. Nil → keep the existing「新建文件夹」default.
+    public static func suggestedFolderNameKey(forCategoryTypes categoryTypes: [String?]) -> String? {
+        guard categoryTypes.count >= 2 else { return nil }
+        let groups = Set(categoryTypes.map { group(forCategoryType: $0) })
+        guard groups.count == 1, let only = groups.first, only != .other else { return nil }
+        return only.titleKey
+    }
+}
+
+// MARK: - Layout change summary (LAYOUT-CHANGE-SUMMARY-CORE-01, not wired)
+
+/// What would change when `old` is replaced by `new` (import confirmation,
+/// undo toasts). Apps are matched by app key, not tile UUID, because an
+/// imported file may carry different ids; folders are matched by id.
+public struct LayoutChangeSummary: Equatable, Sendable {
+    /// Keys that change container (top level ↔ folder, or another folder).
+    public var appsChangingContainer = 0
+    /// Keys only present in `new` / only in `old` (placed tiles only).
+    public var appsAdded = 0
+    public var appsRemoved = 0
+    /// Relative order of top-level apps/folders present in both differs.
+    public var topLevelOrderChanged = false
+    public var foldersAdded = 0
+    public var foldersRemoved = 0
+    public var foldersRenamed = 0
+    public var newlyHidden = 0
+    public var newlyShown = 0
+    /// Alias added, removed or edited.
+    public var aliasesChanged = 0
+
+    public init() {}
+
+    public var isEmpty: Bool { self == LayoutChangeSummary() }
+
+    /// One clause of the post-import message. `count == nil` → plain key.
+    public struct Detail: Equatable, Sendable {
+        public let key: String
+        public let count: Int?
+    }
+
+    public static let importedMessageKey = "布局已导入"
+    /// "%@" = clauses joined by「、」.
+    public static let importedWithDetailsFormatKey = "布局已导入：%@"
+    public static let detailsTruncatedFormatKey = "%@等"
+    public static let restoredMessageKey = "已恢复上次备份"
+    public static let restoredWithDetailsFormatKey = "已恢复上次备份：%@"
+    /// Second import confirm: preview of what the grid would lose/gain.
+    public static let importPreviewFormatKey = "导入后的变化：%@"
+
+    /// Non-zero changes in a fixed, user-relevant order (moves first).
+    public var details: [Detail] {
+        var out: [Detail] = []
+        func add(_ key: String, _ n: Int) { if n > 0 { out.append(Detail(key: key, count: n)) } }
+        add("%d 个应用换了位置", appsChangingContainer)
+        if topLevelOrderChanged { out.append(Detail(key: "图标顺序已调整", count: nil)) }
+        add("新增 %d 个文件夹", foldersAdded)
+        add("移除 %d 个文件夹", foldersRemoved)
+        add("%d 个文件夹改名", foldersRenamed)
+        add("隐藏 %d 个应用", newlyHidden)
+        add("显示 %d 个应用", newlyShown)
+        add("%d 个别名变化", aliasesChanged)
+        add("新增 %d 个应用", appsAdded)
+        add("移除 %d 个应用", appsRemoved)
+        return out
+    }
+
+    /// First `limit` details for a one-line status; `truncated` when more exist.
+    public func importedMessageDetails(limit: Int = 3) -> (details: [Detail], truncated: Bool) {
+        let all = details
+        let n = max(0, limit)
+        return (Array(all.prefix(n)), all.count > n)
+    }
+}
+
+extension LauncherLayout {
+    private enum PlacementContainer: Hashable {
+        case topLevel
+        case folder(UUID)
+    }
+
+    private static func placements(of state: LayoutState) -> (byKey: [String: PlacementContainer], topLevelTokens: [String]) {
+        var byKey: [String: PlacementContainer] = [:]
+        var tokens: [String] = []
+        for entry in state.orderedEntries {
+            switch entry {
+            case .app(let id):
+                guard let key = state.appKeys[id], byKey[key] == nil else { continue }
+                byKey[key] = .topLevel
+                tokens.append("app:" + key)
+            case .folder(let folderID):
+                guard let folder = state.folders[folderID] else { continue }
+                tokens.append("folder:" + folderID.uuidString)
+                for id in folder.itemIDs {
+                    guard let key = state.appKeys[id], byKey[key] == nil else { continue }
+                    byKey[key] = .folder(folderID)
+                }
+            }
+        }
+        return (byKey, tokens)
+    }
+
+    public static func layoutChangeSummary(from old: LayoutState, to new: LayoutState) -> LayoutChangeSummary {
+        var summary = LayoutChangeSummary()
+        let before = placements(of: old)
+        let after = placements(of: new)
+        for (key, container) in after.byKey {
+            if let previous = before.byKey[key] {
+                if previous != container { summary.appsChangingContainer += 1 }
+            } else {
+                summary.appsAdded += 1
+            }
+        }
+        summary.appsRemoved = before.byKey.keys.filter { after.byKey[$0] == nil }.count
+
+        let common = Set(before.topLevelTokens).intersection(after.topLevelTokens)
+        summary.topLevelOrderChanged =
+            before.topLevelTokens.filter(common.contains) != after.topLevelTokens.filter(common.contains)
+
+        let oldFolders = Set(old.orderedEntries.compactMap { entry -> UUID? in
+            if case .folder(let id) = entry, old.folders[id] != nil { return id }
+            return nil
+        })
+        let newFolders = Set(new.orderedEntries.compactMap { entry -> UUID? in
+            if case .folder(let id) = entry, new.folders[id] != nil { return id }
+            return nil
+        })
+        summary.foldersAdded = newFolders.subtracting(oldFolders).count
+        summary.foldersRemoved = oldFolders.subtracting(newFolders).count
+        summary.foldersRenamed = oldFolders.intersection(newFolders).filter {
+            old.folders[$0]?.name != new.folders[$0]?.name
+        }.count
+
+        summary.newlyHidden = new.hiddenAppKeys.subtracting(old.hiddenAppKeys).count
+        summary.newlyShown = old.hiddenAppKeys.subtracting(new.hiddenAppKeys).count
+        let aliasKeys = Set(old.appAliases.keys).union(new.appAliases.keys)
+        summary.aliasesChanged = aliasKeys.filter { old.appAliases[$0] != new.appAliases[$0] }.count
+        return summary
+    }
+}
+
+// MARK: - Import confirmation kind (LAYOUT-IMPORT-CONFIRM-CORE-01, not wired)
+
+/// Which confirmation an import should show, combining the catalog
+/// assessment with the diff against the current layout. Direct still owns
+/// the existing confirm alert; this only picks the variant and extra copy.
+public enum LayoutImportConfirmation: Equatable, Sendable {
+    /// File equals the current layout: skip the alert, show `messageKey` as a toast.
+    case unchanged
+    /// Existing confirmation, no extra warning.
+    case standard
+    /// None of the file's apps are installed here.
+    case warnForeign
+    /// Every installed app would be hidden.
+    case warnHidesEverything
+
+    public var messageKey: String? {
+        switch self {
+        case .unchanged: return "导入的布局与当前布局相同"
+        case .standard: return nil
+        case .warnForeign: return "该布局中的应用都未安装在这台 Mac 上，导入后图标将按默认方式排列。"
+        case .warnHidesEverything: return "该布局会隐藏所有应用，导入后启动台将为空。"
+        }
+    }
+
+    public var showsAlert: Bool { self != .unchanged }
+
+    /// Warning variants need a second, cancel-first confirm after the file is read.
+    public var needsSecondConfirm: Bool { self == .warnForeign || self == .warnHidesEverything }
+    public static let secondConfirmTitleKey = "仍要导入这份布局？"
+    public static let secondConfirmButtonTitleKey = "仍然导入"
+    public static let cancelledMessageKey = "已取消导入"
+}
+
+extension LauncherLayout {
+    /// What committing `imported` would change, as seen after reconcile.
+    /// nil while the catalog is still empty (cannot be judged).
+    public static func layoutImportChangeSummary(
+        imported: LayoutState,
+        current: LayoutState,
+        catalog: [AppCandidate]
+    ) -> LayoutChangeSummary? {
+        guard !catalog.isEmpty else { return nil }
+        return layoutChangeSummary(from: current, to: reconcile(candidates: catalog, into: imported))
+    }
+
+    /// Live-catalog convenience used by Direct. An empty catalog (still
+    /// scanning) cannot be judged, so it falls back to `.standard`.
+    public static func layoutImportConfirmation(
+        imported: LayoutState,
+        current: LayoutState,
+        catalog: [AppCandidate]
+    ) -> LayoutImportConfirmation {
+        guard !catalog.isEmpty else { return .standard }
+        let assessment = layoutImportAssessment(imported: imported, catalog: catalog)
+        let reconciled = reconcile(candidates: catalog, into: imported)
+        let summary = layoutChangeSummary(from: current, to: reconciled)
+        return layoutImportConfirmation(assessment: assessment, summary: summary)
+    }
+
+    public static func layoutImportConfirmation(
+        assessment: LayoutImportAssessment,
+        summary: LayoutChangeSummary
+    ) -> LayoutImportConfirmation {
+        if summary.isEmpty { return .unchanged }
+        if assessment.hidesEverything { return .warnHidesEverything }
+        if assessment.looksForeign { return .warnForeign }
+        return .standard
+    }
+}
+
+// MARK: - Category rearrange copy (BLANK-AREA-CATEGORY-SORT-01)
+
+extension LauncherLayout {
+    /// Copy for the blank-area 「按分类排列…」 item. Kept separate from
+    /// `GridRearrangeSort` so existing exhaustive switches stay untouched.
+    public enum CategoryRearrangeCopy {
+        public static let menuTitleKey = "按分类排列…"
+        /// SETTINGS-REARRANGE-BUTTONS-COPY-01 — Settings button (no ellipsis).
+        public static let settingsButtonTitleKey = "按分类排列"
+        public static let settingsAccessibilityHelpKey = "按应用分类分组，组内按名称；文件夹内应用不变"
+        public static let informativeTextKey = "将按应用分类（效率、开发、创意、影音等）分组，组内按名称，文件夹排在最后；文件夹内应用不变。可在「恢复上次备份」撤销。"
+        public static let toastKey = "已按分类重新排列"
+        /// The menu item stays enabled: computing "would change" needs one
+        /// Info.plist read per app, which must not run on every right-click.
+        public static let menuItemAlwaysEnabled = true
+    }
+}
+
+// MARK: - Suggested name for 「移入新建文件夹」 (FOLDER-NAME-SUGGEST-WIRE-01)
+
+extension LauncherLayout {
+    /// Upper bound on Info.plist reads for one suggestion; larger selections
+    /// keep the plain「新建文件夹」 default.
+    public static let suggestedFolderNameMaximumApps = 40
+
+    /// Category title key shared by every app in `appIDs`, or nil (unknown
+    /// id, missing candidate, mixed/other categories, <2 or too many apps).
+    public static func suggestedFolderNameKey(
+        forAppIDs appIDs: [UUID],
+        in state: LayoutState,
+        catalog: [AppCandidate],
+        categoryType: (AppCandidate) -> String? = { applicationCategoryType(forAppAt: $0.canonicalURL) }
+    ) -> String? {
+        guard appIDs.count >= 2, appIDs.count <= suggestedFolderNameMaximumApps else { return nil }
+        let byKey = AppCandidate.firstByDeduplicationKey(catalog)
+        var firstGroup: AppCategoryGroup?
+        var types: [String?] = []
+        for id in appIDs {
+            guard let key = state.appKeys[id], let candidate = byKey[key] else { return nil }
+            let type = categoryType(candidate)
+            let group = AppCategoryGroup.group(forCategoryType: type)
+            // Stop reading plists as soon as the answer is known to be nil.
+            if group == .other { return nil }
+            if let firstGroup, firstGroup != group { return nil }
+            firstGroup = group
+            types.append(type)
+        }
+        return AppCategoryGroup.suggestedFolderNameKey(forCategoryTypes: types)
+    }
+}
+
+// MARK: - Date rearrange (DATE-REARRANGE-CORE-01, Core only, not wired)
+
+/// Which per-app date drives a one-shot「按添加时间 / 按上次打开时间」rearrange.
+/// Kept apart from `GridRearrangeSort` so existing exhaustive switches stay untouched.
+public enum AppDateRearrangeKind: String, CaseIterable, Equatable, Sendable {
+    /// When the bundle landed in its folder (Spotlight `kMDItemDateAdded`,
+    /// falling back to the file system's added-to-directory / creation date).
+    case dateAdded
+    /// Spotlight `kMDItemLastUsedDate`; apps never opened have no date.
+    case lastOpened
+
+    public var menuTitleKey: String {
+        switch self {
+        case .dateAdded: return "按添加时间排列…"
+        case .lastOpened: return "按上次打开时间排列…"
+        }
+    }
+
+    /// Settings button (no ellipsis; matches 按名称/按分类/按颜色).
+    public var settingsButtonTitleKey: String {
+        switch self {
+        case .dateAdded: return "按添加时间排列"
+        case .lastOpened: return "按上次打开时间排列"
+        }
+    }
+
+    /// Folder context menu. Members only; the folder tile stays in its slot.
+    public var folderMenuTitleKey: String {
+        switch self {
+        case .dateAdded: return "按添加时间排列文件夹内应用"
+        case .lastOpened: return "按上次打开时间排列文件夹内应用"
+        }
+    }
+
+    public var folderToastKey: String {
+        switch self {
+        case .dateAdded: return "已按添加时间排列文件夹内应用"
+        case .lastOpened: return "已按上次打开时间排列文件夹内应用"
+        }
+    }
+
+    public var folderAlreadySortedToastKey: String {
+        switch self {
+        case .dateAdded: return "文件夹内应用已按添加时间排列"
+        case .lastOpened: return "文件夹内应用已按上次打开时间排列"
+        }
+    }
+
+    public var folderAccessibilityHelpKey: String {
+        switch self {
+        case .dateAdded: return "只按添加时间调整这个文件夹内的顺序，主屏幕不变"
+        case .lastOpened: return "只按上次打开时间调整这个文件夹内的顺序，主屏幕不变"
+        }
+    }
+
+    /// Shown while Spotlight dates are read off the main actor.
+    public static let progressToastKey = "正在读取应用时间…"
+
+    public func folderAccessibilityHelp(localize: (String) -> String = { $0 }) -> String {
+        localize(folderAccessibilityHelpKey)
+    }
+
+    public var informativeTextKey: String {
+        switch self {
+        case .dateAdded:
+            return "将把最近添加的应用排在前面，无法确定时间的应用在其后，文件夹排在最后；文件夹内应用不变。可在「恢复上次备份」撤销。"
+        case .lastOpened:
+            return "将把最近打开过的应用排在前面，从未打开的应用在其后，文件夹排在最后；文件夹内应用不变。可在「恢复上次备份」撤销。"
+        }
+    }
+
+    public var toastKey: String {
+        switch self {
+        case .dateAdded: return "已按添加时间重新排列"
+        case .lastOpened: return "已按上次打开时间重新排列"
+        }
+    }
+}
+
+extension LauncherLayout {
+    /// Best-effort date for `kind`, read on demand (never cached in the catalog).
+    /// Returns nil when Spotlight and the file system both have nothing.
+    public static func applicationDate(_ kind: AppDateRearrangeKind, forAppAt url: URL) -> Date? {
+        let item = MDItemCreate(kCFAllocatorDefault, url.path as NSString)
+        switch kind {
+        case .dateAdded:
+            if let item, let date = MDItemCopyAttribute(item, kMDItemDateAdded) as? Date {
+                return date
+            }
+            let values = try? url.resourceValues(forKeys: [.addedToDirectoryDateKey, .creationDateKey])
+            return values?.addedToDirectoryDate ?? values?.creationDate
+        case .lastOpened:
+            guard let item else { return nil }
+            return MDItemCopyAttribute(item, kMDItemLastUsedDate) as? Date
+        }
+    }
+
+    /// Spotlight / file-system dates off the main actor, one lookup per app.
+    /// Callers apply the map on the main actor. Does not touch paging.
+    public static func applicationDates(
+        _ kind: AppDateRearrangeKind,
+        for candidates: [AppCandidate]
+    ) async -> [String: Date] {
+        let snapshot = candidates
+        return await Task.detached(priority: .userInitiated) {
+            var out: [String: Date] = [:]
+            var seen = Set<String>()
+            for candidate in snapshot {
+                let key = candidate.deduplicationKey
+                guard seen.insert(key).inserted else { continue }
+                if let date = LauncherLayout.applicationDate(kind, forAppAt: candidate.canonicalURL) {
+                    out[key] = date
+                }
+            }
+            return out
+        }.value
+    }
+
+    /// Reorders top-level entries newest-first by `kind`; apps without a date
+    /// follow (by name, alias wins), then ids missing from the catalog, and
+    /// folders go last (by name); UUID breaks
+    /// ties. Like the other rearranges it only touches `orderedEntries` —
+    /// never folder contents, aliases, hidden apps, or paging — and leaves
+    /// `updatedAt` alone when nothing moves. `date` runs once per top-level app.
+    public static func rearrangeTopLevelEntriesByDate(
+        _ kind: AppDateRearrangeKind,
+        in state: LayoutState,
+        catalog: [AppCandidate],
+        date: ((AppCandidate) -> Date?)? = nil
+    ) -> LayoutState {
+        let provider = date ?? { applicationDate(kind, forAppAt: $0.canonicalURL) }
+        let byKey = AppCandidate.firstByDeduplicationKey(catalog)
+        // tier 0 = dated app, 1 = undated app, 2 = unresolved app id, 3 = folder.
+        var keys: [UUID: (tier: Int, date: Date?, name: String)] = [:]
+        for entry in state.orderedEntries where keys[entry.id] == nil {
+            switch entry {
+            case .folder(let id):
+                keys[id] = (3, nil, state.folders[id]?.name ?? id.uuidString)
+            case .app(let id):
+                guard let key = state.appKeys[id], let candidate = byKey[key] else {
+                    keys[id] = (2, nil, id.uuidString)
+                    continue
+                }
+                let alias = state.appAliases[key]
+                let name = (alias?.isEmpty == false ? alias : nil) ?? candidate.displayName
+                let value = provider(candidate)
+                keys[id] = (value == nil ? 1 : 0, value, name)
+            }
+        }
+        var next = state
+        next.orderedEntries.sort { lhs, rhs in
+            let l = keys[lhs.id]!, r = keys[rhs.id]!
+            if l.tier != r.tier { return l.tier < r.tier }
+            if let ld = l.date, let rd = r.date, ld != rd { return ld > rd }
+            let nameOrder = l.name.localizedStandardCompare(r.name)
+            if nameOrder != .orderedSame { return nameOrder == .orderedAscending }
+            return lhs.id.uuidString < rhs.id.uuidString
+        }
+        if next.orderedEntries != state.orderedEntries {
+            next.updatedAt = .now
+        }
+        return next
+    }
+}
+
+public extension LauncherLayout {
+    /// Whether a tile hides its name label. The "hide app names" preference
+    /// applies to the grid and open folders only: search results keep names
+    /// (they carry the folder context line), and a tile showing
+    /// 「正在启动…」 keeps its label so the launch feedback stays readable.
+    /// Uses `isHidden`, never alpha, so merge / open-flight fades are untouched.
+    static func tileTitleHidden(hidesAppNames: Bool, inSearchResults: Bool, isLaunching: Bool) -> Bool {
+        hidesAppNames && !inSearchResults && !isLaunching
+    }
+
+    /// Split app / folder name preferences (LaunchOS parity): an app tile
+    /// follows `hidesAppNames`, a folder tile follows `hidesFolderNames`.
+    /// Same search / launching exceptions as above.
+    static func tileTitleHidden(
+        hidesAppNames: Bool,
+        hidesFolderNames: Bool,
+        isFolder: Bool,
+        inSearchResults: Bool,
+        isLaunching: Bool
+    ) -> Bool {
+        tileTitleHidden(
+            hidesAppNames: isFolder ? hidesFolderNames : hidesAppNames,
+            inSearchResults: inSearchResults,
+            isLaunching: isLaunching
+        )
+    }
+}
+
+public extension LauncherLayout {
+    /// Launchpad-style "new app" dot. Keys that a catalog reload added to
+    /// `reconciled` and that `previous` neither placed nor hid. A fresh
+    /// `previous` (first launch, unreadable layout) marks nothing, so the
+    /// whole catalog never lights up at once.
+    static func newlyAddedAppKeys(previous: LayoutState, reconciled: LayoutState) -> Set<String> {
+        guard !previous.appKeys.isEmpty else { return [] }
+        let known = Set(previous.appKeys.values).union(previous.hiddenAppKeys)
+        return Set(reconciled.appKeys.values).subtracting(known)
+    }
+
+    /// The dot shows on grid / folder app tiles only. Search results already
+    /// carry a folder context line, and「正在启动…」replaces the name.
+    static func showsNewAppBadge(isNew: Bool, isFolder: Bool, inSearchResults: Bool, isLaunching: Bool) -> Bool {
+        isNew && !isFolder && !inSearchResults && !isLaunching
+    }
+}
+
+/// Average icon color used by the one-shot「按颜色排列」rearrange (HSB, 0…1).
+public struct IconColorSample: Equatable, Sendable {
+    public var hue: Double
+    public var saturation: Double
+    public var brightness: Double
+
+    public init(hue: Double, saturation: Double, brightness: Double) {
+        self.hue = hue
+        self.saturation = saturation
+        self.brightness = brightness
+    }
+
+    /// Grays, whites, and near-blacks group after the colored icons.
+    public var isChromatic: Bool { saturation >= 0.25 && brightness >= 0.25 }
+
+    /// Twelve hue families starting at red (reds just below 360° wrap to 0).
+    public var hueFamily: Int {
+        let shifted = (hue + 1.0 / 24.0).truncatingRemainder(dividingBy: 1)
+        return min(11, max(0, Int((shifted < 0 ? shifted + 1 : shifted) * 12)))
+    }
+}
+
+public extension LauncherLayout {
+    enum ColorRearrangeCopy {
+        public static let menuTitleKey = "按颜色排列…"
+        /// Settings button (no ellipsis; matches 按名称/按类型/按分类).
+        public static let settingsButtonTitleKey = "按颜色排列"
+        public static let informativeTextKey = "将按图标主色（红、橙、黄、绿、蓝、紫）排列应用，黑白灰图标在其后，文件夹排在最后；文件夹内应用不变。可在「恢复上次备份」撤销。"
+        public static let toastKey = "已按颜色重新排列"
+        public static let progressToastKey = "正在读取图标颜色…"
+    }
+
+    /// Reorders top-level entries by icon color family (red → purple, darker
+    /// shades after brighter ones within a family), then achromatic icons
+    /// (light → dark), then apps with no sample (by name), unresolved ids,
+    /// and folders last (by name); UUID breaks ties. Only `orderedEntries`
+    /// change — never folder contents, aliases, hidden apps, or paging —
+    /// and `updatedAt` stays put when nothing moves.
+    static func rearrangeTopLevelEntriesByColor(
+        in state: LayoutState,
+        catalog: [AppCandidate],
+        color: (AppCandidate) -> IconColorSample?
+    ) -> LayoutState {
+        let byKey = AppCandidate.firstByDeduplicationKey(catalog)
+        // tier 0 = chromatic, 1 = achromatic, 2 = no sample, 3 = unresolved, 4 = folder.
+        var keys: [UUID: (tier: Int, family: Int, brightness: Double, name: String)] = [:]
+        for entry in state.orderedEntries where keys[entry.id] == nil {
+            switch entry {
+            case .folder(let id):
+                keys[id] = (4, 0, 0, state.folders[id]?.name ?? id.uuidString)
+            case .app(let id):
+                guard let key = state.appKeys[id], let candidate = byKey[key] else {
+                    keys[id] = (3, 0, 0, id.uuidString)
+                    continue
+                }
+                let alias = state.appAliases[key]
+                let name = (alias?.isEmpty == false ? alias : nil) ?? candidate.displayName
+                guard let sample = color(candidate) else {
+                    keys[id] = (2, 0, 0, name)
+                    continue
+                }
+                keys[id] = sample.isChromatic
+                    ? (0, sample.hueFamily, sample.brightness, name)
+                    : (1, 0, sample.brightness, name)
+            }
+        }
+        var next = state
+        next.orderedEntries.sort { lhs, rhs in
+            let l = keys[lhs.id]!, r = keys[rhs.id]!
+            if l.tier != r.tier { return l.tier < r.tier }
+            if l.family != r.family { return l.family < r.family }
+            // Quantize so near-identical shades fall back to name order.
+            let lb = Int((l.brightness * 10).rounded()), rb = Int((r.brightness * 10).rounded())
+            if lb != rb { return lb > rb }
+            let nameOrder = l.name.localizedStandardCompare(r.name)
+            if nameOrder != .orderedSame { return nameOrder == .orderedAscending }
+            return lhs.id.uuidString < rhs.id.uuidString
+        }
+        if next.orderedEntries != state.orderedEntries {
+            next.updatedAt = .now
+        }
+        return next
+    }
+}
+
+public extension LauncherLayout {
+    static let sortFolderByColorMenuTitleKey = "按颜色排列文件夹内应用"
+    static let sortFolderByColorToastKey = "已按颜色排列文件夹内应用"
+    static let sortFolderAlreadyColorSortedToastKey = "文件夹内应用已按颜色排列"
+    public static let sortFolderByColorAccessibilityHelpKey = "只按图标颜色调整这个文件夹内的顺序，主屏幕不变"
+
+    /// Folder context menu「按颜色排列文件夹内应用」: same order as the
+    /// top-level color rearrange (hue family → brighter first → achromatic
+    /// light→dark → unsampled → unresolved, name/UUID tiebreak) applied to
+    /// that folder's `itemIDs` only. Returns nil when the folder is missing,
+    /// has fewer than two members, or is already in color order. Top-level
+    /// entries and paging are untouched.
+    static func sortingFolderMembersByColor(
+        _ folderID: UUID,
+        in state: LayoutState,
+        catalog: [AppCandidate],
+        color: (AppCandidate) -> IconColorSample?
+    ) -> LayoutState? {
+        guard let folder = state.folders[folderID], folder.itemIDs.count > 1 else { return nil }
+        let byKey = AppCandidate.firstByDeduplicationKey(catalog)
+        // tier 0 = chromatic, 1 = achromatic, 2 = no sample, 3 = unresolved.
+        var keys: [UUID: (tier: Int, family: Int, brightness: Int, name: String)] = [:]
+        for id in folder.itemIDs where keys[id] == nil {
+            guard let key = state.appKeys[id], let candidate = byKey[key] else {
+                keys[id] = (3, 0, 0, id.uuidString)
+                continue
+            }
+            let alias = state.appAliases[key]
+            let name = (alias?.isEmpty == false ? alias : nil) ?? candidate.displayName
+            guard let sample = color(candidate) else {
+                keys[id] = (2, 0, 0, name)
+                continue
+            }
+            let brightness = Int((sample.brightness * 10).rounded())
+            keys[id] = sample.isChromatic ? (0, sample.hueFamily, brightness, name) : (1, 0, brightness, name)
+        }
+        let sorted = folder.itemIDs.sorted { lhs, rhs in
+            let l = keys[lhs]!, r = keys[rhs]!
+            if l.tier != r.tier { return l.tier < r.tier }
+            if l.family != r.family { return l.family < r.family }
+            if l.brightness != r.brightness { return l.brightness > r.brightness }
+            let order = l.name.localizedStandardCompare(r.name)
+            if order != .orderedSame { return order == .orderedAscending }
+            return lhs.uuidString < rhs.uuidString
+        }
+        guard sorted != folder.itemIDs else { return nil }
+        var next = state
+        next.folders[folderID]?.itemIDs = sorted
+        next.updatedAt = .now
+        return next
+    }
+
+    /// Folder context menu date sort (FOLDER-DATE-SORT-01). Newest dated
+    /// members first, then undated members by alias/name, then ids missing
+    /// from the catalog. Returns nil when the folder is missing, has fewer
+    /// than two members, or is already in that order. Top-level entries and
+    /// paging stay untouched. `date` runs once per resolvable member.
+    static func sortingFolderMembersByDate(
+        _ kind: AppDateRearrangeKind,
+        folderID: UUID,
+        in state: LayoutState,
+        catalog: [AppCandidate],
+        date: (AppCandidate) -> Date?
+    ) -> LayoutState? {
+        guard let folder = state.folders[folderID], folder.itemIDs.count > 1 else { return nil }
+        let byKey = AppCandidate.firstByDeduplicationKey(catalog)
+        // tier 0 = dated, 1 = undated, 2 = unresolved. No nested folders.
+        var keys: [UUID: (tier: Int, date: Date?, name: String)] = [:]
+        for id in folder.itemIDs where keys[id] == nil {
+            guard let key = state.appKeys[id], let candidate = byKey[key] else {
+                keys[id] = (2, nil, id.uuidString)
+                continue
+            }
+            let alias = state.appAliases[key]
+            let name = (alias?.isEmpty == false ? alias : nil) ?? candidate.displayName
+            let value = date(candidate)
+            keys[id] = (value == nil ? 1 : 0, value, name)
+        }
+        let sorted = folder.itemIDs.sorted { lhs, rhs in
+            let l = keys[lhs]!, r = keys[rhs]!
+            if l.tier != r.tier { return l.tier < r.tier }
+            if let ld = l.date, let rd = r.date, ld != rd { return ld > rd }
+            let order = l.name.localizedStandardCompare(r.name)
+            if order != .orderedSame { return order == .orderedAscending }
+            return lhs.uuidString < rhs.uuidString
+        }
+        guard sorted != folder.itemIDs else { return nil }
+        var next = state
+        next.folders[folderID]?.itemIDs = sorted
+        next.updatedAt = .now
+        return next
     }
 }

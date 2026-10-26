@@ -21,8 +21,19 @@ need("func emptyChromeKind(" in core, "Core missing emptyChromeKind")
 need("testEmptyChromeKindSearchNoMatchesUsesGridNotStatusOnly" in tests, "Core test missing")
 
 need("emptyChromeKind(" in direct, "Direct must use emptyChromeKind")
-need('L("未找到匹配的应用")' in direct, "Direct must show PRD title in empty chrome")
-need('L("按 Esc 清除搜索")' in direct, "search empty detail should hint Esc")
+need(
+    'L("未找到匹配的应用")' in direct
+    or "CatalogEmptyChromeCopy" in direct and "searchNoMatchesTitleKey" in core,
+    "Direct must show PRD title via literal or CatalogEmptyChromeCopy",
+)
+need(
+    'L("按 Esc 清除搜索")' in direct
+    or "searchNoMatchesDefaultDetailKey" in core and "CatalogEmptyChromeCopy.content(" in direct,
+    "search empty detail should hint Esc via literal or CatalogEmptyChromeCopy",
+)
+need("func searchHiddenMatchHint(" in core and "testSearchHiddenMatchHint" in tests, "hidden-match hint Core + test")
+need("LauncherLayout.searchHiddenMatchHint(" in direct, "search empty detail should explain hidden matches")
+need("layoutState.hiddenAppKeys.isEmpty ? [] : hiddenApplications()" in direct, "skip hidden scan when nothing hidden")
 need("kind: emptyKind" in direct, "setEmptyStateChrome must take kind")
 need("search.empty" in direct, "search empty a11y id")
 

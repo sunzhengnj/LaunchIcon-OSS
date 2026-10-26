@@ -24,6 +24,9 @@ need("return .hidden" not in elig[elig.index("func menuPresentation"):elig.index
 need(".disabled(explanationKey: key)" in elig[elig.index("func menuPresentation"):elig.index("func isSystemProtectedPath")],
      "read-only must return disabled with explanation")
 need("applyLayoutEditingAccessibilityHelp" in direct, "tiles must apply readonly AX help")
+need("tileOpenAppBlockedFormatKey" in core, "blocked tile help must be a format key")
+need("localize: { L($0) }" in direct, "tile help must localize each key")
+need("L(LauncherLayout.tileAccessibilityHelp" not in direct, "do not look up the joined sentence")
 need("refreshTileReadonlyAccessibilityHelp" in direct, "chrome update must refresh tile AX")
 need("readOnlyStatusAccessibilityLabelKey" in direct, "readOnly status label AX")
 need("uninstallItem.setAccessibilityHelp" in direct, "uninstall menu needs AX help when disabled")

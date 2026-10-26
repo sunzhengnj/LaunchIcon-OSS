@@ -50,9 +50,17 @@ public struct CatalogScanReport: Sendable {
     public let skippedPaths: [URL]
     public let unreadableMetadataPaths: [URL]
     public let unlaunchablePaths: [URL]
+    /// User-added roots that are currently missing (unmounted volume).
+    /// These do **not** block `canPersistReconciledLayout`; callers should
+    /// retain prior candidates under these roots before reconcile.
+    public let unavailableRequiredRootPaths: [URL]
+    /// User-added roots whose scan stopped early (depth / app-count cap).
+    /// Informational only — does **not** block `canPersistReconciledLayout`.
+    public let truncatedScanRootPaths: [URL]
     public let wasCancelled: Bool
 
     /// An empty or identity-incomplete snapshot must not erase the user's saved arrangement.
+    /// Missing optional/user roots are tracked separately and do not lock editing.
     public var canPersistReconciledLayout: Bool {
         !wasCancelled && !candidates.isEmpty
             && Set(candidates.map(\.deduplicationKey)).count == candidates.count
@@ -65,6 +73,8 @@ public struct CatalogScanReport: Sendable {
         unreadableMetadataPaths: [URL] = [],
         unlaunchablePaths: [URL] = [],
         duplicateCandidates: [AppCandidate] = [],
+        unavailableRequiredRootPaths: [URL] = [],
+        truncatedScanRootPaths: [URL] = [],
         wasCancelled: Bool = false
     ) {
         self.candidates = candidates
@@ -72,7 +82,40 @@ public struct CatalogScanReport: Sendable {
         self.skippedPaths = skippedPaths
         self.unreadableMetadataPaths = unreadableMetadataPaths
         self.unlaunchablePaths = unlaunchablePaths
+        self.unavailableRequiredRootPaths = unavailableRequiredRootPaths
+        self.truncatedScanRootPaths = truncatedScanRootPaths
         self.wasCancelled = wasCancelled
+    }
+
+    /// MISSING-ROOT-PARTIAL-EDIT-01 — keep prior apps that lived under an
+    /// unmounted required root so reconcile does not drop their layout slots.
+    public func retainingCandidates(
+        from previous: [AppCandidate],
+        underUnavailableRoots roots: [URL] = []
+    ) -> CatalogScanReport {
+        let roots = roots.isEmpty ? unavailableRequiredRootPaths : roots
+        guard !roots.isEmpty, !previous.isEmpty else { return self }
+        let rootPaths = roots.map { AppCatalogScanner.normalizedRootPath($0.path) }
+        let presentKeys = Set(candidates.map(\.deduplicationKey))
+        var extras: [AppCandidate] = []
+        for candidate in previous {
+            let key = candidate.deduplicationKey
+            guard !presentKeys.contains(key) else { continue }
+            let path = AppCatalogScanner.normalizedRootPath(candidate.canonicalURL.path)
+            guard rootPaths.contains(where: { path == $0 || path.hasPrefix($0 + "/") }) else { continue }
+            extras.append(candidate)
+        }
+        guard !extras.isEmpty else { return self }
+        return CatalogScanReport(
+            candidates: candidates + extras,
+            skippedPaths: skippedPaths,
+            unreadableMetadataPaths: unreadableMetadataPaths,
+            unlaunchablePaths: unlaunchablePaths,
+            duplicateCandidates: duplicateCandidates,
+            unavailableRequiredRootPaths: unavailableRequiredRootPaths,
+            truncatedScanRootPaths: truncatedScanRootPaths,
+            wasCancelled: wasCancelled
+        )
     }
 }
 
@@ -99,9 +142,14 @@ public struct AppSearchIndex: Sendable {
         let spacedLatin: String?
         let compactLatin: String?
         let initials: String?
+        /// First letter of each word, splitting on spaces/punctuation and
+        /// camel-case humps ("Visual Studio Code" → "vsc", "GarageBand" → "gb").
+        /// Nil for single-word names.
+        let wordInitials: String?
 
         init(_ value: String) {
             normalized = Self.normalize(value)
+            wordInitials = Self.wordInitials(of: value)
             guard let latin = value.applyingTransform(.toLatin, reverse: false) else {
                 spacedLatin = nil
                 compactLatin = nil
@@ -128,15 +176,119 @@ public struct AppSearchIndex: Sendable {
             if let spacedLatin, contains(spacedLatin, query) { return true }
             if let compactLatin, contains(compactLatin, query) { return true }
             if let initials, contains(initials, query) { return true }
+            if matchesWordInitials(query) { return true }
             return false
         }
 
-        /// Lower is a closer hit. Exact name, then prefix, then any other match.
+        /// Abbreviation hit: a ≥2-letter query is a prefix of the word
+        /// initials. SEARCH-INITIALS-RANK-01: ranks with word-start hits (3),
+        /// after exact / prefix, ahead of plain contains ("ss" → System Settings
+        /// before Chess / Messages).
+        func matchesWordInitials(_ query: String) -> Bool {
+            guard let wordInitials else { return false }
+            let compactQuery = String(query.filter { !$0.isWhitespace })
+            guard compactQuery.count >= 2 else { return false }
+            return wordInitials.hasPrefix(compactQuery)
+        }
+
+        /// Typo fallback: a ≥5-character query without spaces is within one
+        /// edit (insert, delete, substitute, or swap of neighbours) of the
+        /// start of a word in the name or its pinyin. The first letter must
+        /// agree so short queries do not pull in unrelated names.
+        func matchesWithOneTypo(_ query: String) -> Bool {
+            let needle = Array(query)
+            guard needle.count >= 5, !needle.contains(where: { $0.isWhitespace }) else { return false }
+            for field in [normalized, spacedLatin, compactLatin].compactMap({ $0 }) {
+                let words = field.split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+                for word in words where word.first == needle.first {
+                    let letters = Array(word)
+                    for length in (needle.count - 1)...(needle.count + 1) where length <= letters.count {
+                        if Self.isWithinOneEdit(needle, Array(letters.prefix(length))) { return true }
+                    }
+                }
+            }
+            return false
+        }
+
+        /// Optimal-string-alignment distance ≤ 1.
+        static func isWithinOneEdit(_ a: [Character], _ b: [Character]) -> Bool {
+            if a == b { return true }
+            let (m, n) = (a.count, b.count)
+            if abs(m - n) > 1 { return false }
+            if m == n {
+                let diffs = (0..<m).filter { a[$0] != b[$0] }
+                if diffs.count == 1 { return true }
+                if diffs.count == 2, diffs[1] == diffs[0] + 1,
+                   a[diffs[0]] == b[diffs[1]], a[diffs[1]] == b[diffs[0]] { return true }
+                return false
+            }
+            let (short, long) = m < n ? (a, b) : (b, a)
+            var i = 0
+            while i < short.count, short[i] == long[i] { i += 1 }
+            return Array(short[i...]) == Array(long[(i + 1)...])
+        }
+
+        static func wordInitials(of value: String) -> String? {
+            var result = ""
+            var previous: Character?
+            var words = 0
+            for character in value {
+                defer { previous = character }
+                guard character.isLetter || character.isNumber else { continue }
+                let startsWord: Bool
+                if let previous {
+                    if !previous.isLetter && !previous.isNumber {
+                        startsWord = true
+                    } else if character.isUppercase && previous.isLowercase {
+                        startsWord = true
+                    } else if character.isNumber != previous.isNumber {
+                        startsWord = true
+                    } else {
+                        startsWord = false
+                    }
+                } else {
+                    startsWord = true
+                }
+                if startsWord {
+                    words += 1
+                    result.append(character)
+                }
+            }
+            guard words >= 2 else { return nil }
+            return normalize(result)
+        }
+
+        /// Lower is a closer hit. Exact name, then prefix, then a match at the
+        /// start of a later word ("code" in "Visual Studio Code"), then any
+        /// other match.
         func matchRank(for query: String) -> Int? {
             guard matches(query) else { return nil }
             if isExact(query) { return 0 }
             if isPrefix(query) { return 1 }
-            return 3
+            if isWordStart(query) || matchesWordInitials(query) { return 3 }
+            return 4
+        }
+
+        private func isWordStart(_ query: String) -> Bool {
+            if Self.hasWordStartMatch(normalized, query) { return true }
+            if let spacedLatin, Self.hasWordStartMatch(spacedLatin, query) { return true }
+            return false
+        }
+
+        /// `query` occurs right after a non-alphanumeric character (space,
+        /// hyphen, dot, underscore…).
+        static func hasWordStartMatch(_ field: String, _ query: String) -> Bool {
+            guard !query.isEmpty else { return false }
+            var searchRange = field.startIndex..<field.endIndex
+            while let found = field.range(of: query, range: searchRange) {
+                if found.lowerBound > field.startIndex {
+                    let previous = field[field.index(before: found.lowerBound)]
+                    if !previous.isLetter && !previous.isNumber { return true }
+                }
+                guard found.lowerBound < field.endIndex else { break }
+                searchRange = field.index(after: found.lowerBound)..<field.endIndex
+            }
+            return false
         }
 
         private func isExact(_ query: String) -> Bool {
@@ -234,6 +386,11 @@ public struct AppSearchIndex: Sendable {
 
     /// Display and alias matches outrank the package name, which outranks the bundle id.
     /// Equal ranks keep the layout order so Return opens the closest name.
+    /// Order: name exact 0, name prefix 1, package exact 2, name word-start 3,
+    /// name contains 4, package prefix 5, package other 6, bundle exact 7,
+    /// bundle other 9, one-typo (≥5 chars) name/alias word start 10, package
+    /// one-typo 11 (only when nothing else matched, so it never reorders real hits).
+    /// Word initials rank with word starts (name 3, package 5).
     private func matchRank(of candidate: AppCandidate, query: String) -> Int? {
         let display: SearchText
         let package: SearchText
@@ -258,10 +415,22 @@ public struct AppSearchIndex: Sendable {
             ranks.append(rank)
         }
         if let rank = package.matchRank(for: query) {
-            ranks.append(rank == 0 ? 2 : (rank == 1 ? 4 : 5))
+            // SEARCH-INITIALS-RANK-01: package initials share the package-prefix tier.
+            let initials = rank == 3 && package.matchesWordInitials(query)
+            ranks.append(rank == 0 ? 2 : (rank == 1 || initials ? 5 : 6))
         }
         if let bundle, let rank = SearchText(bundle).matchRank(for: query) {
-            ranks.append(rank == 0 ? 6 : 8)
+            ranks.append(rank == 0 ? 7 : 9)
+        }
+        if ranks.isEmpty,
+           display.matchesWithOneTypo(query)
+            || aliasesByKey[candidate.deduplicationKey]?.matchesWithOneTypo(query) == true {
+            return 10
+        }
+        // SEARCH-TYPO-PACKAGE-01: a localized display name ("计算器") hides the
+        // English bundle name; let "calculater" still find Calculator.app.
+        if ranks.isEmpty, package.matchesWithOneTypo(query) {
+            return 11
         }
         return ranks.min()
     }

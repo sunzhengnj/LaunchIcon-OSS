@@ -344,3 +344,11 @@ M0 不以静态原型、单元测试或单纯 build 替代真实 UI 和沙箱结
 - 2026-09-21 以隔离空目录和按 PID 隔离的临时布局存储验证首次扫描空态：扫描完成后出现“未找到可用的应用”、说明与可访问的“重新扫描”按钮，点击后重复扫描仍稳定且进程存活；清除测试环境并恢复标准 roots 后诊断记录 103 个候选，既有文件夹仍在。测试临时目录已清理，空结果未写入正式布局。
 - 2026-09-21 隔离真实 UI 夹具扫描 1 个临时 App 并持久化，然后移走 App 重扫为空：空态正常显示，临时布局文件哈希仍为 `11b87b69…e490e85c7`；重建同 bundle ID 夹具并重扫，候选恢复为 1，布局 App UUID 仍是 `5BE9B010…4DF73A`。正式布局使用不同路径，未被本次测试覆盖。部分扫描失败的持久化门槛由 Core 单测覆盖，尚未通过真实权限拒绝目录模拟。
 - 168px 图标版 Release 依次浏览第 1→2→3 页、预热约 105 个图标后，`vmmap -summary` Physical Footprint 为 68.0 MiB（peak 70.2 MiB），通过 PRD `<120 MB`。`leaks` 报告 0 leaks；`ps` RSS 含共享映射页，不作为此门槛的判定值。
+
+## 2026-10-26 preview.84 sync
+
+- Source: public PR sync from private tip `a6caf34` (build 84). Team ID stripped.
+- Background gate: run `./script/validate_background.sh` on the public checkout after this sync lands; record pass/fail below when available.
+- Full UI / physical paging / Developer ID / notarization: not claimed for this snapshot.
+- Public installer: rebuild from the public source commit after merge; do **not** reuse private DMG bytes.
+

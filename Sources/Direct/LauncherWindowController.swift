@@ -95,11 +95,19 @@ final class LauncherWindowController: NSWindowController {
     /// show and hide so an already-open menu does not keep the previous verb.
     var onVisibilityChanged: (() -> Void)?
     var hidesAfterLaunch = true
+    /// REOPEN-PAGE-BEHAVIOR-01: page restore policy after dismiss.
+    private var reopenPageBehavior: LauncherReopenPageBehavior = .rememberLast
+    /// Wall-clock of the most recent hide(); used by delayed home reset.
+    private var lastDismissDate: Date?
 
     private let rootView: LauncherRootView
     private let layoutStore: JSONLayoutStore
     private let catalogSnapshotStore: CatalogSnapshotStore
-    private let catalogRoots: [URL]
+    private var catalogRoots: [URL]
+    /// Roots before user folders; user folders apply only on the standard set.
+    private let baseCatalogRoots: [URL]
+    /// User-added roots: missing ones are unavailable (retain prior apps; do not lock edit).
+    private var requiredCatalogRootPaths: Set<String> = []
     private let testWindowSize: NSSize?
     private var directoryWatcher: ApplicationDirectoryWatcher?
     private var catalogLoadingTask: Task<Void, Never>?
@@ -139,15 +147,21 @@ final class LauncherWindowController: NSWindowController {
     private var buttonScriptTimer: Timer?
     #endif
     private let launcherPresentationOptions: NSApplication.PresentationOptions = [.hideDock, .hideMenuBar]
+    /// True after this drag subtracted `.hideDock` and must put it back.
+    private var dockHideSuspendedForExternalDrag = false
 
     init(
         catalogRoots: [URL] = AppCatalogScanner.standardRoots,
+        additionalAppDirectories: [String] = [],
         layoutStore: JSONLayoutStore = JSONLayoutStore(fileURL: JSONLayoutStore.defaultFileURL),
         testWindowSize: NSSize? = nil
     ) {
         rootView = LauncherRootView()
-        rootView.catalogRoots = catalogRoots
-        self.catalogRoots = catalogRoots
+        baseCatalogRoots = catalogRoots
+        let resolved = LauncherWindowController.resolvedCatalogRoots(base: catalogRoots, additional: additionalAppDirectories)
+        rootView.catalogRoots = resolved.roots
+        self.catalogRoots = resolved.roots
+        requiredCatalogRootPaths = resolved.required
         self.layoutStore = layoutStore
         catalogSnapshotStore = CatalogSnapshotStore(
             fileURL: layoutStore.fileURL.deletingLastPathComponent().appendingPathComponent("catalog-v1.json")
@@ -184,6 +198,7 @@ final class LauncherWindowController: NSWindowController {
             object: NSWorkspace.shared
         )
         panel.dismissHandler = { [weak self] in self?.hide() }
+        rootView.onPinchDismissRequested = { [weak self] in self?.hide() }
         panel.keyboardSuspended = { [weak self] in
             LauncherLayout.shouldConsumeLauncherKeyEquivalent(isDismissing: self?.isDismissing == true)
         }
@@ -204,17 +219,32 @@ final class LauncherWindowController: NSWindowController {
         panel.searchHandler = { [weak self] in self?.rootView.focusSearch() }
         panel.pageHandler = { [weak rootView] direction in rootView?.movePage(by: direction) }
         panel.verticalPageHandler = { [weak rootView] direction in
-            rootView?.scrollSearchResults(byPage: direction) ?? false
+            guard let rootView else { return false }
+            if rootView.scrollOpenFolder(byPage: direction) { return true }
+            return rootView.scrollSearchResults(byPage: direction)
         }
         panel.escapeHandler = { [weak rootView] in rootView?.handleEscape() ?? false }
         panel.selectAllHandler = { [weak rootView] in rootView?.selectAllItemsOnCurrentPage() ?? false }
-        panel.settingsHandler = { [weak self] in self?.onSettingsRequested?() }
+        panel.searchRevealHandler = { [weak rootView] keyCode, commandOnly in
+            rootView?.revealSearchKeyboardHighlightOrFirst(keyCode: keyCode, commandOnly: commandOnly) ?? false
+        }
+        panel.settingsHandler = { [weak self] in
+            self?.rootView.clearSelectionBeforeOpeningSettings()
+            self?.onSettingsRequested?()
+        }
         rootView.onCandidateSelected = { [weak self] candidate in self?.launch(candidate) }
         rootView.onLayoutChanged = { [weak self] state in self?.schedulePersist(state) }
         rootView.onReloadRequested = { [weak self] in self?.reloadCatalog() }
         rootView.onUseCachedCatalogRequested = { [weak self] in self?.cancelScanAndUseCachedCatalog() }
         rootView.onDiagnosticEvent = { [weak self] event in self?.onDiagnosticEvent?(event) }
-        rootView.onSettingsRequested = { [weak self] in self?.onSettingsRequested?() }
+        rootView.onSettingsRequested = { [weak self] in
+            self?.rootView.clearSelectionBeforeOpeningSettings()
+            self?.onSettingsRequested?()
+        }
+        rootView.onRevealInFinderRequested = { [weak self] urls in self?.revealInFinder(urls) }
+        rootView.onExternalAppDragActive = { [weak self] active in
+            self?.setExternalAppDragActive(active)
+        }
         startTestButtonScriptIfNeeded()
     }
 
@@ -321,7 +351,7 @@ final class LauncherWindowController: NSWindowController {
         if appearing {
             windowUpdateInterval = signposter.beginInterval("WindowUpdate")
         }
-        let screen = NSScreen.main ?? window.screen
+        let screen = launcherScreen(for: window, appearing: appearing)
         window.setFrame(Self.frame(for: screen?.frame ?? window.frame, testSize: testWindowSize), display: true)
         if let testWindowSize {
             assert(window.frame.size == testWindowSize, "Test window size was constrained by its content")
@@ -333,6 +363,16 @@ final class LauncherWindowController: NSWindowController {
                 preservesQueryAcrossHandoff: !animated
             )
             rootView.prepareForPresentation(clearsSearchQuery: clearsQuery)
+            // REOPEN-PAGE-BEHAVIOR-01: snap to page 0 when policy says so (no animation;
+            // window still hidden). Settings handoff never resets.
+            let elapsed = lastDismissDate.map { Date().timeIntervalSince($0) }
+            if ReopenPageCopy.shouldResetToHomePageOnAppear(
+                behavior: reopenPageBehavior,
+                secondsSinceLastDismiss: elapsed,
+                isSettingsHandoffRestore: !animated
+            ) {
+                rootView.snapGridToHomePageForReopen()
+            }
             if LauncherLayout.shouldRestoreSearchResultsChromeAfterSettingsHandoff(
                 isSettingsHandoffRestore: !animated,
                 hadNonEmptyQueryBeforeHandoff: pendingSettingsHandoffSearchResultsChrome
@@ -445,7 +485,30 @@ final class LauncherWindowController: NSWindowController {
         scheduleAutomatedLaunchVerificationIfNeeded()
     }
 
+    /// DOCK-DRAG-FILE-01: lift only Dock hiding so a drag can reach the Dock.
+    /// The menu bar stays hidden. Tests never took these options (see show()).
+    private func setExternalAppDragActive(_ active: Bool) {
+        if active {
+            guard !dockHideSuspendedForExternalDrag, testWindowSize == nil,
+                  window?.isVisible == true, !isDismissing else { return }
+            NSApp.presentationOptions.subtract(.hideDock)
+            dockHideSuspendedForExternalDrag = true
+            return
+        }
+        guard dockHideSuspendedForExternalDrag else { return }
+        dockHideSuspendedForExternalDrag = false
+        guard LauncherLayout.shouldRestoreDockHideAfterExternalDrag(
+            launcherVisible: window?.isVisible == true,
+            launcherDismissing: isDismissing
+        ), testWindowSize == nil else { return }
+        NSApp.presentationOptions.formUnion(.hideDock)
+    }
+
     func hide(animated: Bool = true) {
+        // REOPEN-PAGE-BEHAVIOR-01: stamp dismiss time for delayed home reset.
+        lastDismissDate = Date()
+        // DISMISS-CLEAR-SELECTION-01: drop multi-select before fade so next show is clean.
+        rootView.clearItemSelectionForDismiss()
         // Snapshot the query before a click that is already down can clear it.
         rootView.freezeSearchFieldForDismiss()
         // The icon menu tracks in its own window. Close it before the alias
@@ -625,6 +688,86 @@ final class LauncherWindowController: NSWindowController {
         rootView.setReducesMotion(enabled)
     }
 
+    func setHidesAppNames(_ hides: Bool) {
+        rootView.setHidesAppNames(hides)
+    }
+
+    func setHidesFolderNames(_ hides: Bool) {
+        rootView.setHidesFolderNames(hides)
+    }
+
+    /// BACKGROUND-DIM-01: only the overlay alpha; no relayout or page change.
+    func setBackgroundDim(_ dim: LauncherBackgroundDim) {
+        rootView.setBackgroundDim(dim)
+    }
+
+    /// BACKGROUND-BLUR-01: only hides/shows the blur layer; no relayout.
+    func setBlursBackground(_ blurs: Bool) {
+        rootView.setBlursBackground(blurs)
+    }
+
+    func setReopenPageBehavior(_ behavior: LauncherReopenPageBehavior) {
+        reopenPageBehavior = behavior
+    }
+
+    func setPinchToDismissEnabled(_ enabled: Bool) {
+        rootView.setPinchToDismissEnabled(enabled)
+    }
+
+    private static func resolvedCatalogRoots(base: [URL], additional: [String]) -> (roots: [URL], required: Set<String>) {
+        guard base == AppCatalogScanner.standardRoots, !additional.isEmpty else { return (base, []) }
+        let roots = AppCatalogScanner.catalogRoots(standard: base, additionalPaths: additional)
+        return (roots, Set(roots.dropFirst(base.count).map { AppCatalogScanner.normalizedRootPath($0.path) }))
+    }
+
+    /// Rescans and re-watches only when the effective root list changes.
+    func setAdditionalAppDirectories(_ paths: [String]) {
+        // CUSTOM-ROOT-COUNT-LIMIT-01 — keep runtime roots aligned with prefs sanitizer.
+        let capped = AppCatalogScanner.sanitizedAdditionalAppDirectories(paths)
+        let resolved = Self.resolvedCatalogRoots(base: baseCatalogRoots, additional: capped)
+        guard resolved.roots != catalogRoots else { return }
+        catalogRoots = resolved.roots
+        rootView.catalogRoots = resolved.roots
+        requiredCatalogRootPaths = resolved.required
+        onDiagnosticEvent?("Catalog roots changed: \(resolved.roots.count) roots")
+        if directoryWatcher != nil {
+            directoryWatcher?.stop()
+            directoryWatcher = nil
+            Task { @MainActor [weak self] in _ = await self?.startWatchingCatalog() }
+        }
+        reloadCatalog()
+    }
+
+    /// Takes effect on the next appearance only (never moves a visible launcher).
+    private var displayTarget: LauncherDisplayTarget = .active
+
+    func setDisplayTarget(_ target: LauncherDisplayTarget) {
+        displayTarget = target
+    }
+
+    /// `.active` is exactly the historical `NSScreen.main ?? window.screen`.
+    /// Other targets are resolved only while appearing; a visible launcher
+    /// stays on its current display so a re-show never jumps screens.
+    private func launcherScreen(for window: NSWindow, appearing: Bool) -> NSScreen? {
+        let fallback = NSScreen.main ?? window.screen
+        guard displayTarget != .active else { return fallback }
+        guard appearing else { return window.screen ?? fallback }
+        let screens = NSScreen.screens
+        guard let index = LauncherDisplayTarget.screenIndex(
+            for: displayTarget,
+            screenFrames: screens.map(\.frame),
+            activeIndex: NSScreen.main.flatMap { main in screens.firstIndex { $0 === main } },
+            pointer: NSEvent.mouseLocation
+        ) else { return fallback }
+        return screens[index]
+    }
+
+
+    /// SETTINGS-CLEAR-SELECTION-01: drop multi-select before Settings covers the grid.
+    func clearSelectionBeforeOpeningSettings() {
+        rootView.clearSelectionBeforeOpeningSettings()
+    }
+
     func hiddenApplications() -> [HiddenApplication] {
         rootView.hiddenApplications()
     }
@@ -632,6 +775,11 @@ final class LauncherWindowController: NSWindowController {
     @discardableResult
     func restoreHiddenApplication(withKey key: String) -> Bool {
         rootView.restoreHiddenApplication(withKey: key)
+    }
+
+    /// Settings「全部恢复」: number of apps restored, or nil when not possible now.
+    func restoreAllHiddenApplications() -> Int? {
+        rootView.restoreAllHiddenApplications()
     }
 
     /// Settings 「残留文件…」: returns a one-line status for the settings window.
@@ -646,6 +794,32 @@ final class LauncherWindowController: NSWindowController {
         rootView.rearrangeTopLevelGrid(sort: sort)
     }
 
+    @discardableResult
+    func rearrangeTopLevelGridByCategory() -> Bool {
+        rootView.rearrangeTopLevelGridByCategory()
+    }
+
+    /// Settings: await icon-color samples then apply (no paging).
+    func rearrangeTopLevelGridByColorAwaitingCompletion() async -> Bool {
+        await rootView.rearrangeTopLevelGridByColorAwaitingCompletion()
+    }
+
+    /// Settings: date rearrange (Spotlight / filesystem off the main actor; no paging).
+    @discardableResult
+    func rearrangeTopLevelGridByDate(_ kind: AppDateRearrangeKind) -> Bool {
+        rootView.rearrangeTopLevelGridByDate(kind)
+    }
+
+    func rearrangeTopLevelGridByDateAwaitingCompletion(_ kind: AppDateRearrangeKind) async -> Bool {
+        await rootView.rearrangeTopLevelGridByDateAwaitingCompletion(kind)
+    }
+
+    /// Settings: wait out the 300ms layout-save debounce so backup.json exists
+    /// before 「恢复上次备份」 is re-enabled (SETTINGS-BACKUP-ENABLE-AFTER-REARRANGE-01).
+    func awaitPendingLayoutPersist() async {
+        await finishPendingLayoutSaves()
+    }
+
     /// Settings: automatic layout-v1.backup.json present next to the live store.
     func layoutBackupAvailable() -> Bool {
         layoutStore.hasBackupFile
@@ -653,13 +827,14 @@ final class LauncherWindowController: NSWindowController {
 
     /// Settings 「导出布局…」: write current in-memory layout to a user-chosen JSON URL.
     func exportLayout(to url: URL) async -> String {
+        // LAYOUT-IO-OUTCOME-COPY-01
         do {
             try await layoutStore.export(rootView.layoutState, to: url)
-            return L("布局已导出")
+            return LauncherLayout.LayoutIOOutcomeCopy.exportSucceeded(localize: { L($0) })
         } catch LayoutStoreIssue.unsupportedSchema(_) {
-            return L("布局版本不受支持，无法导出")
+            return LauncherLayout.LayoutIOOutcomeCopy.exportUnsupportedSchema(localize: { L($0) })
         } catch {
-            return L("导出布局失败")
+            return LauncherLayout.LayoutIOOutcomeCopy.exportFailed(localize: { L($0) })
         }
     }
 
@@ -667,36 +842,126 @@ final class LauncherWindowController: NSWindowController {
     func importLayout(from url: URL) async -> String {
         do {
             let imported = try await layoutStore.importLayout(from: url)
-            guard rootView.applyImportedLayout(imported) else {
-                return L("暂时无法整理，请查看主界面提示")
-            }
-            // Wait out the debounce so layout-v1.backup.json exists before Settings refreshes.
-            await finishPendingLayoutSaves()
-            return L("布局已导入")
+            return await confirmThenApplyImportedLayout(imported)
         } catch LayoutStoreIssue.unsupportedSchema(_) {
-            return L("布局版本不受支持，无法导入")
+            // LAYOUT-IO-OUTCOME-COPY-01
+            return LauncherLayout.LayoutIOOutcomeCopy.importUnsupportedSchema(localize: { L($0) })
         } catch LayoutStoreIssue.corruptedFile(_) {
-            return L("无法读取布局文件")
+            return LauncherLayout.LayoutIOOutcomeCopy.importUnreadableFile(localize: { L($0) })
         } catch {
-            return L("无法读取布局文件")
+            return LauncherLayout.LayoutIOOutcomeCopy.importUnreadableFile(localize: { L($0) })
         }
+    }
+
+    /// Shared by JSON and Launchpad import: unchanged short-circuit, risky
+    /// second confirm with preview, commit, then the change-summary message.
+    private func confirmThenApplyImportedLayout(_ imported: LayoutState) async -> String {
+        let confirmation = rootView.layoutImportConfirmation(for: imported)
+        if confirmation == .unchanged {
+            return L(confirmation.messageKey ?? "布局已导入")
+        }
+        // Judged against the pre-import grid; nil while the catalog is empty.
+        let changeSummary = rootView.layoutImportChangeSummary(for: imported)
+        if confirmation.needsSecondConfirm,
+           !confirmRiskyLayoutImport(confirmation, preview: changeSummary) {
+            return L(LayoutImportConfirmation.cancelledMessageKey)
+        }
+        guard rootView.applyImportedLayout(imported) else {
+            // LAYOUT-IO-OUTCOME-COPY-01
+            return LauncherLayout.LayoutIOOutcomeCopy.layoutEditingBlocked(localize: { L($0) })
+        }
+        // Wait out the debounce so layout-v1.backup.json exists before Settings refreshes.
+        await finishPendingLayoutSaves()
+        return Self.importedLayoutMessage(changeSummary)
+    }
+
+    /// Settings「从启动台导入…」: read the native Launchpad database off the
+    /// main thread (read-only), map it onto the current layout, then the same
+    /// confirm + commit path as JSON import. No paging.
+    func importLaunchpadLayout(from url: URL) async -> String {
+        let snapshot: LaunchpadLayoutSnapshot
+        do {
+            snapshot = try await Task.detached(priority: .userInitiated) {
+                try LaunchpadLayoutImporter.read(databaseAt: url)
+            }.value
+        } catch LaunchpadLayoutImporter.Failure.empty {
+            // LAYOUT-IO-OUTCOME-COPY-01
+            return LauncherLayout.LayoutIOOutcomeCopy.launchpadEmpty(localize: { L($0) })
+        } catch {
+            return LauncherLayout.LayoutIOOutcomeCopy.launchpadUnreadable(localize: { L($0) })
+        }
+        guard let imported = rootView.launchpadImportedLayout(from: snapshot) else {
+            return LauncherLayout.LayoutIOOutcomeCopy.importUnavailable(localize: { L($0) })
+        }
+        return await confirmThenApplyImportedLayout(imported)
+    }
+
+    /// Second, cancel-first confirm for imports that would empty the grid or
+    /// match no installed app. Return/Esc keep the current layout.
+    /// 「布局已导入：3 个应用换了位置、新增 2 个文件夹…」(first 3 clauses).
+    private static func importedLayoutMessage(
+        _ summary: LayoutChangeSummary?,
+        plainKey: String = LayoutChangeSummary.importedMessageKey,
+        detailsFormatKey: String = LayoutChangeSummary.importedWithDetailsFormatKey
+    ) -> String {
+        let plain = L(plainKey)
+        guard let joined = localizedChangeDetails(summary) else { return plain }
+        return String(format: L(detailsFormatKey), joined)
+    }
+
+    /// First 3 clauses joined by「、」(+「等」when more); nil when nothing changes.
+    private static func localizedChangeDetails(_ summary: LayoutChangeSummary?) -> String? {
+        guard let summary else { return nil }
+        let short = summary.importedMessageDetails()
+        guard !short.details.isEmpty else { return nil }
+        var joined = short.details
+            .map { detail in detail.count.map { String(format: L(detail.key), $0) } ?? L(detail.key) }
+            .joined(separator: L("、"))
+        if short.truncated {
+            joined = String(format: L(LayoutChangeSummary.detailsTruncatedFormatKey), joined)
+        }
+        return joined
+    }
+
+    private func confirmRiskyLayoutImport(
+        _ confirmation: LayoutImportConfirmation,
+        preview: LayoutChangeSummary?
+    ) -> Bool {
+        precondition(LauncherLayout.LayoutImportConfirmAlert.cancelIsFirstButton)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = L(LayoutImportConfirmation.secondConfirmTitleKey)
+        var informative = L(confirmation.messageKey ?? LauncherLayout.LayoutImportConfirmAlert.informativeTextKey)
+        if let details = Self.localizedChangeDetails(preview) {
+            informative += "\n\n" + String(format: L(LayoutChangeSummary.importPreviewFormatKey), details)
+        }
+        alert.informativeText = informative
+        alert.addButton(withTitle: L(LauncherLayout.LayoutImportConfirmAlert.cancelButtonTitleKey))
+        alert.addButton(withTitle: L(LayoutImportConfirmation.secondConfirmButtonTitleKey))
+        return alert.runModal() == .alertSecondButtonReturn
     }
 
     /// Settings 「恢复上次备份」: load automatic backup, reconcile, commit (save backs up prior = undo once).
     func restoreLastLayoutBackup() async -> String {
         do {
             guard let backup = try await layoutStore.loadBackup() else {
-                return L("没有可用备份")
+                // LAYOUT-IO-OUTCOME-COPY-01
+                return LauncherLayout.LayoutIOOutcomeCopy.restoreNoBackup(localize: { L($0) })
             }
+            let changeSummary = rootView.layoutImportChangeSummary(for: backup)
             guard rootView.applyImportedLayout(backup) else {
-                return L("暂时无法整理，请查看主界面提示")
+                return LauncherLayout.LayoutIOOutcomeCopy.layoutEditingBlocked(localize: { L($0) })
             }
             await finishPendingLayoutSaves()
-            return L("已恢复上次备份")
+            return Self.importedLayoutMessage(
+                changeSummary,
+                plainKey: LayoutChangeSummary.restoredMessageKey,
+                detailsFormatKey: LayoutChangeSummary.restoredWithDetailsFormatKey
+            )
         } catch LayoutStoreIssue.unsupportedSchema(_) {
-            return L("备份版本不受支持，无法恢复")
+            return LauncherLayout.LayoutIOOutcomeCopy.restoreUnsupportedSchema(localize: { L($0) })
         } catch {
-            return L("无法读取备份")
+            return LauncherLayout.LayoutIOOutcomeCopy.restoreUnreadable(localize: { L($0) })
         }
     }
 
@@ -757,7 +1022,11 @@ final class LauncherWindowController: NSWindowController {
         isScanning = true
         rootView.setCachedCatalogAvailable(false)
         rootView.setRescanVisible(false)
-        rootView.setLayoutEditingEnabled(false, explanation: L("正在扫描应用，暂时无法整理"))
+        // LAYOUT-EDITING-STATUS-COPY-01
+        rootView.setLayoutEditingEnabled(
+            false,
+            explanation: LauncherLayout.LayoutEditingStatusCopy.scanningExplanation(localize: { L($0) })
+        )
         rootView.setLoading(true)
         catalogLoadingTask = Task { [weak self] in
             guard let self else { return }
@@ -776,7 +1045,10 @@ final class LauncherWindowController: NSWindowController {
                             rootView.noteScanCancelledWhileEmpty()
                         }
                         rootView.setLoading(false)
-                        rootView.setLayoutEditingEnabled(false, explanation: L("应用扫描已取消，请重新扫描"))
+                        rootView.setLayoutEditingEnabled(
+                            false,
+                            explanation: LauncherLayout.LayoutEditingStatusCopy.scanCancelledExplanation(localize: { L($0) })
+                        )
                         rootView.setRescanVisible(true)
                     }
                 }
@@ -793,7 +1065,20 @@ final class LauncherWindowController: NSWindowController {
             await waitForTestScanHoldRelease()
             guard !Task.isCancelled else { return }
             #endif
-            let report = await AppCatalogScanner().scan(roots: self.catalogRoots)
+            let scanned = await AppCatalogScanner().scan(
+                roots: self.catalogRoots, requiredRootPaths: self.requiredCatalogRootPaths
+            )
+            // MISSING-ROOT-PARTIAL-EDIT-01: unmounted user roots keep prior apps;
+            // do not treat them as a full-scan failure that locks editing.
+            let previousForRetain = cachedCandidates.isEmpty
+                ? rootView.catalogCandidatesForRetention
+                : cachedCandidates
+            let report = scanned.retainingCandidates(from: previousForRetain)
+            if !scanned.unavailableRequiredRootPaths.isEmpty {
+                onDiagnosticEvent?(
+                    "Catalog retained \(report.candidates.count - scanned.candidates.count) apps under \(scanned.unavailableRequiredRootPaths.count) unavailable root(s)"
+                )
+            }
             guard !Task.isCancelled else { return }
             await finishPendingLayoutSaves()
             guard !Task.isCancelled else { return }
@@ -818,25 +1103,42 @@ final class LauncherWindowController: NSWindowController {
             let layout = LauncherLayout.reconcile(candidates: report.candidates, into: base)
             if replaceCache {
                 isShowingCachedCatalog = false
+                rootView.markNewApps(LauncherLayout.newlyAddedAppKeys(previous: base, reconciled: layout))
                 rootView.setCatalog(report.candidates, layout: layout)
             } else {
                 onDiagnosticEvent?("Catalog reload retained selected cache: generation=\(generation)")
                 rootView.setCachedCatalogAvailable(false)
             }
             rootView.setLoading(false)
+            // LAYOUT-EDITING-STATUS-COPY-01
             let editingExplanation: String? = if !replaceCache {
-                L("正在显示上次应用列表；重新扫描后可整理")
+                LauncherLayout.LayoutEditingStatusCopy.cachedCatalogExplanation(localize: { L($0) })
             } else if !persistable {
-                L("布局文件无法读取，暂时无法整理；原文件已保留")
+                LauncherLayout.LayoutEditingStatusCopy.layoutUnreadableExplanation(localize: { L($0) })
             } else if !report.canPersistReconciledLayout {
-                L("应用扫描不完整，暂时无法整理；请重新扫描")
+                LauncherLayout.LayoutEditingStatusCopy.incompleteScanExplanation(localize: { L($0) })
             } else {
                 nil
             }
             rootView.setLayoutEditingEnabled(persistableLayout, explanation: editingExplanation)
-            rootView.setRescanVisible(!replaceCache || (persistable && !report.canPersistReconciledLayout))
+            rootView.setRescanVisible(!replaceCache || (persistable && !report.canPersistReconciledLayout) || !report.unavailableRequiredRootPaths.isEmpty || !report.truncatedScanRootPaths.isEmpty)
             onDiagnosticEvent?("Catalog reload finished: generation=\(generation); persistable=\(persistableLayout)")
             onCatalogLoaded?(report)
+            if !report.unavailableRequiredRootPaths.isEmpty {
+                onDiagnosticEvent?(
+                    "Catalog unavailable \(report.unavailableRequiredRootPaths.count) custom root(s)"
+                )
+                rootView.showTransientToast(
+                    LauncherLayout.LayoutEditingStatusCopy.unavailableCustomRootExplanation(localize: { L($0) })
+                )
+            } else if !report.truncatedScanRootPaths.isEmpty {
+                onDiagnosticEvent?(
+                    "Catalog truncated \(report.truncatedScanRootPaths.count) custom root(s)"
+                )
+                rootView.showTransientToast(
+                    LauncherLayout.LayoutEditingStatusCopy.truncatedCustomRootExplanation(localize: { L($0) })
+                )
+            }
             onCatalogReloadFinished?(persistableLayout)
             if persistableLayout {
                 schedulePersist(layout)
@@ -885,7 +1187,11 @@ final class LauncherWindowController: NSWindowController {
         rootView.setCachedCatalogAvailable(false)
         rootView.setCatalog(cachedCandidates, layout: LauncherLayout.reconcile(candidates: cachedCandidates, into: cachedLayout))
         rootView.setLoading(false)
-        rootView.setLayoutEditingEnabled(false, explanation: L("正在显示上次应用列表；重新扫描后可整理"))
+        // LAYOUT-EDITING-STATUS-COPY-01
+        rootView.setLayoutEditingEnabled(
+            false,
+            explanation: LauncherLayout.LayoutEditingStatusCopy.cachedCatalogExplanation(localize: { L($0) })
+        )
         rootView.setRescanVisible(true)
         onCatalogReloadFinished?(false)
     }
@@ -925,6 +1231,22 @@ final class LauncherWindowController: NSWindowController {
         rootView.showLayoutSaveError(error)
     }
 
+    /// Context menu「在访达中显示」: dismiss (Finder would open under the
+    /// full-screen launcher), then select one or more bundles in Finder.
+    /// Read-only; multi-select uses BATCH-REVEAL-FINDER-01.
+    private func revealInFinder(_ urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        guard LauncherLayout.shouldAcceptPointerActivation(
+            isDismissing: isDismissing,
+            isVisible: window?.isVisible == true
+        ) else { return }
+        onDiagnosticEvent?("Reveal in Finder requested: \(urls.count) item(s)")
+        if LauncherLayout.revealInFinderDismissesLauncher {
+            hide(animated: true)
+        }
+        NSWorkspace.shared.activateFileViewerSelecting(urls)
+    }
+
     private func launch(_ candidate: AppCandidate) {
         // mouseUp can arrive after the fade starts, or after orderOut. The
         // press must not open the app once the launcher is no longer active.
@@ -937,6 +1259,7 @@ final class LauncherWindowController: NSWindowController {
         // A different app must still launch; the old single task dropped it.
         guard launchesInFlight[key] == nil else { return }
         launchesInFlight[key] = candidate
+        rootView.clearNewApp(key)
         let attempt = (launchAttempts[key] ?? 0) + 1
         launchAttempts[key] = attempt
         let url = candidate.canonicalURL
@@ -1126,6 +1449,8 @@ private final class LauncherPanel: NSPanel, NSWindowDelegate {
     var searchHandler: (() -> Void)?
     /// Command-A: select all icons on the current page (nil / false → pass through).
     var selectAllHandler: (() -> Bool)?
+    /// ⌘↩ in search: reveal the highlighted / first app hit (SEARCH-CMD-RETURN-REVEAL-01).
+    var searchRevealHandler: ((UInt16, Bool) -> Bool)?
     var pageHandler: ((Int) -> Void)?
     /// Page Up/Down while search is showing. Return true to consume the key
     /// instead of turning a grid page.
@@ -1165,7 +1490,17 @@ private final class LauncherPanel: NSPanel, NSWindowDelegate {
         }
         if event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
            event.charactersIgnoringModifiers?.lowercased() == "a" {
+            // Field editor / folder rename must keep ⌘A as Select All text.
+            // Calling selectAllHandler first can race with UI Automation and
+            // steal focus before the editor is visible as first responder.
+            if firstResponder is NSTextView || firstResponder is NSTextField {
+                return super.performKeyEquivalent(with: event)
+            }
             if selectAllHandler?() == true { return true }
+        }
+        if event.keyCode == 36 || event.keyCode == 76 {
+            let commandOnly = event.modifierFlags.intersection([.command, .shift, .option, .control]) == .command
+            if searchRevealHandler?(event.keyCode, commandOnly) == true { return true }
         }
         return super.performKeyEquivalent(with: event)
     }
@@ -1211,6 +1546,12 @@ private final class LauncherPanel: NSPanel, NSWindowDelegate {
         if keyboardSuspended(), event.type == .keyDown || event.type == .keyUp {
             return
         }
+        // PINCH-TO-DISMISS-01: consume magnify when pinch-to-dismiss is on.
+        if event.type == .magnify,
+           let rootView = contentView as? LauncherRootView,
+           rootView.handlePinchMagnify(event) {
+            return
+        }
         // `ignoresMouseEvents` does not stop a click that already went down.
         // Drop a new press so it cannot start. Left-drag and left-up still
         // go through: a drag session ends on mouseUp, and launch / open /
@@ -1245,14 +1586,21 @@ private final class LauncherPanel: NSPanel, NSWindowDelegate {
                 _ = rootView.cancelFolderTitleEditingIfClickOutsideTitle(
                     at: event.locationInWindow
                 )
+                rootView.armMarqueeIfNeeded(with: event)
             }
+        }
+        if event.type == .leftMouseDragged,
+           let rootView = contentView as? LauncherRootView {
+            rootView.updateMarquee(with: event)
         }
         super.sendEvent(event)
         if event.type == .leftMouseUp,
-           let rootView = contentView as? LauncherRootView,
-           !rootView.didConsumeClick,
-           rootView.shouldDismiss(at: event.locationInWindow) {
-            dismissHandler?()
+           let rootView = contentView as? LauncherRootView {
+            _ = rootView.endMarquee(with: event)
+            if !rootView.didConsumeClick,
+               rootView.shouldDismiss(at: event.locationInWindow) {
+                dismissHandler?()
+            }
         }
     }
 
@@ -1313,6 +1661,8 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
     var onUseCachedCatalogRequested: (() -> Void)?
     var onDiagnosticEvent: ((String) -> Void)?
     var onSettingsRequested: (() -> Void)?
+    /// App tile context menu「在访达中显示」.
+    var onRevealInFinderRequested: (([URL]) -> Void)?
     /// Set while Escape is being delivered so a marked range can unmark
     /// without also clearing search or closing the launcher.
     var escapeDeliveredToInputMethod = false
@@ -1324,17 +1674,50 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
     private let countLabel = NSTextField(labelWithString: "")
     private let readOnlyStatusLabel = NSTextField(labelWithString: "")
     private let readOnlyStatusRow = NSStackView()
-    private let rescanButton = LauncherChromeButton(title: L("重新扫描"), target: nil, action: nil)
-    private let readOnlyCachedButton = LauncherChromeButton(title: L("使用上次应用列表"), target: nil, action: nil)
-    private let messageLabel = NSTextField(wrappingLabelWithString: L("正在准备应用…"))
+    // CATALOG-EMPTY-PREPARING-CHROME-01
+    private let rescanButton = LauncherChromeButton(
+        title: LauncherLayout.CatalogEmptyChromeCopy.reloadButtonTitle(localize: { L($0) }),
+        target: nil,
+        action: nil
+    )
+    private let readOnlyCachedButton = LauncherChromeButton(
+        title: LauncherLayout.CatalogEmptyChromeCopy.useCachedButtonTitle(localize: { L($0) }),
+        target: nil,
+        action: nil
+    )
+    private let messageLabel = NSTextField(
+        wrappingLabelWithString: LauncherLayout.CatalogEmptyChromeCopy.preparingMessage(localize: { L($0) })
+    )
     private let scanSkeleton = ScanSkeletonView()
-    private let cachedCatalogButton = LauncherChromeButton(title: L("使用上次应用列表"), target: nil, action: nil)
+    private let cachedCatalogButton = LauncherChromeButton(
+        title: LauncherLayout.CatalogEmptyChromeCopy.useCachedButtonTitle(localize: { L($0) }),
+        target: nil,
+        action: nil
+    )
     private let emptyStateView = NSStackView()
     private let emptyStateIcon = NSImageView()
-    private let emptyStateTitle = NSTextField(labelWithString: L("未找到可用的应用"))
-    private let emptyStateDetail = NSTextField(wrappingLabelWithString: L("请确认应用位于 Applications 文件夹，然后重新扫描。"))
-    private let emptyStateReloadButton = LauncherChromeButton(title: L("重新扫描"), target: nil, action: nil)
-    private let emptyStateCachedButton = LauncherChromeButton(title: L("使用上次应用列表"), target: nil, action: nil)
+    private let emptyStateTitle = NSTextField(
+        labelWithString: LauncherLayout.CatalogEmptyChromeCopy.content(
+            for: .catalogUnavailable,
+            localize: { L($0) }
+        ).title
+    )
+    private let emptyStateDetail = NSTextField(
+        wrappingLabelWithString: LauncherLayout.CatalogEmptyChromeCopy.content(
+            for: .catalogUnavailable,
+            localize: { L($0) }
+        ).detail
+    )
+    private let emptyStateReloadButton = LauncherChromeButton(
+        title: LauncherLayout.CatalogEmptyChromeCopy.reloadButtonTitle(localize: { L($0) }),
+        target: nil,
+        action: nil
+    )
+    private let emptyStateCachedButton = LauncherChromeButton(
+        title: LauncherLayout.CatalogEmptyChromeCopy.useCachedButtonTitle(localize: { L($0) }),
+        target: nil,
+        action: nil
+    )
     private let toastView = NSVisualEffectView()
     private let toastLabel = NSTextField(labelWithString: "")
     private let toastCloseButton = NSButton(title: "", target: nil, action: nil)
@@ -1344,6 +1727,13 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
     private var stagingHost: PagingPageHost
     /// True while the window is fading out. Grid paging must not keep turning.
     var launcherIsDismissing: () -> Bool = { false }
+    /// PINCH-TO-DISMISS-01: pinch-in while visible requests hide via WC.
+    var onPinchDismissRequested: (() -> Void)?
+    /// DOCK-DRAG-FILE-01: true while a drag is offering an app file outside.
+    var onExternalAppDragActive: ((Bool) -> Void)?
+    private var pinchToDismissEnabled = true
+    private var pinchDismissAccumulated: CGFloat = 0
+    private var pinchDismissTriggered = false
 
     /// The launcher is on screen and not fading. A mouseUp, VoiceOver press,
     /// or button action uses this before opening an app, folder, or Settings.
@@ -1360,7 +1750,10 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
     private let searchCollectionView = PagingCollectionView()
     private let pageIndicator = PageIndicatorView()
     private let footerControls = NSStackView()
-    private let dragHintLabel = NSTextField(labelWithString: L("拖拽整理"))
+    // FOOTER-DRAG-HINT-01 — initial single-page string; refreshFooterHints updates.
+    private let dragHintLabel = NSTextField(
+        labelWithString: LauncherLayout.FooterChromeCopy.dragHint(pageCount: 1, localize: { L($0) })
+    )
     private let navigationHintLabel = NSTextField(labelWithString: "")
     private let previousPageButton = PagingArrowButton(symbolName: "chevron.left", accessibilityLabel: L("上一页"))
     private let nextPageButton = PagingArrowButton(symbolName: "chevron.right", accessibilityLabel: L("下一页"))
@@ -1373,6 +1766,8 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
     private var deferredDesktopBackground: CGImage?
     private var desktopBackgroundWaitsForLauncher = false
     private var allCandidates: [AppCandidate] = []
+    /// Snapshot for MISSING-ROOT-PARTIAL-EDIT-01 retention when disk cache is empty.
+    var catalogCandidatesForRetention: [AppCandidate] { allCandidates }
     private var catalogByKey: [String: AppCandidate] = [:]
     private var searchableApps: [AppCandidate] = []
     private var searchableAppIDsByKey: [String: UUID] = [:]
@@ -1418,6 +1813,19 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
     private var launchingID: AppCandidate.ID?
     /// ⌘-click multi-select set (Core `LauncherItemSelection`). Chrome only in this slice.
     private var itemSelection = LauncherItemSelection.empty
+    /// Tracks search active state across `refreshPresentation` for
+    /// SEARCH-ENTER-CLEAR-SELECTION-01 (clear multi-select on enter only).
+    private var lastKnownSearching = false
+    /// SELECTION-A11Y-ANNOUNCE-01: last count spoken to VoiceOver.
+    private var lastAnnouncedSelectionCount = 0
+    /// Rubber-band selection on the current page wallpaper (MARQUEE-WIRE-01).
+    /// Armed on blank left-press; activates only after `LauncherMarquee.activationDistance`.
+    private var marqueeArmed = false
+    private var marqueeActivated = false
+    private var marqueeStartInRoot = CGPoint.zero
+    private var marqueeBaseSelection = LauncherItemSelection.empty
+    private var marqueeModifier: LauncherMarquee.Modifier = .replace
+    private var marqueeOverlay: NSView?
     /// Search keyboard-open target while the field keeps first responder.
     /// Shows focus-fill chrome on the hit; Return / arrows use this id.
     private var searchKeyboardHighlightID: UUID?
@@ -1444,6 +1852,11 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
     /// True only while the alias alert's modal loop is running. Dismiss
     /// aborts that loop; Save has already cleared this and must be kept.
     private var isPromptingForAlias = false
+    /// ICON-COLOR-OFFMAIN-01: one color sort at a time; icons sample off-main.
+    private var isSamplingIconColors = false
+    /// FOLDER-DATE-SORT-01: Spotlight dates sample off-main. Mutually exclusive
+    /// with color sampling so two commits cannot land out of order.
+    private var isSamplingAppDates = false
     var isPromptingForUninstall = false
     /// Tile that opened uninstall; restored after sheets (Core policy).
     private var uninstallSheetFocusItemID: UUID?
@@ -1473,11 +1886,17 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         var showsLift: Bool
     }
     private var activeDragLift: ActiveDragLift?
+    /// Polls screen mouse location while an item drag is active so page-arrow
+    /// drag-hover still turns pages when AppKit skips draggingEntered on a
+    /// zero-alpha arrow and when draggingSession(movedTo:) is quiet during hold.
+    private var pageArrowDragHoverPollToken: UInt64 = 0
     /// Reduced motion changed while the launcher fade was holding the drag
     /// image. The lift is dropped once that hold ends, if the drag is still up.
     private var dragLiftDropWaitsForLauncher = false
     private weak var dropTargetTile: AppGridTileView?
     private weak var dragSourceTile: AppGridTileView?
+    /// Other selected tiles hidden while a multi-drag is airborne (COMPANIONS-01).
+    private var multiDragHiddenCompanionTiles: [AppGridTileView] = []
     private var reorderSlideSignature: ReorderSlideSignature?
     /// `source` is the dragged cell. A new folder records both icons so they
     /// can land in the first two preview slots. A drop onto a folder that
@@ -1717,16 +2136,18 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         desktopBackgroundView.translatesAutoresizingMaskIntoConstraints = false
         addSubview(desktopBackgroundView)
 
-        let effect = NSVisualEffectView(frame: .zero)
+        let effect = backgroundBlurView
         effect.material = .fullScreenUI
         effect.blendingMode = .withinWindow
         effect.state = .active
         effect.translatesAutoresizingMaskIntoConstraints = false
         addSubview(effect)
 
-        let contrastOverlay = NSView()
+        let contrastOverlay = self.contrastOverlay
         contrastOverlay.wantsLayer = true
-        contrastOverlay.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.24).cgColor
+        // BACKGROUND-DIM-01: default .standard keeps the historical 0.24.
+        contrastOverlay.layer?.backgroundColor = NSColor.black
+            .withAlphaComponent(CGFloat(LauncherBackgroundDim.standard.overlayAlpha)).cgColor
         contrastOverlay.translatesAutoresizingMaskIntoConstraints = false
         addSubview(contrastOverlay)
 
@@ -1734,23 +2155,28 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         card.translatesAutoresizingMaskIntoConstraints = false
         addSubview(card)
 
-        searchField.placeholderString = L("搜索应用")
+        // SEARCH-FIELD-CHROME-01
+        searchField.placeholderString = LauncherLayout.SearchFieldChromeCopy.searchPlaceholder(localize: { L($0) })
         searchField.delegate = self
         searchField.sendsSearchStringImmediately = true
         searchField.focusRingType = .none
         searchField.controlSize = .large
         searchField.font = .systemFont(ofSize: 14, weight: .regular)
         searchField.alignment = .center
-        searchField.setAccessibilityLabel(L("搜索应用"))
-        searchField.setAccessibilityHelp(L("按应用名称或 Bundle ID 搜索"))
+        searchField.setAccessibilityLabel(LauncherLayout.SearchFieldChromeCopy.searchAccessibilityLabel(localize: { L($0) }))
+        searchField.setAccessibilityHelp(LauncherLayout.SearchFieldChromeCopy.searchHelp(localize: { L($0) }))
         searchField.isBordered = false
         searchField.isBezeled = false
         searchField.drawsBackground = false
         searchField.translatesAutoresizingMaskIntoConstraints = false
         // Productized clear: NSSearchField's built-in cancel (no custom clearButton).
         if let cell = searchField.cell as? NSSearchFieldCell {
-            cell.cancelButtonCell?.setAccessibilityLabel(L("清除搜索"))
-            cell.cancelButtonCell?.setAccessibilityHelp(L("清除搜索并返回应用网格"))
+            cell.cancelButtonCell?.setAccessibilityLabel(
+                LauncherLayout.SearchFieldChromeCopy.clearSearchLabel(localize: { L($0) })
+            )
+            cell.cancelButtonCell?.setAccessibilityHelp(
+                LauncherLayout.SearchFieldChromeCopy.clearSearchHelp(localize: { L($0) })
+            )
         }
 
         searchChrome.material = .popover
@@ -1768,12 +2194,16 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         searchChrome.addSubview(searchField)
         card.addSubview(countLabel)
 
-        settingsButton.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: L("设置"))
+        // SEARCH-FIELD-CHROME-01
+        settingsButton.image = NSImage(
+            systemSymbolName: "gearshape",
+            accessibilityDescription: LauncherLayout.SearchFieldChromeCopy.settingsLabel(localize: { L($0) })
+        )
         settingsButton.imagePosition = .imageOnly
         settingsButton.bezelStyle = .circular
-        settingsButton.toolTip = L("设置")
-        settingsButton.setAccessibilityLabel(L("设置"))
-        settingsButton.setAccessibilityHelp(L("打开 LaunchIcon 设置"))
+        settingsButton.toolTip = LauncherLayout.SearchFieldChromeCopy.settingsLabel(localize: { L($0) })
+        settingsButton.setAccessibilityLabel(LauncherLayout.SearchFieldChromeCopy.settingsLabel(localize: { L($0) }))
+        settingsButton.setAccessibilityHelp(LauncherLayout.SearchFieldChromeCopy.settingsHelp(localize: { L($0) }))
         settingsButton.target = self
         settingsButton.action = #selector(openSettings)
         settingsButton.onInsertTab = { [weak self] in
@@ -1798,7 +2228,10 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         rescanButton.isHidden = true
         rescanButton.target = self
         rescanButton.action = #selector(reloadCatalog)
-        rescanButton.setAccessibilityHelp(L("重新扫描应用并恢复可整理的列表"))
+        // CATALOG-EMPTY-PREPARING-CHROME-01
+        rescanButton.setAccessibilityHelp(
+            LauncherLayout.CatalogEmptyChromeCopy.rescanRestoreHelp(localize: { L($0) })
+        )
         rescanButton.translatesAutoresizingMaskIntoConstraints = false
         readOnlyCachedButton.bezelStyle = .rounded
         readOnlyCachedButton.controlSize = .small
@@ -1806,7 +2239,9 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         readOnlyCachedButton.target = self
         readOnlyCachedButton.action = #selector(useCachedCatalog)
         readOnlyCachedButton.setAccessibilityIdentifier("cachedCatalog.readOnly")
-        readOnlyCachedButton.setAccessibilityHelp(L("使用本机上次完整扫描的应用列表；整理功能暂不可用"))
+        readOnlyCachedButton.setAccessibilityHelp(
+            LauncherLayout.CatalogEmptyChromeCopy.useCachedHelp(localize: { L($0) })
+        )
         readOnlyCachedButton.translatesAutoresizingMaskIntoConstraints = false
         readOnlyStatusRow.orientation = .horizontal
         readOnlyStatusRow.alignment = .centerY
@@ -1822,7 +2257,10 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         countLabel.alignment = .right
         countLabel.isHidden = true
         countLabel.translatesAutoresizingMaskIntoConstraints = false
-        countLabel.setAccessibilityLabel(L("应用数量"))
+        // SEARCH-FIELD-CHROME-01
+        countLabel.setAccessibilityLabel(
+            LauncherLayout.SearchFieldChromeCopy.itemsAccessibilityLabel(localize: { L($0) })
+        )
         countLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         gridViewport.wantsLayer = true
@@ -1835,6 +2273,9 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
             collectionView.delegate = self
             collectionView.dragSessionEndedHandler = { [weak self] operation, screenPoint in
                 self?.finishItemDragSession(operation: operation, screenPoint: screenPoint)
+            }
+            collectionView.dragSessionMovedHandler = { [weak self] screenPoint in
+                self?.updatePageArrowDragHover(atScreenPoint: screenPoint)
             }
             collectionView.dragExitedHandler = { [weak self] in
                 guard let self else { return }
@@ -1908,7 +2349,9 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
             self?.movePage(by: direction)
         }
         let searchPageByKey = { [weak self] (direction: Int) in
-            self?.scrollSearchResults(byPage: direction) ?? false
+            guard let self else { return false }
+            if self.scrollOpenFolder(byPage: direction) { return true }
+            return self.scrollSearchResults(byPage: direction)
         }
         previousPageButton.onPage = pageByKey
         nextPageButton.onPage = pageByKey
@@ -2098,7 +2541,10 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         emptyStateReloadButton.controlSize = .large
         emptyStateReloadButton.target = self
         emptyStateReloadButton.action = #selector(reloadCatalog)
-        emptyStateReloadButton.setAccessibilityHelp(L("重新扫描标准 Applications 文件夹"))
+        // CATALOG-EMPTY-PREPARING-CHROME-01
+        emptyStateReloadButton.setAccessibilityHelp(
+            LauncherLayout.CatalogEmptyChromeCopy.defaultReloadHelp(localize: { L($0) })
+        )
 
         emptyStateCachedButton.bezelStyle = .rounded
         emptyStateCachedButton.controlSize = .large
@@ -2106,7 +2552,9 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         emptyStateCachedButton.target = self
         emptyStateCachedButton.action = #selector(useCachedCatalog)
         emptyStateCachedButton.setAccessibilityIdentifier("cachedCatalog.empty")
-        emptyStateCachedButton.setAccessibilityHelp(L("使用本机上次完整扫描的应用列表；整理功能暂不可用"))
+        emptyStateCachedButton.setAccessibilityHelp(
+            LauncherLayout.CatalogEmptyChromeCopy.useCachedHelp(localize: { L($0) })
+        )
 
         for view in [emptyStateIcon, emptyStateTitle, emptyStateDetail, emptyStateReloadButton, emptyStateCachedButton] {
             emptyStateView.addArrangedSubview(view)
@@ -2134,12 +2582,15 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
 
         toastCloseButton.image = NSImage(
             systemSymbolName: "xmark.circle.fill",
-            accessibilityDescription: L("关闭提示")
+            accessibilityDescription: LauncherLayout.FooterChromeCopy.toastCloseLabel(localize: { L($0) })
         )
         toastCloseButton.imagePosition = .imageOnly
         toastCloseButton.isBordered = false
         toastCloseButton.contentTintColor = .secondaryLabelColor
-        toastCloseButton.setAccessibilityLabel(L("关闭提示"))
+        // FOOTER-DRAG-HINT-01
+        toastCloseButton.setAccessibilityLabel(
+            LauncherLayout.FooterChromeCopy.toastCloseLabel(localize: { L($0) })
+        )
         toastCloseButton.target = self
         toastCloseButton.action = #selector(closeToast)
         toastCloseButton.translatesAutoresizingMaskIntoConstraints = false
@@ -2573,9 +3024,21 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
 
     func setLayoutEditingEnabled(_ enabled: Bool, explanation: String? = nil) {
         let changed = isLayoutEditingEnabled != enabled
+        // LAYOUT-EDIT-OFF-CLEAR-SELECTION-01: batch menus go away with editing.
+        if LauncherLayout.shouldClearSelectionWhenLayoutEditingDisabled(
+            wasEnabled: isLayoutEditingEnabled,
+            isEnabledNow: enabled,
+            selectionCount: itemSelection.count
+        ) {
+            itemSelection.clear()
+            refreshItemSelectionChrome(announce: false)
+        }
         isLayoutEditingEnabled = enabled
         if !enabled { dragPreview = nil }
-        layoutEditingExplanation = enabled ? nil : explanation ?? L("应用列表正在加载或不完整，暂时无法整理")
+        // LAYOUT-EDITING-STATUS-COPY-01
+        layoutEditingExplanation = enabled
+            ? nil
+            : explanation ?? LauncherLayout.LayoutEditingStatusCopy.defaultBlockedExplanation(localize: { L($0) })
         // The label, drag hint, and title field follow the grid. Touching the
         // field while the launcher is fading can end a rename that should stay
         // a draft until the window is back.
@@ -2660,7 +3123,8 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         let show: Bool
         let text: String
         if layoutSaveFailed {
-            text = L("布局未保存，请检查磁盘空间或文件权限")
+            // LAUNCH-FEEDBACK-COPY-01
+            text = LauncherLayout.LaunchFeedbackCopy.layoutSaveFailed(localize: { L($0) })
             show = true
         } else {
             text = layoutEditingExplanation ?? ""
@@ -2679,6 +3143,117 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         } else {
             readOnlyStatusLabel.setAccessibilityHelp(nil)
         }
+    }
+
+    private var hidesAppNames = false
+    private var hidesFolderNames = false
+    /// BACKGROUND-DIM-01: black overlay over the blurred wallpaper.
+    private let contrastOverlay = NSView()
+    private var backgroundDim: LauncherBackgroundDim = .standard
+    /// BACKGROUND-BLUR-01: blur layer between wallpaper and contrast overlay.
+    private let backgroundBlurView = NSVisualEffectView(frame: .zero)
+    /// Session-only Launchpad-style "new app" dots (not persisted).
+    private var newAppKeys = Set<String>()
+
+    func markNewApps(_ keys: Set<String>) {
+        guard !keys.isSubset(of: newAppKeys) else { return }
+        newAppKeys.formUnion(keys)
+        refreshNewAppBadges()
+    }
+
+    /// Set only; the tile drops its dot on the next launch-highlight or
+    /// configure pass (no tile walk on the launch click stack).
+    func clearNewApp(_ key: String) {
+        newAppKeys.remove(key)
+    }
+
+    private func refreshNewAppBadges() {
+        var pending: [NSView] = [self]
+        while let view = pending.popLast() {
+            if let tile = view as? AppGridTileView { tile.refreshNewAppBadge() }
+            pending.append(contentsOf: view.subviews)
+        }
+    }
+
+    func setHidesAppNames(_ hides: Bool) {
+        guard hides != hidesAppNames else { return }
+        hidesAppNames = hides
+        pushNameVisibilityToTiles()
+    }
+
+    /// BACKGROUND-DIM-01: recolour the overlay in place; no reload, relayout,
+    /// focus or page change.
+    func setBackgroundDim(_ dim: LauncherBackgroundDim) {
+        guard dim != backgroundDim else { return }
+        backgroundDim = dim
+        contrastOverlay.layer?.backgroundColor = NSColor.black
+            .withAlphaComponent(CGFloat(dim.overlayAlpha)).cgColor
+    }
+
+    /// BACKGROUND-BLUR-01: toggle the blur layer in place; no reload,
+    /// relayout, focus or page change.
+    func setBlursBackground(_ blurs: Bool) {
+        guard backgroundBlurView.isHidden == blurs else { return }
+        backgroundBlurView.isHidden = !blurs
+    }
+
+    func setHidesFolderNames(_ hides: Bool) {
+        guard hides != hidesFolderNames else { return }
+        hidesFolderNames = hides
+        pushNameVisibilityToTiles()
+    }
+
+    /// Walk every tile (all pages, folder, search) like applyDeferredLoadedIcons;
+    /// no reload, no relayout, no page / focus change.
+    private func pushNameVisibilityToTiles() {
+        var pending: [NSView] = [self]
+        while let view = pending.popLast() {
+            if let tile = view as? AppGridTileView {
+                tile.hidesTitleByPreference = hidesAppNames
+                tile.hidesFolderTitleByPreference = hidesFolderNames
+            }
+            pending.append(contentsOf: view.subviews)
+        }
+    }
+
+    func setPinchToDismissEnabled(_ enabled: Bool) {
+        pinchToDismissEnabled = enabled
+        if !enabled {
+            pinchDismissAccumulated = 0
+            pinchDismissTriggered = false
+        }
+    }
+
+    /// Trackpad pinch-in while the launcher is open. Returns true when consumed.
+    @discardableResult
+    func handlePinchMagnify(_ event: NSEvent) -> Bool {
+        guard pinchToDismissEnabled else { return false }
+        let phase = event.phase
+        if phase == .began || phase == .mayBegin {
+            pinchDismissAccumulated = 0
+            pinchDismissTriggered = false
+            return true
+        }
+        if phase.contains(.ended) || phase.contains(.cancelled) {
+            pinchDismissAccumulated = 0
+            pinchDismissTriggered = false
+            return true
+        }
+        pinchDismissAccumulated += event.magnification
+        let isPaging = isPageTransitioning || isPagingGesture
+        let isDragging = dragPreview != nil || activeDragLift != nil
+        if !pinchDismissTriggered,
+           PinchDismissPolicy.shouldDismiss(
+               enabled: pinchToDismissEnabled,
+               accumulatedMagnification: Double(pinchDismissAccumulated),
+               isPaging: isPaging,
+               isDragging: isDragging,
+               isDismissing: launcherIsDismissing()
+           ) {
+            pinchDismissTriggered = true
+            onPinchDismissRequested?()
+        }
+        return true
     }
 
     func setReducesMotion(_ enabled: Bool) {
@@ -2785,6 +3360,16 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         return true
     }
 
+    /// One commit for every hidden app (single backup); same reconcile as above.
+    /// Does not page or move focus — the launcher may not even be visible.
+    func restoreAllHiddenApplications() -> Int? {
+        guard isLayoutEditingEnabled,
+              let restored = LauncherLayout.restoringAllHiddenApplications(in: layoutState) else { return nil }
+        let count = layoutState.hiddenAppKeys.count
+        commitLayout(LauncherLayout.reconcile(candidates: allCandidates, into: restored))
+        return count
+    }
+
     /// Settings one-shot rearrange of the top-level grid. Persists via commitLayout
     /// (LayoutStore writes a backup first). Clears multi-select; does not page.
     @discardableResult
@@ -2808,6 +3393,160 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         return true
     }
 
+    /// Category rearrange (blank-area menu). Mirrors `rearrangeTopLevelGrid`:
+    /// only `orderedEntries` change, multi-select clears, no paging.
+    @discardableResult
+    func rearrangeTopLevelGridByCategory() -> Bool {
+        guard isLayoutEditingEnabled else { return false }
+        let next = LauncherLayout.rearrangeTopLevelEntriesByCategory(
+            in: layoutState,
+            catalog: allCandidates
+        )
+        let toast = L(LauncherLayout.CategoryRearrangeCopy.toastKey)
+        guard next.orderedEntries != layoutState.orderedEntries else {
+            showToast(toast)
+            return true
+        }
+        if !itemSelection.isEmpty {
+            itemSelection.clear()
+            refreshItemSelectionChrome()
+        }
+        commitLayout(next)
+        showToast(toast)
+        return true
+    }
+
+    /// Date rearrange (blank-area menu). Spotlight dates are read off the main
+    /// actor (DATE-REARRANGE-OFFMAIN-01); the result is applied to the current
+    /// layout afterwards. Only `orderedEntries` change. No paging.
+    @discardableResult
+    func rearrangeTopLevelGridByDate(_ kind: AppDateRearrangeKind) -> Bool {
+        guard isLayoutEditingEnabled, !isSamplingIconColors, !isSamplingAppDates else { return false }
+        isSamplingAppDates = true
+        let candidates = allCandidates
+        if candidates.count > IconColorSampler.progressToastThreshold {
+            showToast(L(AppDateRearrangeKind.progressToastKey))
+        }
+        Task { @MainActor [weak self] in
+            let dates = await LauncherLayout.applicationDates(kind, for: candidates)
+            guard let self else { return }
+            self.isSamplingAppDates = false
+            _ = self.applyTopLevelDateRearrange(kind, dates: dates)
+        }
+        return true
+    }
+
+    /// Settings path: await date reads, then apply. Same invariants as the
+    /// blank-area path. No paging / page-capacity change.
+    func rearrangeTopLevelGridByDateAwaitingCompletion(_ kind: AppDateRearrangeKind) async -> Bool {
+        guard isLayoutEditingEnabled, !isSamplingIconColors, !isSamplingAppDates else { return false }
+        isSamplingAppDates = true
+        let candidates = allCandidates
+        let dates = await LauncherLayout.applicationDates(kind, for: candidates)
+        isSamplingAppDates = false
+        return applyTopLevelDateRearrange(kind, dates: dates)
+    }
+
+    /// Second half of the date rearrange. Skips if the user opened a folder,
+    /// started searching, or locked the layout while dates were read.
+    /// Returns false only when editing became unavailable mid-read.
+    @discardableResult
+    private func applyTopLevelDateRearrange(_ kind: AppDateRearrangeKind, dates: [String: Date]) -> Bool {
+        guard isLayoutEditingEnabled, openedFolderID == nil, !isSearching else { return false }
+        let next = LauncherLayout.rearrangeTopLevelEntriesByDate(kind, in: layoutState, catalog: allCandidates) {
+            dates[$0.deduplicationKey]
+        }
+        let toast = L(kind.toastKey)
+        guard next.orderedEntries != layoutState.orderedEntries else {
+            showToast(toast)
+            return true
+        }
+        if !itemSelection.isEmpty {
+            itemSelection.clear()
+            refreshItemSelectionChrome()
+        }
+        commitLayout(next)
+        showToast(toast)
+        return true
+    }
+
+    /// Color rearrange (blank-area menu). Icon colors are sampled off the
+    /// main thread (ICON-COLOR-OFFMAIN-01) so hundreds of apps never stall
+    /// the grid; the result is applied to the *current* layout afterwards.
+    @discardableResult
+    func rearrangeTopLevelGridByColor() -> Bool {
+        guard isLayoutEditingEnabled, !isSamplingIconColors, !isSamplingAppDates else { return false }
+        isSamplingIconColors = true
+        let candidates = allCandidates
+        if IconColorSampler.shared.pendingCount(for: candidates) > IconColorSampler.progressToastThreshold {
+            showToast(L(LauncherLayout.ColorRearrangeCopy.progressToastKey))
+        }
+        Task { @MainActor [weak self] in
+            let samples = await IconColorSampler.shared.samples(for: candidates)
+            guard let self else { return }
+            self.isSamplingIconColors = false
+            self.applyColorRearrange(samples)
+        }
+        return true
+    }
+
+    /// Second half of `rearrangeTopLevelGridByColor`. Mirrors
+    /// `rearrangeTopLevelGridByDate`: only `orderedEntries` change,
+    /// multi-select clears, no paging. Skips if the user opened a folder,
+    /// started searching, or locked the layout while icons were sampled.
+    /// Returns false only when editing became unavailable mid-sample.
+    @discardableResult
+    private func applyColorRearrange(_ samples: [String: IconColorSample]) -> Bool {
+        guard isLayoutEditingEnabled, openedFolderID == nil, !isSearching else { return false }
+        let next = LauncherLayout.rearrangeTopLevelEntriesByColor(in: layoutState, catalog: allCandidates) { candidate in
+            samples[candidate.deduplicationKey]
+        }
+        let toast = L(LauncherLayout.ColorRearrangeCopy.toastKey)
+        guard next.orderedEntries != layoutState.orderedEntries else {
+            showToast(toast)
+            return true
+        }
+        if !itemSelection.isEmpty {
+            itemSelection.clear()
+            refreshItemSelectionChrome()
+        }
+        commitLayout(next)
+        showToast(toast)
+        return true
+    }
+
+    /// Settings path: await icon-color samples, then apply. Same invariants as
+    /// the blank-area fire-and-forget path; no paging / page-capacity change.
+    func rearrangeTopLevelGridByColorAwaitingCompletion() async -> Bool {
+        guard isLayoutEditingEnabled, !isSamplingIconColors, !isSamplingAppDates else { return false }
+        isSamplingIconColors = true
+        let candidates = allCandidates
+        let samples = await IconColorSampler.shared.samples(for: candidates)
+        isSamplingIconColors = false
+        return applyColorRearrange(samples)
+    }
+
+    /// Which import confirmation applies against the live catalog and layout.
+    func layoutImportConfirmation(for imported: LayoutState) -> LayoutImportConfirmation {
+        LauncherLayout.layoutImportConfirmation(imported: imported, current: layoutState, catalog: allCandidates)
+    }
+
+    func layoutImportChangeSummary(for imported: LayoutState) -> LayoutChangeSummary? {
+        LauncherLayout.layoutImportChangeSummary(imported: imported, current: layoutState, catalog: allCandidates)
+    }
+
+    /// Launchpad snapshot mapped onto the live layout; nil before the catalog loads.
+    func launchpadImportedLayout(from snapshot: LaunchpadLayoutSnapshot) -> LayoutState? {
+        guard !allCandidates.isEmpty else { return nil }
+        return LaunchpadLayoutImporter.layoutState(
+            from: snapshot,
+            candidates: allCandidates,
+            base: layoutState,
+            // LAYOUT-IO-OUTCOME-COPY-01
+            defaultFolderName: LauncherLayout.LayoutIOOutcomeCopy.launchpadDefaultFolderName(localize: { L($0) })
+        )
+    }
+
     /// Settings import / restore-last-backup. Reconciles with the live catalog,
     /// clears multi-select, commits (LayoutStore backs up prior on persist). No paging.
     @discardableResult
@@ -2819,7 +3558,8 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
             refreshItemSelectionChrome()
         }
         commitLayout(reconciled)
-        showToast(L("布局已更新"))
+        // LAYOUT-IO-OUTCOME-COPY-01
+        showToast(LauncherLayout.LayoutIOOutcomeCopy.layoutUpdatedToast(localize: { L($0) }))
         return true
     }
 
@@ -2973,9 +3713,160 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         didConsumeClick = false
     }
 
+
+    /// True when the window point hits wallpaper (same chain as blank-area menu).
+    private func startsOnBlankArea(at windowPoint: NSPoint) -> Bool {
+        var current = hitTest(windowPoint)
+        while let view = current, view !== self {
+            if view is AppGridTileView || view is NSControl || view === folderOverlay || view === pageIndicator {
+                return false
+            }
+            current = view.superview
+        }
+        let gridPoint = activeCollectionView.convert(windowPoint, from: nil)
+        if activeCollectionView.indexPathForItem(at: gridPoint) != nil {
+            return false
+        }
+        return true
+    }
+
+    /// Arm a marquee on blank left-press. Activation waits for drag distance.
+    func armMarqueeIfNeeded(with event: NSEvent) {
+        cancelMarquee(keepSelection: true)
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let blank = startsOnBlankArea(at: event.locationInWindow)
+        guard LauncherMarquee.canArm(
+            buttonNumber: event.buttonNumber,
+            clickCount: event.clickCount,
+            startsOnBlankArea: blank,
+            isSearching: isSearching,
+            folderOpen: openedFolderID != nil,
+            isDragging: dragPreview != nil || activeDragLift != nil,
+            isPaging: isPageTransitioning || isPagingGesture,
+            isDismissing: launcherIsDismissing() || window?.isVisible != true,
+            isPromptingForAlias: isPromptingForAlias
+        ) else { return }
+        marqueeArmed = true
+        marqueeActivated = false
+        marqueeStartInRoot = convert(event.locationInWindow, from: nil)
+        marqueeBaseSelection = itemSelection
+        marqueeModifier = LauncherMarquee.modifier(
+            command: flags.contains(.command),
+            shift: flags.contains(.shift)
+        )
+    }
+
+    /// Live update while dragging. Activates chrome after the distance threshold.
+    func updateMarquee(with event: NSEvent) {
+        guard marqueeArmed else { return }
+        if isPageTransitioning || isPagingGesture {
+            cancelMarquee(keepSelection: true)
+            return
+        }
+        let current = convert(event.locationInWindow, from: nil)
+        if !marqueeActivated {
+            guard LauncherMarquee.hasActivated(from: marqueeStartInRoot, to: current) else { return }
+            marqueeActivated = true
+            didConsumeClick = true
+            ensureMarqueeOverlay()
+        }
+        let raw = LauncherMarquee.rect(from: marqueeStartInRoot, to: current)
+        let pageBounds = activeHost.convert(activeHost.bounds, to: self)
+        let rect = LauncherMarquee.clamped(raw, to: pageBounds)
+        marqueeOverlay?.frame = rect
+        let hits = LauncherMarquee.hitIDs(in: rect, items: marqueeItemFramesInRoot())
+        let next = LauncherMarquee.selection(
+            base: marqueeBaseSelection,
+            hits: hits,
+            modifier: marqueeModifier
+        )
+        if next.orderedIDs != itemSelection.orderedIDs || next.rangeAnchorID != itemSelection.rangeAnchorID {
+            itemSelection = next
+            // SELECTION-A11Y-ANNOUNCE-01: announce once on endMarquee, not per drag frame.
+            refreshItemSelectionChrome(announce: false)
+        }
+    }
+
+    /// End marquee. Returns true when an activated band consumed the click (no dismiss).
+    @discardableResult
+    func endMarquee(with event: NSEvent) -> Bool {
+        guard marqueeArmed else { return false }
+        if marqueeActivated {
+            // Final geometry pass so a release without a last drag still lands.
+            updateMarquee(with: event)
+        }
+        let activated = marqueeActivated
+        if LauncherMarquee.suppressesDismissOnRelease(didActivate: activated) {
+            didConsumeClick = true
+        }
+        cancelMarquee(keepSelection: true)
+        // SELECTION-A11Y-ANNOUNCE-01: speak final band selection once (not per drag frame).
+        if activated {
+            announceSelectionChangeIfNeeded()
+        }
+        return activated
+    }
+
+    private func cancelMarquee(keepSelection: Bool) {
+        marqueeArmed = false
+        marqueeActivated = false
+        marqueeOverlay?.removeFromSuperview()
+        marqueeOverlay = nil
+        if !keepSelection {
+            // Reserved for future hard abort paths; selection stays by default.
+        }
+    }
+
+    private func ensureMarqueeOverlay() {
+        if marqueeOverlay == nil {
+            let overlay = NSView(frame: .zero)
+            overlay.wantsLayer = true
+            overlay.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.08).cgColor
+            overlay.layer?.borderColor = NSColor.white.withAlphaComponent(0.35).cgColor
+            overlay.layer?.borderWidth = 1
+            overlay.layer?.cornerRadius = 2
+            // Above grid hosts, below folder overlay / chrome that must stay clickable.
+            addSubview(overlay, positioned: .above, relativeTo: activeHost)
+            marqueeOverlay = overlay
+        }
+    }
+
+    private func marqueeItemFramesInRoot() -> [LauncherMarquee.ItemFrame] {
+        let items = presentedItems(for: activeCollectionView)
+        var frames: [LauncherMarquee.ItemFrame] = []
+        frames.reserveCapacity(items.count)
+        for (index, entry) in items.enumerated() {
+            let indexPath = IndexPath(item: index, section: 0)
+            let frame: CGRect
+            if let view = activeCollectionView.item(at: indexPath)?.view {
+                frame = view.convert(view.bounds, to: self)
+            } else if let attributes = activeCollectionView.collectionViewLayout?
+                .layoutAttributesForItem(at: indexPath) {
+                frame = activeCollectionView.convert(attributes.frame, to: self)
+            } else {
+                continue
+            }
+            frames.append(LauncherMarquee.ItemFrame(id: entry.id, frame: frame))
+        }
+        return frames
+    }
+
+
     /// The window is still hidden. Drop a leftover search or open folder so the
     /// next presentation starts on the grid instead of the last session.
+    /// REOPEN-PAGE-BEHAVIOR-01: land on page 0 while the window is still hidden.
+    /// Must not start a page transition animation (paging red line).
+    func snapGridToHomePageForReopen() {
+        settleInterruptedPaging()
+        guard currentPage != 0 else { return }
+        currentPage = 0
+        activeCollectionView.reloadData()
+        layoutCollectionViews()
+        updatePagination(resetToFirstPage: false)
+    }
+
     func prepareForPresentation(clearsSearchQuery: Bool = true) {
+        cancelMarquee(keepSelection: true)
         // Hide may already have landed. Do it again so a transition that
         // finished after hide cannot leave the hosts mid-slide. Clearing a
         // search or folder below does not send the grid back to page 0.
@@ -3424,9 +4315,12 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
     }
 
     func showLaunchError(for candidate: AppCandidate, error: Error) {
-        let title = error as? WorkspaceLaunchError == .timedOut(candidate.canonicalURL)
-            ? String(format: L("打开“%@”超时"), displayName(for: candidate))
-            : String(format: L("无法打开“%@”"), displayName(for: candidate))
+        // LAUNCH-FEEDBACK-COPY-01
+        let title = LauncherLayout.LaunchFeedbackCopy.openFailureMessage(
+            displayName: displayName(for: candidate),
+            timedOut: error as? WorkspaceLaunchError == .timedOut(candidate.canonicalURL),
+            localize: { L($0) }
+        )
         showToast(title, help: L(error.localizedDescription))
     }
 
@@ -3437,7 +4331,11 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         } else {
             catalogPresentationWaitsForLauncher = true
         }
-        showToast(L("布局未保存，请检查磁盘空间或文件权限"), help: error.localizedDescription, autoDismiss: false)
+        showToast(
+            LauncherLayout.LaunchFeedbackCopy.layoutSaveFailed(localize: { L($0) }),
+            help: error.localizedDescription,
+            autoDismiss: false
+        )
     }
 
     func clearLayoutSaveError() {
@@ -3450,11 +4348,11 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         // The save failure may still be waiting out the fade. Drop that
         // request so the next appearance does not show a cleared error.
         // A different toast that replaced it stays.
-        if deferredToast?.message == L("布局未保存，请检查磁盘空间或文件权限") {
+        if deferredToast?.message == LauncherLayout.LaunchFeedbackCopy.layoutSaveFailed(localize: { L($0) }) {
             deferredToast = nil
             toastWaitsForLauncher = false
         }
-        guard toastLabel.stringValue == L("布局未保存，请检查磁盘空间或文件权限") else { return }
+        guard toastLabel.stringValue == LauncherLayout.LaunchFeedbackCopy.layoutSaveFailed(localize: { L($0) }) else { return }
         hideToast(animated: true)
     }
 
@@ -3827,11 +4725,681 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         return false
     }
 
+
+    /// SETTINGS-CLEAR-SELECTION-01: Settings covers the grid; drop multi-select chrome.
+    func clearSelectionBeforeOpeningSettings() {
+        guard LauncherLayout.shouldClearSelectionWhenOpeningSettings(
+            selectionCount: itemSelection.count
+        ) else { return }
+        itemSelection.clear()
+        refreshItemSelectionChrome(announce: false)
+    }
+
     @objc private func openSettings() {
         guard acceptsPointerActivation() else { return }
+        clearSelectionBeforeOpeningSettings()
         onSettingsRequested?()
     }
 
+    // MARK: Blank-area context menu (设置 / 整理布局 / 退出)
+
+    /// Right-click on empty launcher space. Tiles, controls, the search field,
+    /// the folder panel and the page indicator keep their own handling. The
+    /// root view never touches paging state here; it only reads it to stay
+    /// out of the way of an in-flight turn.
+    override func rightMouseDown(with event: NSEvent) {
+        guard let menu = blankAreaContextMenu(at: event.locationInWindow) else {
+            super.rightMouseDown(with: event)
+            return
+        }
+        noteIconContextMenuTracking(menu)
+        defer { noteIconContextMenuTracking(nil) }
+        NSMenu.popUpContextMenu(menu, with: event, for: self)
+    }
+
+    private func blankAreaContextMenu(at point: NSPoint) -> NSMenu? {
+        guard LauncherLayout.showsBlankAreaContextMenu(
+            isSearching: isSearching,
+            folderOpen: openedFolderID != nil,
+            isDragging: dragPreview != nil || activeDragLift != nil,
+            isPaging: isPageTransitioning || isPagingGesture,
+            isDismissing: launcherIsDismissing() || window?.isVisible != true
+        ) else { return nil }
+        var current = hitTest(point)
+        while let view = current, view !== self {
+            if view is AppGridTileView || view is NSControl || view === folderOverlay || view === pageIndicator {
+                return nil
+            }
+            current = view.superview
+        }
+        let menu = NSMenu()
+        let settingsItem = menu.addItem(
+            withTitle: L("设置…"),
+            action: #selector(openSettingsFromBlankAreaMenu),
+            keyEquivalent: ""
+        )
+        settingsItem.target = self
+        let folderCount = LauncherLayout.topLevelFolderCount(in: layoutState)
+        if isLayoutEditingEnabled {
+            // BLANK-SELECT-ALL-01: mouse parity for ⌘A / Esc-clear (this page only).
+            // Avoid naming paging ivars here — blank-area menu guard bans them.
+            let selectAll = menu.addItem(
+                withTitle: L(LauncherLayout.blankAreaSelectAllMenuTitleKey),
+                action: #selector(selectAllFromBlankAreaMenu),
+                keyEquivalent: ""
+            )
+            selectAll.target = self
+            selectAll.setAccessibilityHelp(L("选中当前页的全部图标"))
+            if !itemSelection.isEmpty {
+                let clear = menu.addItem(
+                    withTitle: L(LauncherLayout.blankAreaClearSelectionMenuTitleKey),
+                    action: #selector(clearSelectionFromBlankAreaMenu),
+                    keyEquivalent: ""
+                )
+                clear.target = self
+                clear.setAccessibilityHelp(L("取消多选高亮"))
+            }
+            // BATCH-BLANK-SELECTED-EDGE-01: ≥2 top-level selected → front/back.
+            let selectedTopLevel = LauncherLayout.topLevelEntryIDsInSelection(
+                selection: itemSelection, in: layoutState
+            )
+            if selectedTopLevel.count >= 2 {
+                if LauncherLayout.movingSelectedTopLevelEntriesToEdge(
+                    entryIDs: selectedTopLevel, atStart: true, in: layoutState
+                ) != nil {
+                    let start = menu.addItem(
+                        withTitle: L(LauncherLayout.blankSelectedMovedToStartMenuTitleKey),
+                        action: #selector(moveSelectedEntriesToStartFromBlankAreaMenu),
+                        keyEquivalent: ""
+                    )
+                    start.target = self
+                    start.setAccessibilityHelp(
+                        L(LauncherLayout.blankSelectedMovedToEdgeAccessibilityHelpKey)
+                    )
+                }
+                if LauncherLayout.movingSelectedTopLevelEntriesToEdge(
+                    entryIDs: selectedTopLevel, atStart: false, in: layoutState
+                ) != nil {
+                    let end = menu.addItem(
+                        withTitle: L(LauncherLayout.blankSelectedMovedToEndMenuTitleKey),
+                        action: #selector(moveSelectedEntriesToEndFromBlankAreaMenu),
+                        keyEquivalent: ""
+                    )
+                    end.target = self
+                    end.setAccessibilityHelp(
+                        L(LauncherLayout.blankSelectedMovedToEdgeAccessibilityHelpKey)
+                    )
+                }
+            }
+            // BLANK-BATCH-SELECTION-ACTIONS-01: hide / new-folder for multi-select
+            // from blank (marquee parity with tile menus). Reuses Core counts.
+            let blankHideKeys = LauncherLayout.appKeysForBatchHide(
+                selection: itemSelection, in: layoutState
+            )
+            if !blankHideKeys.isEmpty {
+                let hide = menu.addItem(
+                    withTitle: String(
+                        format: L(LauncherLayout.batchHideMenuTitleFormatKey),
+                        blankHideKeys.count
+                    ),
+                    action: #selector(hideSelectedApplicationsFromBlankAreaMenu),
+                    keyEquivalent: ""
+                )
+                hide.target = self
+                hide.setAccessibilityHelp(L("隐藏所选应用，可在设置中恢复"))
+            }
+            let blankFolderApps = LauncherLayout.topLevelAppIDsForBatchFolder(
+                selection: itemSelection, in: layoutState
+            )
+            if blankFolderApps.count >= 2 {
+                let folder = menu.addItem(
+                    withTitle: String(
+                        format: L(LauncherLayout.batchNewFolderMenuTitleFormatKey),
+                        blankFolderApps.count
+                    ),
+                    action: #selector(moveSelectionToNewFolderFromBlankAreaMenu),
+                    keyEquivalent: ""
+                )
+                folder.target = self
+                folder.setAccessibilityHelp(L("把所选应用放进新建文件夹"))
+            }
+            // BLANK-BATCH-REVEAL-01: ≥2 selection with revealable apps.
+            if itemSelection.count >= 2,
+               let anchor = itemSelection.orderedIDs.first(where: {
+                   layoutState.folders[$0] == nil && layoutState.appKeys[$0] != nil
+               }) ?? itemSelection.orderedIDs.first,
+               let revealURLs = LauncherLayout.revealInFinderURLs(
+                   selection: itemSelection,
+                   anchorID: anchor,
+                   in: layoutState,
+                   candidatesByKey: catalogByKey
+               ), !revealURLs.isEmpty {
+                let reveal = menu.addItem(
+                    withTitle: String(
+                        format: L(LauncherLayout.batchRevealMenuTitleFormatKey),
+                        revealURLs.count
+                    ),
+                    action: #selector(revealSelectedInFinderFromBlankAreaMenu),
+                    keyEquivalent: ""
+                )
+                reveal.target = self
+                reveal.setAccessibilityHelp(L("在访达中选中所选应用"))
+            }
+            // BLANK-BATCH-UNINSTALL-01 + DISABLED-01: ≥2 selection →「卸载 N 个应用…」
+            // (enabled or disabled+reason). Reuses AppBatchUninstallPlan +
+            // uninstallSelectedApplications. Separator before destructive item.
+            if itemSelection.count >= 2,
+               let uninstallAnchor = itemSelection.orderedIDs.first(where: {
+                   layoutState.folders[$0] == nil && layoutState.appKeys[$0] != nil
+               }) ?? itemSelection.orderedIDs.first,
+               let batchPlan = AppBatchUninstallPlan.plan(
+                   selection: itemSelection,
+                   anchorID: uninstallAnchor,
+                   in: layoutState,
+                   candidatesByKey: catalogByKey,
+                   decide: { [weak self] candidate in
+                       guard let self else {
+                           return AppUninstallDecision(allowed: false, blockReason: nil)
+                       }
+                       return self.uninstallDecision(for: candidate)
+                   }
+               ) {
+                switch batchPlan.menuPresentation {
+                case .hidden:
+                    break
+                case .enabled, .disabled:
+                    // BLANK-BATCH-UNINSTALL-DISABLED-01: autoenablesItems=false so
+                    // explicit isEnabled=false sticks (tile context menus do this).
+                    menu.autoenablesItems = false
+                    if menu.numberOfItems > 0, menu.items.last?.isSeparatorItem == false {
+                        menu.addItem(.separator())
+                    }
+                    let titleCount = batchPlan.eligibleIDs.isEmpty
+                        ? max(batchPlan.blocked.count, 2)
+                        : batchPlan.eligibleIDs.count
+                    let uninstall = menu.addItem(
+                        withTitle: String(
+                            format: L(AppBatchUninstallPlan.menuTitleFormatKey),
+                            titleCount
+                        ),
+                        action: #selector(uninstallSelectedApplicationsFromBlankAreaMenu),
+                        keyEquivalent: ""
+                    )
+                    uninstall.target = self
+                    if case .disabled(let explanationKey) = batchPlan.menuPresentation {
+                        uninstall.isEnabled = false
+                        if let explanationKey {
+                            let reason = L(explanationKey)
+                            uninstall.toolTip = reason
+                            uninstall.setAccessibilityHelp(reason)
+                        }
+                    } else {
+                        uninstall.setAccessibilityHelp(L("将所选应用移到废纸篓"))
+                    }
+                }
+            }
+            // BLANK-BATCH-DISSOLVE-01: ≥2 selected top-level folders → dissolve N…
+            // Reuses folderIDsForBatchDissolve + dissolveSelectedFolders (cancel-first).
+            // BLANK-BATCH-DISSOLVE-SEP-01: separator before destructive dissolve.
+            if let foldAnchor = itemSelection.orderedIDs.first(where: {
+                   layoutState.folders[$0] != nil
+                   && layoutState.orderedEntries.contains(.folder($0))
+               }),
+               let dissolveIDs = LauncherLayout.folderIDsForBatchDissolve(
+                   selection: itemSelection,
+                   anchorID: foldAnchor,
+                   in: layoutState
+               ), dissolveIDs.count >= 2 {
+                if menu.numberOfItems > 0, menu.items.last?.isSeparatorItem == false {
+                    menu.addItem(.separator())
+                }
+                let dissolve = menu.addItem(
+                    withTitle: String(
+                        format: L(LauncherLayout.batchDissolveFoldersMenuTitleFormatKey),
+                        dissolveIDs.count
+                    ),
+                    action: #selector(dissolveSelectedFoldersFromBlankAreaMenu),
+                    keyEquivalent: ""
+                )
+                dissolve.target = self
+                dissolve.setAccessibilityHelp(
+                    L(LauncherLayout.batchDissolveFoldersAccessibilityHelpKey)
+                )
+            }
+            let organize = menu.addItem(withTitle: L("整理布局"), action: nil, keyEquivalent: "")
+            let submenu = NSMenu(title: L("整理布局"))
+            // Explicit isEnabled below; auto-enable would ignore it.
+            submenu.autoenablesItems = false
+            let byName = submenu.addItem(
+                withTitle: L(LauncherLayout.blankAreaRearrangeMenuTitleKey(sort: .byName)),
+                action: #selector(rearrangeByNameFromBlankAreaMenu),
+                keyEquivalent: ""
+            )
+            byName.target = self
+            byName.isEnabled = LauncherLayout.rearrangeWouldChange(in: layoutState, catalog: allCandidates, sort: .byName)
+            let byKind = submenu.addItem(
+                withTitle: L(LauncherLayout.blankAreaRearrangeMenuTitleKey(sort: .byKind)),
+                action: #selector(rearrangeByKindFromBlankAreaMenu),
+                keyEquivalent: ""
+            )
+            byKind.target = self
+            byKind.isEnabled = LauncherLayout.rearrangeWouldChange(in: layoutState, catalog: allCandidates, sort: .byKind)
+            let byCategory = submenu.addItem(
+                withTitle: L(LauncherLayout.CategoryRearrangeCopy.menuTitleKey),
+                action: #selector(rearrangeByCategoryFromBlankAreaMenu),
+                keyEquivalent: ""
+            )
+            byCategory.target = self
+            byCategory.isEnabled = LauncherLayout.CategoryRearrangeCopy.menuItemAlwaysEnabled
+            for kind in AppDateRearrangeKind.allCases {
+                let byDate = submenu.addItem(
+                    withTitle: L(kind.menuTitleKey),
+                    action: #selector(rearrangeByDateFromBlankAreaMenu(_:)),
+                    keyEquivalent: ""
+                )
+                byDate.target = self
+                byDate.representedObject = kind.rawValue
+                // Like category: no per-app metadata reads on every right-click.
+                byDate.isEnabled = true
+            }
+            let byColor = submenu.addItem(
+                withTitle: L(LauncherLayout.ColorRearrangeCopy.menuTitleKey),
+                action: #selector(rearrangeByColorFromBlankAreaMenu),
+                keyEquivalent: ""
+            )
+            byColor.target = self
+            // Icons are sampled only after confirmation, never per right-click.
+            byColor.isEnabled = true
+            if folderCount > 0 {
+                appendFolderOrganizeItems(to: submenu)
+            }
+            organize.submenu = submenu
+            appendHiddenApplicationsSubmenu(to: menu)
+        }
+        menu.addItem(.separator())
+        let quitItem = menu.addItem(
+            withTitle: L("退出"),
+            action: #selector(NSApplication.terminate(_:)),
+            keyEquivalent: ""
+        )
+        quitItem.target = NSApp
+        return menu
+    }
+
+    private func appendFolderOrganizeItems(to submenu: NSMenu) {
+        submenu.addItem(.separator())
+        let ungroup = submenu.addItem(
+            withTitle: L("解散所有文件夹…"),
+            action: #selector(ungroupAllFoldersFromMenu),
+            keyEquivalent: ""
+        )
+        ungroup.target = self
+        submenu.addItem(.separator())
+        let toStart = submenu.addItem(
+            withTitle: L("文件夹移到最前"),
+            action: #selector(moveFoldersToStartFromMenu),
+            keyEquivalent: ""
+        )
+        toStart.target = self
+        toStart.isEnabled = LauncherLayout.movingFoldersToEdge(atStart: true, in: layoutState) != nil
+        let toEnd = submenu.addItem(
+            withTitle: L("文件夹移到最后"),
+            action: #selector(moveFoldersToEndFromMenu),
+            keyEquivalent: ""
+        )
+        toEnd.target = self
+        toEnd.isEnabled = LauncherLayout.movingFoldersToEdge(atStart: false, in: layoutState) != nil
+    }
+
+    @objc private func rearrangeByNameFromBlankAreaMenu() {
+        rearrangeFromBlankAreaMenu(sort: .byName)
+    }
+
+    @objc private func rearrangeByKindFromBlankAreaMenu() {
+        rearrangeFromBlankAreaMenu(sort: .byKind)
+    }
+
+    /// Same confirm (cancel first) and Core rearrange as Settings. Focus is
+    /// cleared first so the reload cannot follow an icon to another page.
+    private func rearrangeFromBlankAreaMenu(sort: LauncherLayout.GridRearrangeSort) {
+        guard isLayoutEditingEnabled, acceptsIconContextMenuAction(),
+              openedFolderID == nil, !isSearching else { return }
+        precondition(LauncherLayout.GridRearrangeConfirmAlert.cancelIsFirstButton)
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = L(LauncherLayout.GridRearrangeConfirmAlert.messageTextKey)
+        alert.informativeText = L(LauncherLayout.GridRearrangeConfirmAlert.informativeTextKey(sort: sort))
+        alert.addButton(withTitle: L(LauncherLayout.GridRearrangeConfirmAlert.cancelButtonTitleKey))
+        alert.addButton(withTitle: L(LauncherLayout.GridRearrangeConfirmAlert.confirmButtonTitleKey))
+        isPromptingForAlias = true
+        defer { isPromptingForAlias = false }
+        guard alert.runModal() == .alertSecondButtonReturn,
+              isLayoutEditingEnabled,
+              openedFolderID == nil, !isSearching else { return }
+        _ = window?.makeFirstResponder(self)
+        rearrangeTopLevelGrid(sort: sort)
+    }
+
+    /// 「按分类排列…」: same cancel-first confirm and focus clearing as the
+    /// name/kind items; reads each app's Info.plist only after confirmation.
+    @objc private func rearrangeByCategoryFromBlankAreaMenu() {
+        guard isLayoutEditingEnabled, acceptsIconContextMenuAction(),
+              openedFolderID == nil, !isSearching else { return }
+        precondition(LauncherLayout.GridRearrangeConfirmAlert.cancelIsFirstButton)
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = L(LauncherLayout.GridRearrangeConfirmAlert.messageTextKey)
+        alert.informativeText = L(LauncherLayout.CategoryRearrangeCopy.informativeTextKey)
+        alert.addButton(withTitle: L(LauncherLayout.GridRearrangeConfirmAlert.cancelButtonTitleKey))
+        alert.addButton(withTitle: L(LauncherLayout.GridRearrangeConfirmAlert.confirmButtonTitleKey))
+        isPromptingForAlias = true
+        defer { isPromptingForAlias = false }
+        guard alert.runModal() == .alertSecondButtonReturn,
+              isLayoutEditingEnabled,
+              openedFolderID == nil, !isSearching else { return }
+        _ = window?.makeFirstResponder(self)
+        rearrangeTopLevelGridByCategory()
+    }
+
+    /// 「按添加时间 / 按上次打开时间排列…」: same cancel-first confirm and
+    /// focus clearing as the category item; reads Spotlight dates only after
+    /// confirmation.
+    @objc private func rearrangeByDateFromBlankAreaMenu(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let kind = AppDateRearrangeKind(rawValue: raw),
+              isLayoutEditingEnabled, acceptsIconContextMenuAction(),
+              openedFolderID == nil, !isSearching else { return }
+        precondition(LauncherLayout.GridRearrangeConfirmAlert.cancelIsFirstButton)
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = L(LauncherLayout.GridRearrangeConfirmAlert.messageTextKey)
+        alert.informativeText = L(kind.informativeTextKey)
+        alert.addButton(withTitle: L(LauncherLayout.GridRearrangeConfirmAlert.cancelButtonTitleKey))
+        alert.addButton(withTitle: L(LauncherLayout.GridRearrangeConfirmAlert.confirmButtonTitleKey))
+        isPromptingForAlias = true
+        defer { isPromptingForAlias = false }
+        guard alert.runModal() == .alertSecondButtonReturn,
+              isLayoutEditingEnabled,
+              openedFolderID == nil, !isSearching else { return }
+        _ = window?.makeFirstResponder(self)
+        rearrangeTopLevelGridByDate(kind)
+    }
+
+    /// 「按颜色排列…」: same cancel-first confirm as the date items; icon
+    /// colors are sampled only after confirmation.
+    @objc private func rearrangeByColorFromBlankAreaMenu() {
+        guard isLayoutEditingEnabled, acceptsIconContextMenuAction(),
+              openedFolderID == nil, !isSearching else { return }
+        precondition(LauncherLayout.GridRearrangeConfirmAlert.cancelIsFirstButton)
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = L(LauncherLayout.GridRearrangeConfirmAlert.messageTextKey)
+        alert.informativeText = L(LauncherLayout.ColorRearrangeCopy.informativeTextKey)
+        alert.addButton(withTitle: L(LauncherLayout.GridRearrangeConfirmAlert.cancelButtonTitleKey))
+        alert.addButton(withTitle: L(LauncherLayout.GridRearrangeConfirmAlert.confirmButtonTitleKey))
+        isPromptingForAlias = true
+        defer { isPromptingForAlias = false }
+        guard alert.runModal() == .alertSecondButtonReturn,
+              isLayoutEditingEnabled,
+              openedFolderID == nil, !isSearching else { return }
+        _ = window?.makeFirstResponder(self)
+        rearrangeTopLevelGridByColor()
+    }
+
+    /// 「隐藏的应用 ▸」: only when something is hidden. Restored apps return at
+    /// the end like the Settings restore; the visible page never changes.
+    private func appendHiddenApplicationsSubmenu(to menu: NSMenu) {
+        let hidden = hiddenApplications()
+        guard !hidden.isEmpty else { return }
+        let entries = LauncherLayout.blankAreaHiddenAppsMenuEntries(hidden)
+        let item = menu.addItem(withTitle: L(LauncherLayout.blankAreaHiddenAppsMenuTitleKey), action: nil, keyEquivalent: "")
+        let submenu = NSMenu(title: L(LauncherLayout.blankAreaHiddenAppsMenuTitleKey))
+        for application in entries.shown {
+            let row = submenu.addItem(
+                withTitle: application.displayName,
+                action: #selector(restoreHiddenApplicationFromBlankAreaMenu(_:)),
+                keyEquivalent: ""
+            )
+            row.target = self
+            row.representedObject = application.key
+            row.setAccessibilityHelp(L("把隐藏的应用放回启动器"))
+        }
+        if entries.hasMore {
+            let more = submenu.addItem(
+                withTitle: L(LauncherLayout.blankAreaHiddenAppsMoreTitleKey),
+                action: #selector(openSettingsFromBlankAreaMenu),
+                keyEquivalent: ""
+            )
+            more.target = self
+        }
+        if LauncherLayout.settingsShowsRestoreAllHidden(hiddenCount: hidden.count) {
+            submenu.addItem(.separator())
+            let all = submenu.addItem(
+                withTitle: L(LauncherLayout.restoreAllHiddenButtonTitleKey),
+                action: #selector(restoreAllHiddenApplicationsFromBlankAreaMenu),
+                keyEquivalent: ""
+            )
+            all.target = self
+            all.setAccessibilityHelp(L(LauncherLayout.restoreAllHiddenAccessibilityHelpKey))
+        }
+        item.submenu = submenu
+    }
+
+    @objc private func restoreHiddenApplicationFromBlankAreaMenu(_ sender: NSMenuItem) {
+        guard isLayoutEditingEnabled, acceptsIconContextMenuAction(),
+              let key = sender.representedObject as? String else { return }
+        let name = hiddenApplications().first(where: { $0.key == key })?.displayName ?? sender.title
+        // Clear tile focus first so the reload cannot chase an icon to another page.
+        _ = window?.makeFirstResponder(self)
+        guard restoreHiddenApplication(withKey: key) else { return }
+        showToast(String(format: L(LauncherLayout.restoredHiddenAppToastFormatKey), name))
+    }
+
+    @objc private func restoreAllHiddenApplicationsFromBlankAreaMenu() {
+        guard isLayoutEditingEnabled, acceptsIconContextMenuAction() else { return }
+        _ = window?.makeFirstResponder(self)
+        guard let count = restoreAllHiddenApplications(), count > 0 else { return }
+        showToast(String(format: L(LauncherLayout.restoredAllHiddenMessageFormatKey), count))
+    }
+
+    @objc private func selectAllFromBlankAreaMenu() {
+        guard isLayoutEditingEnabled else { return }
+        guard acceptsIconContextMenuAction() else { return }
+        _ = selectAllItemsOnCurrentPage()
+    }
+
+    @objc private func clearSelectionFromBlankAreaMenu() {
+        guard !itemSelection.isEmpty else { return }
+        itemSelection.clear()
+        refreshItemSelectionChrome()
+    }
+
+    /// DISMISS-CLEAR-SELECTION-01: hide / hotkey / launch-dismiss path.
+    /// announce:false — VO stays quiet under the fade (Esc already announced).
+    func clearItemSelectionForDismiss() {
+        if LauncherLayout.shouldClearSelectionOnDismiss(selectionCount: itemSelection.count) {
+            itemSelection.clear()
+            refreshItemSelectionChrome(announce: false)
+        }
+    }
+
+    /// OPEN-FOLDER-CLEAR-SELECTION-01: drop grid multi-select under the folder veil.
+    private func clearItemSelectionWhenOpeningFolder() {
+        if LauncherLayout.shouldClearSelectionWhenOpeningFolder(selectionCount: itemSelection.count) {
+            itemSelection.clear()
+            refreshItemSelectionChrome()
+        }
+    }
+
+    /// CLOSE-FOLDER-CLEAR-SELECTION-01: drop multi-select when the folder veil lifts.
+    private func clearItemSelectionWhenClosingFolder() {
+        if LauncherLayout.shouldClearSelectionWhenClosingFolder(selectionCount: itemSelection.count) {
+            itemSelection.clear()
+            refreshItemSelectionChrome(announce: false)
+        }
+    }
+
+    @objc private func openSettingsFromBlankAreaMenu() {
+        guard acceptsIconContextMenuAction() else { return }
+        clearSelectionBeforeOpeningSettings()
+        onSettingsRequested?()
+    }
+
+    /// Whole-layout rewrites clear tile focus first, so the reload cannot
+    /// chase a moved icon onto another page; the visible page index stays.
+    private func commitReorganizedLayout(_ next: LayoutState, toast: String) {
+        // REORGANIZE-CLEAR-SELECTION-01: blank ungroup-all / folders-to-edge
+        // (and other callers) must not leave multi-select chrome on dissolved ids.
+        _ = window?.makeFirstResponder(self)
+        if LauncherLayout.shouldClearSelectionAfterReorganize(selectionCount: itemSelection.count) {
+            itemSelection.clear()
+            refreshItemSelectionChrome(announce: false)
+        }
+        commitLayout(next)
+        showToast(toast)
+    }
+
+    @objc private func ungroupAllFoldersFromMenu() {
+        guard isLayoutEditingEnabled, acceptsIconContextMenuAction() else { return }
+        let count = LauncherLayout.topLevelFolderCount(in: layoutState)
+        guard count > 0 else { return }
+        let alert = NSAlert()
+        // UNGROUP-ALL-CONFIRM-COPY-01
+        alert.messageText = LauncherLayout.ungroupAllFoldersConfirmTitle(localize: { L($0) })
+        alert.informativeText = LauncherLayout.ungroupAllFoldersConfirmInformativeText(
+            folderCount: count,
+            localize: { L($0) }
+        )
+        // Cancel first — Return/Esc must not ungroup (same policy as the
+        // rearrange / restore-backup confirms).
+        alert.addButton(withTitle: LauncherLayout.dissolveConfirmCancelButtonTitle(localize: { L($0) }))
+        alert.addButton(withTitle: LauncherLayout.dissolveConfirmDestructiveButtonTitle(localize: { L($0) }))
+        isPromptingForAlias = true
+        defer { isPromptingForAlias = false }
+        guard alert.runModal() == .alertSecondButtonReturn,
+              isLayoutEditingEnabled,
+              openedFolderID == nil, !isSearching,
+              let next = LauncherLayout.ungroupAllFolders(in: layoutState) else { return }
+        commitReorganizedLayout(
+            next,
+            toast: String(format: L(LauncherLayout.ungroupAllFoldersToastMessageFormatKey), count)
+        )
+    }
+
+    @objc private func moveFoldersToStartFromMenu() {
+        moveFoldersToEdgeFromMenu(atStart: true)
+    }
+
+    @objc private func moveFoldersToEndFromMenu() {
+        moveFoldersToEdgeFromMenu(atStart: false)
+    }
+
+    private func moveFoldersToEdgeFromMenu(atStart: Bool) {
+        guard isLayoutEditingEnabled, acceptsIconContextMenuAction(),
+              openedFolderID == nil, !isSearching,
+              let next = LauncherLayout.movingFoldersToEdge(atStart: atStart, in: layoutState) else { return }
+        commitReorganizedLayout(
+            next,
+            toast: L(atStart ? LauncherLayout.foldersMovedToStartToastKey : LauncherLayout.foldersMovedToEndToastKey)
+        )
+    }
+
+
+
+    @objc private func moveSelectedEntriesToStartFromBlankAreaMenu() {
+        moveSelectedEntriesToEdgeFromBlankAreaMenu(atStart: true)
+    }
+
+    @objc private func moveSelectedEntriesToEndFromBlankAreaMenu() {
+        moveSelectedEntriesToEdgeFromBlankAreaMenu(atStart: false)
+    }
+
+    /// BATCH-BLANK-SELECTED-EDGE-01: blank menu moves current multi-select.
+    private func moveSelectedEntriesToEdgeFromBlankAreaMenu(atStart: Bool) {
+        guard isLayoutEditingEnabled, acceptsIconContextMenuAction() else { return }
+        guard openedFolderID == nil, !isSearching else { return }
+        guard !isPageTransitioning, !isPagingGesture else { return }
+        let ids = LauncherLayout.topLevelEntryIDsInSelection(
+            selection: itemSelection, in: layoutState
+        )
+        guard ids.count >= 2,
+              let next = LauncherLayout.movingSelectedTopLevelEntriesToEdge(
+                entryIDs: ids, atStart: atStart, in: layoutState
+              ) else { return }
+        itemSelection.clear()
+        refreshItemSelectionChrome(announce: false)
+        let key = atStart
+            ? LauncherLayout.blankSelectedMovedToStartToastFormatKey
+            : LauncherLayout.blankSelectedMovedToEndToastFormatKey
+        commitReorganizedLayout(next, toast: String(format: L(key), ids.count))
+    }
+
+
+    @objc private func hideSelectedApplicationsFromBlankAreaMenu() {
+        guard isLayoutEditingEnabled, acceptsIconContextMenuAction() else { return }
+        let keys = LauncherLayout.appKeysForBatchHide(selection: itemSelection, in: layoutState)
+        guard !keys.isEmpty else { return }
+        let anchor = itemSelection.orderedIDs.first(where: { layoutState.appKeys[$0] != nil })
+            ?? itemSelection.orderedIDs.first
+            ?? UUID()
+        hideSelectedApplications(anchorFocusID: anchor, in: activeCollectionView)
+    }
+
+    @objc private func moveSelectionToNewFolderFromBlankAreaMenu() {
+        guard isLayoutEditingEnabled, acceptsIconContextMenuAction() else { return }
+        moveSelectionToNewFolder()
+    }
+
+
+    @objc private func revealSelectedInFinderFromBlankAreaMenu() {
+        guard acceptsIconContextMenuAction() else { return }
+        guard itemSelection.count >= 2,
+              let anchor = itemSelection.orderedIDs.first(where: {
+                  layoutState.folders[$0] == nil && layoutState.appKeys[$0] != nil
+              }) ?? itemSelection.orderedIDs.first,
+              let urls = LauncherLayout.revealInFinderURLs(
+                  selection: itemSelection,
+                  anchorID: anchor,
+                  in: layoutState,
+                  candidatesByKey: catalogByKey
+              ), !urls.isEmpty else { return }
+        // Match tile reveal: clear chrome then hand off to Finder (dismisses).
+        itemSelection.clear()
+        refreshItemSelectionChrome(announce: false)
+        onRevealInFinderRequested?(urls)
+    }
+
+
+    /// BLANK-BATCH-UNINSTALL-01 / DISABLED-01: blank menu batch-uninstalls eligible
+    /// selected apps; disabled presentation toasts the Core explanation.
+    @objc private func uninstallSelectedApplicationsFromBlankAreaMenu() {
+        guard isLayoutEditingEnabled, acceptsIconContextMenuAction(), !isPaging else { return }
+        guard let anchor = itemSelection.orderedIDs.first(where: {
+            layoutState.folders[$0] == nil && layoutState.appKeys[$0] != nil
+        }) ?? itemSelection.orderedIDs.first else { return }
+        guard let plan = AppBatchUninstallPlan.plan(
+            selection: itemSelection,
+            anchorID: anchor,
+            in: layoutState,
+            candidatesByKey: catalogByKey,
+            decide: { uninstallDecision(for: $0) }
+        ) else { return }
+        if case .disabled(let explanationKey) = plan.menuPresentation {
+            if let explanationKey { showToast(L(explanationKey)) }
+            return
+        }
+        uninstallSelectedApplications(anchorFocusID: anchor, in: activeCollectionView)
+    }
+
+    /// BLANK-BATCH-DISSOLVE-01: blank menu dissolves ≥2 selected top-level folders.
+    @objc private func dissolveSelectedFoldersFromBlankAreaMenu() {
+        guard isLayoutEditingEnabled, acceptsIconContextMenuAction() else { return }
+        guard let foldAnchor = itemSelection.orderedIDs.first(where: {
+            layoutState.folders[$0] != nil
+                && layoutState.orderedEntries.contains(.folder($0))
+        }) else { return }
+        dissolveSelectedFolders(anchorID: foldAnchor)
+    }
 
     /// Non-empty trimmed query (field editor preferred while present).
     func searchQueryIsNonEmpty() -> Bool {
@@ -3890,7 +5458,7 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
             generation: generation
         )
         setFooterNavigationText(
-            L("Esc 清除搜索"),
+            LauncherLayout.SearchFieldChromeCopy.escClearSearch(localize: { L($0) }),
             chromeVisible: showChrome,
             animated: false,
             generation: generation
@@ -4229,7 +5797,42 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         return true
     }
 
+    /// Page Up/Down inside an open folder. One viewport of the member list.
+    /// The key is consumed even at the end.
+    @discardableResult
+    func scrollOpenFolder(byPage direction: Int) -> Bool {
+        guard LauncherLayout.verticalPageKeyTarget(
+            folderOpen: openedFolderID != nil,
+            searching: isSearching
+        ) == .folderScroll, direction != 0 else { return false }
+        if folderOverlay.isAnimatingClose { return true }
+        guard folderOverlay.scrollMembers(byPage: direction) else { return false }
+        retargetFolderKeyboardFocusIfScrolledAway()
+        rebuildKeyViewLoop()
+        return true
+    }
+
+    /// A recycled off-screen tile would open a different app. Move the keyboard
+    /// to a member that stayed in view. An already visible tile is left alone,
+    /// so this does not pull the list back.
+    private func retargetFolderKeyboardFocusIfScrolledAway() {
+        let collectionView = folderOverlay.collectionView
+        guard let tile = window?.firstResponder as? AppGridTileView,
+              tile.isDescendant(of: collectionView) else { return }
+        let frame = tile.convert(tile.bounds, to: collectionView)
+        let barelyVisible = frame.insetBy(dx: 0, dy: frame.height * 0.5)
+        if collectionView.visibleRect.intersects(barelyVisible) { return }
+        collectionView.layoutSubtreeIfNeeded()
+        let items = presentedItems(for: collectionView)
+        let visibleIndexes = collectionView.visibleItems().compactMap { item in
+            collectionView.indexPath(for: item)?.item
+        }.sorted()
+        guard let index = visibleIndexes.first(where: { items.indices.contains($0) }) else { return }
+        _ = focusPresentedItem(id: items[index].id, in: collectionView)
+    }
+
     func movePage(by direction: Int) {
+        cancelMarquee(keepSelection: true)
         showPage(LauncherLayout.pageIndex(
             movingBy: direction,
             from: currentPage,
@@ -4239,10 +5842,280 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         ))
     }
 
+    /// Drive page-arrow drag-hover from a screen point (drag session movedTo
+    /// or mouse-location poll). Fallback when AppKit does not deliver
+    /// draggingEntered to a zero-alpha PagingArrowButton under UI Automation.
+    private func updatePageArrowDragHover(atScreenPoint screenPoint: NSPoint) {
+        let accepts = isLayoutEditingEnabled
+            && !isSearching
+            && openedFolderID == nil
+            && LauncherLayout.shouldAcceptLayoutDrop(isDismissing: launcherIsDismissing())
+            && (activeDragLift != nil || dragPreview != nil)
+        guard accepts, let window else {
+            previousPageButton.noteExternalDragHover(inside: false)
+            nextPageButton.noteExternalDragHover(inside: false)
+            return
+        }
+        let windowPoint = window.convertPoint(fromScreen: screenPoint)
+        let rootPoint = convert(windowPoint, from: nil)
+        // Inflate slightly: XCTest drag targets the AX frame center; under
+        // Automation the session point can sit a few points outside bounds.
+        let pad: CGFloat = 12
+        let previousFrame = previousPageButton.convert(previousPageButton.bounds, to: self).insetBy(dx: -pad, dy: -pad)
+        let nextFrame = nextPageButton.convert(nextPageButton.bounds, to: self).insetBy(dx: -pad, dy: -pad)
+        previousPageButton.noteExternalDragHover(
+            inside: !previousPageButton.isHidden && previousFrame.contains(rootPoint)
+        )
+        nextPageButton.noteExternalDragHover(
+            inside: !nextPageButton.isHidden && nextFrame.contains(rootPoint)
+        )
+    }
+
+    private func startPageArrowDragHoverPolling() {
+        pageArrowDragHoverPollToken &+= 1
+        let token = pageArrowDragHoverPollToken
+        schedulePageArrowDragHoverPoll(token: token)
+    }
+
+    private func stopPageArrowDragHoverPolling() {
+        pageArrowDragHoverPollToken &+= 1
+        previousPageButton.noteExternalDragHover(inside: false)
+        nextPageButton.noteExternalDragHover(inside: false)
+    }
+
+    private func schedulePageArrowDragHoverPoll(token: UInt64) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0 / 30.0) { [weak self] in
+            guard let self, self.pageArrowDragHoverPollToken == token else { return }
+            guard self.activeDragLift != nil || self.dragPreview != nil else {
+                self.stopPageArrowDragHoverPolling()
+                return
+            }
+            self.updatePageArrowDragHover(atScreenPoint: NSEvent.mouseLocation)
+            self.schedulePageArrowDragHoverPoll(token: token)
+        }
+    }
+
     func numberOfSections(in collectionView: NSCollectionView) -> Int { 1 }
 
     func collectionView(_ collectionView: NSCollectionView, numberOfItemsInSection section: Int) -> Int {
         presentedItems(for: collectionView).count
+    }
+
+    /// Selection-dependent context-menu items (batch hide/reveal/folder/edge/
+    /// remove/uninstall/dissolve). Called at item configuration and again right
+    /// before a menu is presented (MULTI-SELECT-MENU-STALE-01). Never pages.
+    private func applySelectionDependentContextMenu(
+        to tile: AppGridTileView,
+        representedID: UUID,
+        in collectionView: NSCollectionView
+    ) {
+        let multiSelectMenu = self.itemSelection.count > 1
+            && self.itemSelection.contains(representedID)
+            && self.isLayoutEditingEnabled
+        tile.onBatchHideSelection = multiSelectMenu
+            ? { [weak self, weak collectionView] in
+                guard let self, let collectionView else { return }
+                self.hideSelectedApplications(anchorFocusID: representedID, in: collectionView)
+            }
+            : nil
+        // BATCH-MENU-COUNTS-01: title uses hideable-app count (folders skipped).
+        if multiSelectMenu {
+            let hideCount = LauncherLayout.appKeysForBatchHide(
+                selection: self.itemSelection, in: self.layoutState
+            ).count
+            tile.batchHideTitle = hideCount > 0
+                ? String(format: L(LauncherLayout.batchHideMenuTitleFormatKey), hideCount)
+                : nil
+        } else {
+            tile.batchHideTitle = nil
+        }
+        // BATCH-REVEAL-COUNT-01: counted「在访达中显示（N）」(works in read-only too).
+        if self.itemSelection.count > 1,
+           self.itemSelection.contains(representedID),
+           let revealURLs = LauncherLayout.revealInFinderURLs(
+                selection: self.itemSelection,
+                anchorID: representedID,
+                in: self.layoutState,
+                candidatesByKey: self.catalogByKey
+           ), !revealURLs.isEmpty {
+            tile.batchRevealTitle = String(
+                format: L(LauncherLayout.batchRevealMenuTitleFormatKey),
+                revealURLs.count
+            )
+        } else {
+            tile.batchRevealTitle = nil
+        }
+        // New folder only on the main grid (not search / open folder).
+        let canBatchFolder = multiSelectMenu
+            && collectionView !== self.searchCollectionView
+            && collectionView !== self.folderOverlay.collectionView
+            && LauncherLayout.topLevelAppIDsForBatchFolder(
+                selection: self.itemSelection,
+                in: self.layoutState
+            ).count >= 2
+        tile.onBatchMoveSelectionToFolder = canBatchFolder
+            ? { [weak self] in
+                self?.moveSelectionToNewFolder()
+            }
+            : nil
+        if canBatchFolder {
+            let folderCount = LauncherLayout.topLevelAppIDsForBatchFolder(
+                selection: self.itemSelection, in: self.layoutState
+            ).count
+            tile.batchNewFolderTitle = String(
+                format: L(LauncherLayout.batchNewFolderMenuTitleFormatKey),
+                folderCount
+            )
+        } else {
+            tile.batchNewFolderTitle = nil
+        }
+        // BATCH-SELECTED-APPS-EDGE-01: ≥2 top-level apps → front/back.
+        // Omit callbacks when Core would no-op (already at that edge).
+        if multiSelectMenu,
+           collectionView !== self.searchCollectionView,
+           collectionView !== self.folderOverlay.collectionView,
+           let edgeAppIDs = LauncherLayout.appIDsForBatchEdgeMove(
+                selection: self.itemSelection,
+                anchorID: representedID,
+                in: self.layoutState
+           ) {
+            if LauncherLayout.movingSelectedAppsToEdge(
+                appIDs: edgeAppIDs, atStart: true, in: self.layoutState
+            ) != nil {
+                tile.onBatchMoveSelectedAppsToStart = { [weak self] in
+                    self?.moveSelectedAppsToEdge(anchorID: representedID, atStart: true)
+                }
+            } else {
+                tile.onBatchMoveSelectedAppsToStart = nil
+            }
+            if LauncherLayout.movingSelectedAppsToEdge(
+                appIDs: edgeAppIDs, atStart: false, in: self.layoutState
+            ) != nil {
+                tile.onBatchMoveSelectedAppsToEnd = { [weak self] in
+                    self?.moveSelectedAppsToEdge(anchorID: representedID, atStart: false)
+                }
+            } else {
+                tile.onBatchMoveSelectedAppsToEnd = nil
+            }
+        } else {
+            tile.onBatchMoveSelectedAppsToStart = nil
+            tile.onBatchMoveSelectedAppsToEnd = nil
+        }
+        // BATCH-REMOVE-FROM-FOLDER-01: multi-select inside open folder.
+        if multiSelectMenu,
+           collectionView === self.folderOverlay.collectionView,
+           let openFolderID = self.openedFolderID,
+           let batchRemoveIDs = LauncherLayout.appIDsForBatchRemoveFromFolder(
+                selection: self.itemSelection,
+                folderID: openFolderID,
+                in: self.layoutState
+           ) {
+            tile.batchRemoveFromFolderTitle = String(
+                format: L(LauncherLayout.batchRemoveFromFolderMenuTitleFormatKey),
+                batchRemoveIDs.count
+            )
+            tile.onBatchRemoveFromFolder = { [weak self] in
+                self?.removeSelectedApplicationsFromOpenFolder(
+                    batchRemoveIDs, folderID: openFolderID
+                )
+            }
+            // configureContextMenu prefers batch over single「移出文件夹」.
+        } else {
+            tile.onBatchRemoveFromFolder = nil
+            tile.batchRemoveFromFolderTitle = nil
+        }
+        // Batch uninstall: only when the right-clicked app is in a ≥2 selection.
+        if multiSelectMenu,
+           let batchPlan = AppBatchUninstallPlan.plan(
+                selection: self.itemSelection,
+                anchorID: representedID,
+                in: self.layoutState,
+                candidatesByKey: self.catalogByKey,
+                decide: { [weak self] candidate in
+                    guard let self else {
+                        return AppUninstallDecision(allowed: false, blockReason: nil)
+                    }
+                    return self.uninstallDecision(for: candidate)
+                }
+           ) {
+            let titleCount = batchPlan.eligibleIDs.isEmpty
+                ? max(batchPlan.blocked.count, 2)
+                : batchPlan.eligibleIDs.count
+            tile.batchUninstallTitle = String(
+                format: L(AppBatchUninstallPlan.menuTitleFormatKey),
+                titleCount
+            )
+            switch batchPlan.menuPresentation {
+            case .enabled:
+                tile.batchUninstallEnabled = true
+                tile.batchUninstallDisabledReason = nil
+                tile.onBatchUninstallSelection = { [weak self, weak collectionView] in
+                    guard let self, let collectionView else { return }
+                    self.uninstallSelectedApplications(
+                        anchorFocusID: representedID,
+                        in: collectionView
+                    )
+                }
+            case .disabled(let explanationKey):
+                tile.batchUninstallEnabled = false
+                tile.batchUninstallDisabledReason = explanationKey.map(L)
+                // Keep the action so VoiceOver can land on the disabled item.
+                tile.onBatchUninstallSelection = { [weak self] in
+                    guard let self, let key = explanationKey else { return }
+                    self.showToast(L(key))
+                }
+            case .hidden:
+                tile.onBatchUninstallSelection = nil
+                tile.batchUninstallEnabled = false
+                tile.batchUninstallDisabledReason = nil
+                tile.batchUninstallTitle = nil
+            }
+        } else {
+            tile.onBatchUninstallSelection = nil
+            tile.batchUninstallEnabled = false
+            tile.batchUninstallDisabledReason = nil
+            tile.batchUninstallTitle = nil
+        }
+        // BATCH-DISSOLVE-FOLDERS-01 + BATCH-SELECTED-FOLDERS-EDGE-01
+        // Omit front/back callbacks when Core says the order would not change
+        // (already at that edge) so the menu hides those items.
+        if multiSelectMenu,
+           let dissolveIDs = LauncherLayout.folderIDsForBatchDissolve(
+                selection: self.itemSelection,
+                anchorID: representedID,
+                in: self.layoutState
+           ) {
+            tile.batchDissolveFoldersTitle = String(
+                format: L(LauncherLayout.batchDissolveFoldersMenuTitleFormatKey),
+                dissolveIDs.count
+            )
+            tile.onBatchDissolveFolders = { [weak self] in
+                self?.dissolveSelectedFolders(anchorID: representedID)
+            }
+            if LauncherLayout.movingSelectedFoldersToEdge(
+                folderIDs: dissolveIDs, atStart: true, in: self.layoutState
+            ) != nil {
+                tile.onBatchMoveSelectedFoldersToStart = { [weak self] in
+                    self?.moveSelectedFoldersToEdge(anchorID: representedID, atStart: true)
+                }
+            } else {
+                tile.onBatchMoveSelectedFoldersToStart = nil
+            }
+            if LauncherLayout.movingSelectedFoldersToEdge(
+                folderIDs: dissolveIDs, atStart: false, in: self.layoutState
+            ) != nil {
+                tile.onBatchMoveSelectedFoldersToEnd = { [weak self] in
+                    self?.moveSelectedFoldersToEdge(anchorID: representedID, atStart: false)
+                }
+            } else {
+                tile.onBatchMoveSelectedFoldersToEnd = nil
+            }
+        } else {
+            tile.onBatchDissolveFolders = nil
+            tile.batchDissolveFoldersTitle = nil
+            tile.onBatchMoveSelectedFoldersToStart = nil
+            tile.onBatchMoveSelectedFoldersToEnd = nil
+        }
     }
 
     func collectionView(
@@ -4275,6 +6148,10 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         // resume on this turn, and the tile has to know the fade is underway.
         if let tile = item.view as? AppGridTileView {
             tile.launcherIsDismissing = launcherIsDismissing
+            tile.isInSearchResults = collectionView === searchCollectionView
+            tile.isNewAppKey = { [weak self] key in self?.newAppKeys.contains(key) ?? false }
+            tile.hidesTitleByPreference = hidesAppNames
+            tile.hidesFolderTitleByPreference = hidesFolderNames
             if collectionView === folderOverlay.collectionView {
                 tile.folderPanelChromeInFlight = { [weak self] in
                     self?.folderOverlay.panelChromeInFlight ?? false
@@ -4350,6 +6227,53 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
                       ) else { return nil }
                 return String(format: L("文件夹 %@"), name)
             }()
+            var revealInFinder: (() -> Void)?
+            let multiReveal = itemSelection.count > 1 && itemSelection.contains(representedID)
+            if multiReveal,
+               let batchURLs = LauncherLayout.revealInFinderURLs(
+                    selection: itemSelection,
+                    anchorID: representedID,
+                    in: layoutState,
+                    candidatesByKey: catalogByKey
+               ) {
+                revealInFinder = { [weak self] in self?.onRevealInFinderRequested?(batchURLs) }
+            } else if let revealURL = LauncherLayout.revealInFinderURL(for: candidate, isFolder: false) {
+                revealInFinder = { [weak self] in self?.onRevealInFinderRequested?([revealURL]) }
+            }
+            // 「移到文件夹」: grid top-level apps only (Core returns [] for
+            // folder members); search results keep their read-only menu.
+            let moveTargets: [FolderMenuTarget] =
+                (isLayoutEditingEnabled && collectionView !== searchCollectionView)
+                ? LauncherLayout.moveToFolderMenuTargets(forAppID: representedID, in: layoutState)
+                : []
+            var moveToFolder: ((UUID) -> Void)?
+            if !moveTargets.isEmpty {
+                moveToFolder = { [weak self, weak collectionView] folderID in
+                    guard let self, let collectionView else { return }
+                    // Decided at click time: a live multi-selection that
+                    // contains this app moves together.
+                    if let apps = LauncherLayout.batchMoveToFolderAppIDs(
+                        selection: self.itemSelection,
+                        anchorAppID: representedID,
+                        in: self.layoutState
+                    ) {
+                        self.moveSelectedApplications(apps, toFolder: folderID)
+                    } else {
+                        self.moveApplication(representedID, toFolder: folderID, in: collectionView)
+                    }
+                }
+            }
+            // 「移出文件夹」: open-folder members only, and only while the
+            // folder keeps ≥2 members (never dissolves the open overlay).
+            var removeFromFolder: (() -> Void)?
+            if isLayoutEditingEnabled,
+               collectionView === folderOverlay.collectionView,
+               let openFolderID = openedFolderID,
+               LauncherLayout.removingAppFromFolder(representedID, folderID: openFolderID, in: layoutState) != nil {
+                removeFromFolder = { [weak self] in
+                    self?.removeApplicationFromOpenFolder(representedID, folderID: openFolderID)
+                }
+            }
             item.configure(
                 candidate: candidate,
                 displayName: displayName(for: candidate),
@@ -4364,9 +6288,45 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
                 onUninstallApplication: uninstallAction,
                 uninstallEnabled: uninstallEnabled,
                 uninstallDisabledReason: uninstallDisabledReason,
-                searchFolderContext: searchFolder
+                searchFolderContext: searchFolder,
+                onRevealInFinder: revealInFinder,
+                moveToFolderTargets: moveTargets,
+                onMoveToFolder: moveToFolder,
+                onRemoveFromFolder: removeFromFolder
             )
         case .folder(let folder, let preview):
+            // Folder context menu (重命名/解散): editable main grid only.
+            let folderMenuEnabled = isLayoutEditingEnabled
+                && collectionView !== searchCollectionView
+                && collectionView !== folderOverlay.collectionView
+            let folderID = folder.id
+            let renameFolder: (() -> Void)? = folderMenuEnabled
+                ? { [weak self, weak collectionView] in
+                    guard let self, let collectionView else { return }
+                    self.promptForFolderName(folderID, in: collectionView)
+                }
+                : nil
+            let dissolveFolder: (() -> Void)? = folderMenuEnabled
+                ? { [weak self, weak collectionView] in
+                    guard let self, let collectionView else { return }
+                    self.dissolveFolderFromMenu(folderID, in: collectionView)
+                }
+                : nil
+            let sortFolder: (() -> Void)? = folderMenuEnabled
+                ? { [weak self] in
+                    self?.sortFolderByNameFromMenu(folderID)
+                }
+                : nil
+            let sortFolderByColor: (() -> Void)? = folderMenuEnabled
+                ? { [weak self] in
+                    self?.sortFolderByColorFromMenu(folderID)
+                }
+                : nil
+            let sortFolderByDate: ((AppDateRearrangeKind) -> Void)? = folderMenuEnabled
+                ? { [weak self] kind in
+                    self?.sortFolderByDateFromMenu(folderID, kind: kind)
+                }
+                : nil
             item.configure(candidate: AppCandidate(
                 canonicalURL: URL(fileURLWithPath: "/\(folder.id.uuidString)"),
                 bundleIdentifier: nil,
@@ -4376,7 +6336,10 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
             ), displayName: folder.name, isLaunching: false, isFolder: true, preview: preview,
                 reducesMotion: prefersReducedMotion, onActivate: activate, onDragStart: beginDrag,
                 onRenameAlias: nil, onHideApplication: nil, onUninstallApplication: nil,
-                uninstallEnabled: false, uninstallDisabledReason: nil)
+                uninstallEnabled: false, uninstallDisabledReason: nil,
+                onRenameFolder: renameFolder, onDissolveFolder: dissolveFolder,
+                onSortFolderByName: sortFolder, onSortFolderByColor: sortFolderByColor,
+                onSortFolderByDate: sortFolderByDate)
             if pendingMergeAnimation?.createdFolder == true,
                pendingMergeAnimation?.folderID == folder.id,
                collectionView === activeCollectionView || collectionView === stagingCollectionView {
@@ -4458,36 +6421,32 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
                 self.itemSelection.clear()
                 self.refreshItemSelectionChrome()
             }
-            let multiSelectMenu = self.itemSelection.count > 1
-                && self.itemSelection.contains(representedID)
-                && self.isLayoutEditingEnabled
-            tile.onBatchHideSelection = multiSelectMenu
-                ? { [weak self, weak collectionView] in
-                    guard let self, let collectionView else { return }
-                    self.hideSelectedApplications(anchorFocusID: representedID, in: collectionView)
-                }
-                : nil
-            // New folder only on the main grid (not search / open folder).
-            let canBatchFolder = multiSelectMenu
-                && collectionView !== self.searchCollectionView
-                && collectionView !== self.folderOverlay.collectionView
-                && LauncherLayout.topLevelAppIDsForBatchFolder(
-                    selection: self.itemSelection,
-                    in: self.layoutState
-                ).count >= 2
-            tile.onBatchMoveSelectionToFolder = canBatchFolder
-                ? { [weak self] in
-                    self?.moveSelectionToNewFolder()
-                }
-                : nil
+            applySelectionDependentContextMenu(to: tile, representedID: representedID, in: collectionView)
+            // MULTI-SELECT-MENU-STALE-01: cmd/shift-click and marquee only flip
+            // isSelected, so rebuild the selection-dependent items right before
+            // the menu is shown (lazy: no Core work per selection change).
+            tile.onWillPresentContextMenu = { [weak self, weak tile, weak collectionView] in
+                guard let self, let tile, let collectionView else { return }
+                self.applySelectionDependentContextMenu(to: tile, representedID: representedID, in: collectionView)
+                tile.refreshContextMenu()
+            }
             tile.refreshContextMenu()
             tile.onContextMenuTracking = { [weak self] menu in
                 self?.noteIconContextMenuTracking(menu)
             }
             // Same keys as the window. A folder or search still refuses to page.
+            // GRID-KEY-WALK-01: folder and search arrows walk that grid; the
+            // main grid walks up/down only. Left/Right on the main grid still page.
             tile.onPage = { [weak self] direction in self?.movePage(by: direction) }
-            tile.onVerticalPage = { [weak self] direction in
-                self?.scrollSearchResults(byPage: direction) ?? false
+            tile.onGridKeyboardStep = { [weak self] direction in
+                self?.stepGridKeyboard(from: representedID, in: collectionView, direction: direction) ?? false
+            }
+            tile.onVerticalPage = { [weak self, weak collectionView] direction in
+                guard let self else { return false }
+                if collectionView === self.folderOverlay.collectionView {
+                    return self.scrollOpenFolder(byPage: direction)
+                }
+                return self.scrollSearchResults(byPage: direction)
             }
             tile.onType = { [weak self] event in self?.beginSearch(with: event) ?? false }
             tile.onDelete = { [weak self] deletion in self?.deleteSearch(deletion) ?? false }
@@ -4590,6 +6549,7 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
     }
 
     private func finishItemDragSession(operation _: NSDragOperation, screenPoint: NSPoint) {
+        onExternalAppDragActive?(false)
         previousPageButton.cancelDragHover()
         nextPageButton.cancelDragHover()
         // A rejected or cancelled drag never queued a flight. The picture is
@@ -4602,6 +6562,7 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         // the fade: a blank cell is the jump. Content that is flying stays
         // hidden, so this only fills a cell that is not already in the air.
         // Neighbors ease home unless a merge is about to replace them.
+        stopPageArrowDragHoverPolling()
         activeDragLift = nil
         dragLiftDropWaitsForLauncher = false
         restoreDragSourceTile()
@@ -5234,6 +7195,70 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
     private func restoreDragSourceTile() {
         dragSourceTile?.layer?.opacity = 1
         dragSourceTile = nil
+        restoreMultiDragCompanionTiles()
+    }
+
+    /// MULTI-DRAG-COMPANIONS-01: hide other selected top-level tiles so the
+    /// group looks lifted with the badge; restored with the drag source.
+    private func hideMultiDragCompanionTiles(
+        except draggedID: UUID,
+        in collectionView: NSCollectionView
+    ) {
+        restoreMultiDragCompanionTiles()
+        let items = presentedItems(for: collectionView)
+        for (index, item) in items.enumerated()
+        where itemSelection.contains(item.id) && item.id != draggedID {
+            let path = IndexPath(item: index, section: 0)
+            guard let tile = collectionView.item(at: path)?.view as? AppGridTileView else { continue }
+            tile.layer?.opacity = 0
+            multiDragHiddenCompanionTiles.append(tile)
+        }
+    }
+
+    private func restoreMultiDragCompanionTiles() {
+        for tile in multiDragHiddenCompanionTiles {
+            tile.layer?.opacity = 1
+        }
+        multiDragHiddenCompanionTiles.removeAll(keepingCapacity: false)
+    }
+
+    /// MULTI-DRAG-BADGE-01: stamp a small count pill on the drag image when
+    /// ≥2 top-level items are selected. Nil count leaves the image unchanged.
+    private func multiDragBadgeImage(from image: NSImage, count: Int?) -> NSImage? {
+        guard let count, count >= 2 else { return nil }
+        let size = image.size
+        guard size.width > 0, size.height > 0 else { return nil }
+        let out = NSImage(size: size)
+        out.lockFocus()
+        image.draw(
+            in: NSRect(origin: .zero, size: size),
+            from: NSRect(origin: .zero, size: size),
+            operation: .sourceOver,
+            fraction: 1
+        )
+        let label = "\(count)" as NSString
+        let font = NSFont.systemFont(ofSize: max(11, size.width * 0.16), weight: .bold)
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: NSColor.white
+        ]
+        let textSize = label.size(withAttributes: attrs)
+        let padX: CGFloat = 6
+        let padY: CGFloat = 3
+        let pill = NSSize(width: textSize.width + padX * 2, height: textSize.height + padY * 2)
+        let origin = NSPoint(
+            x: size.width - pill.width - 4,
+            y: size.height - pill.height - 4
+        )
+        let pillRect = NSRect(origin: origin, size: pill)
+        NSColor.systemBlue.setFill()
+        NSBezierPath(roundedRect: pillRect, xRadius: pill.height / 2, yRadius: pill.height / 2).fill()
+        label.draw(
+            at: NSPoint(x: origin.x + padX, y: origin.y + padY),
+            withAttributes: attrs
+        )
+        out.unlockFocus()
+        return out
     }
 
     private func dragLiftImage(from source: NSImage, presentation: LauncherLayout.DragLiftPresentation) -> NSImage {
@@ -5427,6 +7452,19 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         preservedFolderMember preCapturedFolderMember: (id: UUID, index: Int)? = nil,
         folderFocusCaptured: Bool = false
     ) {
+        // SEARCH-ENTER-CLEAR-SELECTION-01: grid multi-select must not linger
+        // as chrome on search hits. ⌘A inside search still works afterwards.
+        let searchingNow = isSearching
+        if LauncherLayout.shouldClearSelectionWhenEnteringSearch(
+            wasSearching: lastKnownSearching,
+            isSearchingNow: searchingNow,
+            selectionCount: itemSelection.count
+        ) {
+            itemSelection.clear()
+            // Tiles rebuild below; still announce so VO matches Escape clear.
+            announceSelectionChangeIfNeeded()
+        }
+        lastKnownSearching = searchingNow
         // The focused tile's index is into the list still on screen. The
         // replacement below can put a different hit at that index.
         let capturedSearchFocus = (openedFolderID == nil) ? focusedSearchResultID() : nil
@@ -5492,10 +7530,11 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         // Loading / non-search empty grid still uses the status line; search
         // no-matches is grid chrome only (PRD: 网格区域显示「未找到匹配的应用」).
         let statusMessage: String?
+        // CATALOG-EMPTY-PREPARING-CHROME-01
         if isCatalogLoading, allCandidates.isEmpty {
-            statusMessage = L("正在准备应用…")
+            statusMessage = LauncherLayout.CatalogEmptyChromeCopy.preparingMessage(localize: { L($0) })
         } else if !isSearching, presented.isEmpty, !allCandidates.isEmpty {
-            statusMessage = L("正在准备应用…")
+            statusMessage = LauncherLayout.CatalogEmptyChromeCopy.preparingMessage(localize: { L($0) })
         } else {
             statusMessage = nil
         }
@@ -5603,6 +7642,19 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
     /// Isolated from statusChromeGeneration so empty/read-only updates
     /// cannot cancel search-adjacent hide completions (count/settings/pill).
     private var searchAdjacentChromeGeneration: UInt64 = 0
+    /// Per-view token for status chrome hide completions. The shared
+    /// generations also move for updates that never touch a given view
+    /// (read-only status, search chrome), which used to drop its hide
+    /// completion and leave skeleton/message unhidden at opacity 0 over the
+    /// grid, swallowing accessibility hit tests on every tile.
+    private var statusChromeViewTokens: [ObjectIdentifier: UInt64] = [:]
+
+    private func bumpStatusChromeToken(for view: NSView) -> UInt64 {
+        let key = ObjectIdentifier(view)
+        let next = (statusChromeViewTokens[key] ?? 0) &+ 1
+        statusChromeViewTokens[key] = next
+        return next
+    }
 
     /// Empty-state title/detail. When the stack stays visible and cancelled ↔
     /// not-found flips, crossfade the host so copy does not hard-cut.
@@ -5616,28 +7668,42 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         let detail: String
         let showActions: Bool
         let help: String
+        // CATALOG-EMPTY-PREPARING-CHROME-01
         switch kind {
-        case .catalogCancelled:
-            title = L("扫描已取消")
-            detail = L("应用扫描已取消，请重新扫描。")
-            showActions = true
-            help = L("重新扫描应用")
-        case .catalogUnavailable:
-            title = L("未找到可用的应用")
-            detail = L("请确认应用位于 Applications 文件夹，然后重新扫描。")
-            showActions = true
-            help = L("重新扫描标准 Applications 文件夹")
-        case .searchNoMatches:
-            title = L("未找到匹配的应用")
-            detail = L("按 Esc 清除搜索")
-            showActions = false
-            help = L("重新扫描标准 Applications 文件夹")
+        case .some(let chromeKind):
+            let searchDetail: String?
+            if chromeKind == .searchNoMatches {
+                // Hidden apps never appear as hits; say so instead of a dead end.
+                switch LauncherLayout.searchHiddenMatchHint(
+                    query: currentSearchQuery(),
+                    hiddenNames: layoutState.hiddenAppKeys.isEmpty ? [] : hiddenApplications().map(\.displayName)
+                ) {
+                case .none:
+                    searchDetail = nil
+                case .one(let name):
+                    searchDetail = String(format: L(LauncherLayout.SearchHiddenMatchHint.oneFormatKey), name)
+                case .several(let count):
+                    searchDetail = String(format: L(LauncherLayout.SearchHiddenMatchHint.severalFormatKey), count)
+                }
+            } else {
+                searchDetail = nil
+            }
+            let copy = LauncherLayout.CatalogEmptyChromeCopy.content(
+                for: chromeKind,
+                searchDetail: searchDetail,
+                localize: { L($0) }
+            )
+            title = copy.title
+            detail = copy.detail
+            showActions = copy.showActions
+            help = copy.help
         case nil:
             title = emptyStateTitle.stringValue
             detail = emptyStateDetail.stringValue
             showActions = false
-            help = L("重新扫描标准 Applications 文件夹")
+            help = LauncherLayout.CatalogEmptyChromeCopy.defaultReloadHelp(localize: { L($0) })
         }
+
         let currentlyHidden = emptyStateView.isHidden
         let textChanging = emptyStateTitle.stringValue != title
             || emptyStateDetail.stringValue != detail
@@ -5666,11 +7732,16 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
             let timing = CAMediaTimingFunction(name: .easeOut)
             let half = LauncherLayout.searchTransitionDuration * 0.5
             emptyStateView.wantsLayer = true
+            let emptyToken = bumpStatusChromeToken(for: emptyStateView)
             CATransaction.begin()
             CATransaction.setDisableActions(true)
             CATransaction.setCompletionBlock { [weak self] in
                 finishFlightOnLandingTurn { [weak self] in
-                    guard let self, self.statusChromeGeneration == generation else { return }
+                    // Per-view token: unrelated status chrome must not strand
+                    // the empty state at opacity 0 with stale copy.
+                    guard let self,
+                          self.statusChromeViewTokens[ObjectIdentifier(self.emptyStateView)] == emptyToken
+                    else { return }
                     applyCopy()
                     CATransaction.begin()
                     CATransaction.setDisableActions(true)
@@ -5737,16 +7808,35 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         let kind = LauncherLayout.searchCountLabelKind(
             isSearching: isSearching,
             folderOpen: folderOpen,
-            folderClosing: folderClosing
+            folderClosing: folderClosing,
+            selectionCount: itemSelection.count
         )
         let countText: String?
         switch kind {
         case .results:
-            countText = String(format: L("%d 个结果"), currentPresentedItems().count)
-            countLabel.setAccessibilityLabel(L("搜索结果数量"))
+            countText = LauncherLayout.SearchFieldChromeCopy.resultsCountText(
+                count: currentPresentedItems().count,
+                localize: { L($0) }
+            )
+            countLabel.setAccessibilityLabel(
+                LauncherLayout.SearchFieldChromeCopy.resultsAccessibilityLabel(localize: { L($0) })
+            )
+        case .selected:
+            countText = String(
+                format: L(LauncherLayout.selectedCountLabelFormatKey),
+                itemSelection.count
+            )
+            countLabel.setAccessibilityLabel(
+                LauncherLayout.SearchFieldChromeCopy.selectedAccessibilityLabel(localize: { L($0) })
+            )
         case .items:
-            countText = String(format: L("%d 个项目"), layoutState.orderedEntries.count)
-            countLabel.setAccessibilityLabel(L("应用数量"))
+            countText = LauncherLayout.SearchFieldChromeCopy.itemsCountText(
+                count: layoutState.orderedEntries.count,
+                localize: { L($0) }
+            )
+            countLabel.setAccessibilityLabel(
+                LauncherLayout.SearchFieldChromeCopy.itemsAccessibilityLabel(localize: { L($0) })
+            )
         case nil:
             countText = nil
         }
@@ -5825,15 +7915,17 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
             let timing = CAMediaTimingFunction(name: .easeOut)
             let half = LauncherLayout.searchTransitionDuration * 0.5
             label.wantsLayer = true
+            let labelToken = bumpStatusChromeToken(for: label)
             CATransaction.begin()
             CATransaction.setDisableActions(true)
             CATransaction.setCompletionBlock { [weak self, weak label] in
                 finishFlightOnLandingTurn { [weak self, weak label] in
                     guard let self, let label else { return }
-                    let live = fadeKey == LauncherLayout.searchAdjacentChromeFadeAnimationKey
-                        ? self.searchAdjacentChromeGeneration
-                        : self.statusChromeGeneration
-                    guard live == generation else { return }
+                    // Only a later call for this same label cancels the swap
+                    // (see statusChromeViewTokens). The shared generation also
+                    // moves for unrelated chrome and used to strand the label
+                    // at opacity 0 with stale text ("正在扫描应用…").
+                    guard self.statusChromeViewTokens[ObjectIdentifier(label)] == labelToken else { return }
                     label.stringValue = next
                     CATransaction.begin()
                     CATransaction.setDisableActions(true)
@@ -5881,6 +7973,7 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         let currentlyHidden = view.isHidden
         let currentlyShown = !currentlyHidden
         view.wantsLayer = true
+        let viewToken = bumpStatusChromeToken(for: view)
         let presentedOpacity = CGFloat(
             view.layer?.presentation()?.opacity
                 ?? view.layer?.opacity
@@ -5931,10 +8024,9 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
                 CATransaction.setCompletionBlock { [weak self, weak view] in
                     finishFlightOnLandingTurn { [weak self, weak view] in
                         guard let self, let view else { return }
-                        let live = fadeKey == LauncherLayout.searchAdjacentChromeFadeAnimationKey
-                            ? self.searchAdjacentChromeGeneration
-                            : self.statusChromeGeneration
-                        guard live == generation else { return }
+                        // Only a later call for this same view cancels the
+                        // hide (see statusChromeViewTokens).
+                        guard self.statusChromeViewTokens[ObjectIdentifier(view)] == viewToken else { return }
                         // Park alpha at 1 while hidden — next reveal clears
                         // opacity before unhide (statusChromeShouldClearOpacity…).
                         view.isHidden = true
@@ -6605,8 +8697,32 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
             }
         }
 
+        // Multi-select → gap on the same page: move the whole block (WIRE-01).
+        // Insert index is the pre-removal topLevelIndex from the drop path.
+        let batchReorderIDs: [UUID]? = {
+            guard case .topLevelIndex(let insertAt) = drop.destination,
+                  case .topLevel(let draggedID) = drop.source,
+                  LauncherLayout.shouldBatchReorderSelection(
+                    selection: itemSelection,
+                    draggedID: draggedID,
+                    insertAt: insertAt,
+                    in: layoutState
+                  ) else { return nil }
+            return LauncherLayout.topLevelIDsForBatchReorder(
+                selection: itemSelection,
+                draggedID: draggedID,
+                insertAt: insertAt,
+                in: layoutState
+            )
+        }()
+        let batchReorderInsertAt: Int? = {
+            guard batchReorderIDs != nil,
+                  case .topLevelIndex(let insertAt) = drop.destination else { return nil }
+            return insertAt
+        }()
+
         // Multi-select → existing folder on the same page: batch-move selected
-        // top-level apps. Single-item drag / new-folder merge / reorder unchanged.
+        // top-level apps. Single-item drag / new-folder merge / single reorder unchanged.
         let batchIntoFolder: (folderID: UUID, apps: [UUID])? = {
             guard case .merge(let target) = drop.destination,
                   case .topLevel(let folderID) = target,
@@ -6644,8 +8760,36 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
             )
         }()
 
+        // App-on-app merge: name the new folder by a shared category
+        // (e.g.「开发工具」) like Launchpad; otherwise「新建文件夹」. Only the
+        // name changes — the drop geometry and animation are untouched.
+        let newFolderName: String = {
+            // FOLDER-EMPTY-NAME-FALLBACK-01
+            let fallback = LauncherLayout.emptyFolderDisplayName(localize: { L($0) })
+            guard batchIntoFolder == nil,
+                  case .merge(let target) = drop.destination,
+                  case .topLevel(let targetAppID) = target,
+                  layoutState.folders[targetAppID] == nil else { return fallback }
+            let ids: [UUID]
+            if let apps = batchCreateFolderApps {
+                ids = apps
+            } else if case .topLevel(let draggedID) = drop.source {
+                ids = [targetAppID, draggedID]
+            } else {
+                return fallback
+            }
+            return LauncherLayout.suggestedFolderNameKey(
+                forAppIDs: ids,
+                in: layoutState,
+                catalog: allCandidates
+            ).map { L($0) } ?? fallback
+        }()
+
         let dropResult: Result<LayoutState, LayoutMutationError>
-        if let batch = batchIntoFolder {
+        if let ids = batchReorderIDs, let insertAt = batchReorderInsertAt,
+           let next = LauncherLayout.reorderingTopLevelSelection(ids, insertAt: insertAt, in: layoutState) {
+            dropResult = .success(next)
+        } else if let batch = batchIntoFolder {
             dropResult = LauncherLayout.moveTopLevelApps(
                 batch.apps,
                 intoFolder: batch.folderID,
@@ -6655,13 +8799,13 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
             dropResult = LauncherLayout.createFolderFromTopLevelApps(
                 orderedAppIDs: apps,
                 in: layoutState,
-                name: L("新建文件夹")
+                name: newFolderName
             ).map(\.state)
         } else {
             dropResult = LauncherLayout.applyDrop(
                 drop,
                 to: layoutState,
-                newFolderName: L("新建文件夹")
+                newFolderName: newFolderName
             )
         }
 
@@ -6746,7 +8890,8 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
             }
             commitLayout(next)
             dissolveScatterExcludedItemID = nil
-            if batchIntoFolder != nil || batchCreateFolderApps != nil, !itemSelection.isEmpty {
+            if batchReorderIDs != nil || batchIntoFolder != nil || batchCreateFolderApps != nil,
+               !itemSelection.isEmpty {
                 itemSelection.clear()
                 refreshItemSelectionChrome()
             }
@@ -6772,7 +8917,7 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
             return true
         case .failure(let error):
             if error == .nestedFolder {
-                showToast(L("不能将文件夹放入另一个文件夹"))
+                showToast(LauncherLayout.FolderDropChromeCopy.nestRejectToast(localize: { L($0) }))
             }
             // The drag image is still up. Put the preview back so the session
             // end can fly it home instead of popping the cell in.
@@ -6865,20 +9010,26 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         let field = AliasNameField(string: layoutState.appAliases[candidate.deduplicationKey] ?? "")
         field.frame = NSRect(x: 0, y: 0, width: 220, height: 24)
         field.placeholderString = candidate.displayName
-        field.setAccessibilityLabel(String(format: L("%@ 的别名"), candidate.displayName))
+        // ALIAS-FOLDER-PROMPT-COPY-01
+        field.setAccessibilityLabel(LauncherLayout.AppAliasPromptAlert.accessibilityLabel(
+            appDisplayName: candidate.displayName,
+            localize: { L($0) }
+        ))
 
         let alert = NSAlert()
-        alert.messageText = L("设置应用别名")
-        alert.informativeText = L("别名会用于显示和搜索；留空可恢复原名称。")
+        alert.messageText = LauncherLayout.AppAliasPromptAlert.messageText(localize: { L($0) })
+        alert.informativeText = LauncherLayout.AppAliasPromptAlert.informativeText(localize: { L($0) })
         alert.accessoryView = field
-        alert.addButton(withTitle: L("保存"))
-        alert.addButton(withTitle: L("取消"))
+        precondition(LauncherLayout.AppAliasPromptAlert.saveIsFirstButton)
+        alert.addButton(withTitle: LauncherLayout.AppAliasPromptAlert.saveButtonTitle(localize: { L($0) }))
+        alert.addButton(withTitle: LauncherLayout.AppAliasPromptAlert.cancelButtonTitle(localize: { L($0) }))
         field.adoptAlertButtons(alert.buttons)
-        // The accessory field is not in the window until the alert lays out.
-        // Setting the first responder before that is ignored, so typing never
-        // reaches the name until the user clicks it.
+        // ALERT-ACCESSORY-FOCUS-01: accessory is not in the window until layout.
+        // initialFirstResponder alone can still lose to the default button on
+        // some macOS builds — makeFirstResponder after layout pins the field.
         alert.layout()
         alert.window.initialFirstResponder = field
+        _ = alert.window.makeFirstResponder(field)
         // The alert takes the keyboard. Remember the icon before the modal
         // returns, including when the user cancels and the layout is unchanged.
         // Hide aborts this loop. Save has already returned and is kept.
@@ -6972,10 +9123,373 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
             )
         } else {
             showToast(
-                LauncherLayout.hideSelectedApplicationsToastMessage(count: count),
+                String(format: L(LauncherLayout.hideSelectedApplicationsToastMessageFormatKey), count),
                 help: L(LauncherLayout.hideApplicationToastHelpKey)
             )
         }
+    }
+
+    /// Multi-select 「卸载 N 个应用…」: one confirm, sequential trash-only via
+    /// UninstallCoordinator. Refuses while paging or dismissing. No related-file sheets.
+    private func uninstallSelectedApplications(
+        anchorFocusID: UUID,
+        in collectionView: NSCollectionView
+    ) {
+        guard isLayoutEditingEnabled, acceptsIconContextMenuAction(), !isPaging else { return }
+        guard uninstallTask == nil, !isPromptingForUninstall else { return }
+        guard let plan = AppBatchUninstallPlan.plan(
+            selection: itemSelection,
+            anchorID: anchorFocusID,
+            in: layoutState,
+            candidatesByKey: catalogByKey,
+            decide: { uninstallDecision(for: $0) }
+        ), plan.menuPresentation == .enabled else { return }
+        noteUninstallSheetFocus(itemID: anchorFocusID, in: collectionView)
+        // Clear chrome before sheets so a cancel does not leave a stale multi-select.
+        itemSelection.clear()
+        refreshItemSelectionChrome()
+        uninstallTask = Task { [weak self] in
+            guard let self else { return }
+            await UninstallCoordinator.promptToBatchUninstall(plan, host: self)
+            self.uninstallTask = nil
+        }
+    }
+
+    /// Folder context menu「重命名文件夹…」: same alert + field as app aliases,
+    /// so the open-folder title editor (and its chrome) is never involved.
+    private func promptForFolderName(_ folderID: UUID, in collectionView: NSCollectionView) {
+        guard isLayoutEditingEnabled, acceptsIconContextMenuAction() else { return }
+        guard openedFolderID == nil, !isSearching,
+              let folder = layoutState.folders[folderID] else { return }
+        let field = AliasNameField(string: folder.name)
+        field.frame = NSRect(x: 0, y: 0, width: 220, height: 24)
+        // ALIAS-FOLDER-PROMPT-COPY-01
+        field.placeholderString = LauncherLayout.FolderRenamePromptAlert.placeholder(localize: { L($0) })
+        field.setAccessibilityLabel(LauncherLayout.FolderRenamePromptAlert.accessibilityLabel(localize: { L($0) }))
+
+        let alert = NSAlert()
+        alert.messageText = LauncherLayout.FolderRenamePromptAlert.messageText(localize: { L($0) })
+        alert.informativeText = LauncherLayout.FolderRenamePromptAlert.informativeText(localize: { L($0) })
+        alert.accessoryView = field
+        precondition(LauncherLayout.FolderRenamePromptAlert.saveIsFirstButton)
+        alert.addButton(withTitle: LauncherLayout.FolderRenamePromptAlert.saveButtonTitle(localize: { L($0) }))
+        alert.addButton(withTitle: LauncherLayout.FolderRenamePromptAlert.cancelButtonTitle(localize: { L($0) }))
+        field.adoptAlertButtons(alert.buttons)
+        // ALERT-ACCESSORY-FOCUS-01
+        alert.layout()
+        alert.window.initialFirstResponder = field
+        _ = alert.window.makeFirstResponder(field)
+        isPromptingForAlias = true
+        defer { isPromptingForAlias = false }
+        let saved = alert.runModal() == .alertFirstButtonReturn
+        // Hide or a layout reload may have run during the modal.
+        guard isLayoutEditingEnabled, layoutState.folders[folderID] != nil else { return }
+        if saved {
+            let renamed = LauncherLayout.renameFolder(folderID, to: field.stringValue, in: layoutState)
+            if renamed != layoutState {
+                commitLayout(renamed)
+            }
+        }
+        if openedFolderID == nil, !isSearching {
+            restoreFocusAfterAlias(folderID, in: collectionView)
+        }
+    }
+
+    /// Folder context menu「解散文件夹」: members take the folder slot. Plain
+    /// commit (no scatter flight) and same-page focus only — never pages.
+    /// Folder context menu「按名称排列文件夹内应用」: reorders that folder's
+    /// members only; the folder tile keeps its slot, so focus/page stay put.
+    private func sortFolderByNameFromMenu(_ folderID: UUID) {
+        guard isLayoutEditingEnabled, acceptsIconContextMenuAction() else { return }
+        guard openedFolderID == nil, !isSearching, layoutState.folders[folderID] != nil else { return }
+        guard let next = LauncherLayout.sortingFolderMembersByName(
+            folderID,
+            in: layoutState,
+            catalog: allCandidates
+        ) else {
+            showToast(L(LauncherLayout.sortFolderAlreadySortedToastKey))
+            return
+        }
+        commitLayout(next)
+        showToast(L(LauncherLayout.sortFolderByNameToastKey))
+    }
+
+    /// Folder context menu「按颜色排列文件夹内应用」: like the name sort, only
+    /// that folder's members move; icons are sampled on click, never per
+    /// right-click, and the folder tile keeps its slot (no paging).
+    private func sortFolderByColorFromMenu(_ folderID: UUID) {
+        guard isLayoutEditingEnabled, acceptsIconContextMenuAction() else { return }
+        guard openedFolderID == nil, !isSearching, !isSamplingIconColors, !isSamplingAppDates,
+              let memberIDs = layoutState.folders[folderID]?.itemIDs else { return }
+        // ICON-COLOR-OFFMAIN-01: sample only this folder's members, off-main.
+        let byKey = AppCandidate.firstByDeduplicationKey(allCandidates)
+        let members = memberIDs.compactMap { layoutState.appKeys[$0].flatMap { byKey[$0] } }
+        isSamplingIconColors = true
+        Task { @MainActor [weak self] in
+            let samples = await IconColorSampler.shared.samples(for: members)
+            guard let self else { return }
+            self.isSamplingIconColors = false
+            self.applyFolderColorSort(folderID, samples: samples)
+        }
+    }
+
+    private func applyFolderColorSort(_ folderID: UUID, samples: [String: IconColorSample]) {
+        guard isLayoutEditingEnabled, openedFolderID == nil, !isSearching, layoutState.folders[folderID] != nil else { return }
+        guard let next = LauncherLayout.sortingFolderMembersByColor(
+            folderID,
+            in: layoutState,
+            catalog: allCandidates,
+            color: { candidate in samples[candidate.deduplicationKey] }
+        ) else {
+            showToast(L(LauncherLayout.sortFolderAlreadyColorSortedToastKey))
+            return
+        }
+        commitLayout(next)
+        showToast(L(LauncherLayout.sortFolderByColorToastKey))
+    }
+
+    /// Folder context menu date sort. Dates are read off the main actor;
+    /// only this folder's members move, so the tile keeps its slot.
+    private func sortFolderByDateFromMenu(_ folderID: UUID, kind: AppDateRearrangeKind) {
+        guard isLayoutEditingEnabled, acceptsIconContextMenuAction() else { return }
+        guard openedFolderID == nil, !isSearching, !isSamplingIconColors, !isSamplingAppDates,
+              layoutState.folders[folderID] != nil else { return }
+        guard let memberIDs = layoutState.folders[folderID]?.itemIDs, memberIDs.count > 1 else {
+            showToast(L(kind.folderAlreadySortedToastKey))
+            return
+        }
+        let byKey = AppCandidate.firstByDeduplicationKey(allCandidates)
+        let members = memberIDs.compactMap { layoutState.appKeys[$0].flatMap { byKey[$0] } }
+        isSamplingAppDates = true
+        Task { @MainActor [weak self] in
+            let dates = await LauncherLayout.applicationDates(kind, for: members)
+            guard let self else { return }
+            self.isSamplingAppDates = false
+            self.applyFolderDateSort(folderID, kind: kind, dates: dates)
+        }
+    }
+
+    private func applyFolderDateSort(_ folderID: UUID, kind: AppDateRearrangeKind, dates: [String: Date]) {
+        guard isLayoutEditingEnabled, openedFolderID == nil, !isSearching,
+              layoutState.folders[folderID] != nil else { return }
+        guard let next = LauncherLayout.sortingFolderMembersByDate(
+            kind,
+            folderID: folderID,
+            in: layoutState,
+            catalog: allCandidates,
+            date: { dates[$0.deduplicationKey] }
+        ) else {
+            showToast(L(kind.folderAlreadySortedToastKey))
+            return
+        }
+        commitLayout(next)
+        showToast(L(kind.folderToastKey))
+    }
+
+    /// Multi-select 「解散 N 个文件夹…」: cancel-first confirm, then dissolve
+    /// each selected top-level folder in place. Clears selection; does not page.
+    /// BATCH-SELECTED-APPS-EDGE-01: move only selected top-level apps to front/back.
+    private func moveSelectedAppsToEdge(anchorID: UUID, atStart: Bool) {
+        guard isLayoutEditingEnabled, acceptsIconContextMenuAction() else { return }
+        guard openedFolderID == nil, !isSearching else { return }
+        guard !isPageTransitioning, !isPagingGesture else { return }
+        guard let ids = LauncherLayout.appIDsForBatchEdgeMove(
+            selection: itemSelection,
+            anchorID: anchorID,
+            in: layoutState
+        ) else { return }
+        guard let next = LauncherLayout.movingSelectedAppsToEdge(
+            appIDs: ids,
+            atStart: atStart,
+            in: layoutState
+        ) else { return }
+        itemSelection.clear()
+        refreshItemSelectionChrome(announce: false)
+        let key = atStart
+            ? LauncherLayout.selectedAppsMovedToStartToastFormatKey
+            : LauncherLayout.selectedAppsMovedToEndToastFormatKey
+        commitReorganizedLayout(
+            next,
+            toast: String(format: L(key), ids.count)
+        )
+    }
+
+    /// BATCH-SELECTED-FOLDERS-EDGE-01: move only selected folders to front/back.
+    private func moveSelectedFoldersToEdge(anchorID: UUID, atStart: Bool) {
+        guard isLayoutEditingEnabled, acceptsIconContextMenuAction() else { return }
+        guard openedFolderID == nil, !isSearching else { return }
+        guard !isPageTransitioning, !isPagingGesture else { return }
+        guard let ids = LauncherLayout.folderIDsForBatchDissolve(
+            selection: itemSelection,
+            anchorID: anchorID,
+            in: layoutState
+        ) else { return }
+        guard let next = LauncherLayout.movingSelectedFoldersToEdge(
+            folderIDs: ids,
+            atStart: atStart,
+            in: layoutState
+        ) else { return }
+        itemSelection.clear()
+        refreshItemSelectionChrome(announce: false)
+        let key = atStart
+            ? LauncherLayout.selectedFoldersMovedToStartToastFormatKey
+            : LauncherLayout.selectedFoldersMovedToEndToastFormatKey
+        commitReorganizedLayout(
+            next,
+            toast: String(format: L(key), ids.count)
+        )
+    }
+
+    private func dissolveSelectedFolders(anchorID: UUID) {
+        // BATCH-DISSOLVE-FOLDERS-01
+        guard isLayoutEditingEnabled, acceptsIconContextMenuAction() else { return }
+        guard openedFolderID == nil, !isSearching else { return }
+        guard !isPageTransitioning, !isPagingGesture else { return }
+        guard let ids = LauncherLayout.folderIDsForBatchDissolve(
+            selection: itemSelection,
+            anchorID: anchorID,
+            in: layoutState
+        ) else { return }
+        let count = ids.count
+        let alert = NSAlert()
+        alert.messageText = L(LauncherLayout.batchDissolveFoldersConfirmTitleKey)
+        alert.informativeText = String(
+            format: L(LauncherLayout.batchDissolveFoldersConfirmInfoFormatKey),
+            count
+        )
+        // Cancel first — Return/Esc must not dissolve (same as ungroup-all).
+        // UNGROUP-ALL-CONFIRM-COPY-01: share Cancel/解散 button titles with ungroup-all.
+        alert.addButton(withTitle: LauncherLayout.dissolveConfirmCancelButtonTitle(localize: { L($0) }))
+        alert.addButton(withTitle: LauncherLayout.dissolveConfirmDestructiveButtonTitle(localize: { L($0) }))
+        isPromptingForAlias = true
+        defer { isPromptingForAlias = false }
+        guard alert.runModal() == .alertSecondButtonReturn,
+              isLayoutEditingEnabled,
+              openedFolderID == nil,
+              !isSearching else { return }
+        let still = ids.filter { layoutState.folders[$0] != nil }
+        guard let next = LauncherLayout.dissolvingFolders(still, in: layoutState) else { return }
+        itemSelection.clear()
+        refreshItemSelectionChrome(announce: false)
+        commitReorganizedLayout(
+            next,
+            toast: String(format: L(LauncherLayout.ungroupAllFoldersToastMessageFormatKey), still.count)
+        )
+    }
+
+    private func dissolveFolderFromMenu(_ folderID: UUID, in collectionView: NSCollectionView) {
+        guard isLayoutEditingEnabled, acceptsIconContextMenuAction() else { return }
+        guard openedFolderID == nil, !isSearching,
+              let name = layoutState.folders[folderID]?.name,
+              let next = LauncherLayout.dissolveFolder(folderID, in: layoutState) else { return }
+        let previousEntries = layoutState.orderedEntries
+        commitLayout(next)
+        if let focus = LauncherLayout.focusIDAfterMenuDissolve(
+            folderID: folderID,
+            previousEntries: previousEntries,
+            currentEntries: layoutState.orderedEntries
+        ) {
+            restoreFocusAfterAlias(focus, in: collectionView)
+        } else {
+            _ = window?.makeFirstResponder(self)
+        }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        showToast(String(
+            format: L(LauncherLayout.dissolveFolderToastMessageFormatKey),
+            LauncherLayout.displayName(forFolderNamed: trimmed, localize: { L($0) })
+        ))
+    }
+
+    /// Context menu「移到文件夹」: one top-level grid app → existing folder.
+    /// Focus moves to the next remaining tile (like hide) instead of jumping
+    /// to the folder, so this never pages the grid.
+    private func moveApplication(
+        _ appID: UUID,
+        toFolder folderID: UUID,
+        in collectionView: NSCollectionView
+    ) {
+        guard isLayoutEditingEnabled, acceptsIconContextMenuAction() else { return }
+        guard openedFolderID == nil, !isSearching else { return }
+        guard let folderName = layoutState.folders[folderID]?.name,
+              case .success(let next) = LauncherLayout.moveTopLevelApp(
+                appID,
+                toFolder: folderID,
+                in: layoutState
+              ) else { return }
+        let previousIDs = presentedItems(for: collectionView).map(\.id)
+        commitLayout(next)
+        let remainingIDs = previousIDs.filter { $0 != appID }
+        if let focus = LauncherLayout.focusItemIDAfterHiding(
+            hiddenID: appID,
+            remainingIDs: remainingIDs,
+            previousOrderedIDs: previousIDs
+        ) {
+            restoreFocusAfterAlias(focus, in: collectionView)
+        } else {
+            _ = window?.makeFirstResponder(self)
+        }
+        let trimmed = folderName.trimmingCharacters(in: .whitespacesAndNewlines)
+        showToast(String(
+            format: L(LauncherLayout.moveToFolderToastMessageFormatKey),
+            LauncherLayout.displayName(forFolderNamed: trimmed, localize: { L($0) })
+        ))
+    }
+
+    /// Open-folder member context menu「移出文件夹」. Core only offers it
+    /// while the folder keeps ≥2 members, so the overlay stays open and no
+    /// grid page changes; the app lands right after the folder tile.
+    private func removeApplicationFromOpenFolder(_ appID: UUID, folderID: UUID) {
+        guard isLayoutEditingEnabled, acceptsIconContextMenuAction() else { return }
+        guard openedFolderID == folderID,
+              let folderName = layoutState.folders[folderID]?.name,
+              let next = LauncherLayout.removingAppFromFolder(appID, folderID: folderID, in: layoutState)
+        else { return }
+        commitLayout(next)
+        let trimmed = folderName.trimmingCharacters(in: .whitespacesAndNewlines)
+        showToast(String(
+            format: L(LauncherLayout.removeFromFolderToastFormatKey),
+            LauncherLayout.displayName(forFolderNamed: trimmed, localize: { L($0) })
+        ))
+    }
+
+    /// BATCH-REMOVE-FROM-FOLDER-01: open-folder multi-select「移出 N 个应用」.
+    private func removeSelectedApplicationsFromOpenFolder(_ appIDs: [UUID], folderID: UUID) {
+        guard isLayoutEditingEnabled, acceptsIconContextMenuAction() else { return }
+        guard openedFolderID == folderID,
+              let next = LauncherLayout.removingAppsFromFolder(appIDs, folderID: folderID, in: layoutState)
+        else { return }
+        _ = window?.makeFirstResponder(self)
+        commitLayout(next)
+        itemSelection.clear()
+        refreshItemSelectionChrome()
+        showToast(String(
+            format: L(LauncherLayout.batchRemoveFromFolderToastFormatKey),
+            appIDs.count
+        ))
+    }
+
+    /// Multi-select「移到文件夹 ▸ <folder>」. Focus is cleared before the
+    /// commit so the reload never chases an icon onto another page.
+    private func moveSelectedApplications(_ apps: [UUID], toFolder folderID: UUID) {
+        guard isLayoutEditingEnabled, acceptsIconContextMenuAction() else { return }
+        guard openedFolderID == nil, !isSearching, apps.count >= 2 else { return }
+        guard let folderName = layoutState.folders[folderID]?.name,
+              case .success(let next) = LauncherLayout.moveTopLevelApps(
+                apps,
+                intoFolder: folderID,
+                in: layoutState
+              ),
+              next != layoutState else { return }
+        _ = window?.makeFirstResponder(self)
+        commitLayout(next)
+        itemSelection.clear()
+        refreshItemSelectionChrome()
+        let trimmed = folderName.trimmingCharacters(in: .whitespacesAndNewlines)
+        showToast(String(
+            format: L(LauncherLayout.batchMoveToFolderToastMessageFormatKey),
+            apps.count,
+            LauncherLayout.displayName(forFolderNamed: trimmed, localize: { L($0) })
+        ))
     }
 
     private func moveSelectionToNewFolder() {
@@ -6983,10 +9497,17 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         guard openedFolderID == nil, !isSearching else { return }
         let apps = LauncherLayout.topLevelAppIDsForBatchFolder(selection: itemSelection, in: layoutState)
         guard apps.count >= 2 else { return }
+        // Shared category (e.g.「开发工具」) names the folder; otherwise the
+        // usual「新建文件夹」. Drag-to-merge uses the same rule.
+        let suggestedKey = LauncherLayout.suggestedFolderNameKey(
+            forAppIDs: apps,
+            in: layoutState,
+            catalog: allCandidates
+        )
         switch LauncherLayout.createFolderFromTopLevelApps(
             orderedAppIDs: apps,
             in: layoutState,
-            name: L("新建文件夹")
+            name: L(suggestedKey ?? "新建文件夹")
         ) {
         case .failure:
             return
@@ -6995,7 +9516,11 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
             itemSelection.clear()
             refreshItemSelectionChrome()
             focusGridEntry(result.folderID)
-            showToast(L("已移入新建文件夹"))
+            if let suggestedKey {
+                showToast(String(format: L(LauncherLayout.moveToFolderToastMessageFormatKey), L(suggestedKey)))
+            } else {
+                showToast(L("已移入新建文件夹"))
+            }
         }
     }
 
@@ -7019,6 +9544,11 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
 
     func showUninstallToast(_ message: String, help: String?, autoDismiss: Bool) {
         showToast(message, help: help, autoDismiss: autoDismiss)
+    }
+
+    /// Soft catalog notices (e.g. CUSTOM-ROOT-SCAN-LIMIT-01 truncation); does not lock editing.
+    func showTransientToast(_ message: String) {
+        showToast(message, autoDismiss: true)
     }
 
     func hideUninstallToast(animated: Bool) {
@@ -7068,7 +9598,12 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
     @discardableResult
     func applySuccessfulUninstall(of candidate: AppCandidate, otherCopyMayExist: Bool) {
         let key = candidate.deduplicationKey
-        let remaining = allCandidates.filter { $0.deduplicationKey != key }
+        // UNINSTALL-BATCH-OTHER-COPY-02: a surviving copy keeps its catalog entry
+        // (and so its layout slot) until the post-uninstall reload refreshes it.
+        guard otherCopyMayExist == false else { return }
+        let remaining = AppUninstallEligibility.catalogAfterUninstall(
+            allCandidates, removing: candidate, otherCopyMayExist: otherCopyMayExist
+        )
         allCandidates = remaining
         catalogByKey = AppCandidate.firstByDeduplicationKey(remaining)
         appSearchIndexGeneration &+= 1
@@ -7090,11 +9625,9 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
             self.appSearchIndexBuildTask = nil
             self.refreshSearchResultsForInstalledIndex()
         }
-        if !otherCopyMayExist {
-            let forgotten = LauncherLayout.forgetUninstalledApplication(withKey: key, in: layoutState)
-            let reconciled = LauncherLayout.reconcile(candidates: remaining, into: forgotten)
-            commitLayout(reconciled)
-        }
+        let forgotten = LauncherLayout.forgetUninstalledApplication(withKey: key, in: layoutState)
+        let reconciled = LauncherLayout.reconcile(candidates: remaining, into: forgotten)
+        commitLayout(reconciled)
     }
 
     @discardableResult
@@ -7278,6 +9811,28 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         scrollSearchKeyboardHighlightIntoViewIfNeeded()
     }
 
+    /// SEARCH-CMD-RETURN-REVEAL-01: ⌘↩ reveals the highlighted (or first) app
+    /// hit in Finder (Spotlight parity). Folder hits consume the key without
+    /// launching. Read-only: no layout, page, or selection change.
+    func revealSearchKeyboardHighlightOrFirst(keyCode: UInt16, commandOnly: Bool) -> Bool {
+        guard LauncherLayout.searchRevealShortcutMatches(
+            keyCode: keyCode,
+            commandOnly: commandOnly,
+            isSearching: isSearching,
+            folderOpen: openedFolderID != nil,
+            hasMarkedText: inputMethodHasMarkedText()
+        ) else { return false }
+        let items = currentPresentedItems()
+        let target = searchKeyboardHighlightID.flatMap { id in items.first { $0.id == id } }
+            ?? items.first
+        guard case .app(_, let candidate)? = target,
+              let url = LauncherLayout.revealInFinderURL(for: candidate, isFolder: false) else {
+            return true
+        }
+        onRevealInFinderRequested?([url])
+        return true
+    }
+
     private func activateSearchKeyboardHighlightOrFirst() {
         let items = currentPresentedItems()
         let target = searchKeyboardHighlightID.flatMap { id in items.first { $0.id == id } }
@@ -7324,7 +9879,7 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
     }
 
     /// Re-apply selection chrome on materialized tiles. Does not touch paging.
-    private func refreshItemSelectionChrome() {
+    private func refreshItemSelectionChrome(announce: Bool = true) {
         func apply(to collection: NSCollectionView?) {
             guard let collection else { return }
             let items = presentedItems(for: collection)
@@ -7342,6 +9897,52 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         apply(to: stagingCollectionView)
         apply(to: searchCollectionView)
         apply(to: folderOverlay.collectionView)
+        // SELECTED-COUNT-LABEL-01: swap「N 个项目」↔「已选 N 项」.
+        updateSearchAdjacentChrome(animated: false)
+        // SELECTION-A11Y-ANNOUNCE-01: skip while marquee is live (announce on end).
+        // Do not advance lastAnnouncedSelectionCount when announce==false, or
+        // endMarquee would see no delta and stay silent.
+        if announce {
+            announceSelectionChangeIfNeeded()
+        }
+    }
+
+    /// VoiceOver:「已选 N 项」/「已清除选择」when multi-select count changes.
+    private func announceSelectionChangeIfNeeded() {
+        let newCount = itemSelection.count
+        // Suppress while dismissing or marquee-active (callers pass announce:false
+        // during drag; this is a second belt for any other refresh).
+        if marqueeActivated || launcherIsDismissing() {
+            lastAnnouncedSelectionCount = newCount
+            return
+        }
+        guard let kind = LauncherLayout.selectionAnnouncementKind(
+            previousCount: lastAnnouncedSelectionCount,
+            newCount: newCount
+        ) else {
+            lastAnnouncedSelectionCount = newCount
+            return
+        }
+        lastAnnouncedSelectionCount = newCount
+        let message: String
+        switch kind {
+        case .cleared:
+            message = L(LauncherLayout.selectionClearedAnnouncementKey)
+        case .selected(let count):
+            message = String(
+                format: L(LauncherLayout.selectedCountLabelFormatKey),
+                count
+            )
+        }
+        NSAccessibility.post(
+            element: NSApplication.shared,
+            notification: .announcementRequested,
+            userInfo: [
+                NSAccessibility.NotificationUserInfoKey.announcement: message,
+                NSAccessibility.NotificationUserInfoKey.priority:
+                    NSAccessibilityPriorityLevel.medium.rawValue
+            ]
+        )
     }
 
     private func visibleGridTiles() -> [AppGridTileView] {
@@ -9832,6 +12433,18 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         let pasteboardItem = NSPasteboardItem()
         guard let data = try? JSONEncoder().encode(payload) else { return false }
         pasteboardItem.setData(data, forType: layoutItemPasteboardType)
+        let outsideOffer: LauncherLayout.LayoutDragOutsideOffer
+        switch presented {
+        case .app(_, let candidate):
+            outsideOffer = LauncherLayout.layoutDragOutsideOffer(for: candidate, isFolder: false)
+        case .folder:
+            outsideOffer = .none
+        }
+        if case .linkToApp(let url) = outsideOffer {
+            // Public file URL so the Dock can link the app. The grid still
+            // accepts only the layout payload.
+            pasteboardItem.setString(url.absoluteString, forType: .fileURL)
+        }
         let draggingItem = NSDraggingItem(pasteboardWriter: pasteboardItem)
         let sourceRef: LayoutItemRef
         if collectionView === folderOverlay.collectionView, let folderID = openedFolderID {
@@ -9841,8 +12454,17 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         }
         if let itemView = collectionView.item(at: indexPath)?.view {
             let frame = itemView.convert(itemView.bounds, to: self)
-            let sourceImage = (itemView as? AppGridTileView)?.draggingImageWithoutCellChrome()
+            let baseImage = (itemView as? AppGridTileView)?.draggingImageWithoutCellChrome()
                 ?? itemView.draggingImage()
+            let badgeCount: Int? = {
+                guard case .topLevel(let draggedID) = sourceRef else { return nil }
+                return LauncherLayout.multiDragBadgeCount(
+                    selection: itemSelection,
+                    draggedID: draggedID,
+                    in: layoutState
+                )
+            }()
+            let sourceImage = multiDragBadgeImage(from: baseImage, count: badgeCount) ?? baseImage
             let pointer = convert(event.locationInWindow, from: nil)
             dragPreview = (
                 sourceRef, frame, sourceImage,
@@ -9863,20 +12485,30 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
             )
             itemView.layer?.opacity = 0
             dragSourceTile = itemView as? AppGridTileView
+            if let badgeCount, badgeCount >= 2, case .topLevel(let draggedID) = sourceRef {
+                hideMultiDragCompanionTiles(except: draggedID, in: collectionView)
+            }
             let session = collectionView.beginDraggingSession(
                 with: [draggingItem], event: event, source: collectionView
             )
+            if LauncherLayout.shouldTemporarilyRevealDock(for: outsideOffer) {
+                onExternalAppDragActive?(true)
+            }
             activeDragLift = ActiveDragLift(
                 session: session,
                 sourceImage: sourceImage,
                 sourceSize: sourceInCollection.size,
                 showsLift: !snapLift && presentation.shadowOpacity > 0
             )
+            startPageArrowDragHoverPolling()
             dragLiftDropWaitsForLauncher = false
             didConsumeClick = true
             return true
         }
         collectionView.beginDraggingSession(with: [draggingItem], event: event, source: collectionView)
+        if LauncherLayout.shouldTemporarilyRevealDock(for: outsideOffer) {
+            onExternalAppDragActive?(true)
+        }
         didConsumeClick = true
         return true
     }
@@ -10127,6 +12759,7 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         openedFolderID = id
         updatePagingControls()
         updateSearchAdjacentChrome()
+        clearItemSelectionWhenOpeningFolder()
         setLauncherContentAccessibilityHidden(true)
         let items = presentedItems(for: folderOverlay.collectionView)
         folderOverlay.show(folder: folder, items: items)
@@ -10236,8 +12869,13 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         return .outsideOverlay
     }
 
+    /// Only tiles inside the open folder's collection count. A mouse-opened
+    /// folder leaves the clicked grid folder tile as first responder; treating
+    /// it as a member skipped the handoff, so Shift-Tab / Return then acted on
+    /// the background grid instead of the modal.
     private func folderMemberTile(containing view: NSView?) -> AppGridTileView? {
-        var current = view
+        guard let view, view.isDescendant(of: folderOverlay.collectionView) else { return nil }
+        var current: NSView? = view
         while let node = current {
             if let tile = node as? AppGridTileView { return tile }
             current = node.superview
@@ -10303,6 +12941,7 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
         )
         // isAnimatingClose is true until land — keep count hidden through the veil.
         updateSearchAdjacentChrome()
+        clearItemSelectionWhenClosingFolder()
         updatePagingControls()
         setLauncherContentAccessibilityHidden(false)
         NSAccessibility.post(element: self, notification: .layoutChanged)
@@ -10389,6 +13028,42 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
             return
         }
         _ = focusPresentedItem(id: items[slot].id, in: folderOverlay.collectionView)
+    }
+
+    /// Arrow step inside the collection that owns `itemID`. Folder and search
+    /// walk in every direction. The main grid walks up/down only; left/right
+    /// return false so the tile's existing `onPage` path still turns the page.
+    /// An edge returns true and does not call `movePage` / `showPage`.
+    @discardableResult
+    private func stepGridKeyboard(
+        from itemID: UUID,
+        in collectionView: NSCollectionView,
+        direction: LauncherLayout.GridKeyboardDirection
+    ) -> Bool {
+        let isFolder = collectionView === folderOverlay.collectionView
+        let isSearch = collectionView === searchCollectionView
+        if !isFolder && !isSearch && (direction == .left || direction == .right) {
+            return false
+        }
+        let items = presentedItems(for: collectionView)
+        guard let slot = items.firstIndex(where: { $0.id == itemID }) else { return false }
+        let columns = isFolder
+            ? LauncherLayout.folderDisplayColumns(forItemCount: items.count)
+            : LauncherLayout.pageColumns
+        guard let next = LauncherLayout.gridKeyboardNeighborSlot(
+            from: slot,
+            count: items.count,
+            columns: columns,
+            direction: direction
+        ) else {
+            return true
+        }
+        if isSearch {
+            searchKeyboardHighlightID = items[next].id
+            refreshSearchKeyboardHighlightChrome()
+        }
+        _ = focusPresentedItem(id: items[next].id, in: collectionView)
+        return true
     }
 
     @discardableResult
@@ -10722,9 +13397,11 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
             hasEntries: !layoutState.orderedEntries.isEmpty
         )
         if showDrag {
-            dragHintLabel.stringValue = pageCount > 1
-                ? L("拖拽整理 · 悬停左右边缘跨页")
-                : L("拖拽整理")
+            // FOOTER-DRAG-HINT-01 — copy only; paging/edge logic untouched.
+            dragHintLabel.stringValue = LauncherLayout.FooterChromeCopy.dragHint(
+                pageCount: pageCount,
+                localize: { L($0) }
+            )
         }
         let dragVisible = showDrag && showChrome
         // Presence/opacity only — not page-turn / swipe / indicator selection.
@@ -10741,9 +13418,12 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
             generation: generation
         )
 
-        let navText = isSearching
-            ? L("Esc 清除搜索")
-            : (pageCount > 1 ? L("← → 翻页 · Esc 返回") : L("Esc 返回"))
+        // SEARCH-FIELD-CHROME-01 — footer chrome only; paging logic untouched.
+        let navText = LauncherLayout.SearchFieldChromeCopy.footerNavigationText(
+            isSearching: isSearching,
+            pageCount: pageCount,
+            localize: { L($0) }
+        )
         setFooterNavigationText(
             navText,
             chromeVisible: showChrome,
@@ -11061,6 +13741,7 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
     private func updatePageDrag(_ distance: CGFloat) {
         guard !isPageTransitioning else { return }
         guard distance != 0 else { return }
+        cancelMarquee(keepSelection: true)
         isPagingGesture = true
         // Reduced motion keeps the current page still. The gesture stays so
         // the release can still turn. A launcher fade that is holding the
@@ -11693,6 +14374,15 @@ private final class LauncherRootView: NSView, UninstallHost, NSCollectionViewDat
             closeFolder()
             return false
         }
+        // BLANK-CLICK-CLEAR-SELECTION-01: Escape parity — clear multi-select
+        // before dismissing. A second blank click (or Esc) still dismisses.
+        if LauncherLayout.shouldClearSelectionInsteadOfDismiss(
+            selectionCount: itemSelection.count
+        ) {
+            itemSelection.clear()
+            refreshItemSelectionChrome()
+            return false
+        }
         return true
     }
 
@@ -11994,6 +14684,10 @@ private final class PagingCollectionView: NSCollectionView {
     /// still arrive; they must not turn a page.
     var isDismissing: () -> Bool = { false }
     var dragSessionEndedHandler: ((NSDragOperation, NSPoint) -> Void)?
+    /// Screen-point updates while an item drag session is active. Used to
+    /// drive page-arrow drag-hover when AppKit does not deliver
+    /// draggingEntered to a zero-alpha arrow under UI Automation.
+    var dragSessionMovedHandler: ((NSPoint) -> Void)?
     var dragExitedHandler: (() -> Void)?
     private var accumulatedDelta: CGFloat = 0
     private var lastTimestamp: TimeInterval?
@@ -12029,12 +14723,23 @@ private final class PagingCollectionView: NSCollectionView {
     }
 
     override func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
-        .move
+        // DOCK-DRAG-FILE-01: outside the launcher, a real app file is a link.
+        // `.move` would let the Trash relocate the bundle. Inside stays a layout move.
+        if context == .outsideApplication {
+            let offersAppLink = session.draggingPasteboard.types?.contains(.fileURL) == true
+            return offersAppLink ? .link : NSDragOperation()
+        }
+        return .move
     }
 
     override func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
         super.draggingSession(session, endedAt: screenPoint, operation: operation)
         dragSessionEndedHandler?(operation, screenPoint)
+    }
+
+    override func draggingSession(_ session: NSDraggingSession, movedTo screenPoint: NSPoint) {
+        super.draggingSession(session, movedTo: screenPoint)
+        dragSessionMovedHandler?(screenPoint)
     }
 
     override func draggingExited(_ sender: NSDraggingInfo?) {
@@ -12754,7 +15459,16 @@ private final class AppGridItem: NSCollectionViewItem {
         onUninstallApplication: (() -> Void)?,
         uninstallEnabled: Bool,
         uninstallDisabledReason: String?,
-        searchFolderContext: String? = nil
+        searchFolderContext: String? = nil,
+        onRevealInFinder: (() -> Void)? = nil,
+        moveToFolderTargets: [FolderMenuTarget] = [],
+        onMoveToFolder: ((UUID) -> Void)? = nil,
+        onRemoveFromFolder: (() -> Void)? = nil,
+        onRenameFolder: (() -> Void)? = nil,
+        onDissolveFolder: (() -> Void)? = nil,
+        onSortFolderByName: (() -> Void)? = nil,
+        onSortFolderByColor: (() -> Void)? = nil,
+        onSortFolderByDate: ((AppDateRearrangeKind) -> Void)? = nil
     ) {
         guard let tile = view as? AppGridTileView else { return }
         tile.configure(
@@ -12771,7 +15485,16 @@ private final class AppGridItem: NSCollectionViewItem {
             onUninstallApplication: onUninstallApplication,
             uninstallEnabled: uninstallEnabled,
             uninstallDisabledReason: uninstallDisabledReason,
-            searchFolderContext: searchFolderContext
+            searchFolderContext: searchFolderContext,
+            onRevealInFinder: onRevealInFinder,
+            moveToFolderTargets: moveToFolderTargets,
+            onMoveToFolder: onMoveToFolder,
+            onRemoveFromFolder: onRemoveFromFolder,
+            onRenameFolder: onRenameFolder,
+            onDissolveFolder: onDissolveFolder,
+            onSortFolderByName: onSortFolderByName,
+            onSortFolderByColor: onSortFolderByColor,
+            onSortFolderByDate: onSortFolderByDate
         )
     }
 
@@ -12804,7 +15527,11 @@ private final class AppGridTileView: NSView {
     var onType: ((NSEvent) -> Bool)?
     var onTab: ((Int) -> Bool)?
     var onDelete: ((LauncherSearchDeletion) -> Bool)?
+    /// Plain arrows. Return true to consume the key. False lets left/right page.
+    var onGridKeyboardStep: ((LauncherLayout.GridKeyboardDirection) -> Bool)?
     var onContextMenuTracking: ((NSMenu?) -> Void)?
+    /// MULTI-SELECT-MENU-STALE-01: refresh selection-dependent items before showing.
+    var onWillPresentContextMenu: (() -> Void)?
     /// True while the launcher is fading. A decoded icon waits instead of
     /// swapping the placeholder under that fade. A hidden window is not fading.
     var launcherIsDismissing: () -> Bool = { false }
@@ -12820,7 +15547,43 @@ private final class AppGridTileView: NSView {
     var onBatchHideSelection: (() -> Void)?
     /// Multi-select (≥2 top-level apps) → new folder.
     var onBatchMoveSelectionToFolder: (() -> Void)?
+    var onBatchRemoveFromFolder: (() -> Void)?
+    /// Multi-select (≥2) 「卸载 N 个应用…」; when set, replaces single uninstall.
+    var onBatchUninstallSelection: (() -> Void)?
+    var batchUninstallEnabled = false
+    var batchUninstallDisabledReason: String?
+    var batchUninstallTitle: String?
+    /// Multi-select (≥2 folders) 「解散 N 个文件夹…」; when set, replaces single folder menu.
+    var onBatchDissolveFolders: (() -> Void)?
+    var batchDissolveFoldersTitle: String?
+    /// BATCH-SELECTED-FOLDERS-EDGE-01: move only selected folders to front/back.
+    var onBatchMoveSelectedFoldersToStart: (() -> Void)?
+    var onBatchMoveSelectedFoldersToEnd: (() -> Void)?
+    /// BATCH-SELECTED-APPS-EDGE-01
+    var onBatchMoveSelectedAppsToStart: (() -> Void)?
+    var onBatchMoveSelectedAppsToEnd: (() -> Void)?
+    /// BATCH-REMOVE-FROM-FOLDER-01 menu title「移出 N 个应用」.
+    var batchRemoveFromFolderTitle: String?
+    /// BATCH-MENU-COUNTS-01:「隐藏 N 个应用」.
+    var batchHideTitle: String?
+    /// BATCH-MENU-COUNTS-01:「移入新建文件夹（N）」.
+    var batchNewFolderTitle: String?
+    /// BATCH-REVEAL-COUNT-01:「在访达中显示（N）」.
+    var batchRevealTitle: String?
     private var onUninstallApplication: (() -> Void)?
+    /// Read-only「在访达中显示」; survives incomplete-scan read-only mode.
+    private var onRevealInFinder: (() -> Void)?
+    /// 「移到文件夹」submenu targets (existing folders, layout order).
+    private var moveToFolderTargets: [FolderMenuTarget] = []
+    private var onMoveToFolder: ((UUID) -> Void)?
+    /// Open-folder member「移出文件夹」.
+    private var onRemoveFromFolder: (() -> Void)?
+    /// Folder tiles only: context menu「重命名文件夹…」/「解散文件夹」.
+    private var onRenameFolder: (() -> Void)?
+    private var onDissolveFolder: (() -> Void)?
+    private var onSortFolderByName: (() -> Void)?
+    private var onSortFolderByColor: (() -> Void)?
+    private var onSortFolderByDate: ((AppDateRearrangeKind) -> Void)?
     private var uninstallEnabled = false
     private var uninstallDisabledReason: String?
     private var iconLoadTask: Task<Void, Never>?
@@ -12847,11 +15610,81 @@ private final class AppGridTileView: NSView {
         didSet {
             updateAppearance()
             if isLaunching, !oldValue { playLaunchFeedback() }
+            applyTitleVisibility()
         }
+    }
+
+    /// "Hide app names" preference, pushed by the root view (grid + folder).
+    var hidesTitleByPreference = false {
+        didSet { if hidesTitleByPreference != oldValue { applyTitleVisibility() } }
+    }
+    /// "Hide folder names" preference; applies only while `isFolder`.
+    var hidesFolderTitleByPreference = false {
+        didSet { if hidesFolderTitleByPreference != oldValue { applyTitleVisibility() } }
+    }
+    /// Search tiles always keep their name (set by the data source).
+    var isInSearchResults = false {
+        didSet { if isInSearchResults != oldValue { applyTitleVisibility() } }
+    }
+
+    /// `isHidden` only — merge / open-flight fades drive `alphaValue`.
+    private func applyTitleVisibility() {
+        let hidden = LauncherLayout.tileTitleHidden(
+            hidesAppNames: hidesTitleByPreference,
+            hidesFolderNames: hidesFolderTitleByPreference,
+            isFolder: isFolder,
+            inSearchResults: isInSearchResults,
+            isLaunching: isLaunching
+        )
+        if titleLabel.isHidden != hidden { titleLabel.isHidden = hidden }
     }
 
     /// Dedup key for in-place「正在启动…」updates (nil for folders).
     private var launchHighlightKey: String?
+    /// Session "new app" lookup, set by the data source (root view keys).
+    var isNewAppKey: (String) -> Bool = { _ in false }
+    /// Plain text last put in `titleLabel` (without the new-app dot).
+    private var plainTitle = ""
+
+    /// Sets the name label, prefixing a blue dot for a newly installed app.
+    /// Text only — no layout, frame or alpha change.
+    private func setTitleText(_ text: String) {
+        plainTitle = text
+        let isNew = launchHighlightKey.map(isNewAppKey) ?? false
+        let badge = LauncherLayout.showsNewAppBadge(
+            isNew: isNew, isFolder: isFolder,
+            inSearchResults: isInSearchResults, isLaunching: isLaunching
+        )
+        setAccessibilityValue(badge ? L("新安装") : nil)
+        guard badge else {
+            titleLabel.stringValue = text
+            return
+        }
+        let font = titleLabel.font ?? .systemFont(ofSize: 12)
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        paragraph.lineBreakMode = .byTruncatingTail
+        let base: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: titleLabel.textColor ?? NSColor.labelColor,
+            .paragraphStyle: paragraph
+        ]
+        let title = NSMutableAttributedString(
+            string: "\u{25CF}\u{2009}",
+            attributes: base.merging([
+                .foregroundColor: NSColor.systemBlue,
+                .font: NSFont.systemFont(ofSize: max(font.pointSize - 4, 6))
+            ]) { $1 }
+        )
+        title.append(NSAttributedString(string: text, attributes: base))
+        titleLabel.attributedStringValue = title
+    }
+
+    /// Re-evaluates the dot after the root view's new-app keys change.
+    func refreshNewAppBadge() {
+        guard launchHighlightKey != nil else { return }
+        setTitleText(plainTitle)
+    }
     /// Title restored when launch pending clears.
     private var restingTitle = ""
 
@@ -12955,7 +15788,16 @@ private final class AppGridTileView: NSView {
         onUninstallApplication: (() -> Void)?,
         uninstallEnabled: Bool,
         uninstallDisabledReason: String?,
-        searchFolderContext: String? = nil
+        searchFolderContext: String? = nil,
+        onRevealInFinder: (() -> Void)? = nil,
+        moveToFolderTargets: [FolderMenuTarget] = [],
+        onMoveToFolder: ((UUID) -> Void)? = nil,
+        onRemoveFromFolder: (() -> Void)? = nil,
+        onRenameFolder: (() -> Void)? = nil,
+        onDissolveFolder: (() -> Void)? = nil,
+        onSortFolderByName: (() -> Void)? = nil,
+        onSortFolderByColor: (() -> Void)? = nil,
+        onSortFolderByDate: ((AppDateRearrangeKind) -> Void)? = nil
     ) {
         self.reducesMotion = reducesMotion
         self.isFolder = isFolder
@@ -12971,6 +15813,15 @@ private final class AppGridTileView: NSView {
         self.onRenameAlias = onRenameAlias
         self.onHideApplication = onHideApplication
         self.onUninstallApplication = onUninstallApplication
+        self.onRevealInFinder = isFolder ? nil : onRevealInFinder
+        self.moveToFolderTargets = isFolder ? [] : moveToFolderTargets
+        self.onMoveToFolder = isFolder || moveToFolderTargets.isEmpty ? nil : onMoveToFolder
+        self.onRemoveFromFolder = isFolder ? nil : onRemoveFromFolder
+        self.onRenameFolder = isFolder ? onRenameFolder : nil
+        self.onDissolveFolder = isFolder ? onDissolveFolder : nil
+        self.onSortFolderByName = isFolder ? onSortFolderByName : nil
+        self.onSortFolderByColor = isFolder ? onSortFolderByColor : nil
+        self.onSortFolderByDate = isFolder ? onSortFolderByDate : nil
         self.uninstallEnabled = uninstallEnabled
         self.uninstallDisabledReason = uninstallDisabledReason
         previewCandidates = preview
@@ -12985,14 +15836,15 @@ private final class AppGridTileView: NSView {
         let folderContext = searchFolderContext?.trimmingCharacters(in: .whitespacesAndNewlines)
         let folderLine = (folderContext?.isEmpty == false) ? folderContext : nil
         if isLaunching {
-            titleLabel.stringValue = L("正在启动…")
+            // LAUNCH-FEEDBACK-COPY-01
+            setTitleText(LauncherLayout.LaunchFeedbackCopy.launchingTitle(localize: { L($0) }))
         } else if let folderLine, !isFolder {
-            titleLabel.stringValue = LauncherLayout.searchHitTitle(
+            setTitleText(LauncherLayout.searchHitTitle(
                 displayName: displayName,
                 containingFolderName: folderLine
-            )
+            ))
         } else {
-            titleLabel.stringValue = displayName
+            setTitleText(displayName)
         }
         if let folderLine, !isFolder {
             toolTip = String(format: L("%@ — 文件夹 %@"), displayName, folderLine)
@@ -13006,7 +15858,12 @@ private final class AppGridTileView: NSView {
             toolTip = displayName
             setAccessibilityLabel(isFolder ? String(format: L("文件夹 %@"), displayName) : displayName)
         }
-        baseAccessibilityHelp = isFolder ? L("按下以打开文件夹") : L("按下以打开应用")
+        baseAccessibilityHelp = LauncherLayout.tileAccessibilityHelp(
+            isFolder: isFolder,
+            layoutEditingEnabled: true,
+            layoutEditingExplanation: nil,
+            localize: { L($0) }
+        )
         setAccessibilityHelp(baseAccessibilityHelp)
         updateDropTargetAppearance()
         configureContextMenu()
@@ -13056,6 +15913,10 @@ private final class AppGridTileView: NSView {
             }
         }
         self.isLaunching = isLaunching
+        // A reused tile can flip app <-> folder; re-evaluate the name rule.
+        applyTitleVisibility()
+        // isLaunching / search flags are final now; redo the dot once.
+        setTitleText(plainTitle)
         needsDisplay = true
     }
 
@@ -13084,8 +15945,12 @@ private final class AppGridTileView: NSView {
     func applyLaunchHighlightState(pendingKey: String?) {
         guard let launchHighlightKey, !isFolder else { return }
         let launching = pendingKey == launchHighlightKey
-        titleLabel.stringValue = launching ? L("正在启动…") : restingTitle
         isLaunching = launching
+        setTitleText(
+            launching
+                ? LauncherLayout.LaunchFeedbackCopy.launchingTitle(localize: { L($0) })
+                : restingTitle
+        )
     }
 
     func resetForReuse() {
@@ -13100,6 +15965,9 @@ private final class AppGridTileView: NSView {
         keyboardFocusAvailable = { true }
         launchHighlightKey = nil
         restingTitle = ""
+        isNewAppKey = { _ in false }
+        plainTitle = ""
+        setAccessibilityValue(nil)
         isLaunching = false
         titleLabel.stringValue = ""
         iconView.image = nil
@@ -13122,12 +15990,37 @@ private final class AppGridTileView: NSView {
         onTab = nil
         onDelete = nil
         onContextMenuTracking = nil
+        onWillPresentContextMenu = nil
         onDragStart = nil
         onRenameAlias = nil
         onHideApplication = nil
         onBatchHideSelection = nil
         onBatchMoveSelectionToFolder = nil
+        onBatchRemoveFromFolder = nil
+        onBatchUninstallSelection = nil
+        batchUninstallEnabled = false
+        batchUninstallDisabledReason = nil
+        batchUninstallTitle = nil
+        onBatchDissolveFolders = nil
+        batchDissolveFoldersTitle = nil
+        onBatchMoveSelectedFoldersToStart = nil
+        onBatchMoveSelectedFoldersToEnd = nil
+        onBatchMoveSelectedAppsToStart = nil
+        onBatchMoveSelectedAppsToEnd = nil
+        batchRemoveFromFolderTitle = nil
+        batchHideTitle = nil
+        batchNewFolderTitle = nil
+        batchRevealTitle = nil
         onUninstallApplication = nil
+        onRevealInFinder = nil
+        moveToFolderTargets = []
+        onMoveToFolder = nil
+        onRemoveFromFolder = nil
+        onRenameFolder = nil
+        onDissolveFolder = nil
+        onSortFolderByName = nil
+        onSortFolderByColor = nil
+        onSortFolderByDate = nil
         uninstallEnabled = false
         uninstallDisabledReason = nil
         menu = nil
@@ -13309,6 +16202,19 @@ private final class AppGridTileView: NSView {
         }
     }
 
+    override func menu(for event: NSEvent) -> NSMenu? {
+        // Control-click path; right-click refreshes in rightMouseDown.
+        if event.type != .rightMouseDown {
+            onWillPresentContextMenu?()
+        }
+        return super.menu(for: event)
+    }
+
+    override func accessibilityPerformShowMenu() -> Bool {
+        onWillPresentContextMenu?()
+        return super.accessibilityPerformShowMenu()
+    }
+
     override func accessibilityPerformPress() -> Bool {
         guard let onActivate else { return false }
         onActivate()
@@ -13316,6 +16222,7 @@ private final class AppGridTileView: NSView {
     }
 
     override func rightMouseDown(with event: NSEvent) {
+        onWillPresentContextMenu?()
         guard let menu else {
             super.rightMouseDown(with: event)
             return
@@ -13408,11 +16315,12 @@ private final class AppGridTileView: NSView {
         layoutEditingEnabled: Bool,
         layoutEditingExplanation: String?
     ) {
-        let help = L(LauncherLayout.tileAccessibilityHelp(
+        let help = LauncherLayout.tileAccessibilityHelp(
             isFolder: isFolder,
             layoutEditingEnabled: layoutEditingEnabled,
-            layoutEditingExplanation: layoutEditingExplanation
-        ))
+            layoutEditingExplanation: layoutEditingExplanation,
+            localize: { L($0) }
+        )
         baseAccessibilityHelp = help
         // Drop-target chrome may temporarily override help; restore when idle.
         if !isDropTarget {
@@ -13426,13 +16334,74 @@ private final class AppGridTileView: NSView {
         let canSingleHide = onHideApplication != nil
         let hasAlias = onRenameAlias != nil
         let hasUninstall = onUninstallApplication != nil
+        let hasReveal = onRevealInFinder != nil
+        let hasMoveToFolder = onMoveToFolder != nil && !moveToFolderTargets.isEmpty
+        let hasRemoveFromFolder = onRemoveFromFolder != nil && !batchHide
+        let batchRemoveFromFolder = onBatchRemoveFromFolder != nil
+        if isFolder {
+            configureFolderContextMenu(batchSelection: batchHide)
+            return
+        }
         // Incomplete-scan read-only clears rename/hide callbacks but still
         // passes a disabled uninstall action — keep that item for VoiceOver.
-        guard !isFolder, hasAlias || canSingleHide || batchHide || hasUninstall else {
+        let hasAppsEdgeMenu = onBatchMoveSelectedAppsToStart != nil || onBatchMoveSelectedAppsToEnd != nil
+        guard !isFolder, hasAlias || canSingleHide || batchHide || hasUninstall || hasReveal || hasMoveToFolder || hasRemoveFromFolder || batchRemoveFromFolder || hasAppsEdgeMenu else {
             menu = nil
             return
         }
         let contextMenu = NSMenu()
+        // Explicit isEnabled (disabled uninstall for SIP/read-only apps) must
+        // win over NSMenu auto-validation, which enables any item whose
+        // target responds to its action.
+        contextMenu.autoenablesItems = false
+        // Single or multi (BATCH-REVEAL-FINDER-01): callback already carries URLs.
+        if hasReveal {
+            // Keep「在访达中显示」literal for guards; prefer counted title.
+            let revealTitle = batchRevealTitle ?? L("在访达中显示")
+            let revealItem = contextMenu.addItem(
+                withTitle: revealTitle,
+                action: #selector(revealInFinder),
+                keyEquivalent: ""
+            )
+            revealItem.target = self
+            revealItem.setAccessibilityHelp(
+                batchRevealTitle != nil
+                    ? L("在访达中选中所选应用")
+                    : L("在访达中选中这个应用")
+            )
+            if hasAlias || hasMoveToFolder || hasRemoveFromFolder || canSingleHide || batchFolder || hasUninstall || hasAppsEdgeMenu {
+                contextMenu.addItem(.separator())
+            }
+        }
+        // BATCH-SELECTED-APPS-EDGE-01
+        let hasAppsEdge = onBatchMoveSelectedAppsToStart != nil || onBatchMoveSelectedAppsToEnd != nil
+        if hasAppsEdge {
+            if onBatchMoveSelectedAppsToStart != nil {
+                let startItem = contextMenu.addItem(
+                    withTitle: L(LauncherLayout.selectedAppsMovedToStartMenuTitleKey),
+                    action: #selector(batchMoveSelectedAppsToStartMenuItem),
+                    keyEquivalent: ""
+                )
+                startItem.target = self
+                startItem.setAccessibilityHelp(
+                    L(LauncherLayout.selectedAppsMovedToEdgeAccessibilityHelpKey)
+                )
+            }
+            if onBatchMoveSelectedAppsToEnd != nil {
+                let endItem = contextMenu.addItem(
+                    withTitle: L(LauncherLayout.selectedAppsMovedToEndMenuTitleKey),
+                    action: #selector(batchMoveSelectedAppsToEndMenuItem),
+                    keyEquivalent: ""
+                )
+                endItem.target = self
+                endItem.setAccessibilityHelp(
+                    L(LauncherLayout.selectedAppsMovedToEdgeAccessibilityHelpKey)
+                )
+            }
+            if hasAlias || hasMoveToFolder || hasRemoveFromFolder || canSingleHide || batchHide || hasUninstall {
+                contextMenu.addItem(.separator())
+            }
+        }
         if hasAlias {
             let aliasItem = contextMenu.addItem(
                 withTitle: L("设置别名…"),
@@ -13441,14 +16410,54 @@ private final class AppGridTileView: NSView {
             )
             aliasItem.target = self
         }
+        // Single item, or a main-grid batch (moves the whole selection).
+        if hasMoveToFolder, !batchHide || batchFolder {
+            let moveItem = contextMenu.addItem(
+                withTitle: L("移到文件夹"),
+                action: nil,
+                keyEquivalent: ""
+            )
+            let submenu = NSMenu(title: L("移到文件夹"))
+            for target in moveToFolderTargets {
+                let item = submenu.addItem(
+                    withTitle: LauncherLayout.displayName(forFolderNamed: target.name, localize: { L($0) }),
+                    action: #selector(moveToFolderMenuItem(_:)),
+                    keyEquivalent: ""
+                )
+                item.target = self
+                item.representedObject = target.id.uuidString
+            }
+            moveItem.submenu = submenu
+            moveItem.setAccessibilityHelp(batchHide ? L("把所选应用放进已有的文件夹") : L("把这个应用放进已有的文件夹"))
+        }
+        if batchRemoveFromFolder {
+            let removeItem = contextMenu.addItem(
+                withTitle: batchRemoveFromFolderTitle
+                    ?? L(LauncherLayout.batchRemoveFromFolderMenuTitleFormatKey),
+                action: #selector(batchRemoveFromFolderMenuItem),
+                keyEquivalent: ""
+            )
+            removeItem.target = self
+            removeItem.setAccessibilityHelp(L("把所选应用放回主网格，紧跟在文件夹后面"))
+        } else if hasRemoveFromFolder {
+            let removeItem = contextMenu.addItem(
+                withTitle: L(LauncherLayout.removeFromFolderMenuTitleKey),
+                action: #selector(removeFromFolderMenuItem),
+                keyEquivalent: ""
+            )
+            removeItem.target = self
+            removeItem.setAccessibilityHelp(L("把这个应用放回主网格，紧跟在文件夹后面"))
+        }
         if batchHide {
+            // Keep「隐藏所选应用」literal for guards; prefer counted title.
+            let hideTitle = batchHideTitle ?? L("隐藏所选应用")
             let hideItem = contextMenu.addItem(
-                withTitle: L("隐藏所选应用"),
+                withTitle: hideTitle,
                 action: #selector(hideSelectedApplications),
                 keyEquivalent: ""
             )
             hideItem.target = self
-            hideItem.setAccessibilityLabel(L("隐藏所选应用"))
+            hideItem.setAccessibilityLabel(hideTitle)
         } else if canSingleHide {
             let hideItem = contextMenu.addItem(
                 withTitle: L("隐藏应用"),
@@ -13458,16 +16467,41 @@ private final class AppGridTileView: NSView {
             hideItem.target = self
         }
         if batchFolder {
+            // Keep「移入新建文件夹」literal for guards; prefer counted title.
+            let folderTitle = batchNewFolderTitle ?? L("移入新建文件夹")
             let folderItem = contextMenu.addItem(
-                withTitle: L("移入新建文件夹"),
+                withTitle: folderTitle,
                 action: #selector(moveSelectionToNewFolder),
                 keyEquivalent: ""
             )
             folderItem.target = self
-            folderItem.setAccessibilityLabel(L("移入新建文件夹"))
+            folderItem.setAccessibilityLabel(folderTitle)
         }
-        // Uninstall stays single-item only (batch uninstall is out of scope).
-        if !batchHide, onUninstallApplication != nil {
+        // Batch selection: 「卸载 N 个应用…」 (Core AppBatchUninstallPlan).
+        // Single selection keeps 「卸载应用…」.
+        if batchHide, onBatchUninstallSelection != nil {
+            if contextMenu.numberOfItems > 0, contextMenu.items.last?.isSeparatorItem == false {
+                contextMenu.addItem(.separator())
+            }
+            let title = batchUninstallTitle ?? L(AppBatchUninstallPlan.menuTitleFormatKey)
+            let uninstallItem = contextMenu.addItem(
+                withTitle: title,
+                action: #selector(uninstallSelectedApplications),
+                keyEquivalent: ""
+            )
+            uninstallItem.target = self
+            uninstallItem.isEnabled = batchUninstallEnabled
+            uninstallItem.toolTip = batchUninstallDisabledReason
+            if let batchUninstallDisabledReason, !batchUninstallEnabled {
+                uninstallItem.setAccessibilityHelp(batchUninstallDisabledReason)
+            } else {
+                uninstallItem.setAccessibilityHelp(L("将所选应用移到废纸篓"))
+            }
+        } else if !batchHide, onUninstallApplication != nil {
+            // Destructive item sits alone at the bottom, like Finder's Move to Trash.
+            if contextMenu.numberOfItems > 0, contextMenu.items.last?.isSeparatorItem == false {
+                contextMenu.addItem(.separator())
+            }
             let uninstallItem = contextMenu.addItem(
                 withTitle: L("卸载应用…"),
                 action: #selector(uninstallApplication),
@@ -13485,8 +16519,175 @@ private final class AppGridTileView: NSView {
         menu = contextMenu
     }
 
+    /// Folder tiles: single-folder actions, or batch dissolve when the
+    /// multi-selection contains ≥2 folders (BATCH-DISSOLVE-FOLDERS-01).
+    private func configureFolderContextMenu(batchSelection: Bool) {
+        if onBatchDissolveFolders != nil {
+            // BATCH-SELECTED-FOLDERS-EDGE-01 + BATCH-DISSOLVE-FOLDERS-01
+            let contextMenu = NSMenu()
+            contextMenu.autoenablesItems = false
+            if onBatchMoveSelectedFoldersToStart != nil {
+                let startItem = contextMenu.addItem(
+                    withTitle: L(LauncherLayout.selectedFoldersMovedToStartMenuTitleKey),
+                    action: #selector(batchMoveSelectedFoldersToStartMenuItem),
+                    keyEquivalent: ""
+                )
+                startItem.target = self
+                startItem.setAccessibilityHelp(
+                    L(LauncherLayout.selectedFoldersMovedToEdgeAccessibilityHelpKey)
+                )
+            }
+            if onBatchMoveSelectedFoldersToEnd != nil {
+                let endItem = contextMenu.addItem(
+                    withTitle: L(LauncherLayout.selectedFoldersMovedToEndMenuTitleKey),
+                    action: #selector(batchMoveSelectedFoldersToEndMenuItem),
+                    keyEquivalent: ""
+                )
+                endItem.target = self
+                endItem.setAccessibilityHelp(
+                    L(LauncherLayout.selectedFoldersMovedToEdgeAccessibilityHelpKey)
+                )
+            }
+            if onBatchMoveSelectedFoldersToStart != nil || onBatchMoveSelectedFoldersToEnd != nil {
+                contextMenu.addItem(.separator())
+            }
+            let title = batchDissolveFoldersTitle
+                ?? L(LauncherLayout.batchDissolveFoldersMenuTitleFormatKey)
+            let dissolveItem = contextMenu.addItem(
+                withTitle: title,
+                action: #selector(batchDissolveFoldersMenuItem),
+                keyEquivalent: ""
+            )
+            dissolveItem.target = self
+            dissolveItem.setAccessibilityHelp(
+                L(LauncherLayout.batchDissolveFoldersAccessibilityHelpKey)
+            )
+            menu = contextMenu
+            return
+        }
+        let hasRename = onRenameFolder != nil
+        let hasDissolve = onDissolveFolder != nil
+        let hasSort = onSortFolderByName != nil || onSortFolderByColor != nil || onSortFolderByDate != nil
+        guard !batchSelection, hasRename || hasDissolve || hasSort else {
+            menu = nil
+            return
+        }
+        let contextMenu = NSMenu()
+        if hasRename {
+            let renameItem = contextMenu.addItem(
+                withTitle: L("重命名文件夹…"),
+                action: #selector(renameFolderMenuItem),
+                keyEquivalent: ""
+            )
+            renameItem.target = self
+        }
+        if onSortFolderByName != nil {
+            let sortItem = contextMenu.addItem(
+                withTitle: L(LauncherLayout.sortFolderByNameMenuTitleKey),
+                action: #selector(sortFolderByNameMenuItem),
+                keyEquivalent: ""
+            )
+            sortItem.target = self
+            sortItem.setAccessibilityHelp(LauncherLayout.sortFolderByNameAccessibilityHelp(localize: { L($0) }))
+        }
+        if onSortFolderByColor != nil {
+            let colorItem = contextMenu.addItem(
+                withTitle: L(LauncherLayout.sortFolderByColorMenuTitleKey),
+                action: #selector(sortFolderByColorMenuItem),
+                keyEquivalent: ""
+            )
+            colorItem.target = self
+            colorItem.setAccessibilityHelp(LauncherLayout.sortFolderByColorAccessibilityHelp(localize: { L($0) }))
+        }
+        if onSortFolderByDate != nil {
+            for kind in AppDateRearrangeKind.allCases {
+                let dateItem = contextMenu.addItem(
+                    withTitle: L(kind.folderMenuTitleKey),
+                    action: #selector(sortFolderByDateMenuItem(_:)),
+                    keyEquivalent: ""
+                )
+                dateItem.target = self
+                dateItem.representedObject = kind.rawValue
+                dateItem.setAccessibilityHelp(kind.folderAccessibilityHelp(localize: { L($0) }))
+            }
+        }
+        if hasDissolve {
+            if hasRename || hasSort {
+                contextMenu.addItem(.separator())
+            }
+            let dissolveItem = contextMenu.addItem(
+                withTitle: L("解散文件夹"),
+                action: #selector(dissolveFolderMenuItem),
+                keyEquivalent: ""
+            )
+            dissolveItem.target = self
+            dissolveItem.setAccessibilityHelp(L("把文件夹里的应用放回这个位置"))
+        }
+        menu = contextMenu
+    }
+
+    @objc private func renameFolderMenuItem() {
+        onRenameFolder?()
+    }
+
+    @objc private func dissolveFolderMenuItem() {
+        onDissolveFolder?()
+    }
+
+    @objc private func batchDissolveFoldersMenuItem() {
+        onBatchDissolveFolders?()
+    }
+
+    @objc private func batchMoveSelectedFoldersToStartMenuItem() {
+        onBatchMoveSelectedFoldersToStart?()
+    }
+
+    @objc private func batchMoveSelectedFoldersToEndMenuItem() {
+        onBatchMoveSelectedFoldersToEnd?()
+    }
+
+    @objc private func batchMoveSelectedAppsToStartMenuItem() {
+        onBatchMoveSelectedAppsToStart?()
+    }
+
+    @objc private func batchMoveSelectedAppsToEndMenuItem() {
+        onBatchMoveSelectedAppsToEnd?()
+    }
+
+    @objc private func sortFolderByNameMenuItem() {
+        onSortFolderByName?()
+    }
+
+    @objc private func sortFolderByColorMenuItem() {
+        onSortFolderByColor?()
+    }
+
+    @objc private func sortFolderByDateMenuItem(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let kind = AppDateRearrangeKind(rawValue: raw) else { return }
+        onSortFolderByDate?(kind)
+    }
+
+    @objc private func removeFromFolderMenuItem() {
+        onRemoveFromFolder?()
+    }
+
+    @objc private func batchRemoveFromFolderMenuItem() {
+        onBatchRemoveFromFolder?()
+    }
+
     @objc private func renameAlias() {
         onRenameAlias?()
+    }
+
+    @objc private func revealInFinder() {
+        onRevealInFinder?()
+    }
+
+    @objc private func moveToFolderMenuItem(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let folderID = UUID(uuidString: raw) else { return }
+        onMoveToFolder?(folderID)
     }
 
     @objc private func hideApplication() {
@@ -13503,6 +16704,10 @@ private final class AppGridTileView: NSView {
 
     @objc private func uninstallApplication() {
         onUninstallApplication?()
+    }
+
+    @objc private func uninstallSelectedApplications() {
+        onBatchUninstallSelection?()
     }
 
     override func becomeFirstResponder() -> Bool {
@@ -13526,13 +16731,31 @@ private final class AppGridTileView: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
+        // NSView.keyDown does not run interpretKeyEvents, so the insertTab /
+        // insertBacktab overrides below never saw a key press; the window's
+        // generic key-view walk ran instead. Search and folder tiles route Tab
+        // themselves (edge → field / close / title); grid tiles (onTab == nil)
+        // keep the system walk.
+        if event.keyCode == 48, let onTab,
+           event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
+           onTab(event.modifierFlags.contains(.shift) ? -1 : 1) {
+            return
+        }
         if event.keyCode == 36 || event.keyCode == 76 || event.characters == " " {
             onActivate?()
             return
         }
-        // Left/Right and Page Up/Down page the grid, including after a folder
-        // close leaves this tile focused. They do not walk icon to icon.
-        // Page Up/Down scroll an open search instead of doing nothing.
+        // Plain arrows may walk the current grid (folder, search, or up/down
+        // on the main page). Command/option/control/shift keep the paging path.
+        // Page Up/Down are not grid steps.
+        if event.modifierFlags.intersection([.command, .shift, .option, .control]).isEmpty,
+           let direction = LauncherLayout.gridKeyboardDirection(forKeyCode: event.keyCode),
+           onGridKeyboardStep?(direction) == true {
+            return
+        }
+        // Left/Right and Page Up/Down page the main grid, including after a
+        // folder close leaves this tile focused. Page Up/Down scroll an open
+        // search instead of doing nothing.
         if launcherConsumesVerticalSearchPage(event, using: onVerticalPage) { return }
         switch event.keyCode {
         case 123, 116:
@@ -13827,7 +17050,7 @@ private final class AppGridTileView: NSView {
         }
         if isDropTarget {
             setAccessibilitySelected(true)
-            setAccessibilityHelp(isFolder ? L("拖放到此文件夹") : L("拖放到此以合并"))
+            setAccessibilityHelp(LauncherLayout.FolderDropChromeCopy.dropTargetHelp(isFolder: isFolder, localize: { L($0) }))
         } else {
             setAccessibilitySelected(isSelected)
             if !baseAccessibilityHelp.isEmpty {
@@ -14169,6 +17392,23 @@ private final class PagingArrowButton: NSButton {
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
         cancelDragHover()
         return false
+    }
+
+    /// Item-drag session movedTo fallback when draggingEntered never fires.
+    func noteExternalDragHover(inside: Bool) {
+        guard !isHidden else {
+            cancelDragHover()
+            return
+        }
+        if inside {
+            if !isDragHovering {
+                isDragHovering = true
+                updateVisibility(animated: true)
+                scheduleDragHover(after: LauncherLayout.pageButtonDragHoverDelay)
+            }
+        } else if isDragHovering {
+            cancelDragHover()
+        }
     }
 
     func cancelDragHover() {
@@ -14769,20 +18009,101 @@ private final class FolderTitleField: NSTextField {
         setEditUnderlineVisible(false, animated: true)
     }
 
+    /// Uptime of the previous pointer-down used to reconstruct a double-click
+    /// when UI Automation delivers two clickCount==1 events instead of one
+    /// coalesced clickCount>=2 mouseDown.
+    private var lastPointerDownUptimeForRename: TimeInterval?
+    /// FOLDER-TITLE-AM-BEGIN-01 — retry opening the field editor when chrome
+    /// landing or AM focus handoff missed the first makeFirstResponder.
+    private var renameBeginRetryGeneration: UInt64 = 0
+    private var renameBeginRetryAttempts = 0
+
     override func mouseDown(with event: NSEvent) {
-        // Already editing: place the caret / extend selection as usual.
+        // Already editing: a further double-click re-selects the whole name
+        // (rename UX). Single-click keeps AppKit caret / drag-select.
         if currentEditor() != nil {
-            super.mouseDown(with: event)
+            if LauncherLayout.folderTitleShouldBeginEditingFromPointer(clickCount: event.clickCount) {
+                selectText(nil)
+            } else {
+                super.mouseDown(with: event)
+            }
             return
         }
-        guard pointerEditingAvailable() else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        let sincePrevious = lastPointerDownUptimeForRename.map { now - $0 }
+        lastPointerDownUptimeForRename = now
+        let allowSingleClickBegin = ProcessInfo.processInfo.environment["LAUNCHICON_TEST_LAYOUT_PATH"] != nil
         guard LauncherLayout.folderTitleShouldBeginEditingFromPointer(
-            clickCount: event.clickCount
+            clickCount: event.clickCount,
+            secondsSincePreviousPointerDown: sincePrevious,
+            doubleClickInterval: NSEvent.doubleClickInterval,
+            allowSingleClickBegin: allowSingleClickBegin
         ) else {
-            // Single-click does not start a rename.
+            // Single-click does not start a rename (production).
             return
         }
-        super.mouseDown(with: event)
+        // Chrome still landing — queue the rename begin instead of dropping it.
+        // UI fixtures also bypass a stuck chrome-in-flight gate so AM can rename.
+        guard pointerEditingAvailable() || allowSingleClickBegin else {
+            scheduleRenameBeginRetry()
+            return
+        }
+        beginRenameEditingFromPointer()
+    }
+
+    /// Open the field editor explicitly. Under UI Automation the default
+    /// NSTextField double-click path may never become first responder;
+    /// makeFirstResponder + selectText opens the editor the XCTest
+    /// typeText path needs. FOLDER-TITLE-AM-BEGIN-01 also publishes AX
+    /// focus on the field itself — the field editor is often a window
+    /// child, so XCTest `typeText` on the TextField element otherwise
+    /// sees "no keyboard focus".
+    private func beginRenameEditingFromPointer() {
+        renameBeginRetryGeneration &+= 1
+        renameBeginRetryAttempts = 0
+        openFieldEditorForRename()
+        if currentEditor() == nil {
+            scheduleRenameBeginRetry()
+        }
+    }
+
+    private func openFieldEditorForRename() {
+        _ = window?.makeFirstResponder(self)
+        selectText(nil)
+        if let editor = currentEditor() {
+            _ = window?.makeFirstResponder(editor)
+            NSAccessibility.post(element: self, notification: .focusedUIElementChanged)
+        }
+    }
+
+    override func isAccessibilityFocused() -> Bool {
+        // Report the title as focused while its field editor owns the keyboard
+        // so AM can typeText/typeKey on the TextField element.
+        if currentEditor() != nil { return true }
+        return super.isAccessibilityFocused()
+    }
+
+    private func scheduleRenameBeginRetry() {
+        renameBeginRetryGeneration &+= 1
+        let generation = renameBeginRetryGeneration
+        renameBeginRetryAttempts += 1
+        // ~1.5s of retries covers open-chrome fade under AM without looping forever.
+        guard renameBeginRetryAttempts <= 10 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard let self, self.renameBeginRetryGeneration == generation else { return }
+            guard self.currentEditor() == nil else {
+                NSAccessibility.post(element: self, notification: .focusedUIElementChanged)
+                return
+            }
+            guard self.pointerEditingAvailable() else {
+                self.scheduleRenameBeginRetry()
+                return
+            }
+            self.openFieldEditorForRename()
+            if self.currentEditor() == nil {
+                self.scheduleRenameBeginRetry()
+            }
+        }
     }
 
     var onBacktab: (() -> Bool)?
@@ -14831,6 +18152,27 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
     #if DEBUG
     var testContentScrollElasticityIsNone: Bool { folderScrollView.verticalScrollElasticity == .none }
     #endif
+
+    /// One viewport of folder members. Same offset math as search results.
+    /// Does not turn a launcher page.
+    @discardableResult
+    func scrollMembers(byPage direction: Int) -> Bool {
+        guard direction != 0 else { return false }
+        collectionView.layoutSubtreeIfNeeded()
+        folderScrollView.layoutSubtreeIfNeeded()
+        let clipView = folderScrollView.contentView
+        let next = LauncherLayout.scrolledPageOffset(
+            current: clipView.bounds.origin.y,
+            documentLength: collectionView.frame.height,
+            viewportLength: clipView.bounds.height,
+            forward: direction > 0
+        )
+        if next != clipView.bounds.origin.y {
+            clipView.scroll(to: NSPoint(x: clipView.bounds.origin.x, y: next))
+            folderScrollView.reflectScrolledClipView(clipView)
+        }
+        return true
+    }
     private var preferredPanelWidth: NSLayoutConstraint!
     private var preferredPanelHeight: NSLayoutConstraint!
     private var animationGeneration: UInt64 = 0
@@ -14914,7 +18256,7 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
         collectionView.backgroundColors = [.clear]
         collectionView.setAccessibilityElement(true)
         collectionView.setAccessibilityRole(.list)
-        collectionView.setAccessibilityLabel(L("文件夹中的应用"))
+        collectionView.setAccessibilityLabel(LauncherLayout.FolderDropChromeCopy.folderMembersLabel(localize: { L($0) }))
 
         preferredPanelWidth = panel.widthAnchor.constraint(equalToConstant: 820)
         // Keep the preferred width below fitting-size compression so it cannot enlarge the window.
@@ -15074,7 +18416,7 @@ private final class FolderOverlayView: NSView, NSTextFieldDelegate {
 
     @discardableResult
     func focusCloseButton() -> Bool {
-        window?.makeFirstResponder(closeButton) == true
+        return window?.makeFirstResponder(closeButton) == true
     }
 
     @discardableResult

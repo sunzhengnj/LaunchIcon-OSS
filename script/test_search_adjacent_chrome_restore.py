@@ -48,7 +48,8 @@ vis = direct[
     )
 ]
 need("restoreGate" in vis, "setStatusChromeVisible must accept restoreGate")
-need("searchAdjacentChromeGeneration" in vis, "hide completion must honor adjacent generation")
+need("statusChromeViewTokens[ObjectIdentifier(view)] == viewToken" in vis, "hide completion must be cancelled only by a later call for the same view")
+need("live == generation" not in vis.split("if !visible {")[1].split("fadeViewOpacityFromPresentation")[0], "hide completion must not depend on shared generations")
 need("fadeKey" in vis, "setStatusChromeVisible must use fadeKey param")
 
 # Recovery buttons must still use status generation (not steal adjacent)

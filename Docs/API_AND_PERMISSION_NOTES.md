@@ -1,5 +1,21 @@
 # API 与权限 Spike 记录
 
+## 2026-10-11 — 当前原 Store ID 沙箱运行与显式启动（部分通过，热键待实体）
+
+- **环境/产物：** Mac mini/macOS 27.0.1（26A434）、Xcode 27.0（27A266a），`build/preview68-store-preflight/Build/Products/Release/LaunchIconStoreSpike.app`，原 ID `com.sunzheng.LaunchIcon.StoreSpike`。现有本地 ad-hoc 产物 `codesign --verify --deep --strict` 通过；实际权限仅 app-sandbox，无 get-task-allow，非 App Store 分发签名。
+- **复现：** `open -n --env LAUNCHICON_TEST_PREFERENCES_SUITE=<独立测试标记> --env LAUNCHICON_DIAGNOSTICS_PATH=<容器内独立日志> <上述App>`；appendEvidence 的隔离标记避免改写旧 M0SpikeEvidence。容器日志读取被系统拒绝，未改权限，未使用其他身份或绕过。CUA 通过完整 App 路径读取实际 AX/截图，105 candidates/0 skipped、Clock display name 时钟、Icon read true、热键 registered。点击“启动系统计算器（测试）”，探针显示请求提交；计算器真实窗口和键盘控件可见。为排除观察工具自行启动应用的干扰，再次确认进程不存在后点击探针按钮，先用 ps 确认 PID 62340 已出现，再选择计算器读取窗口；测试后仅终止该精确 PID。
+- **运行对照：** 初始 PID 60301 的 sample 显示主线程 NSApplication event loop，未重现旧 ID 的 secinit 停顿；不宣称旧问题根因修复。只修改 Store toggleVisibility 增加一条显隐诊断后，同命令覆盖构建 build/analyze 退出 0，权限仍仅 sandbox，重新运行 PID 60980 扫描也完成。CUA 合成 alt+space 实际触发扫描按钮、没有显隐记录，不等同物理全局热键失败；已请求实体两次输入，回调待验。
+- **证据/限制：** `/private/tmp/LaunchIcon-StoreRuntime-20261011.VaH39q` 中 Build.log、Analyze.log、Entitlements/UpdatedEntitlements、Startup.sample、NetworkGuard 均本地；原生 CUA AX/截图在本会话。当前探针保留供用户实体测试。仅一个系统目标应用与首图标，不证明全部第三方应用或全部图标、物理热键、App Store archive/审核、公证或 Direct 安装体验；没有读取系统 Launchpad DB/私有框架、没有清旧容器。
+
+
+## 2026-10-11 — preview.68 阶段签名/沙箱静态预检（未运行）
+
+- **复现环境：** macOS 27.0.1（26A434）、Apple Silicon、Xcode 27.0（27A266a），私有 `main` 为 `5fe2e14`；产品源码与 preview.68 包内 `1eeb888` 一致。遵守当前不抢前台要求，未启动 App、Runner 或 Store 探针。
+- **公证预检：** `./script/distribution_preflight.sh --preflight` 退出 1，未找到 Developer ID Application 签名身份；日志 `/private/tmp/LaunchIcon-preview68-DistributionPreflight-20261011.log`。仅检查当前可发现身份，不修改钥匙串、不提交公证；公证 profile 未验证。ad-hoc 候选不能据此称正式公证版本。
+- **Store 构建对照：** `xcodebuild -quiet -project LaunchIcon.xcodeproj -scheme LaunchIconStoreSpike -configuration Release -destination 'generic/platform=macOS' -derivedDataPath build/preview68-store-preflight CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- build` 退出 0，但提取的实际权限除 `app-sandbox=true` 外还有 `get-task-allow=true`。增加命令行 `CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO` 再构建，退出 0，签名中的权限逐项与 `LaunchIconStoreSpike.entitlements` 相等，仅保留 sandbox。产品源文件与配置未改，不能把这份本地覆盖配置当成默认 Release 或 App Store 分发结果。
+- **产物与证据：** `build/preview68-store-preflight/Build/Products/Release/LaunchIconStoreSpike.app`，`codesign --verify --deep --strict` 与 `lipo -archs` 通过（x86_64/arm64），实际为 ad-hoc、无 Team ID。前后构建日志 `/private/tmp/LaunchIcon-preview68-StoreBuild-20261011.log`、`/private/tmp/LaunchIcon-preview68-StoreBuild-NoDebug-20261011.log`；前后权限文件 `/private/tmp/LaunchIcon-preview68-StoreEntitlements-20261011.plist`、`/private/tmp/LaunchIcon-preview68-StoreEntitlements-NoDebug-20261011.plist`，签名细节为对应的 `StoreSignature` 文件。
+- **限制与公开路径：** 以上只证明签名与权限存在，不证明沙箱初始化、标准目录扫描、图标读取、显式目标 App 启动或物理热键可用。获准前台后用当前探针复验；遵循已有 `FileManager`/CoreServices/`NSWorkspace`/`RegisterEventHotKey` 公开路径，不重置旧容器、不绕过授权。正式 Direct 公证仍使用现有 `distribution_preflight.sh --archive-and-notarize`，需要可用 Developer ID 与公证 profile。历史 macOS 27.0 的运行证据不替代本次 macOS 27.0.1 产物。
+
 ## 2026-09-26 — XCTest 自动化模式的本机身份验证
 
 - **复现环境与步骤：** macOS 27.0（26A428）、Apple Silicon、Xcode 27.0；在隔离 DerivedData 运行 `LaunchIconUITests/LauncherDragUITests/testBlankBackgroundClickHidesLauncherWithoutQuitting`，结果包 `/tmp/LaunchIcon-UITest926/AfterAuthorization.xcresult`。`testmanagerd` 记录测试 runner 请求 automation mode。

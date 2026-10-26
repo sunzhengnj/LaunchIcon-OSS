@@ -21,7 +21,7 @@ need(
     or "AppRelatedFileScanner.relatedCleanupDefaultSelected" in views,
     "Direct must use Core defaultSelected policy",
 )
-need("relatedCleanupReviewMessageKey" in coord, "confirmRelatedFileDeletion must use Core review message")
+need("relatedCleanupReviewMessage" in coord, "confirmRelatedFileDeletion must use Core review message")
 idx = coord.index("static func confirmRelatedFileDeletion")
 body = coord[idx : idx + 1600]
 need("默认全选" not in body, "confirmRelatedFileDeletion must not say 默认全选")
@@ -53,14 +53,22 @@ need("restoreFocusAfterUninstallSheet" in direct, "Direct must implement focus r
 cancel = 'L("取消")'
 trash = 'L("移到废纸篓")'
 confirm = coord[coord.index("static func confirmRelatedFileDeletion") : coord.index("static func uninstallDecision")]
-need(confirm.index(cancel) < confirm.index(trash), "confirmRelated: Cancel before Trash")
+# RELATED-CLEANUP-CONFIRM-COPY-01: Cancel/Trash titles come from Core helpers.
+confirm_cancel = "confirmCancelButtonTitle" if "confirmCancelButtonTitle" in confirm else cancel
+confirm_trash = "confirmDestructiveButtonTitle" if "confirmDestructiveButtonTitle" in confirm else trash
+need(confirm.index(confirm_cancel) < confirm.index(confirm_trash), "confirmRelated: Cancel before Trash")
 need(
     "precondition(AppRelatedFileScanner.relatedCleanupAlertCancelIsFirstButton)" in confirm,
     "confirmRelated must precondition Cancel-first",
 )
+need("relatedCleanupConfirmTitle(" in confirm, "confirmRelated must use Core title helper")
+need('L("选择要清理的' not in confirm, "confirmRelated must not hardcode title")
 
 prompt = coord[coord.index("static func promptToUninstall") : coord.index("static func cleanUpOrphanLeftovers")]
-need(prompt.index(cancel) < prompt.index("trashTitle"), "promptToUninstall: Cancel before Trash")
+# UNINSTALL-SINGLE-CONFIRM-CHROME-01: Cancel/Trash titles come from Core helpers.
+cancel_token = "confirmCancelButtonTitle" if "confirmCancelButtonTitle" in prompt else cancel
+trash_token = "confirmDestructiveButtonTitle" if "confirmDestructiveButtonTitle" in prompt else "trashTitle"
+need(prompt.index(cancel_token) < prompt.index(trash_token), "promptToUninstall: Cancel before Trash")
 need(
     "precondition(AppRelatedFileScanner.relatedCleanupAlertCancelIsFirstButton)" in prompt,
     "promptToUninstall must precondition Cancel-first",
@@ -69,7 +77,10 @@ need("restoreFocusAfterUninstallSheet" in prompt, "promptToUninstall defer must 
 
 orphan = coord[coord.index("static func cleanUpOrphanLeftovers") :]
 orphan = orphan[: orphan.index("static func hasOtherInstalledCopy")]
-need(orphan.index(cancel) < orphan.index(trash), "orphan: Cancel before Trash")
+# ORPHAN-LEFTOVER-CONFIRM-COPY-01: Cancel/Trash titles come from Core helpers.
+orphan_cancel = "confirmCancelButtonTitle" if "confirmCancelButtonTitle" in orphan else cancel
+orphan_trash = "confirmDestructiveButtonTitle" if "confirmDestructiveButtonTitle" in orphan else trash
+need(orphan.index(orphan_cancel) < orphan.index(orphan_trash), "orphan: Cancel before Trash")
 need("restoreFocusAfterUninstallSheet" in orphan, "orphan defer must restore focus")
 
 eligibility = (root / "Sources/Core/AppUninstallEligibility.swift").read_text()

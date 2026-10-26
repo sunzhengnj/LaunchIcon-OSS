@@ -228,7 +228,8 @@ prep_end = direct.index("func applyDeferredVisualState()", prep_start)
 prep = direct[prep_start:prep_end]
 if "shouldEnsureSearchFooterChromeWhenPreservingQuery" not in prep:
     fail("prepare when preserving query must ensure search footer chrome")
-if 'L("Esc 清除搜索")' not in direct:
+# SEARCH-FIELD-CHROME-01: Esc-clear owned by SearchFieldChromeCopy (reuses CatalogEmpty detail).
+if "LauncherLayout.SearchFieldChromeCopy.escClearSearch" not in direct:
     fail("search footer snap must land Esc-clear navigation hint")
 if "shouldSnapSearchAdjacentChromeAfterSettingsHandoff" not in core:
     fail("Core missing shouldSnapSearchAdjacentChromeAfterSettingsHandoff")

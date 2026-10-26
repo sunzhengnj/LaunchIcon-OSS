@@ -24,14 +24,27 @@ need("nonisolated let backupURL" in store, "backupURL should stay nonisolated fo
 need("testLayoutStoreExportImportRoundTripDoesNotTouchLiveFiles" in tests, "Core export/import test missing")
 need("XCTAssertEqual(backup, first)" in tests or "loadBackup()" in tests, "Core loadBackup assertion missing")
 
-need("导出布局" in settings and "导入布局" in settings and "恢复上次备份" in settings,
-     "Settings missing export/import/restore controls")
+need(
+    (
+        "导出布局" in settings and "导入布局" in settings and "恢复上次备份" in settings
+    )
+    or (
+        "SettingsLayoutIOChromeCopy.exportButtonTitleKey" in settings
+        and "SettingsLayoutIOChromeCopy.importButtonTitleKey" in settings
+        and "SettingsLayoutIOChromeCopy.restoreBackupButtonTitleKey" in settings
+    ),
+    "Settings missing export/import/restore controls",
+)
 need("onExportLayout" in settings and "onImportLayout" in settings and "onRestoreLayoutBackup" in settings,
      "Settings missing layout backup callbacks")
 need("layoutBackupAvailable" in settings, "Settings missing backup availability probe")
-need('title: L("维护")' in settings, "backup controls should live under 维护")
+# SETTINGS-SECTION-CHROME-01: section title owned by Core.
+need(
+    "SettingsSectionChromeCopy.maintenanceSectionTitle" in settings,
+    "backup controls should live under 维护 (Core-owned)",
+)
 # layout backup row must be in 维护 section with actions
-maint = settings.index('title: L("维护")')
+maint = settings.index("SettingsSectionChromeCopy.maintenanceSectionTitle")
 block = settings[max(0, maint - 800):maint + 200]
 need("layoutBackupRow" in block or "exportLayoutButton" in block,
      "export/import/restore should be in 维护 section build")
@@ -93,6 +106,31 @@ for name in ("confirmLayoutRestoreBackup", "confirmLayoutImport", "confirmGridRe
     need("alertSecondButtonReturn" in body, f"{name} must apply on second button")
     need("cancelIsFirstButton" in body, f"{name} must precondition Cancel-first")
     need("showPage" not in body and "pageTransition" not in body, f"{name} must not touch paging")
+
+# Import variants (LAYOUT-IMPORT-CONFIRM-WIRE-01): unchanged files are a no-op,
+# risky files need a second Cancel-first confirm before applyImportedLayout.
+wc_imp = direct[direct.index("func importLayout(from"):direct.index("func restoreLastLayoutBackup")]
+need(wc_imp.index("layoutImportConfirmation(for: imported)") < wc_imp.index("applyImportedLayout(imported)"),
+     "import variant must be decided before applying")
+need("confirmation == .unchanged" in wc_imp and "needsSecondConfirm" in wc_imp, "import variants must be handled")
+risky = direct[direct.index("private func confirmRiskyLayoutImport"):]
+risky = risky[:risky.index("\n    }\n")]
+need("cancelIsFirstButton" in risky and "alertSecondButtonReturn" in risky, "risky import confirm must be Cancel-first")
+need("testLayoutImportConfirmationAgainstLiveCatalog" in tests, "import variant Core test missing")
+# Success line lists what changed (first 3 clauses), judged before applying.
+need(wc_imp.index("layoutImportChangeSummary(for: imported)") < wc_imp.index("applyImportedLayout(imported)"),
+     "change summary must be taken from the pre-import grid")
+need("Self.importedLayoutMessage(changeSummary)" in wc_imp, "import success must report the change summary")
+need("testLayoutChangeSummaryDetailsOrderAndTruncation" in tests, "change-summary details Core test missing")
+# Risky confirm previews the same summary (LAYOUT-IMPORT-CONFIRM-PREVIEW-01).
+need(wc_imp.index("layoutImportChangeSummary(for: imported)") < wc_imp.index("confirmRiskyLayoutImport(confirmation, preview: changeSummary)"),
+     "risky confirm must preview the change summary")
+need("LayoutChangeSummary.importPreviewFormatKey" in risky, "risky confirm must show the preview line")
+wc_restore = direct[direct.index("func restoreLastLayoutBackup"):]
+wc_restore = wc_restore[:wc_restore.index("\n    }\n")]
+need(wc_restore.index("layoutImportChangeSummary(for: backup)") < wc_restore.index("applyImportedLayout(backup)"),
+     "restore summary must be taken before applying")
+need("LayoutChangeSummary.restoredWithDetailsFormatKey" in wc_restore, "restore success must report the change summary")
 
 if failures:
     for f in failures:
