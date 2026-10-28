@@ -624,11 +624,86 @@ public enum LauncherLayout {
         return .linkToApp(url)
     }
 
-    /// The Dock is hidden while the launcher is up. Reveal it only for a drag
-    /// that actually offers an app file. Menu-bar hiding stays as it is.
+    /// The Dock is hidden while the launcher is up. An app-file drag is
+    /// *eligible* to reveal it. The pointer still has to reach a screen edge
+    /// (`shouldRevealDockForDragLocation`) so an in-grid reorder does not
+    /// flash the Dock over the bottom row. Menu-bar hiding stays as it is.
     public static func shouldTemporarilyRevealDock(for offer: LayoutDragOutsideOffer) -> Bool {
         if case .linkToApp = offer { return true }
         return false
+    }
+
+    /// Points from the screen edge that arm a Dock reveal. Wider than a
+    /// couple of pixels so the pointer can hit it, narrower than the footer
+    /// (56 pt above the bottom) so page dots and the last icon row do not.
+    public static let externalDragDockRevealEdgeInset: CGFloat = 12
+    /// Once the Dock is out, keep it while the pointer is still over a typical
+    /// Dock. Pulling back into the grid past this inset hides it again.
+    public static let externalDragDockKeepVisibleInset: CGFloat = 96
+
+    /// Reveal the Dock only for an app-file drag whose pointer is on the
+    /// bottom or side edge of `screenFrame`. The top edge is the menu bar.
+    /// `currentlyRevealed` widens the zone so the Dock does not flicker as
+    /// soon as the pointer climbs onto it. Does not page.
+    public static func shouldRevealDockForDragLocation(
+        offer: LayoutDragOutsideOffer,
+        pointerInScreen: CGPoint,
+        screenFrame: CGRect,
+        currentlyRevealed: Bool,
+        revealInset: CGFloat = externalDragDockRevealEdgeInset,
+        keepVisibleInset: CGFloat = externalDragDockKeepVisibleInset
+    ) -> Bool {
+        guard shouldTemporarilyRevealDock(for: offer) else { return false }
+        guard screenFrame.width > 0, screenFrame.height > 0 else { return false }
+        let inset = currentlyRevealed ? keepVisibleInset : revealInset
+        guard inset > 0 else { return false }
+        return pointerIsInExternalDragDockZone(
+            pointerInScreen: pointerInScreen,
+            screenFrame: screenFrame,
+            inset: inset
+        )
+    }
+
+    /// Search, folder title, and alias fields must not insert the `.fileURL`
+    /// a layout drag attaches for the Dock.
+    public static func launcherTextRejectsFileURLDrop(pasteboardHasFileURL: Bool) -> Bool {
+        pasteboardHasFileURL
+    }
+
+    /// A file URL on the pasteboard at session start lets AppKit replace the
+    /// custom drag image and its hotspot. An in-window drop then misses the
+    /// icon center (merge) even though the pointer started on it. Attach the
+    /// Dock link only after the pointer has left the launcher window. Does
+    /// not page, and does not reveal the Dock by itself.
+    public static func layoutDragPasteboardIncludesFileURL(
+        offer: LayoutDragOutsideOffer,
+        pointerInScreen: CGPoint,
+        launcherWindowFrame: CGRect
+    ) -> Bool {
+        guard case .linkToApp = offer else { return false }
+        guard launcherWindowFrame.width > 0, launcherWindowFrame.height > 0 else { return false }
+        return !launcherWindowFrame.contains(pointerInScreen)
+    }
+
+    private static func pointerIsInExternalDragDockZone(
+        pointerInScreen: CGPoint,
+        screenFrame: CGRect,
+        inset: CGFloat
+    ) -> Bool {
+        let nearX = pointerInScreen.x >= screenFrame.minX - inset
+            && pointerInScreen.x <= screenFrame.maxX + inset
+        let nearY = pointerInScreen.y >= screenFrame.minY - inset
+            && pointerInScreen.y <= screenFrame.maxY + inset
+        let nearBottom = pointerInScreen.y <= screenFrame.minY + inset
+            && pointerInScreen.y >= screenFrame.minY - inset
+            && nearX
+        let nearLeft = pointerInScreen.x <= screenFrame.minX + inset
+            && pointerInScreen.x >= screenFrame.minX - inset
+            && nearY
+        let nearRight = pointerInScreen.x >= screenFrame.maxX - inset
+            && pointerInScreen.x <= screenFrame.maxX + inset
+            && nearY
+        return nearBottom || nearLeft || nearRight
     }
 
     /// Put Dock hiding back only when the launcher is still the surface on screen.
@@ -1822,9 +1897,13 @@ public enum LauncherLayout {
 
     // STATUS-ITEM-CLICK-01 — left click toggles; right/Control-click opens menu.
     // STATUS-ITEM-OPTION-SETTINGS-01 — Option+left click opens Settings.
+    // STATUS-ITEM-NONPOINTER-MENU-01 — no mouse event (VoiceOver / keyboard) opens the menu.
     public enum StatusItemPointerKind: Equatable, Sendable {
         case primary
         case secondary
+        /// Activation without a mouse event. Opens the menu so Settings and Quit
+        /// stay reachable from VoiceOver or the keyboard.
+        case nonPointer
     }
 
     public enum StatusItemButtonAction: Equatable, Sendable {
@@ -1838,7 +1917,7 @@ public enum LauncherLayout {
         optionDown: Bool = false
     ) -> StatusItemButtonAction {
         switch pointer {
-        case .secondary:
+        case .secondary, .nonPointer:
             return .showMenu
         case .primary where optionDown:
             return .openSettings
@@ -1922,6 +2001,47 @@ public enum LauncherLayout {
     /// Showing the launcher again keeps the text that was already there.
     public static func shouldApplySearchFieldEdit(isDismissing: Bool, isVisible: Bool) -> Bool {
         shouldAcceptPointerActivation(isDismissing: isDismissing, isVisible: isVisible)
+    }
+
+    /// The search cell can report a frame flipped inside the window, and a
+    /// field editor that is not on screen reports a null frame. Clicks and
+    /// typeText then miss the field. Prefer the view's own screen frame when
+    /// it has a real size. Does not page.
+    public static func accessibilityFrameOnScreen(
+        viewFrameInScreen: CGRect,
+        reportedFrame: CGRect
+    ) -> CGRect {
+        if viewFrameInScreen.width > 1, viewFrameInScreen.height > 1,
+           viewFrameInScreen.origin.x.isFinite, viewFrameInScreen.origin.y.isFinite {
+            return viewFrameInScreen
+        }
+        if reportedFrame.width > 1, reportedFrame.height > 1,
+           reportedFrame.origin.x.isFinite, reportedFrame.origin.y.isFinite,
+           !reportedFrame.isNull, !reportedFrame.isInfinite {
+            return reportedFrame
+        }
+        return .zero
+    }
+
+    /// XCUI types into the application element. A borderless panel can leave
+    /// that frame null, so the text event never finds a display. Prefer the
+    /// key window's screen frame, then any other visible window. Does not page.
+    public static func applicationAccessibilityFrame(
+        keyWindowFrame: CGRect?,
+        otherVisibleWindowFrames: [CGRect],
+        reportedFrame: CGRect
+    ) -> CGRect {
+        var candidates: [CGRect] = []
+        if let keyWindowFrame { candidates.append(keyWindowFrame) }
+        candidates.append(contentsOf: otherVisibleWindowFrames)
+        for candidate in candidates {
+            let resolved = accessibilityFrameOnScreen(
+                viewFrameInScreen: candidate,
+                reportedFrame: .null
+            )
+            if resolved.width > 1, resolved.height > 1 { return resolved }
+        }
+        return accessibilityFrameOnScreen(viewFrameInScreen: .zero, reportedFrame: reportedFrame)
     }
 
     /// What to do with a pointer event once the launcher is fading or gone.
@@ -4036,6 +4156,20 @@ public enum LauncherLayout {
         shouldApplySearchFieldEdit(isDismissing: isDismissing, isVisible: isVisible)
     }
 
+    /// Blank-area and folder date/color sorts finish after a background read.
+    /// Hide bumps `currentToken`, so that result does not rewrite the layout
+    /// while the launcher is fading or gone, and does not land on the next
+    /// open. Settings paths that await the read do not use this token.
+    /// Does not page.
+    public static func shouldApplyDeferredGridRearrange(
+        isDismissing: Bool,
+        isVisible: Bool,
+        startedToken: UInt64,
+        currentToken: UInt64
+    ) -> Bool {
+        startedToken == currentToken && isVisible && !isDismissing
+    }
+
     /// The catalog search index is built off the main thread. It can finish
     /// during the fade, or after the window has already ordered out. The
     /// query did not change, so the field-editor refilter will not retry.
@@ -4306,6 +4440,70 @@ public enum LauncherLayout {
         }
     }
 
+    /// Shift held alone. Command, Option, and Control keep their own paths,
+    /// including main-grid left/right paging.
+    public static func gridKeyboardExtendsSelection(
+        shift: Bool,
+        command: Bool,
+        option: Bool,
+        control: Bool
+    ) -> Bool {
+        shift && !command && !option && !control
+    }
+
+    /// Shift+arrow selection inside one grid. `consumesKey` is false only for
+    /// left/right when `walksLeftRight` is false, so the main grid can still page.
+    /// An edge consumes the key and leaves the selection where it is.
+    public struct GridKeyboardShiftStep: Equatable, Sendable {
+        public var selection: LauncherItemSelection
+        public var focusID: UUID?
+        public var consumesKey: Bool
+
+        public init(selection: LauncherItemSelection, focusID: UUID?, consumesKey: Bool) {
+            self.selection = selection
+            self.focusID = focusID
+            self.consumesKey = consumesKey
+        }
+    }
+
+    public static func gridKeyboardShiftStep(
+        focusedID: UUID,
+        slot: Int,
+        presentedOrder: [UUID],
+        columns: Int,
+        direction: GridKeyboardDirection,
+        walksLeftRight: Bool,
+        current: LauncherItemSelection
+    ) -> GridKeyboardShiftStep {
+        if !walksLeftRight && (direction == .left || direction == .right) {
+            return GridKeyboardShiftStep(selection: current, focusID: nil, consumesKey: false)
+        }
+        let count = presentedOrder.count
+        guard let neighbor = gridKeyboardNeighborSlot(
+            from: slot,
+            count: count,
+            columns: columns,
+            direction: direction
+        ), presentedOrder.indices.contains(neighbor) else {
+            return GridKeyboardShiftStep(selection: current, focusID: focusedID, consumesKey: true)
+        }
+        var base = current
+        if base.rangeAnchorID == nil {
+            let ids = base.contains(focusedID) ? base.orderedIDs : base.orderedIDs + [focusedID]
+            base = LauncherItemSelection(orderedIDs: ids, rangeAnchorID: focusedID)
+        }
+        let next = LauncherItemSelection.applyingRange(
+            to: presentedOrder[neighbor],
+            presentedOrder: presentedOrder,
+            current: base
+        )
+        return GridKeyboardShiftStep(
+            selection: next,
+            focusID: presentedOrder[neighbor],
+            consumesKey: true
+        )
+    }
+
     /// Slot to focus on the destination page. `previousSlot` is nil when focus
     /// was not on a grid tile. Nil means the destination has no tile to focus.
     public static func focusSlot(previousSlot: Int?, itemCount: Int) -> Int? {
@@ -4405,6 +4603,74 @@ public enum LauncherLayout {
         query + characters
     }
 
+    /// A letter typed on the grid opens search. `.interpret` hands that event
+    /// to the text input system. Calling the field editor's `keyDown` walks
+    /// back through the search field, which calls the editor again, and the
+    /// root view starts another route until the stack overflows.
+    /// `.consume` is a route that is already in progress: swallow it.
+    /// `.ignore` leaves the key to the caller. Does not page.
+    public enum SearchGridKeyRoute: Equatable, Sendable {
+        case ignore
+        case consume
+        case interpret
+    }
+
+    public static func searchGridKeyRoute(
+        folderOpen: Bool,
+        commandOrControl: Bool,
+        hasPrintableCharacter: Bool,
+        alreadyRouting: Bool
+    ) -> SearchGridKeyRoute {
+        if alreadyRouting { return .consume }
+        guard !folderOpen, !commandOrControl, hasPrintableCharacter else { return .ignore }
+        return .interpret
+    }
+
+    /// `characters` on a synthesized key can be empty while the letter sits
+    /// in `charactersIgnoringModifiers`. A single ASCII letter or digit is
+    /// still the query text. Anything else stays on the raw string so an
+    /// input method can own it. Does not page.
+    public static func searchGridTypedCharacters(raw: String, ignoringModifiers: String) -> String {
+        if raw.unicodeScalars.contains(where: { !CharacterSet.controlCharacters.contains($0) }) {
+            return raw
+        }
+        guard ignoringModifiers.count == 1,
+              let scalar = ignoringModifiers.unicodeScalars.first,
+              scalar.isASCII,
+              Character(scalar).isLetter || Character(scalar).isNumber else {
+            return raw
+        }
+        return ignoringModifiers
+    }
+
+    /// What to write into the search field after the text input system has
+    /// seen a grid letter. Marked pinyin stays in the editor. A letter the
+    /// editor did not take is appended, because writing it only into the
+    /// editor during that same event does not show up in the field. An editor
+    /// string that the field has not committed yet is copied across. Does not page.
+    public enum SearchGridKeyCommit: Equatable, Sendable {
+        case keepEditor
+        case replace(String)
+    }
+
+    public static func searchGridKeyCommit(
+        before: String,
+        editorAfter: String,
+        hadMarkedText: Bool,
+        hasMarkedText: Bool,
+        typed: String,
+        committed: String
+    ) -> SearchGridKeyCommit {
+        if hasMarkedText || hadMarkedText { return .keepEditor }
+        if editorAfter == before {
+            return .replace(searchQueryAppending(before, typed))
+        }
+        if committed != editorAfter {
+            return .replace(editorAfter)
+        }
+        return .keepEditor
+    }
+
     /// The field editor's string includes pinyin that is still marked.
     /// `stringValue` does not, so a composition would otherwise filter nothing.
     public static func searchQuery(committed: String, editing: String?) -> String {
@@ -4500,6 +4766,53 @@ public enum LauncherLayout {
             documentLength: documentLength,
             viewportLength: viewportLength
         )
+    }
+
+    /// Offset that puts the whole item inside the viewport when it fits.
+    /// An item already fully inside stays put. Nearest-edge scrolling leaves
+    /// a cell hanging off the clip, so keyboard focus looks off-screen.
+    /// An item taller than the viewport stays when it already spans the
+    /// clip; otherwise the nearer end comes on screen. Does not page.
+    public static func scrollOffsetRevealingItem(
+        current: CGFloat,
+        viewportLength: CGFloat,
+        documentLength: CGFloat,
+        itemMin: CGFloat,
+        itemLength: CGFloat
+    ) -> CGFloat {
+        let viewport = max(viewportLength, 0)
+        let length = max(itemLength, 0)
+        let itemMax = itemMin + length
+        var offset = current
+        if length <= viewport {
+            if itemMax > offset + viewport {
+                offset = itemMax - viewport
+            }
+            if itemMin < offset {
+                offset = itemMin
+            }
+        } else if itemMax <= offset {
+            offset = itemMax - viewport
+        } else if itemMin >= offset + viewport {
+            offset = itemMin
+        }
+        return clampedScrollOffset(
+            offset,
+            documentLength: max(documentLength, 0),
+            viewportLength: viewport
+        )
+    }
+
+    /// Key-view scrolling asks for a tiny rect on the focused edge. That leaves
+    /// the rest of a folder or search cell outside the clip. Ask for the whole
+    /// cell when its bounds are real. A zero or non-finite bounds keeps the
+    /// requested rect. Does not page.
+    public static func scrollRectRevealingFocusedCell(cellBounds: CGRect, requested: CGRect) -> CGRect {
+        guard cellBounds.width > 1, cellBounds.height > 1,
+              cellBounds.origin.x.isFinite, cellBounds.origin.y.isFinite else {
+            return requested
+        }
+        return cellBounds
     }
 
     public static func visiblePageIndices(pageCount: Int, selectedPage: Int, maxVisible: Int = pageIndicatorLimit) -> [Int] {
@@ -4623,6 +4936,18 @@ public enum LauncherLayout {
         if !hasContent(stored) { return memory }
         if memory.updatedAt >= stored.updatedAt { return memory }
         return stored
+    }
+
+    /// A reconcile that dropped apps on an untrusted custom root must not become
+    /// the newer layout. `layoutBaseForCatalogReload` prefers memory when its
+    /// timestamp is greater than or equal to the file.
+    public static func layoutKeepingStoredNewerThanUnsafeReconcile(
+        reconciled: LayoutState,
+        stored: LayoutState
+    ) -> LayoutState {
+        var layout = reconciled
+        layout.updatedAt = stored.updatedAt.addingTimeInterval(-1)
+        return layout
     }
 
     /// A user-selected cached list stays visible until a complete scan can
@@ -5731,6 +6056,26 @@ public enum LauncherLayout {
         }
         state.updatedAt = .now
         return state
+    }
+
+    /// Clears alias and hidden marks for apps a truncated scan confirmed are
+    /// gone. Visible slots are `reconcile`'s job (those keys are not in the
+    /// retained catalog). An empty set does not touch `updatedAt`.
+    public static func removingConfirmedAbsentCatalogIdentity(
+        _ keys: Set<String>,
+        from state: LayoutState
+    ) -> LayoutState {
+        guard !keys.isEmpty else { return state }
+        var next = state
+        let hiddenBefore = next.hiddenAppKeys
+        next.hiddenAppKeys.subtract(keys)
+        var changed = next.hiddenAppKeys != hiddenBefore
+        for key in keys where next.appAliases.removeValue(forKey: key) != nil {
+            changed = true
+        }
+        guard changed else { return state }
+        next.updatedAt = .now
+        return next
     }
 
     /// Removes a successfully trashed app from layout identity (not a hide).

@@ -42,6 +42,7 @@ need("LauncherLayout.applicationDates(" in fn, "folder date sort must read dates
 need("LauncherLayout.sortingFolderMembersByDate(" in fn, "folder date sort must go through Core")
 need("commitLayout(next)" in fn, "folder date sort must commit")
 need("isSamplingAppDates" in fn and "isSamplingIconColors" in fn, "date sort must not overlap color sampling")
+need("shouldApplyDeferredGridRearrange" in fn, "folder date sort must not land after hide")
 for banned in ("showPage", "focusGridEntry", "scrollToPage", "currentPage", "transitionToPage"):
     need(banned not in fn, f"folder date sort must not touch paging ({banned})")
 

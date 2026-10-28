@@ -6,6 +6,46 @@ func L(_ key: String) -> String {
     Bundle.main.localizedString(forKey: key, value: key, table: "Localizable")
 }
 
+/// Shared application. `main` creates this before `NSApplication.shared`, and
+/// the principal class is the same type, so the process does not lock in a
+/// plain `NSApplication` whose frame is null.
+@objc(LauncherApplication)
+final class LauncherApplication: NSApplication {
+    /// Grid typing is delivered to the application element. A missing
+    /// position or size attribute is what XCTest reads as a null frame.
+    private func launcherScreenFrame() -> NSRect {
+        let others = windows.filter { $0 !== keyWindow && $0.isVisible }.map(\.frame)
+        return LauncherLayout.applicationAccessibilityFrame(
+            keyWindowFrame: keyWindow?.frame,
+            otherVisibleWindowFrames: others,
+            reportedFrame: .null
+        )
+    }
+
+    override func accessibilityAttributeNames() -> [NSAccessibility.Attribute] {
+        var names = super.accessibilityAttributeNames()
+        if !names.contains(.position) { names.append(.position) }
+        if !names.contains(.size) { names.append(.size) }
+        return names
+    }
+
+    override func accessibilityAttributeValue(_ attribute: NSAccessibility.Attribute) -> Any? {
+        let screen = launcherScreenFrame()
+        switch attribute {
+        case .position:
+            return NSValue(point: screen.origin)
+        case .size:
+            return NSValue(size: screen.size)
+        default:
+            return super.accessibilityAttributeValue(attribute)
+        }
+    }
+
+    override func accessibilityFrame() -> NSRect {
+        launcherScreenFrame()
+    }
+}
+
 @main
 final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
     nonisolated(unsafe) private static var retained: DirectAppDelegate?
@@ -28,7 +68,7 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
     private var toggleMenuItem: NSMenuItem?
 
     static func main() {
-        let application = NSApplication.shared
+        let application = LauncherApplication.shared
         let delegate = DirectAppDelegate()
         retained = delegate
         application.delegate = delegate
@@ -84,6 +124,13 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
         launcherController?.setDisplayTarget(preferences.displayTarget)
         launcherController?.setBackgroundDim(preferences.backgroundDim)
         launcherController?.setBlursBackground(preferences.blursBackground)
+        // UI tests cannot push a suite UserDefaults value into this process
+        // reliably. The same setter the Settings popup uses applies the override.
+        if ProcessInfo.processInfo.environment["LAUNCHICON_TEST_LAYOUT_PATH"] != nil,
+           let raw = ProcessInfo.processInfo.environment["LAUNCHICON_TEST_REOPEN_PAGE_BEHAVIOR"],
+           let override = LauncherReopenPageBehavior(rawValue: raw) {
+            preferences.reopenPageBehavior = override
+        }
         launcherController?.setReopenPageBehavior(preferences.reopenPageBehavior)
         launcherController?.setPinchToDismissEnabled(preferences.pinchToDismiss)
         launcherController?.onSettingsRequested = { [weak self] in self?.showSettings() }
@@ -332,15 +379,20 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
     private static func statusItemPointerKind(
         for event: NSEvent?
     ) -> LauncherLayout.StatusItemPointerKind {
-        guard let event else { return .primary }
+        // STATUS-ITEM-NONPOINTER-MENU-01: a missing event or a non-mouse event
+        // (VoiceOver AXPress, keyboard) opens the menu. Real clicks stay as before.
+        guard let event else { return .nonPointer }
         switch event.type {
-        case .rightMouseUp, .rightMouseDown:
-            return .secondary
-        default:
-            if event.modifierFlags.contains(.control) {
+        case .leftMouseDown, .leftMouseUp, .leftMouseDragged,
+             .rightMouseDown, .rightMouseUp, .rightMouseDragged,
+             .otherMouseDown, .otherMouseUp, .otherMouseDragged:
+            if event.type == .rightMouseDown || event.type == .rightMouseUp || event.type == .rightMouseDragged
+                || event.modifierFlags.contains(.control) {
                 return .secondary
             }
             return .primary
+        default:
+            return .nonPointer
         }
     }
 

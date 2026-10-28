@@ -68,6 +68,18 @@ body = "\n".join(direct[start:].splitlines()[:80])
 for bad in ("showPage(", "transitionToPage(", "animatePage", "movePage("):
     if bad in body:
         fail(f"handlePinchMagnify must not call {bad} (paging red line)")
+edit_at = body.find("folderOverlay.isEditingTitle")
+policy_at = body.find("PinchDismissPolicy.shouldDismiss")
+phase_at = body.find("let phase = event.phase")
+editing_prefix = body[:phase_at] if phase_at > 0 else ""
+if edit_at < 0 or "searchField.currentEditor()" not in editing_prefix or "isPromptingForAlias" not in editing_prefix:
+    fail("pinch must ignore folder title, search, and alias editing")
+if "pinchDismissAccumulated = 0" not in editing_prefix or "return true" not in editing_prefix:
+    fail("editing pinch must reset and stay consumed")
+if policy_at < 0 or edit_at > policy_at or "isEditingText:" not in body:
+    fail("editing check must reach PinchDismissPolicy before dismiss")
+if "isEditingText" not in prefs or "isEditingText: true" not in tests:
+    fail("Core policy must refuse dismiss while editing text")
 
 for key in (
     "双指捏合收起",

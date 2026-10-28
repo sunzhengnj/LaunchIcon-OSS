@@ -26,6 +26,7 @@ s = w.find("private func applyColorRearrange")
 body = w[s:w.find("\n    }\n", s)]
 checks += [
     ("offmain sampler", "IconColorSampler.shared.samples(for:" in launch and "isSamplingIconColors" in launch),
+    ("hide drops color sort", "shouldApplyDeferredGridRearrange" in launch),
     ("no main-thread sampling", "IconColorSample.sample(of:" not in w),
     ("apply rechecks state", "openedFolderID == nil" in body and "!isSearching" in body),
 

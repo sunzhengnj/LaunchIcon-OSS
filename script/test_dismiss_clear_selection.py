@@ -19,7 +19,8 @@ if "func clearItemSelectionForDismiss()" not in direct:
 hide_idx = direct.find("func hide(animated: Bool = true)")
 if hide_idx < 0:
     fail("hide() missing")
-hide_window = direct[hide_idx : hide_idx + 600]
+# Preamble also stamps the reopen clock and bumps the deferred-sort token.
+hide_window = direct[hide_idx : hide_idx + 800]
 if "clearItemSelectionForDismiss()" not in hide_window:
     fail("hide() must call clearItemSelectionForDismiss")
 # Helper body (not the hide() comment) must clear + refresh announce:false

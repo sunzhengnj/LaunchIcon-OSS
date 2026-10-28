@@ -7,6 +7,7 @@ root = Path(__file__).resolve().parents[1]
 layout = (root / "Sources/Core/LauncherLayout.swift").read_text()
 direct = (root / "Sources/Direct/LauncherWindowController.swift").read_text()
 tests = (root / "Tests/CoreTests/LaunchIconCoreTests.swift").read_text()
+ui = (root / "Tests/UITests/LauncherDragUITests.swift").read_text()
 failures = []
 
 
@@ -34,7 +35,16 @@ for banned in ("showPage", "movePage", "transitionToPage", "completePageTransiti
 need("verticalPageKeyTarget(" in folder, "folder scroll must ask Core")
 need("== .folderScroll" in folder, "folder scroll must require the folder target")
 need("scrollMembers(byPage:" in folder, "folder scroll must use the member scroller")
+need(
+    "updateGridAccessibilityChildren(for: folderOverlay.collectionView)" in folder,
+    "folder page scroll must refresh accessibility children",
+)
+need(
+    "updateGridAccessibilityChildren(for: searchCollectionView)" in body(direct, "func scrollSearchResults(", "func scrollOpenFolder("),
+    "search page scroll must refresh accessibility children",
+)
 need("focusPresentedItem" in folder, "off-screen folder tile must not keep the keyboard")
+need("testFolderPageDownScrollsMembersWithoutTurningMainGrid" in ui, "UI folder page-down case missing")
 
 members = body(direct, "func scrollMembers(byPage", "override init(frame frameRect: NSRect)")
 need("scrolledPageOffset(" in members, "member scroller must use the shared offset")

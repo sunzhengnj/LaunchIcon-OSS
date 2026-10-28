@@ -27,6 +27,14 @@ need("truncatedCustomRootExplanationKey" in layout, "Core soft notice copy missi
 need("showTransientToast" in direct, "Direct must toast truncated notice")
 need("truncatedScanRootPaths.isEmpty" in direct, "Direct rescan/toast must check truncated")
 need("testCustomRootScanRespectsDepthAndAppCountCaps" in tests, "Core cap test missing")
+retain = models[models.index("func retainingCandidates"):models.index("enum LauncherSearchHit")]
+need("truncatedScanRootPaths" in retain, "retainingCandidates must keep apps under truncated roots")
+need("bundleExists" in retain, "truncated retain must be able to drop a bundle that is gone")
+need("confirmedAbsentTruncatedKeys" in models, "gone truncated bundles need an explicit key set")
+need("testTruncatedCustomRootRetainsDeepAppFolderAndPage" in tests, "Core truncated-root retain test missing")
+need("testTruncatedCustomRootDropsDeletedAppAndKeepsTheRest" in tests, "Core truncated-root drop-gone test missing")
+need("removingConfirmedAbsentCatalogIdentity" in layout, "gone truncated apps must drop alias and hidden marks")
+need("removingConfirmedAbsentCatalogIdentity" in direct, "Direct must clear identity when the drop can be saved")
 start = scanner.index("CUSTOM-ROOT-SCAN-LIMIT-01")
 chunk = scanner[start:start + 1200]
 for bad in ("scrollToPage", "pageTransition", "movePage"):
