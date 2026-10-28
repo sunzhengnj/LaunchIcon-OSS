@@ -11,7 +11,7 @@ Press <kbd>⌥ Space</kbd> to see your apps in a 7 × 5 grid. Sort them into fol
 Native AppKit · no account · no network · your layout stays on your Mac.</p>
 
 <p align="center">
-  <a href="https://github.com/sunzhengnj/LaunchIcon-OSS/releases/tag/v1.0.0-preview.84"><img src="https://img.shields.io/github/v/release/sunzhengnj/LaunchIcon-OSS?label=release" alt="Latest release"></a>
+  <a href="https://github.com/sunzhengnj/LaunchIcon-OSS/releases/tag/v1.0.0-preview.85"><img src="https://img.shields.io/github/v/release/sunzhengnj/LaunchIcon-OSS?label=release" alt="Latest release"></a>
   <a href="https://github.com/sunzhengnj/LaunchIcon-OSS/actions/workflows/macos-validation.yml"><img src="https://github.com/sunzhengnj/LaunchIcon-OSS/actions/workflows/macos-validation.yml/badge.svg" alt="macOS validation"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache-2.0 license"></a>
   <img src="https://img.shields.io/badge/macOS-26%2B-black" alt="macOS 26 or later">
@@ -19,7 +19,7 @@ Native AppKit · no account · no network · your layout stays on your Mac.</p>
 </p>
 
 <p align="center">
-  <a href="https://github.com/sunzhengnj/LaunchIcon-OSS/releases/tag/v1.0.0-preview.84"><strong>⬇ Download (unnotarized preview)</strong></a> ·
+  <a href="https://github.com/sunzhengnj/LaunchIcon-OSS/releases/tag/v1.0.0-preview.85"><strong>⬇ Download (unnotarized preview)</strong></a> ·
   <a href="#install">Install</a> ·
   <a href="#known-limitations">Known limitations</a> ·
   <a href="#build-from-source">Build from source</a> ·
@@ -52,7 +52,7 @@ Native AppKit · no account · no network · your layout stays on your Mac.</p>
 > **Early release, feedback welcome.** The installer is ad-hoc signed and **not notarized** (see [Install](#install)). The full UI suite and continuous physical-input paging feel have not been verified for this preview. See [Known limitations](#known-limitations).
 
 > [!IMPORTANT]
-> **Current WIP preview:84 / build84.** [Download preview.84](https://github.com/sunzhengnj/LaunchIcon-OSS/releases/tag/v1.0.0-preview.84). The public installer is built from commit `de7ab2b` in this public release tag; internal signing settings are excluded. Background validation and CI passed, while full UI and cold-start checks remain open. See [snapshot notes](Docs/SOURCE_SNAPSHOT_2026-10-26.md).
+> **Current WIP preview:85 / build85.** [Download preview.85](https://github.com/sunzhengnj/LaunchIcon-OSS/releases/tag/v1.0.0-preview.85). The public installer is built from commit `89b5305` in this public release tag; internal signing settings are excluded. Background validation and CI passed, while full UI and cold-start checks remain open. See [snapshot notes](Docs/SOURCE_SNAPSHOT_2026-10-28.md).
 
 ## Highlights
 
@@ -73,22 +73,22 @@ Native AppKit · no account · no network · your layout stays on your Mac.</p>
 
 LaunchIcon uses its own visual design. It does not read the system Launchpad database, copy another launcher's assets, or require an account or cloud sync. It follows the macOS Reduce Motion setting. Pinyin transliteration uses Foundation's default pronunciation.
 
-### New in preview.84
+### New in preview.85
 
-- Denser Settings Form (menus over button walls)
-- Menu-bar click gestures; optional F4 summon (default still Option-Space)
-- Folder date sort; Page Up/Down scrolls open-folder members
-- Arrow keys walk inside folder / search / grid rows (paging path unchanged)
-- Dock drag offers real app file links
-- Grid row/column preferences persisted (not yet wired into Direct paging)
-- Custom app-root scan limits and missing-root soft notices
+- Truncated / missing custom-root retain and no-cache persist safety
+- Launchpad import wording aligned with AGENTS/README intent
+- Status menu open without pointer; Dock reveal only at screen edge
+- Shift-arrow range selection; pinch-dismiss while typing; reopen stamp; date rearrange hide
+- UI-RUNNER T5 coverage adds (suite still not fully green)
+- Dock drag attaches `.fileURL` only after the pointer leaves the window (fullscreen Dock-drop risk)
+- Search-grid typing / focus frame / cell reveal + field-editor commit for ignored grid letters
 
 
 ## Install
 
-1. Download `LaunchIcon-v1.0.0-preview.84-macOS-unnotarized.dmg` and its `.sha256` file from [preview.84](https://github.com/sunzhengnj/LaunchIcon-OSS/releases/tag/v1.0.0-preview.84), then verify both files:
+1. Download `LaunchIcon-v1.0.0-preview.85-macOS-unnotarized.dmg` and its `.sha256` file from [preview.85](https://github.com/sunzhengnj/LaunchIcon-OSS/releases/tag/v1.0.0-preview.85), then verify both files:
    ```bash
-   shasum -a 256 -c LaunchIcon-v1.0.0-preview.84-macOS-unnotarized.dmg.sha256
+   shasum -a 256 -c LaunchIcon-v1.0.0-preview.85-macOS-unnotarized.dmg.sha256
    ```
 2. Open the DMG and drag `LaunchIcon.app` to Applications. Quit an older copy before replacing it; your saved layout and preferences live outside the app bundle.
 3. Open LaunchIcon once. macOS will say it can't verify the developer. This is expected: the app is **ad-hoc signed and not notarized yet**.
@@ -100,7 +100,7 @@ Please don't disable Gatekeeper or run quarantine-removal commands you don't tru
 ## Known limitations
 
 - The installer is ad-hoc signed, not Developer ID signed or notarized.
-- No full UI suite or isolated cold-start of the public DMG was run for preview.84.
+- No full UI suite or isolated cold-start of the public DMG was run for preview.85.
 - Continuous physical-input paging, cross-page drag, VoiceOver, large-folder behavior, and dark Dock/Finder icon checks remain open.
 
 - Requires macOS 26 or later.
@@ -129,12 +129,12 @@ LAUNCHICON_ALLOW_VISIBLE_TESTS=1 ./script/test_direct_bootstrap.sh
 
 | Area | Current evidence |
 | --- | --- |
-| Core and build | Public checkout background gate and PR CI passed: Core 309/309 locally, Direct/StoreSpike Release analysis and UI target compile. See [test matrix](Docs/TEST_MATRIX.md). |
-| Full UI | No full UI suite or isolated cold-start was run for preview.84; continuous physical-input paging remains unverified. |
-| Distribution | [preview.84](https://github.com/sunzhengnj/LaunchIcon-OSS/releases/tag/v1.0.0-preview.84) is a WIP prerelease, ad-hoc signed and unnotarized. The release notes record package identity, checksum, and remote redownload verification; no visible UI/cold-start run is claimed. |
+| Core and build | Public checkout background gate and PR CI passed: Core 443/443 locally, Direct/StoreSpike Release analysis and UI target compile. See [test matrix](Docs/TEST_MATRIX.md). |
+| Full UI | No full UI suite or isolated cold-start was run for preview.85; continuous physical-input paging remains unverified. |
+| Distribution | [preview.85](https://github.com/sunzhengnj/LaunchIcon-OSS/releases/tag/v1.0.0-preview.85) is a WIP prerelease, ad-hoc signed and unnotarized. The release notes record package identity, checksum, and remote redownload verification; no visible UI/cold-start run is claimed. |
 | Open checks | Physical drag and drop, large folders, individual app launches, VoiceOver, Store sandbox behavior, and the dark Dock/Finder icon. |
 
-The CI badge reports **background validation only**. It is not a claim that the full UI suite or distribution checks passed. See the [test matrix](Docs/TEST_MATRIX.md) and [snapshot notes](Docs/SOURCE_SNAPSHOT_2026-10-26.md).
+The CI badge reports **background validation only**. It is not a claim that the full UI suite or distribution checks passed. See the [test matrix](Docs/TEST_MATRIX.md) and [snapshot notes](Docs/SOURCE_SNAPSHOT_2026-10-28.md).
 
 ## Contributing
 
