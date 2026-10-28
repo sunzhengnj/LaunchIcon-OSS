@@ -349,6 +349,14 @@ M0 不以静态原型、单元测试或单纯 build 替代真实 UI 和沙箱结
 - 2026-09-21 隔离真实 UI 夹具扫描 1 个临时 App 并持久化，然后移走 App 重扫为空：空态正常显示，临时布局文件哈希仍为 `11b87b69…e490e85c7`；重建同 bundle ID 夹具并重扫，候选恢复为 1，布局 App UUID 仍是 `5BE9B010…4DF73A`。正式布局使用不同路径，未被本次测试覆盖。部分扫描失败的持久化门槛由 Core 单测覆盖，尚未通过真实权限拒绝目录模拟。
 - 168px 图标版 Release 依次浏览第 1→2→3 页、预热约 105 个图标后，`vmmap -summary` Physical Footprint 为 68.0 MiB（peak 70.2 MiB），通过 PRD `<120 MB`。`leaks` 报告 0 leaks；`ps` RSS 含共享映射页，不作为此门槛的判定值。
 
+## 2026-10-28 preview.85 sync
+
+- Source: public PR sync from private tip `36944f0` (build 85). Team ID stripped; optional-`DECISIONS.md` hot-corner guard retained.
+- Background gate: `./script/validate_background.sh` **passed** on public tip `48d1fb6` (Core 443/443 + Release analyze + UI build-for-testing + script guards; no App/UI Runner launched).
+- Full UI Runner / physical paging / Developer ID / notarization: not claimed (private tip UI suite still not fully green).
+- Known product risks carried from private: late Dock .fileURL attach may fail on full-screen window; grid geometry prefs still not wired to paging.
+- Public installer: rebuild from the public source commit after merge; do **not** reuse private DMG bytes.
+
 ## 2026-10-26 preview.84 sync
 
 - Source: public PR sync from private tip `a6caf34` (build 84). Team ID stripped.
