@@ -659,6 +659,124 @@ final class LaunchIconCoreTests: XCTestCase {
         _ = externalApp
     }
 
+    func testMissingRootWithoutRetentionSourceDoesNotPersist() {
+        // MISSING-ROOT-NO-CACHE-01: unavailable root + nothing to retain must not
+        // persist a reconcile that deletes the saved folder. Editing stays read-only
+        // because Direct treats a false result as not persistable.
+        let local = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Local.app"),
+            bundleIdentifier: "com.example.Local",
+            displayName: "Local",
+            sourcePriority: 0,
+            discoveredAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        let ext = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Volumes/Missing/Ext.app"),
+            bundleIdentifier: "com.example.Ext",
+            displayName: "Ext",
+            sourcePriority: 1,
+            discoveredAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        let missingRoot = URL(fileURLWithPath: "/Volumes/Missing", isDirectory: true)
+        let report = CatalogScanReport(
+            candidates: [local],
+            skippedPaths: [],
+            unavailableRequiredRootPaths: [missingRoot]
+        )
+        XCTAssertTrue(report.canPersistReconciledLayout)
+        let localID = UUID()
+        let extID = UUID()
+        let folderID = UUID()
+        let stored = LayoutState(
+            orderedEntries: [.folder(folderID)],
+            folders: [folderID: LauncherFolder(id: folderID, name: "Disk", itemIDs: [localID, extID])],
+            appKeys: [localID: local.deduplicationKey, extID: ext.deduplicationKey],
+            updatedAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        XCTAssertFalse(report.allowsPersistingReconcile(retainingFrom: [], into: stored))
+        XCTAssertFalse(report.allowsPersistingReconcile(retainingFrom: [local], into: stored))
+        XCTAssertTrue(report.allowsPersistingReconcile(retainingFrom: [local, ext], into: stored))
+        let kept = LauncherLayout.reconcile(
+            candidates: report.retainingCandidates(from: [local, ext]).candidates,
+            into: stored
+        )
+        XCTAssertEqual(kept.folders[folderID]?.itemIDs, [localID, extID])
+
+        let dropped = LauncherLayout.reconcile(candidates: report.candidates, into: stored)
+        XCTAssertNil(dropped.folders[folderID])
+        let shown = LauncherLayout.layoutKeepingStoredNewerThanUnsafeReconcile(
+            reconciled: dropped,
+            stored: stored
+        )
+        XCTAssertEqual(LauncherLayout.layoutBaseForCatalogReload(memory: shown, stored: stored), stored)
+
+        let firstLaunch = LayoutState()
+        XCTAssertTrue(report.allowsPersistingReconcile(retainingFrom: [], into: firstLaunch))
+
+        let uninstall = CatalogScanReport(candidates: [local], skippedPaths: [])
+        XCTAssertTrue(uninstall.allowsPersistingReconcile(retainingFrom: [], into: stored))
+
+        let deep = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Volumes/Big/a/b/c/d/Deep.app"),
+            bundleIdentifier: "com.example.Deep",
+            displayName: "Deep",
+            sourcePriority: 1,
+            discoveredAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        let deepID = UUID()
+        let truncated = CatalogScanReport(
+            candidates: [local],
+            skippedPaths: [],
+            truncatedScanRootPaths: [URL(fileURLWithPath: "/Volumes/Big", isDirectory: true)]
+        )
+        let deepLayout = LayoutState(
+            orderedEntries: [.app(localID), .app(deepID)],
+            appKeys: [localID: local.deduplicationKey, deepID: deep.deduplicationKey],
+            updatedAt: stored.updatedAt
+        )
+        XCTAssertFalse(truncated.allowsPersistingReconcile(retainingFrom: [], into: deepLayout))
+        let stillThere: (URL) -> Bool = { _ in true }
+        XCTAssertTrue(
+            truncated.retainingCandidates(from: [local, deep], bundleExists: stillThere)
+                .candidates.contains { $0.displayName == "Deep" }
+        )
+        XCTAssertTrue(truncated.allowsPersistingReconcile(
+            retainingFrom: [local, deep], into: deepLayout, bundleExists: stillThere
+        ))
+        XCTAssertTrue(truncated.confirmedAbsentTruncatedKeys(from: [local, deep], bundleExists: stillThere).isEmpty)
+        let gone: (URL) -> Bool = { !$0.path.hasSuffix("Deep.app") }
+        XCTAssertFalse(
+            truncated.retainingCandidates(from: [local, deep], bundleExists: gone)
+                .candidates.contains { $0.displayName == "Deep" }
+        )
+        XCTAssertEqual(
+            truncated.confirmedAbsentTruncatedKeys(from: [local, deep], bundleExists: gone),
+            Set([deep.deduplicationKey])
+        )
+        XCTAssertTrue(truncated.allowsPersistingReconcile(
+            retainingFrom: [local, deep], into: deepLayout, bundleExists: gone
+        ))
+        var marked = deepLayout
+        marked.hiddenAppKeys = [deep.deduplicationKey]
+        marked.appAliases = [deep.deduplicationKey: "Old Deep"]
+        let stripped = LauncherLayout.removingConfirmedAbsentCatalogIdentity(
+            truncated.confirmedAbsentTruncatedKeys(from: [local, deep], bundleExists: gone),
+            from: marked
+        )
+        XCTAssertFalse(stripped.hiddenAppKeys.contains(deep.deduplicationKey))
+        XCTAssertNil(stripped.appAliases[deep.deduplicationKey])
+        XCTAssertEqual(
+            LauncherLayout.removingConfirmedAbsentCatalogIdentity([], from: marked).updatedAt,
+            marked.updatedAt
+        )
+        // An unmounted root is not "confirmed gone" even when the file does not stat.
+        XCTAssertTrue(
+            report.retainingCandidates(from: [local, ext], bundleExists: { _ in false })
+                .candidates.contains { $0.displayName == "Ext" }
+        )
+        XCTAssertTrue(report.confirmedAbsentTruncatedKeys(from: [local, ext], bundleExists: { _ in false }).isEmpty)
+    }
+
     func testCustomRootScanRespectsDepthAndAppCountCaps() async throws {
         // CUSTOM-ROOT-SCAN-LIMIT-01
         let base = FileManager.default.temporaryDirectory.appendingPathComponent("LaunchIconCap-\(UUID().uuidString)")
@@ -707,6 +825,199 @@ final class LaunchIconCoreTests: XCTestCase {
         let uncapped = await AppCatalogScanner().scan(roots: [base])
         XCTAssertTrue(uncapped.truncatedScanRootPaths.isEmpty)
         XCTAssertEqual(Set(uncapped.candidates.map(\.displayName)), ["Shallow", "TooDeep"])
+    }
+
+    func testTruncatedCustomRootRetainsDeepAppFolderAndPage() async throws {
+        // TRUNCATED-ROOT-RETAIN-01: a depth-5 app already placed in a folder
+        // keeps that folder and its page when a later scan stops at depth 4.
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LaunchIconDeepRetain-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+
+        var deepDir = base
+        for part in ["a", "b", "c", "d"] {
+            deepDir = deepDir.appendingPathComponent(part, isDirectory: true)
+            try FileManager.default.createDirectory(at: deepDir, withIntermediateDirectories: true)
+        }
+        _ = try makeMacBundle(named: "TooDeep", in: deepDir, executable: "TooDeep")
+        _ = try makeMacBundle(named: "Partner", in: base, executable: "Partner")
+        for index in 0..<LauncherLayout.pageCapacity {
+            let name = String(format: "Fill%03d", index)
+            _ = try makeMacBundle(named: name, in: base, executable: name)
+        }
+
+        let full = await AppCatalogScanner().scan(roots: [base])
+        XCTAssertTrue(full.truncatedScanRootPaths.isEmpty)
+        XCTAssertTrue(full.candidates.contains { $0.displayName == "TooDeep" })
+
+        var layout = LauncherLayout.reconcile(candidates: full.candidates, into: LayoutState())
+        func id(named name: String, in state: LayoutState, catalog: [AppCandidate]) -> UUID {
+            let key = catalog.first { $0.displayName == name }!.deduplicationKey
+            return state.appKeys.first { $0.value == key }!.key
+        }
+        let deepID = id(named: "TooDeep", in: layout, catalog: full.candidates)
+        let partnerID = id(named: "Partner", in: layout, catalog: full.candidates)
+        let fillerIDs = (0..<LauncherLayout.pageCapacity).map { index in
+            id(named: String(format: "Fill%03d", index), in: layout, catalog: full.candidates)
+        }
+        let folderID = UUID()
+        layout.folders = [
+            folderID: LauncherFolder(
+                id: folderID,
+                name: "Held",
+                itemIDs: [partnerID, deepID],
+                createdAt: Date(timeIntervalSince1970: 1_700_000_000)
+            )
+        ]
+        layout.orderedEntries = fillerIDs.map { .app($0) } + [.folder(folderID)]
+        layout = LauncherLayout.reconcile(candidates: full.candidates, into: layout)
+        let pageSlot = try XCTUnwrap(layout.orderedEntries.firstIndex(of: .folder(folderID)))
+        XCTAssertEqual(pageSlot, LauncherLayout.pageCapacity)
+        XCTAssertEqual(LauncherLayout.pageIndex(containingEntryAt: pageSlot), 1)
+        XCTAssertEqual(layout.folders[folderID]?.itemIDs, [partnerID, deepID])
+
+        let capped = await AppCatalogScanner().scan(
+            roots: [base],
+            requiredRootPaths: [AppCatalogScanner.normalizedRootPath(base.path)]
+        )
+        XCTAssertEqual(capped.truncatedScanRootPaths.map(\.path), [base.path])
+        XCTAssertFalse(capped.candidates.contains { $0.displayName == "TooDeep" })
+        XCTAssertTrue(capped.canPersistReconciledLayout)
+
+        let dropped = LauncherLayout.reconcile(candidates: capped.candidates, into: layout)
+        XCTAssertNil(dropped.folders[folderID])
+
+        let retained = capped.retainingCandidates(from: full.candidates)
+        XCTAssertTrue(retained.candidates.contains { $0.displayName == "TooDeep" })
+        XCTAssertTrue(retained.canPersistReconciledLayout)
+        let reconciled = LauncherLayout.reconcile(candidates: retained.candidates, into: layout)
+        XCTAssertEqual(reconciled.folders[folderID]?.itemIDs, [partnerID, deepID])
+        XCTAssertEqual(reconciled.appKeys[deepID], layout.appKeys[deepID])
+        let keptSlot = try XCTUnwrap(reconciled.orderedEntries.firstIndex(of: .folder(folderID)))
+        XCTAssertEqual(keptSlot, pageSlot)
+        XCTAssertEqual(LauncherLayout.pageIndex(containingEntryAt: keptSlot), 1)
+    }
+
+    func testTruncatedCustomRootRetainsAppsBeyondCountCap() async throws {
+        // Same retain path when the per-root app cap, not depth, stops the scan.
+        let many = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LaunchIconCountRetain-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            AppCatalogScanner.customRootMaxAppsOverride = nil
+            try? FileManager.default.removeItem(at: many)
+        }
+        try FileManager.default.createDirectory(at: many, withIntermediateDirectories: true)
+        AppCatalogScanner.customRootMaxAppsOverride = nil
+        for index in 0..<5 {
+            let name = String(format: "Cap%02d", index)
+            _ = try makeMacBundle(named: name, in: many, executable: name)
+        }
+        let full = await AppCatalogScanner().scan(roots: [many])
+        XCTAssertEqual(full.candidates.count, 5)
+        var layout = LauncherLayout.reconcile(candidates: full.candidates, into: LayoutState())
+        let memberIDs = full.candidates.map { candidate in
+            layout.appKeys.first { $0.value == candidate.deduplicationKey }!.key
+        }
+        let folderID = UUID()
+        layout.folders = [
+            folderID: LauncherFolder(id: folderID, name: "Capped", itemIDs: memberIDs)
+        ]
+        layout.orderedEntries = [.folder(folderID)]
+        layout = LauncherLayout.reconcile(candidates: full.candidates, into: layout)
+        XCTAssertEqual(layout.folders[folderID]?.itemIDs, memberIDs)
+
+        AppCatalogScanner.customRootMaxAppsOverride = 2
+        let capped = await AppCatalogScanner().scan(
+            roots: [many],
+            requiredRootPaths: [AppCatalogScanner.normalizedRootPath(many.path)]
+        )
+        XCTAssertEqual(capped.candidates.count, 2)
+        XCTAssertEqual(capped.truncatedScanRootPaths.map(\.path), [many.path])
+        let retained = capped.retainingCandidates(from: full.candidates)
+        XCTAssertEqual(Set(retained.candidates.map(\.deduplicationKey)), Set(full.candidates.map(\.deduplicationKey)))
+        let reconciled = LauncherLayout.reconcile(candidates: retained.candidates, into: layout)
+        XCTAssertEqual(reconciled.folders[folderID]?.itemIDs, memberIDs)
+        XCTAssertEqual(reconciled.orderedEntries, [.folder(folderID)])
+    }
+
+    func testTruncatedCustomRootDropsDeletedAppAndKeepsTheRest() async throws {
+        // TRUNCATED-ROOT-DROP-GONE-01: the cap still keeps apps it did not
+        // reach. An app deleted past the cap leaves the folder and may be saved.
+        // A sibling the cap also skipped stays, including its alias.
+        let many = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LaunchIconCountDrop-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            AppCatalogScanner.customRootMaxAppsOverride = nil
+            try? FileManager.default.removeItem(at: many)
+        }
+        try FileManager.default.createDirectory(at: many, withIntermediateDirectories: true)
+        for index in 0..<4 {
+            let name = String(format: "Cap%02d", index)
+            _ = try makeMacBundle(named: name, in: many, executable: name)
+        }
+        let full = await AppCatalogScanner().scan(roots: [many])
+        XCTAssertEqual(full.candidates.count, 4)
+        var layout = LauncherLayout.reconcile(candidates: full.candidates, into: LayoutState())
+        let memberIDs = full.candidates.map { candidate in
+            layout.appKeys.first { $0.value == candidate.deduplicationKey }!.key
+        }
+        let folderID = UUID()
+        layout.folders = [
+            folderID: LauncherFolder(id: folderID, name: "Capped", itemIDs: memberIDs)
+        ]
+        layout.orderedEntries = [.folder(folderID)]
+        layout = LauncherLayout.reconcile(candidates: full.candidates, into: layout)
+
+        AppCatalogScanner.customRootMaxAppsOverride = 2
+        let capped = await AppCatalogScanner().scan(
+            roots: [many],
+            requiredRootPaths: [AppCatalogScanner.normalizedRootPath(many.path)]
+        )
+        XCTAssertEqual(capped.candidates.count, 2)
+        XCTAssertEqual(capped.truncatedScanRootPaths.map(\.path), [many.path])
+        let missing = full.candidates.filter { candidate in
+            !capped.candidates.contains { $0.deduplicationKey == candidate.deduplicationKey }
+        }
+        let doomed = try XCTUnwrap(missing.first)
+        let keptPastCap = Array(missing.dropFirst())
+        XCTAssertFalse(keptPastCap.isEmpty)
+        try FileManager.default.removeItem(at: doomed.canonicalURL)
+
+        let retained = capped.retainingCandidates(from: full.candidates)
+        XCTAssertFalse(retained.candidates.contains { $0.deduplicationKey == doomed.deduplicationKey })
+        for other in keptPastCap {
+            XCTAssertTrue(retained.candidates.contains { $0.deduplicationKey == other.deduplicationKey })
+        }
+        layout.appAliases[doomed.deduplicationKey] = "Gone"
+        if let keptKey = keptPastCap.first?.deduplicationKey {
+            layout.appAliases[keptKey] = "Stay"
+            layout.hiddenAppKeys.insert(keptKey)
+        }
+        XCTAssertTrue(capped.allowsPersistingReconcile(retainingFrom: full.candidates, into: layout))
+        var reconciled = LauncherLayout.reconcile(candidates: retained.candidates, into: layout)
+        reconciled = LauncherLayout.removingConfirmedAbsentCatalogIdentity(
+            capped.confirmedAbsentTruncatedKeys(from: full.candidates),
+            from: reconciled
+        )
+        XCTAssertNil(reconciled.appKeys.values.first { $0 == doomed.deduplicationKey })
+        XCTAssertNil(reconciled.appAliases[doomed.deduplicationKey])
+        let doomedID = layout.appKeys.first { $0.value == doomed.deduplicationKey }!.key
+        XCTAssertNil(reconciled.appKeys[doomedID])
+        XCTAssertFalse(reconciled.orderedEntries.contains(.app(doomedID)))
+        XCTAssertFalse(reconciled.folders.values.contains { $0.itemIDs.contains(doomedID) })
+        for other in full.candidates where other.deduplicationKey != doomed.deduplicationKey {
+            XCTAssertTrue(reconciled.appKeys.values.contains(other.deduplicationKey)
+                || reconciled.hiddenAppKeys.contains(other.deduplicationKey))
+        }
+        if let keptKey = keptPastCap.first?.deduplicationKey {
+            XCTAssertEqual(reconciled.appAliases[keptKey], "Stay")
+            XCTAssertTrue(reconciled.hiddenAppKeys.contains(keptKey))
+        }
+        XCTAssertEqual(
+            capped.confirmedAbsentTruncatedKeys(from: full.candidates),
+            Set([doomed.deduplicationKey])
+        )
     }
 
     func testUnavailableCustomRootCopyKeyExists() {
@@ -780,6 +1091,10 @@ final class LaunchIconCoreTests: XCTestCase {
             behavior: .homeAfter30Seconds, secondsSinceLastDismiss: 30, isSettingsHandoffRestore: false))
         XCTAssertFalse(ReopenPageCopy.shouldResetToHomePageOnAppear(
             behavior: .homeAfter1Minute, secondsSinceLastDismiss: nil, isSettingsHandoffRestore: false))
+        XCTAssertTrue(ReopenPageCopy.shouldStampDismissInstant(windowVisible: true, alreadyDismissing: false))
+        XCTAssertFalse(ReopenPageCopy.shouldStampDismissInstant(windowVisible: true, alreadyDismissing: true))
+        XCTAssertFalse(ReopenPageCopy.shouldStampDismissInstant(windowVisible: false, alreadyDismissing: false))
+        XCTAssertFalse(ReopenPageCopy.shouldStampDismissInstant(windowVisible: false, alreadyDismissing: true))
         let suite = "LaunchIcon.ReopenPageTest.\(UUID().uuidString)"
         defer { UserDefaults().removePersistentDomain(forName: suite) }
         let store = LauncherPreferencesStore(suiteName: suite)
@@ -794,7 +1109,16 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertEqual(fallback.reopenPageBehavior, .rememberLast)
     }
 
-
+    func testDeferredGridRearrangeSkipsHiddenLauncher() {
+        XCTAssertTrue(LauncherLayout.shouldApplyDeferredGridRearrange(
+            isDismissing: false, isVisible: true, startedToken: 1, currentToken: 1))
+        XCTAssertFalse(LauncherLayout.shouldApplyDeferredGridRearrange(
+            isDismissing: true, isVisible: true, startedToken: 1, currentToken: 1))
+        XCTAssertFalse(LauncherLayout.shouldApplyDeferredGridRearrange(
+            isDismissing: false, isVisible: false, startedToken: 1, currentToken: 1))
+        XCTAssertFalse(LauncherLayout.shouldApplyDeferredGridRearrange(
+            isDismissing: false, isVisible: true, startedToken: 1, currentToken: 2))
+    }
 
     func testFolderSortAccessibilityHelpCopy() {
         XCTAssertEqual(LauncherLayout.sortFolderByNameAccessibilityHelp(localize: { $0 }), "只调整这个文件夹内的顺序，主屏幕不变")
@@ -853,6 +1177,10 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertFalse(PinchDismissPolicy.shouldDismiss(
             enabled: true, accumulatedMagnification: -1.0,
             isPaging: false, isDragging: false, isDismissing: true))
+        XCTAssertFalse(PinchDismissPolicy.shouldDismiss(
+            enabled: true, accumulatedMagnification: -1.0,
+            isPaging: false, isDragging: false, isDismissing: false,
+            isEditingText: true))
         let suite = "LaunchIcon.PinchDismissTest.\(UUID().uuidString)"
         defer { UserDefaults().removePersistentDomain(forName: suite) }
         let store = LauncherPreferencesStore(suiteName: suite)
@@ -3635,6 +3963,15 @@ final class LaunchIconCoreTests: XCTestCase {
         // Option must not steal the secondary-click menu.
         XCTAssertEqual(
             LauncherLayout.statusItemButtonAction(for: .secondary, optionDown: true),
+            .showMenu
+        )
+        // STATUS-ITEM-NONPOINTER-MENU-01: VoiceOver / keyboard opens the menu.
+        XCTAssertEqual(
+            LauncherLayout.statusItemButtonAction(for: .nonPointer),
+            .showMenu
+        )
+        XCTAssertEqual(
+            LauncherLayout.statusItemButtonAction(for: .nonPointer, optionDown: true),
             .showMenu
         )
     }
@@ -8038,6 +8375,73 @@ final class LaunchIconCoreTests: XCTestCase {
         )
     }
 
+    func testGridKeyboardShiftExtendsSelectionWithoutPaging() {
+        let ids = (0..<16).map { _ in UUID() }
+        XCTAssertTrue(LauncherLayout.gridKeyboardExtendsSelection(
+            shift: true, command: false, option: false, control: false
+        ))
+        XCTAssertFalse(LauncherLayout.gridKeyboardExtendsSelection(
+            shift: true, command: true, option: false, control: false
+        ))
+        XCTAssertFalse(LauncherLayout.gridKeyboardExtendsSelection(
+            shift: false, command: false, option: false, control: false
+        ))
+
+        let down = LauncherLayout.gridKeyboardShiftStep(
+            focusedID: ids[0],
+            slot: 0,
+            presentedOrder: ids,
+            columns: 7,
+            direction: .down,
+            walksLeftRight: false,
+            current: .empty
+        )
+        XCTAssertTrue(down.consumesKey)
+        XCTAssertEqual(down.focusID, ids[7])
+        XCTAssertEqual(down.selection.rangeAnchorID, ids[0])
+        XCTAssertEqual(down.selection.orderedIDs, Array(ids[0...7]))
+
+        let further = LauncherLayout.gridKeyboardShiftStep(
+            focusedID: ids[7],
+            slot: 7,
+            presentedOrder: ids,
+            columns: 7,
+            direction: .right,
+            walksLeftRight: true,
+            current: down.selection
+        )
+        XCTAssertTrue(further.consumesKey)
+        XCTAssertEqual(further.focusID, ids[8])
+        XCTAssertEqual(further.selection.rangeAnchorID, ids[0])
+        XCTAssertEqual(further.selection.orderedIDs, Array(ids[0...8]))
+
+        let page = LauncherLayout.gridKeyboardShiftStep(
+            focusedID: ids[1],
+            slot: 1,
+            presentedOrder: ids,
+            columns: 7,
+            direction: .left,
+            walksLeftRight: false,
+            current: down.selection
+        )
+        XCTAssertFalse(page.consumesKey)
+        XCTAssertNil(page.focusID)
+        XCTAssertEqual(page.selection, down.selection)
+
+        let edge = LauncherLayout.gridKeyboardShiftStep(
+            focusedID: ids[0],
+            slot: 0,
+            presentedOrder: ids,
+            columns: 7,
+            direction: .up,
+            walksLeftRight: false,
+            current: LauncherItemSelection(orderedIDs: [ids[0]], rangeAnchorID: ids[0])
+        )
+        XCTAssertTrue(edge.consumesKey)
+        XCTAssertEqual(edge.focusID, ids[0])
+        XCTAssertEqual(edge.selection.orderedIDs, [ids[0]])
+    }
+
     func testRepeatedPageTurnContinuesFromInFlightPage() {
         XCTAssertEqual(
             LauncherLayout.pageIndex(movingBy: 1, from: 0, inFlightPage: nil, queuedPage: nil, pageCount: 4),
@@ -9036,6 +9440,131 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertEqual(LauncherLayout.textByRemovingMarkedRange("草稿", utf16Location: 0, utf16Length: 1), "稿")
     }
 
+    func testSearchGridKeyRouteDoesNotReenterTheFieldEditor() {
+        XCTAssertEqual(
+            LauncherLayout.searchGridKeyRoute(
+                folderOpen: false,
+                commandOrControl: false,
+                hasPrintableCharacter: true,
+                alreadyRouting: false
+            ),
+            .interpret
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchGridKeyRoute(
+                folderOpen: false,
+                commandOrControl: false,
+                hasPrintableCharacter: true,
+                alreadyRouting: true
+            ),
+            .consume,
+            "a keyDown echo must not start another route"
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchGridKeyRoute(
+                folderOpen: true,
+                commandOrControl: false,
+                hasPrintableCharacter: true,
+                alreadyRouting: false
+            ),
+            .ignore
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchGridKeyRoute(
+                folderOpen: false,
+                commandOrControl: true,
+                hasPrintableCharacter: true,
+                alreadyRouting: false
+            ),
+            .ignore
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchGridKeyRoute(
+                folderOpen: false,
+                commandOrControl: false,
+                hasPrintableCharacter: false,
+                alreadyRouting: false
+            ),
+            .ignore
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchGridKeyRoute(
+                folderOpen: true,
+                commandOrControl: true,
+                hasPrintableCharacter: true,
+                alreadyRouting: true
+            ),
+            .consume,
+            "an in-progress route is consumed even when the key would otherwise be ignored"
+        )
+    }
+
+    func testSearchGridKeyCommitLandsTheLetter() {
+        XCTAssertEqual(LauncherLayout.searchGridTypedCharacters(raw: "C", ignoringModifiers: "C"), "C")
+        XCTAssertEqual(LauncherLayout.searchGridTypedCharacters(raw: "", ignoringModifiers: "C"), "C")
+        XCTAssertEqual(LauncherLayout.searchGridTypedCharacters(raw: "", ignoringModifiers: "Clock"), "")
+        XCTAssertEqual(LauncherLayout.searchGridTypedCharacters(raw: "", ignoringModifiers: "\u{F704}"), "")
+        XCTAssertEqual(
+            LauncherLayout.searchGridKeyCommit(
+                before: "",
+                editorAfter: "",
+                hadMarkedText: false,
+                hasMarkedText: false,
+                typed: "C",
+                committed: ""
+            ),
+            .replace("C"),
+            "a letter the editor ignores is still the query"
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchGridKeyCommit(
+                before: "Cl",
+                editorAfter: "Cl",
+                hadMarkedText: false,
+                hasMarkedText: false,
+                typed: "o",
+                committed: "Cl"
+            ),
+            .replace("Clo")
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchGridKeyCommit(
+                before: "",
+                editorAfter: "ni",
+                hadMarkedText: false,
+                hasMarkedText: true,
+                typed: "n",
+                committed: ""
+            ),
+            .keepEditor,
+            "marked pinyin stays in the editor"
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchGridKeyCommit(
+                before: "C",
+                editorAfter: "Cl",
+                hadMarkedText: false,
+                hasMarkedText: false,
+                typed: "l",
+                committed: "Cl"
+            ),
+            .keepEditor,
+            "the field already has the editor's text"
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchGridKeyCommit(
+                before: "C",
+                editorAfter: "Cl",
+                hadMarkedText: false,
+                hasMarkedText: false,
+                typed: "l",
+                committed: "C"
+            ),
+            .replace("Cl"),
+            "an editor insert the field has not committed is copied across"
+        )
+    }
+
     func testSearchScrollQueryKeyIgnoresCaseWidthAccentsAndInteriorSpaces() {
         let fullwidthClock = "\u{FF23}\u{FF4C}\u{FF4F}\u{FF43}\u{FF4B}"
         XCTAssertEqual(LauncherLayout.searchScrollQueryKey("Clock"), LauncherLayout.searchScrollQueryKey("clock"))
@@ -9102,6 +9631,76 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertEqual(
             LauncherLayout.scrolledPageOffset(current: -20, documentLength: 100, viewportLength: 50, forward: true),
             30
+        )
+    }
+
+    func testScrollOffsetRevealingItemShowsTheWholeCell() {
+        XCTAssertEqual(
+            LauncherLayout.scrollOffsetRevealingItem(
+                current: 0, viewportLength: 400, documentLength: 2000, itemMin: 20, itemLength: 80
+            ),
+            0,
+            "a cell already inside the clip stays put"
+        )
+        XCTAssertEqual(
+            LauncherLayout.scrollOffsetRevealingItem(
+                current: 0, viewportLength: 410, documentLength: 1200, itemMin: 802, itemLength: 88
+            ),
+            480,
+            "a cell below the fold is brought fully inside, not left as a sliver"
+        )
+        XCTAssertEqual(
+            LauncherLayout.scrollOffsetRevealingItem(
+                current: 400, viewportLength: 410, documentLength: 1200, itemMin: 802, itemLength: 88
+            ),
+            480,
+            "two points of overlap is not enough"
+        )
+        XCTAssertEqual(
+            LauncherLayout.scrollOffsetRevealingItem(
+                current: 500, viewportLength: 400, documentLength: 2000, itemMin: 40, itemLength: 80
+            ),
+            40,
+            "a cell above the clip aligns to its start"
+        )
+        XCTAssertEqual(
+            LauncherLayout.scrollOffsetRevealingItem(
+                current: 100, viewportLength: 100, documentLength: 2000, itemMin: 50, itemLength: 200
+            ),
+            100,
+            "a cell taller than the clip that already spans it stays"
+        )
+        XCTAssertEqual(
+            LauncherLayout.scrollOffsetRevealingItem(
+                current: 0, viewportLength: 100, documentLength: 2000, itemMin: 300, itemLength: 200
+            ),
+            300
+        )
+        XCTAssertEqual(
+            LauncherLayout.scrollOffsetRevealingItem(
+                current: 900, viewportLength: 100, documentLength: 500, itemMin: 480, itemLength: 80
+            ),
+            400,
+            "the offset cannot run past the document"
+        )
+    }
+
+    func testScrollRectRevealingFocusedCellUsesTheWholeCell() {
+        let cell = CGRect(x: 10, y: 20, width: 138, height: 88)
+        let sliver = CGRect(x: 10, y: 106, width: 138, height: 2)
+        XCTAssertEqual(
+            LauncherLayout.scrollRectRevealingFocusedCell(cellBounds: cell, requested: sliver),
+            cell
+        )
+        XCTAssertEqual(
+            LauncherLayout.scrollRectRevealingFocusedCell(cellBounds: .zero, requested: sliver),
+            sliver,
+            "an unlaid-out cell keeps the rect AppKit asked for"
+        )
+        let nonFinite = CGRect(x: CGFloat.infinity, y: 0, width: 40, height: 40)
+        XCTAssertEqual(
+            LauncherLayout.scrollRectRevealingFocusedCell(cellBounds: nonFinite, requested: sliver),
+            sliver
         )
     }
 
@@ -10979,6 +11578,164 @@ final class LaunchIconCoreTests: XCTestCase {
                 launcherDismissing: false
             )
         )
+    }
+
+    func testLayoutDragDockRevealWaitsForScreenEdge() {
+        let screen = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let app = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Example.app"),
+            bundleIdentifier: "com.example.app",
+            displayName: "Example",
+            sourcePriority: 0,
+            discoveredAt: .distantPast
+        )
+        let offer = LauncherLayout.layoutDragOutsideOffer(for: app, isFolder: false)
+        // Middle of the grid, the footer band, and the menu-bar edge stay hidden.
+        XCTAssertFalse(LauncherLayout.shouldRevealDockForDragLocation(
+            offer: offer, pointerInScreen: CGPoint(x: 720, y: 450),
+            screenFrame: screen, currentlyRevealed: false))
+        XCTAssertFalse(LauncherLayout.shouldRevealDockForDragLocation(
+            offer: offer, pointerInScreen: CGPoint(x: 720, y: 56),
+            screenFrame: screen, currentlyRevealed: false))
+        XCTAssertFalse(LauncherLayout.shouldRevealDockForDragLocation(
+            offer: offer, pointerInScreen: CGPoint(x: 720, y: 890),
+            screenFrame: screen, currentlyRevealed: false))
+        XCTAssertTrue(LauncherLayout.shouldRevealDockForDragLocation(
+            offer: offer, pointerInScreen: CGPoint(x: 720, y: 4),
+            screenFrame: screen, currentlyRevealed: false))
+        XCTAssertTrue(LauncherLayout.shouldRevealDockForDragLocation(
+            offer: offer, pointerInScreen: CGPoint(x: 2, y: 400),
+            screenFrame: screen, currentlyRevealed: false))
+        XCTAssertTrue(LauncherLayout.shouldRevealDockForDragLocation(
+            offer: offer, pointerInScreen: CGPoint(x: 1438, y: 400),
+            screenFrame: screen, currentlyRevealed: false))
+        // Hysteresis: the pointer can sit on a revealed Dock without hiding it,
+        // and a return to the grid hides it again.
+        XCTAssertTrue(LauncherLayout.shouldRevealDockForDragLocation(
+            offer: offer, pointerInScreen: CGPoint(x: 720, y: 70),
+            screenFrame: screen, currentlyRevealed: true))
+        XCTAssertFalse(LauncherLayout.shouldRevealDockForDragLocation(
+            offer: offer, pointerInScreen: CGPoint(x: 720, y: 220),
+            screenFrame: screen, currentlyRevealed: true))
+        XCTAssertFalse(LauncherLayout.shouldRevealDockForDragLocation(
+            offer: .none, pointerInScreen: CGPoint(x: 720, y: 0),
+            screenFrame: screen, currentlyRevealed: false))
+        XCTAssertFalse(LauncherLayout.shouldRevealDockForDragLocation(
+            offer: offer, pointerInScreen: CGPoint(x: 720, y: 0),
+            screenFrame: .zero, currentlyRevealed: false))
+        XCTAssertTrue(LauncherLayout.launcherTextRejectsFileURLDrop(pasteboardHasFileURL: true))
+        XCTAssertFalse(LauncherLayout.launcherTextRejectsFileURLDrop(pasteboardHasFileURL: false))
+    }
+
+    func testLayoutDragFileURLWaitsUntilPointerLeavesWindow() {
+        let window = CGRect(x: 448, y: 156, width: 1024, height: 768)
+        let app = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/System/Applications/Calculator.app"),
+            bundleIdentifier: "com.apple.calculator",
+            displayName: "Calculator",
+            sourcePriority: 0,
+            discoveredAt: .distantPast
+        )
+        let offer = LauncherLayout.layoutDragOutsideOffer(for: app, isFolder: false)
+        // Icon row and the middle of the launcher stay a layout drag.
+        XCTAssertFalse(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: CGPoint(x: 620, y: 760),
+            launcherWindowFrame: window))
+        XCTAssertFalse(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: CGPoint(x: 960, y: 540),
+            launcherWindowFrame: window))
+        // Just outside the window, still far from the screen edge: the Dock
+        // can link the app, and the in-window hotspot is already gone.
+        XCTAssertTrue(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: CGPoint(x: 960, y: 140),
+            launcherWindowFrame: window))
+        XCTAssertTrue(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: CGPoint(x: 1500, y: 540),
+            launcherWindowFrame: window))
+        XCTAssertFalse(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: .none,
+            pointerInScreen: CGPoint(x: 960, y: 40),
+            launcherWindowFrame: window))
+        XCTAssertFalse(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: CGPoint(x: 960, y: 40),
+            launcherWindowFrame: .zero))
+    }
+
+    func testAccessibilityFramePrefersTheViewScreenFrame() {
+        let visual = CGRect(x: 760, y: 850, width: 384, height: 28)
+        let flipped = CGRect(x: 767, y: 196, width: 386, height: 30)
+        XCTAssertEqual(
+            LauncherLayout.accessibilityFrameOnScreen(viewFrameInScreen: visual, reportedFrame: flipped),
+            visual
+        )
+        XCTAssertEqual(
+            LauncherLayout.accessibilityFrameOnScreen(viewFrameInScreen: visual, reportedFrame: .null),
+            visual
+        )
+        XCTAssertEqual(
+            LauncherLayout.accessibilityFrameOnScreen(viewFrameInScreen: .zero, reportedFrame: flipped),
+            flipped
+        )
+        let unusable = LauncherLayout.accessibilityFrameOnScreen(
+            viewFrameInScreen: .null,
+            reportedFrame: .null
+        )
+        XCTAssertEqual(unusable, .zero)
+        XCTAssertFalse(unusable.isNull)
+        XCTAssertFalse(unusable.isInfinite)
+        let infiniteReported = LauncherLayout.accessibilityFrameOnScreen(
+            viewFrameInScreen: .zero,
+            reportedFrame: .infinite
+        )
+        XCTAssertEqual(infiniteReported, .zero)
+        XCTAssertFalse(infiniteReported.isInfinite)
+        let nonFiniteView = CGRect(x: 10, y: CGFloat.infinity, width: 40, height: 20)
+        XCTAssertEqual(
+            LauncherLayout.accessibilityFrameOnScreen(viewFrameInScreen: nonFiniteView, reportedFrame: flipped),
+            flipped
+        )
+    }
+
+    func testApplicationAccessibilityFrameUsesTheKeyWindow() {
+        let key = CGRect(x: 100, y: 200, width: 1024, height: 768)
+        let other = CGRect(x: 8, y: 900, width: 40, height: 24)
+        XCTAssertEqual(
+            LauncherLayout.applicationAccessibilityFrame(
+                keyWindowFrame: key,
+                otherVisibleWindowFrames: [other],
+                reportedFrame: .null
+            ),
+            key
+        )
+        XCTAssertEqual(
+            LauncherLayout.applicationAccessibilityFrame(
+                keyWindowFrame: .zero,
+                otherVisibleWindowFrames: [other],
+                reportedFrame: .null
+            ),
+            other
+        )
+        XCTAssertEqual(
+            LauncherLayout.applicationAccessibilityFrame(
+                keyWindowFrame: .null,
+                otherVisibleWindowFrames: [],
+                reportedFrame: CGRect(x: 12, y: 12, width: 80, height: 40)
+            ),
+            CGRect(x: 12, y: 12, width: 80, height: 40)
+        )
+        let missing = LauncherLayout.applicationAccessibilityFrame(
+            keyWindowFrame: nil,
+            otherVisibleWindowFrames: [],
+            reportedFrame: .null
+        )
+        XCTAssertEqual(missing, .zero)
+        XCTAssertFalse(missing.isNull)
+        XCTAssertFalse(missing.isInfinite)
     }
 
     func testRevealInFinderURLsForMultiSelectionSkipsFoldersAndDedupes() {

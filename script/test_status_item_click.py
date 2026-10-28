@@ -38,6 +38,10 @@ need("button?.action = #selector(statusItemButtonActivated" in cfg
 need("STATUS-ITEM-OPTION-SETTINGS-01" in core or "openSettings" in core, "Core missing Option→Settings action")
 need("case .openSettings" in delegate or "openSettings()" in delegate, "Direct must open Settings on Option+primary")
 need("optionDown" in core and "optionDown" in delegate, "optionDown must flow Core←Direct")
+need(".nonPointer" in core, "Core must treat non-pointer activation as its own kind")
+need("case .secondary, .nonPointer" in core, "non-pointer activation must show the menu")
+need("return .nonPointer" in delegate, "Direct must map a missing or non-mouse event to nonPointer")
+need("statusItemButtonAction(for: .nonPointer" in tests, "Core test must cover non-pointer menu")
 
 # No paging retune in the click path
 chunk = delegate[delegate.index("statusItemButtonActivated"):

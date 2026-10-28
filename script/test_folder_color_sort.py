@@ -7,7 +7,7 @@ checks = [
     ("menu title", "L(LauncherLayout.sortFolderByColorMenuTitleKey)" in w),
     ("menu selector", "#selector(sortFolderByColorMenuItem)" in w),
     ("folder-only callback", "self.onSortFolderByColor = isFolder ? onSortFolderByColor : nil" in w),
-    ("tile wiring", "onSortFolderByColor: sortFolderByColor)" in w),
+    ("tile wiring", "onSortFolderByColor: sortFolderByColor" in w),
     ("name sort kept", "#selector(sortFolderByNameMenuItem)" in w),
 ]
 s = w.find("private func sortFolderByColorFromMenu")
@@ -16,6 +16,7 @@ s = w.find("private func applyFolderColorSort")
 body = launch + w[s:w.find("\n    }\n", s)]
 checks += [
     ("offmain sampler", "IconColorSampler.shared.samples(for: members)" in launch),
+    ("hide drops color sort", "shouldApplyDeferredGridRearrange" in launch),
 
     ("core call", "LauncherLayout.sortingFolderMembersByColor(" in body),
     ("not in folder/search", "openedFolderID == nil" in body and "!isSearching" in body),

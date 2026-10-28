@@ -1664,6 +1664,126 @@ final class LauncherDragUITests: XCTestCase {
         }
     }
 
+    /// REOPEN-PAGE-BEHAVIOR-01 / daily T5. Always-home snaps while the window
+    /// is hidden. This does not drive `showPage`.
+    @MainActor
+    func testReopenAlwaysHomeReturnsToFirstPage() throws {
+        try withFixture(additionalApps: 34, buttonScript: true, reopenPageBehavior: "alwaysHome") { app, layout in
+            let secondPage = app.buttons["第 2 页"]
+            XCTAssertTrue(secondPage.waitForExistence(timeout: 15))
+            secondPage.click()
+            XCTAssertTrue(app.buttons["Fixture 34"].waitForExistence(timeout: 5))
+            XCTAssertFalse(app.buttons["计算器"].exists)
+
+            let window = app.windows.firstMatch
+            window.coordinate(withNormalizedOffset: CGVector(dx: 0.1, dy: 0.9)).click()
+            let hidden = expectation(
+                for: NSPredicate(format: "exists == NO"),
+                evaluatedWith: window,
+                handler: nil
+            )
+            wait(for: [hidden], timeout: 3)
+            // Carbon hotkey has no window to type into after orderOut.
+            // The debug script calls the same show() the hotkey uses.
+            let script = layout.deletingLastPathComponent().appendingPathComponent("button-script")
+            try Data("show-launcher".utf8).write(to: script, options: .atomic)
+            XCTAssertTrue(app.buttons["计算器"].waitForExistence(timeout: 8))
+            XCTAssertFalse(app.buttons["Fixture 34"].exists)
+            XCTAssertTrue(app.buttons["第 2 页"].waitForExistence(timeout: 3))
+        }
+    }
+
+    /// FOLDER-PAGE-KEYS-01 / daily T5. Page Down scrolls a tall folder.
+    /// Closing it must still be on the main grid's first page.
+    @MainActor
+    func testFolderPageDownScrollsMembersWithoutTurningMainGrid() throws {
+        try withFixture(additionalApps: 68) { app, layout in
+            app.terminate()
+            try seedLeadingFolder(in: layout, memberCount: 30, name: "翻页键")
+            app.launch()
+
+            let folder = app.buttons["文件夹 翻页键"]
+            XCTAssertTrue(folder.waitForExistence(timeout: 15))
+            XCTAssertFalse(app.buttons["Fixture 63"].exists)
+            folder.click()
+
+            let panel = app.groups["文件夹 翻页键"]
+            XCTAssertTrue(panel.waitForExistence(timeout: 5))
+            // Off-screen members are not in the AX tree. The sixth row starts
+            // at Fixture 24; the fifth row's last icon is Fixture 23.
+            XCTAssertTrue(app.buttons["Fixture 23"].waitForExistence(timeout: 5))
+            XCTAssertFalse(app.buttons["Fixture 24"].exists)
+            let calculator = app.buttons["计算器"]
+            let focused = expectation(
+                for: NSPredicate(format: "hasKeyboardFocus == true"),
+                evaluatedWith: calculator,
+                handler: nil
+            )
+            wait(for: [focused], timeout: 5)
+            app.typeKey(XCUIKeyboardKey.pageDown, modifierFlags: [])
+            XCTAssertTrue(app.buttons["Fixture 24"].waitForExistence(timeout: 3))
+
+            app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
+            let closed = expectation(
+                for: NSPredicate(format: "exists == NO"),
+                evaluatedWith: panel,
+                handler: nil
+            )
+            wait(for: [closed], timeout: 3)
+            XCTAssertTrue(folder.waitForExistence(timeout: 3))
+            XCTAssertFalse(app.buttons["Fixture 63"].exists)
+
+            app.typeKey(XCUIKeyboardKey.rightArrow, modifierFlags: [])
+            XCTAssertTrue(app.buttons["Fixture 63"].waitForExistence(timeout: 5))
+            XCTAssertFalse(folder.exists)
+        }
+    }
+
+    /// GRID-KEY-WALK-01 / daily T5. Up and left at the first folder member
+    /// stay there. The main grid is still on page 1 after the folder closes,
+    /// and right arrow can still turn that page.
+    @MainActor
+    func testArrowAtFolderEdgeStaysInsideAndKeepsMainPage() throws {
+        try withFixture(additionalApps: 36) { app, layout in
+            app.terminate()
+            try seedLeadingFolder(in: layout, memberCount: 2, name: "边缘")
+            app.launch()
+
+            let folder = app.buttons["文件夹 边缘"]
+            XCTAssertTrue(folder.waitForExistence(timeout: 15))
+            XCTAssertFalse(app.buttons["Fixture 35"].exists)
+            folder.click()
+            let panel = app.groups["文件夹 边缘"]
+            XCTAssertTrue(panel.waitForExistence(timeout: 5))
+            let calculator = app.buttons["计算器"]
+            let focused = expectation(
+                for: NSPredicate(format: "hasKeyboardFocus == true"),
+                evaluatedWith: calculator,
+                handler: nil
+            )
+            wait(for: [focused], timeout: 5)
+
+            app.typeKey(XCUIKeyboardKey.upArrow, modifierFlags: [])
+            XCTAssertEqual(calculator.value(forKey: "hasKeyboardFocus") as? Bool, true)
+            app.typeKey(XCUIKeyboardKey.leftArrow, modifierFlags: [])
+            XCTAssertEqual(calculator.value(forKey: "hasKeyboardFocus") as? Bool, true)
+            XCTAssertFalse(app.buttons["Fixture 35"].exists)
+
+            app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
+            let closed = expectation(
+                for: NSPredicate(format: "exists == NO"),
+                evaluatedWith: panel,
+                handler: nil
+            )
+            wait(for: [closed], timeout: 3)
+            XCTAssertTrue(folder.waitForExistence(timeout: 3))
+            XCTAssertFalse(app.buttons["Fixture 35"].exists)
+            app.typeKey(XCUIKeyboardKey.rightArrow, modifierFlags: [])
+            XCTAssertTrue(app.buttons["Fixture 35"].waitForExistence(timeout: 5))
+            XCTAssertFalse(folder.exists)
+        }
+    }
+
     @MainActor
     func testFullPageBoundariesAtThirtyFiveAndSeventyApps() throws {
         try withFixture(additionalApps: 33) { app, _ in
@@ -1827,6 +1947,7 @@ final class LauncherDragUITests: XCTestCase {
         dismissDelayMS: Int? = nil,
         mergeDiagnostics: Bool = false,
         buttonScript: Bool = false,
+        reopenPageBehavior: String? = nil,
         _ body: (XCUIApplication, URL) throws -> Void
     ) throws {
         let directory = FileManager.default.temporaryDirectory
@@ -1881,6 +2002,9 @@ final class LauncherDragUITests: XCTestCase {
         }
         if let dismissDelayMS {
             app.launchEnvironment["LAUNCHICON_TEST_DISMISS_DELAY_MS"] = String(dismissDelayMS)
+        }
+        if let reopenPageBehavior {
+            app.launchEnvironment["LAUNCHICON_TEST_REOPEN_PAGE_BEHAVIOR"] = reopenPageBehavior
         }
         app.launch()
         defer { app.terminate() }
@@ -2031,6 +2155,28 @@ final class LauncherDragUITests: XCTestCase {
         app.buttons.allElementsBoundByIndex.map(\.label).filter {
             $0 == "计算器" || $0 == "时钟" || $0.hasPrefix("Fixture ")
         }
+    }
+
+    private func seedLeadingFolder(in layout: URL, memberCount: Int, name: String) throws {
+        let data = try Data(contentsOf: layout)
+        var document = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let entries = try XCTUnwrap(document["orderedEntries"] as? [[String: Any]])
+        XCTAssertGreaterThan(entries.count, memberCount)
+        let memberIDs = try entries.prefix(memberCount).map { entry in
+            try XCTUnwrap((entry["app"] as? [String: String])?["_0"])
+        }
+        let folderID = UUID().uuidString
+        document["orderedEntries"] = [["folder": ["_0": folderID]]] + Array(entries.dropFirst(memberCount))
+        document["folders"] = [folderID, [
+            "id": folderID,
+            "name": name,
+            "itemIDs": memberIDs,
+            "createdAt": 0.0
+        ]]
+        let seeded = try JSONSerialization.data(withJSONObject: document, options: [.sortedKeys])
+        try seeded.write(to: layout, options: .atomic)
+        XCTAssertEqual(try LayoutSnapshot.load(from: layout).folders.count, 1)
+        XCTAssertEqual(try LayoutSnapshot.load(from: layout).folders.values.first?.itemIDs.count, memberCount)
     }
 
     private func seedTwentyFiveMemberFolder(in layout: URL) throws {

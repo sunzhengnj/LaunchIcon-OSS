@@ -27,12 +27,20 @@ for needle in (
     "reopenPageBehavior: LauncherReopenPageBehavior = .rememberLast",
     "enum ReopenPageCopy",
     "shouldResetToHomePageOnAppear",
+    "shouldStampDismissInstant",
 ):
     if needle not in prefs:
         fail(f"Core missing {needle!r}")
 
 if "testReopenPageBehaviorDefaultsAndPolicy" not in tests:
     fail("Core test missing")
+ui = (ROOT / "Tests/UITests/LauncherDragUITests.swift").read_text(encoding="utf-8")
+if "testReopenAlwaysHomeReturnsToFirstPage" not in ui:
+    fail("UI test missing always-home reopen")
+if "LAUNCHICON_TEST_REOPEN_PAGE_BEHAVIOR" not in ui or "LAUNCHICON_TEST_REOPEN_PAGE_BEHAVIOR" not in delegate:
+    fail("UI reopen override must be an env var the app applies with setReopenPageBehavior")
+if "shouldStampDismissInstant" not in tests:
+    fail("Core test missing dismiss-stamp assertions")
 
 for needle in (
     "reopenPagePopup",
@@ -58,6 +66,7 @@ for needle in (
     "func setReopenPageBehavior",
     "func snapGridToHomePageForReopen",
     "lastDismissDate = Date()",
+    "ReopenPageCopy.shouldStampDismissInstant",
     "ReopenPageCopy.shouldResetToHomePageOnAppear",
 ):
     if needle not in direct:

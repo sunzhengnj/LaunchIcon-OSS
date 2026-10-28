@@ -492,6 +492,15 @@ public enum ReopenPageCopy {
         guard let elapsed = secondsSinceLastDismiss else { return false }
         return elapsed >= delay
     }
+
+    /// Stamp the home-reset clock only when a visible launcher starts
+    /// dismissing. A second hide during the fade must not push that clock.
+    public static func shouldStampDismissInstant(
+        windowVisible: Bool,
+        alreadyDismissing: Bool
+    ) -> Bool {
+        windowVisible && !alreadyDismissing
+    }
 }
 
 /// PINCH-TO-DISMISS-01: LaunchOS-parity pinch-in to hide while the launcher is open.
@@ -630,9 +639,10 @@ public enum PinchDismissPolicy {
         isPaging: Bool,
         isDragging: Bool,
         isDismissing: Bool,
+        isEditingText: Bool = false,
         threshold: Double = pinchInThreshold
     ) -> Bool {
-        guard enabled, !isPaging, !isDragging, !isDismissing else { return false }
+        guard enabled, !isPaging, !isDragging, !isDismissing, !isEditingText else { return false }
         return accumulatedMagnification <= threshold
     }
 }

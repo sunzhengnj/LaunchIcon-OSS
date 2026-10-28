@@ -55,7 +55,9 @@ public struct CatalogScanReport: Sendable {
     /// retain prior candidates under these roots before reconcile.
     public let unavailableRequiredRootPaths: [URL]
     /// User-added roots whose scan stopped early (depth / app-count cap).
-    /// Informational only — does **not** block `canPersistReconciledLayout`.
+    /// Does **not** block `canPersistReconciledLayout`. Callers must
+    /// `retainingCandidates` so apps the cap skipped keep their layout slots.
+    /// A bundle directory that is already gone is not kept.
     public let truncatedScanRootPaths: [URL]
     public let wasCancelled: Bool
 
@@ -87,23 +89,45 @@ public struct CatalogScanReport: Sendable {
         self.wasCancelled = wasCancelled
     }
 
-    /// MISSING-ROOT-PARTIAL-EDIT-01 — keep prior apps that lived under an
-    /// unmounted required root so reconcile does not drop their layout slots.
+    /// The bundle directory is still on disk. A missing directory means the
+    /// app was removed; a file that is not a directory is not a bundle.
+    /// Unmounted volumes are not asked — those roots are unavailable, not truncated.
+    public static func bundleDirectoryExists(_ url: URL) -> Bool {
+        var isDirectory = ObjCBool(false)
+        return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory)
+            && isDirectory.boolValue
+    }
+
+    /// Keep prior apps that lived under an unmounted required root, or under a
+    /// custom root this scan did not finish, so reconcile does not drop their slots.
+    /// An explicit `underUnavailableRoots` replaces only the missing-root list.
+    /// Truncated roots on this report always participate.
+    /// TRUNCATED-ROOT-DROP-GONE-01: a truncated-root app whose bundle directory
+    /// is gone is left out. Unavailable roots are kept without statting the file,
+    /// because an unmounted volume looks the same as a deleted bundle.
     public func retainingCandidates(
         from previous: [AppCandidate],
-        underUnavailableRoots roots: [URL] = []
+        underUnavailableRoots roots: [URL] = [],
+        bundleExists: (URL) -> Bool = CatalogScanReport.bundleDirectoryExists
     ) -> CatalogScanReport {
-        let roots = roots.isEmpty ? unavailableRequiredRootPaths : roots
-        guard !roots.isEmpty, !previous.isEmpty else { return self }
-        let rootPaths = roots.map { AppCatalogScanner.normalizedRootPath($0.path) }
+        let unavailable = roots.isEmpty ? unavailableRequiredRootPaths : roots
+        let unavailablePaths = Self.retainRootPaths(unavailable)
+        let truncatedPaths = Self.retainRootPaths(truncatedScanRootPaths)
+        guard (!unavailablePaths.isEmpty || !truncatedPaths.isEmpty), !previous.isEmpty else { return self }
         let presentKeys = Set(candidates.map(\.deduplicationKey))
+        let absent = confirmedAbsentTruncatedKeys(
+            from: previous,
+            underUnavailableRoots: roots,
+            bundleExists: bundleExists
+        )
         var extras: [AppCandidate] = []
         for candidate in previous {
             let key = candidate.deduplicationKey
-            guard !presentKeys.contains(key) else { continue }
+            guard !presentKeys.contains(key), !absent.contains(key) else { continue }
             let path = AppCatalogScanner.normalizedRootPath(candidate.canonicalURL.path)
-            guard rootPaths.contains(where: { path == $0 || path.hasPrefix($0 + "/") }) else { continue }
-            extras.append(candidate)
+            let keep = Self.pathIsUnderRetainRoot(path, roots: unavailablePaths)
+                || Self.pathIsUnderRetainRoot(path, roots: truncatedPaths)
+            if keep { extras.append(candidate) }
         }
         guard !extras.isEmpty else { return self }
         return CatalogScanReport(
@@ -116,6 +140,60 @@ public struct CatalogScanReport: Sendable {
             truncatedScanRootPaths: truncatedScanRootPaths,
             wasCancelled: wasCancelled
         )
+    }
+
+    /// Dedup keys under a truncated root whose bundle directory is gone.
+    /// Keys under an unavailable root are never included.
+    public func confirmedAbsentTruncatedKeys(
+        from previous: [AppCandidate],
+        underUnavailableRoots roots: [URL] = [],
+        bundleExists: (URL) -> Bool = CatalogScanReport.bundleDirectoryExists
+    ) -> Set<String> {
+        let unavailable = Self.retainRootPaths(roots.isEmpty ? unavailableRequiredRootPaths : roots)
+        let truncated = Self.retainRootPaths(truncatedScanRootPaths)
+        guard !truncated.isEmpty, !previous.isEmpty else { return [] }
+        var keys = Set<String>()
+        for candidate in previous {
+            let path = AppCatalogScanner.normalizedRootPath(candidate.canonicalURL.path)
+            if Self.pathIsUnderRetainRoot(path, roots: unavailable) { continue }
+            guard Self.pathIsUnderRetainRoot(path, roots: truncated) else { continue }
+            if !bundleExists(candidate.canonicalURL) {
+                keys.insert(candidate.deduplicationKey)
+            }
+        }
+        return keys
+    }
+
+    /// MISSING-ROOT-NO-CACHE-01 — persisting is unsafe when this scan is
+    /// otherwise complete, but a missing or truncated custom root would still
+    /// make reconcile delete layout entries that `previous` could not restore.
+    /// A truncated-root bundle that is confirmed gone is a real removal and
+    /// may be saved. An empty layout has nothing to delete, so a first launch
+    /// can still save.
+    public func allowsPersistingReconcile(
+        retainingFrom previous: [AppCandidate],
+        into layout: LayoutState,
+        bundleExists: (URL) -> Bool = CatalogScanReport.bundleDirectoryExists
+    ) -> Bool {
+        guard canPersistReconciledLayout else { return false }
+        let untrusted = !unavailableRequiredRootPaths.isEmpty || !truncatedScanRootPaths.isEmpty
+        guard untrusted else { return true }
+        let live = Set(
+            retainingCandidates(from: previous, bundleExists: bundleExists)
+                .candidates.map(\.deduplicationKey)
+        )
+        let missing = Set(layout.appKeys.values.filter { !live.contains($0) })
+        if missing.isEmpty { return true }
+        let absent = confirmedAbsentTruncatedKeys(from: previous, bundleExists: bundleExists)
+        return missing.isSubset(of: absent)
+    }
+
+    private static func retainRootPaths(_ urls: [URL]) -> [String] {
+        urls.map { AppCatalogScanner.normalizedRootPath($0.path) }
+    }
+
+    private static func pathIsUnderRetainRoot(_ path: String, roots: [String]) -> Bool {
+        roots.contains { path == $0 || path.hasPrefix($0 + "/") }
     }
 }
 

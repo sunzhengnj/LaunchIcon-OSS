@@ -18,6 +18,8 @@ checks = [
     ("settings callback", "var onRearrangeByDate: ((AppDateRearrangeKind) async -> Bool)?" in settings),
     ("root date API", "func rearrangeTopLevelGridByDate(_ kind: AppDateRearrangeKind) -> Bool" in w),
     ("offmain dates", "LauncherLayout.applicationDates(" in w and "isSamplingAppDates" in w),
+    ("hide drops date sort", "shouldApplyDeferredGridRearrange" in w
+     and "invalidateDeferredGridRearrange" in w),
     ("wc forwarder", "rootView.rearrangeTopLevelGridByDate(kind)" in w
      and "rearrangeTopLevelGridByDateAwaitingCompletion(kind)" in w),
     ("delegate wire", "onRearrangeByDate" in delegate
