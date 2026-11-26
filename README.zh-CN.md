@@ -11,7 +11,7 @@
 原生 AppKit · 无需账号 · 不联网 · 布局只存在你的 Mac 上。</p>
 
 <p align="center">
-  <a href="https://github.com/sunzhengnj/LaunchIcon-OSS/releases/tag/v1.0.0-preview.84"><img src="https://img.shields.io/github/v/release/sunzhengnj/LaunchIcon-OSS?label=release" alt="最新版本"></a>
+  <a href="https://github.com/sunzhengnj/LaunchIcon-OSS/releases/tag/v1.0.0-preview.98"><img src="https://img.shields.io/github/v/release/sunzhengnj/LaunchIcon-OSS?label=release" alt="最新版本"></a>
   <a href="https://github.com/sunzhengnj/LaunchIcon-OSS/actions/workflows/macos-validation.yml"><img src="https://github.com/sunzhengnj/LaunchIcon-OSS/actions/workflows/macos-validation.yml/badge.svg" alt="macOS 后台验证"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache-2.0 许可证"></a>
   <img src="https://img.shields.io/badge/macOS-26%2B-black" alt="macOS 26 或更高版本">
@@ -19,7 +19,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/sunzhengnj/LaunchIcon-OSS/releases/tag/v1.0.0-preview.84"><strong>⬇ 下载（未公证预览版）</strong></a> ·
+  <a href="https://github.com/sunzhengnj/LaunchIcon-OSS/releases/tag/v1.0.0-preview.98"><strong>⬇ 下载（未公证预览版）</strong></a> ·
   <a href="#安装">安装</a> ·
   <a href="#已知限制">已知限制</a> ·
   <a href="#从源码构建">从源码构建</a> ·
@@ -52,7 +52,7 @@
 > **早期版本，欢迎反馈**。安装包采用 ad-hoc 签名，**尚未完成 Apple 公证**（见[安装](#安装)）。本版尚未完成完整 UI 测试与连续实体输入翻页手感验收。详见[已知限制](#已知限制)。
 
 > [!IMPORTANT]
-> **当前 WIP 试用版：preview.84 / 构建84。** [下载preview.84](https://github.com/sunzhengnj/LaunchIcon-OSS/releases/tag/v1.0.0-preview.84)。公开安装包由本仓标签中的提交 `de7ab2b` 重新构建，已移除内部签名配置。后台验证及 CI 通过；完整 UI 与冷启动仍待验。见[源码快照说明](Docs/SOURCE_SNAPSHOT_2026-10-26.md)。
+> **当前 WIP 试用版：preview.98 / 构建 98。** [下载 preview.98](https://github.com/sunzhengnj/LaunchIcon-OSS/releases/tag/v1.0.0-preview.98)。公开安装包由本仓标签中的提交 `18390f20` 重新构建，SHA-256 `3e9c2acde20c139070793036274bfadfc77c29ba769e5fc99093be0e9a629d11`。已移除内部签名配置。同步 PR 后台验证通过（Core 619 项、1 跳过、0 失败）；完整 UI 与冷启动仍待验。见[源码快照说明](Docs/SOURCE_SNAPSHOT_2026-11-26.md)。
 
 ## 亮点
 
@@ -73,22 +73,16 @@
 
 LaunchIcon 使用自己的视觉设计，不读取系统 Launchpad 数据库、不复制其他启动器的资源，也不需要账号或云同步。应用遵循 macOS 的“减少动态效果”设置。拼音转写使用 Foundation 的默认读音。
 
-### preview.84 新增
+### preview.98 新增
 
-- 更密的设置 Form（菜单优先，少按钮墙）
-- 菜单栏点击手势；可选 F4 呼出（默认仍是 Option-Space）
-- 文件夹按时间排；打开文件夹时 Page Up/Down 滚成员列表
-- 文件夹 / 搜索 / 网格内方向键走动（不改翻页路径）
-- 拖到 Dock 时提供真实应用文件链接
-- 网格行列偏好已落盘（尚未接入 Direct 翻页）
-- 自定义应用目录扫描上限与缺失根软提示
+相对公开 preview.85（也晚于公开 preview.84）：设置滚动与 settle、动态壁纸及有界解码、网格行列偏好（默认仍为 7×5，翻页函数未改）、键盘整理与一步撤销、Page Up/Down 与 chrome 单次分发、搜索/文件夹打字、隐藏与设置耐久。详见 [Docs/RELEASE_NOTES_PREVIEW98.md](Docs/RELEASE_NOTES_PREVIEW98.md)。
 
 
 ## 安装
 
-1. 从 [preview.84 Release](https://github.com/sunzhengnj/LaunchIcon-OSS/releases/tag/v1.0.0-preview.84) 下载 `LaunchIcon-v1.0.0-preview.84-macOS-unnotarized.dmg` 和同页的 `.sha256` 文件，在两个文件所在的文件夹里核对完整性：
+1. 从 [preview.98 Release](https://github.com/sunzhengnj/LaunchIcon-OSS/releases/tag/v1.0.0-preview.98) 下载 `LaunchIcon-v1.0.0-preview.98-macOS-unnotarized.dmg` 和同页的 `.sha256` 文件，在两个文件所在的文件夹里核对完整性：
    ```bash
-   shasum -a 256 -c LaunchIcon-v1.0.0-preview.84-macOS-unnotarized.dmg.sha256
+   shasum -a 256 -c LaunchIcon-v1.0.0-preview.98-macOS-unnotarized.dmg.sha256
    ```
 2. 打开 DMG，把 `LaunchIcon.app` 拖进“应用程序”。替换旧版前先退出旧 App；布局与偏好保存在 App 包之外，不会丢失。
 3. 先打开一次 LaunchIcon。macOS 会提示无法验证开发者，这是正常现象：App 采用 **ad-hoc 签名，尚未完成公证**。
@@ -100,7 +94,7 @@ LaunchIcon 使用自己的视觉设计，不读取系统 Launchpad 数据库、�
 ## 已知限制
 
 - 安装包是 ad-hoc 签名，没有 Developer ID 签名，也没有经过 Apple 公证。
-- preview.84 未运行完整 UI 测试，也未对公开 DMG 做隔离冷启动。
+- preview.98 未运行完整 UI 测试，也未对公开 DMG 做隔离冷启动。
 - 连续实体翻页、跨页拖拽、VoiceOver、大文件夹和 Dock / 访达深色图标仍待验。
 
 - 需要 macOS 26 或更高版本。
@@ -129,12 +123,12 @@ LAUNCHICON_ALLOW_VISIBLE_TESTS=1 ./script/test_direct_bootstrap.sh
 
 | 范围 | 当前证据 |
 | --- | --- |
-| Core 与构建 | 公开检出后台门与 PR CI 通过：本地 Core 309/309、双渠道 Release 分析和 UI 目标编译。见[测试矩阵](Docs/TEST_MATRIX.md)。 |
-| 完整 UI | preview.84 未运行完整 UI 或隔离冷启动；连续实体翻页手感未验收。 |
-| 发布 | [preview.84](https://github.com/sunzhengnj/LaunchIcon-OSS/releases/tag/v1.0.0-preview.84)为WIP预发布、ad-hoc签名、未公证；发布说明记录包身份、校验和回下载结果；没有新的可见 UI/冷启动结论。 |
+| Core 与构建 | 公开同步 PR #13 的 macOS 校验通过：Core 619 项、1 跳过、0 失败，以及 Direct/StoreSpike Release 分析和 UI 目标编译。见[测试矩阵](Docs/TEST_MATRIX.md)。 |
+| 完整 UI | preview.98 未运行完整 UI 或隔离冷启动；连续实体翻页手感未验收。 |
+| 发布 | [preview.98](https://github.com/sunzhengnj/LaunchIcon-OSS/releases/tag/v1.0.0-preview.98) 为 WIP 预发布、ad-hoc 签名、未公证；发布说明记录包身份、校验和回下载结果；没有新的可见 UI/冷启动结论。 |
 | 待验 | 实体拖拽、大文件夹、逐个目标应用启动、VoiceOver、Store 沙箱和 Dock/访达深色图标。 |
 
-CI 徽章**只代表后台质量门**，不表示完整 UI 或发布验收通过。详见[测试矩阵](Docs/TEST_MATRIX.md)与[源码快照说明](Docs/SOURCE_SNAPSHOT_2026-10-26.md)。
+CI 徽章**只代表后台质量门**，不表示完整 UI 或发布验收通过。详见[测试矩阵](Docs/TEST_MATRIX.md)与[源码快照说明](Docs/SOURCE_SNAPSHOT_2026-11-26.md)。
 
 ## 参与贡献
 

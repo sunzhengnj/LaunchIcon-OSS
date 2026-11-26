@@ -14,6 +14,10 @@ private final class CallbackCounter: @unchecked Sendable {
         lock.withLock { value += 1 }
     }
 
+    func reset() {
+        lock.withLock { value = 0 }
+    }
+
     var count: Int {
         lock.withLock { value }
     }
@@ -5219,18 +5223,67 @@ func testReopenPageBehaviorDefaultsAndPolicy() async {
         defer { watcher.stop() }
 
         let path = root.path
-        for _ in 0..<5 {
-            watcher.handleEvents(at: [path], rootChanged: false)
+        let window = Duration.seconds(interval)
+        // Stay inside a fraction of the debounce window, matching the old 20ms
+        // intent, but measure with a monotonic clock. Task.sleep(20ms) can
+        // overshoot the 50ms deadline on a loaded CI runner and then treat a
+        // timely callback as an early fire.
+        let midWindowObservation = window * 0.4
+        let clock = ContinuousClock()
+        var observedSilenceInsideWindow = false
+        for _ in 0..<8 {
+            changes.reset()
+            rootsChanged.reset()
+            let start = clock.now
+            for _ in 0..<5 {
+                watcher.handleEvents(at: [path], rootChanged: false)
+            }
+            var earlyFire = false
+            var overshot = false
+            while true {
+                let elapsed = clock.now - start
+                if elapsed >= window {
+                    overshot = true
+                    break
+                }
+                if changes.count != 0 {
+                    earlyFire = true
+                    break
+                }
+                if elapsed >= midWindowObservation {
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(1))
+            }
+            if earlyFire {
+                XCTFail("events inside the debounce window must not fire yet")
+                return
+            }
+            if overshot {
+                watcher.stop()
+                XCTAssertTrue(watcher.start(roots: [root]))
+                continue
+            }
+            XCTAssertEqual(changes.count, 0, "events inside the debounce window must not fire yet")
+            observedSilenceInsideWindow = true
+            let remaining = window - (clock.now - start)
+            if remaining > .zero {
+                try await Task.sleep(for: remaining)
+            }
+            // Allow the main-queue work item to run after its deadline.
+            try await Task.sleep(for: .milliseconds(40))
+            XCTAssertEqual(changes.count, 1)
+            XCTAssertEqual(rootsChanged.count, 0)
+            break
         }
-        try await Task.sleep(for: .milliseconds(20))
-        XCTAssertEqual(changes.count, 0, "events inside the debounce window must not fire yet")
-        try await Task.sleep(for: .milliseconds(80))
-        XCTAssertEqual(changes.count, 1)
-        XCTAssertEqual(rootsChanged.count, 0)
+        XCTAssertTrue(
+            observedSilenceInsideWindow,
+            "could not observe the debounce window without the wait overshooting it"
+        )
 
         watcher.handleEvents(at: [path], rootChanged: false)
         watcher.handleEvents(at: [path], rootChanged: false)
-        try await Task.sleep(for: .milliseconds(100))
+        try await Task.sleep(for: window + .milliseconds(50))
         XCTAssertEqual(changes.count, 2)
         XCTAssertEqual(rootsChanged.count, 0)
     }
