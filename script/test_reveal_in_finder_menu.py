@@ -31,7 +31,7 @@ need('"在访达中选中所选应用"' in (root / "Resources/Localizable.xcstri
 need("|| hasReveal || hasMoveToFolder" in menu and "else {" in menu, "read-only tiles with only reveal must still get a menu")
 
 ctl_start = direct.index("private func revealInFinder(_ urls: [URL]) {")
-ctl = direct[ctl_start : direct.index("private func launch(_ candidate: AppCandidate)", ctl_start)]
+ctl = direct[ctl_start : direct.index("func launch(_ candidate: AppCandidate)", ctl_start)]
 need("shouldAcceptPointerActivation(" in ctl, "reveal must ignore clicks during dismiss")
 need("activateFileViewerSelecting(urls)" in ctl, "reveal must use NSWorkspace activateFileViewerSelecting(urls)")
 need("hide(animated: true)" in ctl, "reveal must dismiss the launcher first")

@@ -63,7 +63,8 @@ need("fillMode = .backwards" in chrome_chunk, "member focus fill must use fillMo
 need("presentedChromeFillAlpha" in chrome_chunk, "member fill must read presentation")
 need("tileChromeFillFadeDuration" in chrome_chunk, "member fill must use shared fade duration")
 
-need("folderCloseGridFocusID" in direct, "must not regress close-focus")
+need("folderCloseFocusIDAfterExtract" in direct, "must not regress close-focus")
+need("folderCloseGridFocusID" in core, "must not drop Core close-focus helper")
 need("folderOpenEmptyFocusesTitle" in direct, "must not regress empty-title")
 need("focusMainGridEntry" in direct, "must not regress close-focus main grid")
 

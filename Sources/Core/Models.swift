@@ -164,20 +164,24 @@ public struct CatalogScanReport: Sendable {
         return keys
     }
 
-    /// MISSING-ROOT-NO-CACHE-01 — persisting is unsafe when this scan is
-    /// otherwise complete, but a missing or truncated custom root would still
-    /// make reconcile delete layout entries that `previous` could not restore.
-    /// A truncated-root bundle that is confirmed gone is a real removal and
-    /// may be saved. An empty layout has nothing to delete, so a first launch
-    /// can still save.
+    /// MISSING-ROOT-NO-CACHE-01 / MISSING-ROOT-TRUSTED-DELETE-01 — persisting is
+    /// unsafe when a missing or truncated custom root would still make reconcile
+    /// delete layout entries that `previous` could not restore. Keys under a
+    /// trusted, complete root may leave the layout even while another root is
+    /// offline (e.g. uninstall from `/Applications` with an external volume
+    /// unmounted). A truncated-root bundle that is confirmed gone is a real
+    /// removal and may be saved. Keys not present in `previous` stay unsafe
+    /// (cold start / empty retention). An empty layout has nothing to delete,
+    /// so a first launch can still save.
     public func allowsPersistingReconcile(
         retainingFrom previous: [AppCandidate],
         into layout: LayoutState,
         bundleExists: (URL) -> Bool = CatalogScanReport.bundleDirectoryExists
     ) -> Bool {
         guard canPersistReconciledLayout else { return false }
-        let untrusted = !unavailableRequiredRootPaths.isEmpty || !truncatedScanRootPaths.isEmpty
-        guard untrusted else { return true }
+        let unavailablePaths = Self.retainRootPaths(unavailableRequiredRootPaths)
+        let truncatedPaths = Self.retainRootPaths(truncatedScanRootPaths)
+        guard !unavailablePaths.isEmpty || !truncatedPaths.isEmpty else { return true }
         let live = Set(
             retainingCandidates(from: previous, bundleExists: bundleExists)
                 .candidates.map(\.deduplicationKey)
@@ -185,7 +189,25 @@ public struct CatalogScanReport: Sendable {
         let missing = Set(layout.appKeys.values.filter { !live.contains($0) })
         if missing.isEmpty { return true }
         let absent = confirmedAbsentTruncatedKeys(from: previous, bundleExists: bundleExists)
-        return missing.isSubset(of: absent)
+        var previousByKey: [String: AppCandidate] = [:]
+        previousByKey.reserveCapacity(previous.count)
+        for candidate in previous {
+            previousByKey[candidate.deduplicationKey] = candidate
+        }
+        for key in missing {
+            if absent.contains(key) { continue }
+            guard let candidate = previousByKey[key] else {
+                // No provenance: could be an offline-root entry with empty
+                // retention — refuse so a cold start cannot drop the layout.
+                return false
+            }
+            let path = AppCatalogScanner.normalizedRootPath(candidate.canonicalURL.path)
+            let underUntrusted = Self.pathIsUnderRetainRoot(path, roots: unavailablePaths)
+                || Self.pathIsUnderRetainRoot(path, roots: truncatedPaths)
+            if underUntrusted { return false }
+            // Trusted-root deletion while another root is untrusted: OK.
+        }
+        return true
     }
 
     private static func retainRootPaths(_ urls: [URL]) -> [String] {
@@ -264,7 +286,7 @@ public struct AppSearchIndex: Sendable {
         /// before Chess / Messages).
         func matchesWordInitials(_ query: String) -> Bool {
             guard let wordInitials else { return false }
-            let compactQuery = String(query.filter { !$0.isWhitespace })
+            let compactQuery = Self.compactSearchText(query)
             guard compactQuery.count >= 2 else { return false }
             return wordInitials.hasPrefix(compactQuery)
         }
@@ -385,10 +407,10 @@ public struct AppSearchIndex: Sendable {
             _ query: String,
             _ body: (String, String, String, Bool) -> Bool
         ) -> Bool {
-            let compactQuery = String(query.filter { !$0.isWhitespace })
+            let compactQuery = Self.compactSearchText(query)
             let folded = compactQuery.count >= 2
             func compact(_ field: String) -> String {
-                String(field.filter { !$0.isWhitespace })
+                Self.compactSearchText(field)
             }
             if body(normalized, compact(normalized), compactQuery, folded) { return true }
             if let spacedLatin, body(spacedLatin, compact(spacedLatin), compactQuery, folded) { return true }
@@ -396,16 +418,36 @@ public struct AppSearchIndex: Sendable {
             return false
         }
 
-        /// A query may include or omit spaces that the name has. "oldtool" finds
-        /// "Old Tool", and "photo shop" finds "PhotoShop". One-character queries
-        /// stay exact so a single letter does not match every compacted name.
+        /// A query may include or omit spaces, hyphens, underscores, dots, and
+        /// apostrophes that the name has. "oldtool" finds "Old Tool",
+        /// "photo shop" and "photo-shop" find "PhotoShop", and "google.chrome"
+        /// finds "Google Chrome". One-character queries stay exact so a single
+        /// letter does not match every compacted name.
         private func contains(_ field: String, _ query: String) -> Bool {
             if field.contains(query) { return true }
-            let compactQuery = String(query.filter { !$0.isWhitespace })
+            let compactQuery = Self.compactSearchText(query)
             guard compactQuery.count >= 2 else { return false }
-            let compactField = String(field.filter { !$0.isWhitespace })
+            let compactField = Self.compactSearchText(field)
             guard compactField != field || compactQuery != query else { return false }
             return compactField.contains(compactQuery)
+        }
+
+        /// SEARCH-SEPARATOR-01. Spaces and the marks people type instead of a
+        /// space. The remainder must still be at least two characters before
+        /// prefix, exact, contains, or initials use this form.
+        static func compactSearchText(_ value: String) -> String {
+            String(value.filter { character in
+                !character.isWhitespace && !isSearchSeparator(character)
+            })
+        }
+
+        static func isSearchSeparator(_ character: Character) -> Bool {
+            switch character {
+            case "-", "‐", "‑", "–", "—", "_", ".", "/", "'", "’", "·":
+                return true
+            default:
+                return false
+            }
         }
 
         private static func normalize(_ value: String) -> String {
@@ -448,7 +490,7 @@ public struct AppSearchIndex: Sendable {
     }
 
     public func filter(_ candidates: [AppCandidate], query: String) -> [AppCandidate] {
-        let normalizedQuery = Self.normalize(query.trimmingCharacters(in: .whitespacesAndNewlines))
+        let normalizedQuery = Self.preparedQuery(query)
         guard !normalizedQuery.isEmpty else { return candidates }
 
         return candidates.enumerated().compactMap { offset, candidate -> (Int, Int, AppCandidate)? in
@@ -523,7 +565,7 @@ public struct AppSearchIndex: Sendable {
         query: String,
         topLevelKeys: Set<String> = []
     ) -> [LauncherSearchHit] {
-        let normalizedQuery = Self.normalize(query.trimmingCharacters(in: .whitespacesAndNewlines))
+        let normalizedQuery = Self.preparedQuery(query)
         guard !normalizedQuery.isEmpty else { return hits }
         return hits.enumerated().compactMap { offset, hit -> (Int, Int, Int, LauncherSearchHit)? in
             let rank: Int?
@@ -568,6 +610,16 @@ public struct AppSearchIndex: Sendable {
 
     private static func normalize(_ value: String) -> String {
         value.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: .current)
+    }
+
+    /// Trim and sanitize, then clip to `maximumSearchQueryLength` before
+    /// normalizing so typo / pinyin ranking of a pasted novel stays bounded.
+    private static func preparedQuery(_ query: String) -> String {
+        let trimmed = LauncherLayout.sanitizedSearchInput(query)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let limit = LauncherLayout.maximumSearchQueryLength
+        let clipped = trimmed.count <= limit ? trimmed : String(trimmed.prefix(limit))
+        return normalize(clipped)
     }
 }
 
@@ -646,7 +698,7 @@ public struct LayoutState: Codable, Equatable, Sendable {
         try container.encode(orderedEntries, forKey: .orderedEntries)
         try container.encode(folders, forKey: .folders)
         try container.encode(appKeys, forKey: .appKeys)
-        try container.encode(hiddenAppKeys, forKey: .hiddenAppKeys)
+        try container.encode(hiddenAppKeys.sorted(), forKey: .hiddenAppKeys)
         try container.encode(appAliases, forKey: .appAliases)
         try container.encode(updatedAt, forKey: .updatedAt)
     }

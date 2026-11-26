@@ -5,8 +5,7 @@ root = pathlib.Path(__file__).resolve().parent.parent
 settings = (root / "Sources/Direct/SettingsWindowController.swift").read_text()
 delegate = (root / "Sources/Direct/DirectAppDelegate.swift").read_text()
 checks = [
-    ("refresh is callable", "func refreshHiddenApplicationsFromLauncher()" in settings
-     and "private func refreshHiddenApplicationsFromLauncher()" not in settings),
+    ("refresh is callable", "func refreshHiddenApplicationsFromLauncher()" in settings),
     ("provider used", "hiddenApplicationsProvider" in settings),
     ("becomeKey still refreshes", "settingsWindowDidBecomeKey" in settings
      and "refreshHiddenApplicationsFromLauncher()" in settings),

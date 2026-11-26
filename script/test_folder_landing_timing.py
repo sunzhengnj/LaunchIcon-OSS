@@ -13,8 +13,14 @@ import sys
 import tempfile
 
 root = Path(__file__).resolve().parents[1]
-source_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parents[1] / "Sources/Direct/LauncherWindowController.swift"
-source = source_path.read_text()
+if len(sys.argv) > 1:
+    source = Path(sys.argv[1]).read_text()
+else:
+    base = Path(__file__).resolve().parents[1] / "Sources/Direct"
+    source = "".join(
+        p.read_text()
+        for p in [base / "LauncherWindowController.swift", *sorted(base.glob("LauncherWindowController+*.swift"))]
+    )
 start=source.index('    private func playFolderLandingAnimation(')
 end=source.index('\n    /// Remember this tile', start)
 method=source[start:end].replace('    private func playFolderLandingAnimation(', '    func playFolderLandingAnimation(', 1)
@@ -22,7 +28,7 @@ tracking_start = source.index('    private func beginTrackedFolderLanding(')
 tracking_end = source.index('    private func finishFolderLandingLater(', tracking_start)
 cleanup_start = source.index('    private func finishFolderLandingIfAllowed(')
 # Drop-landing flights sit next. They are not part of the folder spring.
-cleanup_end = source.index('    private func beginPendingDropLanding(', cleanup_start)
+cleanup_end = source.index('    private func activateItem(withID itemID: UUID, in collectionView: NSCollectionView) {', cleanup_start)
 timer_end = source.index('    /// Final opacity', tracking_end)
 timer_method = source[tracking_end:timer_end].replace(
     'private func finishFolderLandingLater(', 'private func performScheduledCleanup(', 1)
@@ -215,8 +221,8 @@ def plate_model_shares_the_fade_transaction(text: str) -> str | None:
 def shadow_model_shares_the_fade_transaction(text: str) -> str | None:
     """The lift shadow ends at 0. That model write has to share the fade
     transaction, or the commit frame drops the shadow."""
-    start = text.index("    private func fadeLiftShadow(")
-    end = text.index("    private func topLevelSourceIndex(", start)
+    start = text.index("func fadeLiftShadow(")
+    end = text.index("func topLevelSourceIndex(", start)
     body = text[start:end]
     add = body.index('layer.add(fade, forKey: "lift-shadow")')
     opacity = body.rindex("layer.shadowOpacity = 0", 0, add)
@@ -236,7 +242,7 @@ print("PASS: merge plate model shares the fade transaction")
 def reduced_merge_fade_shares_the_transaction(text: str) -> str | None:
     """Reduced-motion merge flyer snaps off (no 0.12s half-fade)."""
     start = text.index("    private func playMergeAnimation(")
-    end = text.index("    private func materializedFolderItem(", start)
+    end = text.index("func materializedFolderItem(", start)
     body = text[start:end]
     branch = body.index("if prefersReducedMotion {")
     reduced = body[branch:body.index("\n            return\n", branch)]
@@ -265,7 +271,7 @@ def whole_cell_merge_fade_shares_the_transaction(text: str) -> str | None:
     """The flying icon ends at opacity 0. That model write has to share the
     late-dissolve fade, or the commit frame hides the icon in the air."""
     start = text.index("    private func playMergeAnimation(")
-    end = text.index("    private func materializedFolderItem(", start)
+    end = text.index("func materializedFolderItem(", start)
     body = text[start:end]
     branch = body.index("if prefersReducedMotion {")
     after = body.index("\n            return\n", branch)
@@ -504,7 +510,7 @@ print("PASS: page host fade shares the model transaction")
 def toast_fade_shares_the_transaction(text: str) -> str | None:
     """Toast show/hide must fade from presentation, not animator().alphaValue."""
     start = text.index("    private func presentToast(")
-    end = text.index("    func hideToast(animated: Bool)", start)
+    end = text.index("func hideToast(animated: Bool)", start)
     present = text[start:end]
     if "animator().alphaValue" in present:
         return "toast show still writes opacity through animator()"
@@ -534,7 +540,7 @@ def launch_press_holds_presentation_transform(text: str) -> str | None:
     """Launch-press pulse must start from on-screen transform with fillMode backwards.
     Reduced motion snaps to identity first (no scale pulse)."""
     start = text.index("    private func playLaunchFeedback() {")
-    end = text.index("    func snapLaunchFeedbackForMotionChange()", start)
+    end = text.index("func snapLaunchFeedbackForMotionChange()", start)
     body = text[start:end]
     if "shouldSnapLaunchPressForReducedMotion" not in body:
         return "launch press missing reduced-motion snap gate"
@@ -565,8 +571,8 @@ if launch_problem:
 print("PASS: launch press holds presentation transform")
 def reorder_holds_presentation_until_frames_ready(text: str) -> str | None:
     """Neighbors must not snap-then-ease when reorder layout frames are empty."""
-    start = text.index("    private func applyReorderSlots(")
-    end = text.index("    private func restoreDragSourceTile()", start)
+    start = text.index("func applyReorderSlots(")
+    end = text.index("func restoreDragSourceTile()", start)
     body = text[start:end]
     if "shouldHoldReorderPresentationUntilFramesReady" not in body:
         return "applyReorderSlots does not hold presentation until frames are ready"
@@ -575,7 +581,7 @@ def reorder_holds_presentation_until_frames_ready(text: str) -> str | None:
     # Must not call setReorderTranslation with animated:false solely because ready is false.
     if "animated: animated && ready" in body:
         return "applyReorderSlots still snaps when ready is false (animated && ready)"
-    set_start = text.index("    func setReorderTranslation(_ translation: CGSize, animated: Bool) {")
+    set_start = text.index("func setReorderTranslation(_ translation: CGSize, animated: Bool) {")
     set_end = text.index("    fileprivate func receiveReorderSlideFrame", set_start)
     setter = text[set_start:set_end]
     if "Hold presentation until the display-link spring is attached" not in setter:
@@ -665,7 +671,7 @@ def flyer_flights_hold_presentation_frame(direct: str, core: str) -> str | None:
             return f"missing flight commit {needle}"
     # Dissolve path must call the presentation flyer helper.
     start = direct.index("Folder dissolve scatter:")
-    end = direct.index("    private func tileForPresentedItem(", start)
+    end = direct.index("    func tileForPresentedItem(", start)
     body = direct[start:end]
     if "runFlyerFrameAnimations" not in body:
         return "dissolve scatter still not using runFlyerFrameAnimations"
@@ -696,8 +702,8 @@ def page_arrows_fade_presence_from_presentation(direct: str, core: str) -> str |
             code = line.split("//", 1)[0]
             if "isHidden =" in code and "PageButton" in code:
                 return "updatePagingControls still snaps arrow isHidden"
-    arrow_start = direct.index("    func setPagingAvailable(_ available: Bool, animated: Bool)")
-    arrow_end = direct.index("    func settleHoverFadeForDismissal()", arrow_start)
+    arrow_start = direct.index("func setPagingAvailable(_ available: Bool, animated: Bool)")
+    arrow_end = direct.index("func settleHoverFadeForDismissal()", arrow_start)
     body = direct[arrow_start:arrow_end]
     if "animatePresence" not in body:
         return "setPagingAvailable does not animate presence"
@@ -743,7 +749,7 @@ def footer_hints_fade_from_presentation(direct: str, core: str) -> str | None:
             code = line.split("//", 1)[0]
             if "dragHintLabel.isHidden =" in code:
                 return "updateFooterHint still snaps dragHintLabel.isHidden"
-    if "fadeViewOpacityFromPresentation" not in body:
+    if "fadeViewOpacityFromPresentation" not in body and "fadeStage1OpacityFromPresentation" not in body:
         return "footer hint helpers missing presentation opacity fade"
     if "footerHintFadeAnimationKey" not in body:
         return "footer hint fade missing animation key"
@@ -785,8 +791,8 @@ def folder_dimmer_backdrop_veil_holds_presentation(direct: str, core: str) -> st
         return "Core missing folderCloseVeilUsesLateDissolve"
     if "folderCloseVeilTiming" not in direct:
         return "Direct missing folderCloseVeilTiming"
-    open_start = direct.index("    func animateOpen(collapse:")
-    open_end = direct.index("    func animateClose(", open_start)
+    open_start = direct.index("func animateOpen(collapse:")
+    open_end = direct.index("func animateClose(", open_start)
     open_body = direct[open_start:open_end]
     if "dimmerFade" not in open_body or "fillMode = .backwards" not in open_body:
         return "animateOpen dimmer fade missing fillMode.backwards"
@@ -809,7 +815,7 @@ def folder_dimmer_backdrop_veil_holds_presentation(direct: str, core: str) -> st
             return "animateOpen must not set dimmer opacity=1 before reveal"
     if open_body.count("CATransaction.commit()") < 2:
         return "animateOpen should park+reveal then animate in separate transactions"
-    close_start = direct.index("    func animateClose(")
+    close_start = direct.index("func animateClose(")
     close_end = direct.index("    private func collapsedPanelTransform(", close_start)
     close_body = direct[close_start:close_end]
     if "dimmerFade" not in close_body:
@@ -897,7 +903,7 @@ def folder_title_edit_underline_fades_from_presentation(direct: str, core: str) 
     if "folderTitleEditUnderlineAlpha" not in core:
         return "Core missing folderTitleEditUnderlineAlpha"
     start = direct.index("private final class FolderTitleField:")
-    end = direct.index("@MainActor\nprivate final class FolderOverlayView:", start)
+    end = direct.index("@MainActor\nfinal class FolderOverlayView:", start)
     body = direct[start:end]
     if "editUnderlineLayer" not in body:
         return "FolderTitleField missing editUnderlineLayer"
@@ -1004,8 +1010,8 @@ def folder_title_selects_all_on_begin(direct: str, core: str) -> str | None:
     if "selectAllTitleTextIfNeeded" not in direct:
         return "Direct missing selectAllTitleTextIfNeeded"
     # Folder overlay's begin-editing (not the search field's audit hook).
-    start = direct.index("    func controlTextDidBeginEditing(_ obj: Notification) {\n        titleBeforeEdit")
-    end = direct.index("    func controlTextDidEndEditing(_ obj: Notification) {\n        titleField.needsDisplay", start)
+    start = direct.index("func controlTextDidBeginEditing(_ obj: Notification) {\n        titleBeforeEdit")
+    end = direct.index("func controlTextDidEndEditing(_ obj: Notification) {\n        titleField.needsDisplay", start)
     begin = direct[start:end]
     if "selectAllTitleTextIfNeeded()" not in begin:
         return "title controlTextDidBeginEditing does not select-all"
@@ -1025,7 +1031,7 @@ def folder_title_double_click_to_edit(direct: str, core: str) -> str | None:
     if "folderTitleShouldBeginEditingFromPointer" not in direct:
         return "FolderTitleField missing double-click gate"
     start = direct.index("@MainActor\nprivate final class FolderTitleField:")
-    end = direct.index("\n@MainActor\nprivate final class FolderOverlayView:", start)
+    end = direct.index("\n@MainActor\nfinal class FolderOverlayView:", start)
     body = direct[start:end]
     if "override func mouseDown(with event: NSEvent)" not in body:
         return "FolderTitleField missing mouseDown override"
@@ -1036,17 +1042,30 @@ def folder_title_double_click_to_edit(direct: str, core: str) -> str | None:
         return "Core missing folderTitleFocusesFirstMemberAfterEndingEdit"
     if "refocusAfterTitleEditingEnds" not in direct:
         return "FolderOverlay missing refocusAfterTitleEditingEnds"
-    cancel = direct[direct.index("    func cancelTitleEditingIfActive("):direct.index("    func abandonTitleEditingForResignKey(")]
+    cancel = direct[direct.index("func cancelTitleEditingIfActive("):direct.index("func abandonTitleEditingForResignKey(")]
     if "refocusAfterTitleEditingEnds()" not in cancel:
         return "cancelTitleEditingIfActive must call refocusAfterTitleEditingEnds"
     # Return commit must share the same first-member handoff (not collectionView-only).
     # Scope to FolderOverlayView — LWC also has a search-field doCommandBy.
-    overlay = direct[direct.index("@MainActor\nprivate final class FolderOverlayView:"):]
+    overlay = direct[direct.index("@MainActor\nfinal class FolderOverlayView:"):]
     ctrl_start = "    func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {"
     ctrl_end = "\n    func control(_ control: NSControl, textShouldEndEditing"
     ctrl = overlay[overlay.index(ctrl_start):overlay.index(ctrl_end, overlay.index(ctrl_start))]
     if "insertNewline" not in ctrl:
         return "title doCommandBy missing insertNewline"
+    if "folderTitleReturnEndsEditing" not in core:
+        return "Core missing folderTitleReturnEndsEditing"
+    if "folderTitleReturnEndsEditing" not in ctrl:
+        return "Return must ask folderTitleReturnEndsEditing before leaving the field"
+    newline = ctrl[ctrl.index("insertNewline"):ctrl.index("insertBacktab")]
+    gate = newline.index("folderTitleReturnEndsEditing")
+    refocus = newline.index("refocusAfterTitleEditingEnds()")
+    if gate > refocus:
+        return "folderTitleReturnEndsEditing must run before refocusAfterTitleEditingEnds"
+    if "return false" not in newline[gate:refocus]:
+        return "marked Return must return false and keep the composition"
+    if "discardMarkedTitleComposition" in newline:
+        return "Return must not strip marked text; the IME confirms it"
     if "refocusAfterTitleEditingEnds()" not in ctrl:
         return "Return commit must call refocusAfterTitleEditingEnds"
     helper_start = "    private func refocusAfterTitleEditingEnds()"
@@ -1076,7 +1095,8 @@ def folder_title_cancel_on_outside_click(direct: str, core: str) -> str | None:
         return "Direct missing Core outside-click gate"
     # Panel leftMouseDown must ask root to cancel before super.
     panel_start = direct.index("override func sendEvent(_ event: NSEvent)")
-    panel = direct[panel_start:panel_start + 2800]
+    panel_end = direct.index("private static func shouldDropInactivePointerEvent", panel_start)
+    panel = direct[panel_start:panel_end]
     if "cancelFolderTitleEditingIfClickOutsideTitle" not in panel:
         return "LauncherPanel.sendEvent missing outside-title cancel"
     if "leftMouseDown" not in panel:
@@ -1211,8 +1231,12 @@ def folder_close_defers_grid_focus_until_chrome_lands(direct: str, core: str) ->
     land = direct[land_start:land_end]
     if "focusMainGridEntry(" not in land and "focusGridEntry(restoreID)" not in land:
         return "finishFolderCloseChromeLand missing focusMainGridEntry"
-    if "folderCloseGridFocusID" not in land:
-        return "finishFolderCloseChromeLand must resolve via folderCloseGridFocusID"
+    if "folderCloseFocusIDAfterExtract" not in land:
+        return "finishFolderCloseChromeLand must resolve via folderCloseFocusIDAfterExtract"
+    if "snapGridToPageWithoutAnimation(" not in land:
+        return "finishFolderCloseChromeLand must snap off-page extracts without showPage"
+    if "showPage(" in land:
+        return "finishFolderCloseChromeLand must not call showPage"
     if "refreshFocusChrome()" not in land:
         return "finishFolderCloseChromeLand missing refreshFocusChrome"
     if "releaseBorrowedPreviewPlate()" not in land:
@@ -1261,7 +1285,7 @@ def folder_overlay_refuses_keyboard_while_closing(direct: str, core: str) -> str
     if idx < 0:
         return "folder keyViews missing closing omit comment"
     kv_start = direct.rfind(marker, 0, idx)
-    kv_end = direct.index("    func breakKeyViewLoop()", kv_start)
+    kv_end = direct.index("func breakKeyViewLoop()", kv_start)
     kv = direct[kv_start:kv_end]
     if "folderOverlayKeyViewsShouldIncludeControls" not in kv:
         return "folder keyViews must gate on folderOverlayKeyViewsShouldIncludeControls"
@@ -1290,7 +1314,7 @@ def chrome_reveal_clears_opacity_before_unhide(direct: str) -> str | None:
     """Toast/footer/page chrome must not unhide at alpha 1 then clear."""
     # Toast: opacity 0 and isHidden = false share one transaction before fade.
     toast_start = direct.index("    private func presentToast(")
-    toast_end = direct.index("    func hideToast(animated:", toast_start)
+    toast_end = direct.index("func hideToast(animated:", toast_start)
     toast = direct[toast_start:toast_end]
     if "toastShouldClearOpacityBeforeUnhide" not in toast:
         return "presentToast missing toastShouldClearOpacityBeforeUnhide"
@@ -1367,7 +1391,7 @@ def status_chrome_fades_from_presentation(direct: str, core: str) -> str | None:
         direct.index("private func setStatusChromeLabeledText("):
         direct.index("private func setStatusChromeVisible(")
     ]
-    if "fadeViewOpacityFromPresentation" not in labeled:
+    if "fadeViewOpacityFromPresentation" not in labeled and "fadeStage1OpacityFromPresentation" not in labeled:
         return "status labeled text crossfade missing presentation fade"
     if "messageLabel.stringValue = statusMessage" in direct:
         return "catalog status still snaps messageLabel.stringValue before show"
@@ -1500,7 +1524,7 @@ print("PASS: search count label fades with status chrome")
 
 def recovery_buttons_use_status_chrome_fade(direct: str, core: str) -> str | None:
     start = direct.index("    private func updateRecoveryButtons(")
-    end = direct.index("    func setLayoutEditingEnabled(", start)
+    end = direct.index("func setLayoutEditingEnabled(", start)
     body = direct[start:end]
     if "setStatusChromeVisible" not in body:
         return "updateRecoveryButtons missing setStatusChromeVisible"
@@ -1553,7 +1577,7 @@ def footer_restores_interrupted_fade(direct: str) -> str | None:
             return f"{fn} must restore interrupted fade from presentation"
     helper = direct[direct.index("private func restoreInterruptedFooterFade("):]
     helper = helper[:helper.index("\n    }\n")]
-    if "fadeViewOpacityFromPresentation" not in helper:
+    if "fadeViewOpacityFromPresentation" not in helper and "fadeStage1OpacityFromPresentation" not in helper:
         return "restore helper must fade from presentation"
     return None
 
@@ -1568,15 +1592,15 @@ print("PASS: footer restores interrupted fade from presentation")
 
 def folder_open_defers_reveal_until_animate_open(direct: str) -> str | None:
     """show(folder) must not paint resting open chrome before animateOpen."""
-    start = direct.index("    func show(folder: LauncherFolder, items: [PresentedItem])")
+    start = direct.index("func show(folder: LauncherFolder, items: [PresentedItem])")
     end = direct.index("    /// A previously scrolled folder must not open", start)
     show_body = direct[start:end]
     for line in show_body.splitlines():
         code = line.split("//", 1)[0]
         if "isHidden = false" in code:
             return "show(folder) still reveals overlay before animateOpen"
-    open_start = direct.index("    func animateOpen(collapse: LauncherLayout.FolderChromeCollapse)")
-    open_end = direct.index("    func animateClose(", open_start)
+    open_start = direct.index("func animateOpen(collapse: LauncherLayout.FolderChromeCollapse)")
+    open_end = direct.index("func animateClose(", open_start)
     open_body = direct[open_start:open_end]
     if "isHidden = false" not in open_body:
         return "animateOpen does not reveal overlay with open chrome"
@@ -1601,7 +1625,8 @@ def folder_open_dismisses_visible_toast(direct: str, core: str) -> str | None:
     end = direct.index("\n    private func ", start + 10)
     # openFolder is long — bound by next private func after a reasonable span
     # Prefer closing at setFolderBackdrop / animateOpen neighborhood via hideToast call
-    body = direct[start:start + 2500]
+    # Window widened after SEARCH-KEYBOARD-HIGHLIGHT-CLEAR-ON-OPEN-FOLDER-01.
+    body = direct[start:start + 3500]
     if "hideToast(animated: true)" not in body:
         return "openFolder must hideToast(animated:) when dismissing toast"
     if "isToastVisible: !toastView.isHidden" not in body:

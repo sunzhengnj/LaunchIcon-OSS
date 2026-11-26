@@ -5,7 +5,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 core = (ROOT / "Sources/Core/LauncherLayout.swift").read_text(encoding="utf-8")
-direct = (ROOT / "Sources/Direct/LauncherWindowController.swift").read_text(encoding="utf-8")
+direct = "".join(p.read_text(encoding="utf-8") for p in [ROOT / "Sources/Direct/LauncherWindowController.swift", *sorted((ROOT / "Sources/Direct").glob("LauncherWindowController+*.swift"))])
 
 def fail(msg: str) -> None:
     print(f"FAIL: {msg}")
@@ -20,7 +20,7 @@ hide_idx = direct.find("func hide(animated: Bool = true)")
 if hide_idx < 0:
     fail("hide() missing")
 # Preamble also stamps the reopen clock and bumps the deferred-sort token.
-hide_window = direct[hide_idx : hide_idx + 800]
+hide_window = direct[hide_idx : hide_idx + 1600]
 if "clearItemSelectionForDismiss()" not in hide_window:
     fail("hide() must call clearItemSelectionForDismiss")
 # Helper body (not the hide() comment) must clear + refresh announce:false

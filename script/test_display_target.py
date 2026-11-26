@@ -8,7 +8,7 @@ SRC = (ROOT / "Sources/Direct/LauncherWindowController.swift").read_text()
 DELEGATE = (ROOT / "Sources/Direct/DirectAppDelegate.swift").read_text()
 SETTINGS = (ROOT / "Sources/Direct/SettingsWindowController.swift").read_text()
 fail = []
-m = re.search(r"private func launcherScreen\(for window: NSWindow, appearing: Bool\).*?\n    \}\n", SRC, re.S)
+m = re.search(r"func launcherScreen\(for window: NSWindow, appearing: Bool\).*?\n    \}\n", SRC, re.S)
 body = m.group(0) if m else ""
 if not body:
     fail.append("missing launcherScreen")
@@ -25,7 +25,7 @@ if "let screen = launcherScreen(for: window, appearing: appearing)" not in SRC:
     fail.append("show() not wired")
 if DELEGATE.count("setDisplayTarget(") != 2:
     fail.append("delegate must apply at launch and on change")
-for t in ("displayTargetPopup.selectItem(", "proposed.displayTarget =", 'makeFormRow(title: L("显示于"), control: displayTargetPopup)'):
+for t in ("displayTargetPopup.selectItem(", "proposed.displayTarget =", "DisplayTargetCopy.label(localize:", "control: displayTargetPopup"):
     if t not in SETTINGS:
         fail.append(f"settings missing {t}")
 if fail:

@@ -29,11 +29,15 @@ public actor JSONLayoutStore: LayoutStoring {
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
     private var recoveredCorruptPrimary: Data?
+    /// Where a failed backup rotation is recorded. Nil keeps the failure quiet.
+    /// The primary save still succeeds either way.
+    private let backupFailureLogURL: URL?
 
-    public init(fileURL: URL, fileManager: FileManager = .default) {
+    public init(fileURL: URL, fileManager: FileManager = .default, backupFailureLogURL: URL? = nil) {
         self.fileURL = fileURL
         self.backupURL = fileURL.deletingPathExtension().appendingPathExtension("backup.json")
         self.fileManager = fileManager
+        self.backupFailureLogURL = backupFailureLogURL
         self.encoder = JSONEncoder()
         self.encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         self.decoder = JSONDecoder()
@@ -64,6 +68,9 @@ public actor JSONLayoutStore: LayoutStoring {
             throw LayoutStoreIssue.unsupportedSchema(state.schemaVersion)
         }
         try fileManager.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        // Rotate the single backup slot only after the new primary is in place.
+        // Writing backup first would destroy the undo copy when replaceItemAt fails.
+        var previousValidData: Data?
         if fileManager.fileExists(atPath: fileURL.path) {
             let previousData = try Data(contentsOf: fileURL)
             let previousState: LayoutState?
@@ -76,7 +83,7 @@ public actor JSONLayoutStore: LayoutStoring {
             }
             if let previousState {
                 if previousState == state { return }
-                try previousData.write(to: backupURL, options: .atomic)
+                previousValidData = previousData
             } else {
                 guard previousData == recoveredCorruptPrimary else {
                     throw LayoutStoreIssue.corruptedFile(fileURL)
@@ -94,6 +101,21 @@ public actor JSONLayoutStore: LayoutStoring {
             _ = try fileManager.replaceItemAt(fileURL, withItemAt: temporaryURL)
         } else {
             try fileManager.moveItem(at: temporaryURL, to: fileURL)
+        }
+        if let previousValidData {
+            // LAYOUT-BACKUP-WRITE-BEST-EFFORT-01: the primary is already in
+            // place. A backup failure must not surface as a failed save.
+            do {
+                try previousValidData.write(to: backupURL, options: .atomic)
+            } catch {
+                let nsError = error as NSError
+                if let backupFailureLogURL {
+                    LocalDiagnostics.append(
+                        "Layout backup write failed: domain=\(nsError.domain); code=\(nsError.code)",
+                        to: backupFailureLogURL
+                    )
+                }
+            }
         }
         recoveredCorruptPrimary = nil
     }

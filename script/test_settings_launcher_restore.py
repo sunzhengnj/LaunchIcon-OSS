@@ -59,11 +59,11 @@ if "shouldAnimateLauncherHideForSettingsHandoff" not in core:
     fail("Core missing shouldAnimateLauncherHideForSettingsHandoff")
 if "shouldAnimateLauncherHideForSettingsHandoff" not in app:
     fail("showSettings must pass settings handoff animated gate to hide")
-direct = (root / "Sources/Direct/LauncherWindowController.swift").read_text()
+direct = "".join(p.read_text() for p in [root / "Sources/Direct/LauncherWindowController.swift", *sorted((root / "Sources/Direct").glob("LauncherWindowController+*.swift"))])
 if "func hide(animated: Bool = true)" not in direct:
     fail("LauncherWindowController missing hide(animated:)")
 hide_start = direct.index("func hide(animated: Bool = true)")
-hide_end = direct.index("@objc private func windowDidUpdate", hide_start)
+hide_end = direct.index("func toggleVisibility", hide_start)
 hide_body = direct[hide_start:hide_end]
 if "if !animated" not in hide_body:
     fail("hide(animated:) missing immediate branch")
@@ -120,7 +120,7 @@ if "searchFieldHoldsKeyboardFocus" not in direct:
 if "focusSearchFieldForSettingsHandoffRestore" not in direct:
     fail("Direct missing focusSearchFieldForSettingsHandoffRestore")
 hide_start = direct.index("func hide(animated: Bool = true)")
-hide_end = direct.index("@objc private func windowDidUpdate", hide_start)
+hide_end = direct.index("func toggleVisibility", hide_start)
 hide_body = direct[hide_start:hide_end]
 if "shouldParkSearchFocusForSettingsHandoff" not in hide_body:
     fail("immediate hide must park search focus")
@@ -144,7 +144,7 @@ if "searchQueryIsNonEmpty" not in direct:
 if "snapSearchResultsChromeForSettingsHandoffRestore" not in direct:
     fail("Direct missing snapSearchResultsChromeForSettingsHandoffRestore")
 hide_start = direct.index("func hide(animated: Bool = true)")
-hide_end = direct.index("@objc private func windowDidUpdate", hide_start)
+hide_end = direct.index("func toggleVisibility", hide_start)
 hide_body = direct[hide_start:hide_end]
 if "shouldParkSearchResultsChromeForSettingsHandoff" not in hide_body:
     fail("immediate hide must park search results chrome")
@@ -166,7 +166,7 @@ if "shouldEnsurePageIndicatorSuppressedWhenPreservingQuery" not in core:
 if "snapPageIndicatorSuppressedForSettingsHandoffRestore" not in direct:
     fail("Direct missing snapPageIndicatorSuppressedForSettingsHandoffRestore")
 hide_start = direct.index("func hide(animated: Bool = true)")
-hide_end = direct.index("@objc private func windowDidUpdate", hide_start)
+hide_end = direct.index("func toggleVisibility", hide_start)
 hide_body = direct[hide_start:hide_end]
 if "snapPageIndicatorSuppressedForSettingsHandoffRestore()" not in hide_body:
     fail("immediate hide with non-empty query must snap page indicator suppressed")
@@ -189,7 +189,7 @@ if "shouldEnsurePageArrowsSuppressedWhenPreservingQuery" not in core:
 if "snapPageArrowsSuppressedForSettingsHandoffRestore" not in direct:
     fail("Direct missing snapPageArrowsSuppressedForSettingsHandoffRestore")
 hide_start = direct.index("func hide(animated: Bool = true)")
-hide_end = direct.index("@objc private func windowDidUpdate", hide_start)
+hide_end = direct.index("func toggleVisibility", hide_start)
 hide_body = direct[hide_start:hide_end]
 if "snapPageArrowsSuppressedForSettingsHandoffRestore()" not in hide_body:
     fail("immediate hide with non-empty query must snap page arrows suppressed")
@@ -212,7 +212,7 @@ if "shouldEnsureSearchFooterChromeWhenPreservingQuery" not in core:
 if "snapSearchFooterChromeForSettingsHandoffRestore" not in direct:
     fail("Direct missing snapSearchFooterChromeForSettingsHandoffRestore")
 hide_start = direct.index("func hide(animated: Bool = true)")
-hide_end = direct.index("@objc private func windowDidUpdate", hide_start)
+hide_end = direct.index("func toggleVisibility", hide_start)
 hide_body = direct[hide_start:hide_end]
 if "snapSearchFooterChromeForSettingsHandoffRestore()" not in hide_body:
     fail("immediate hide with non-empty query must snap search footer chrome")
@@ -238,7 +238,7 @@ if "shouldEnsureSearchAdjacentChromeWhenPreservingQuery" not in core:
 if "snapSearchAdjacentChromeForSettingsHandoffRestore" not in direct:
     fail("Direct missing snapSearchAdjacentChromeForSettingsHandoffRestore")
 hide_start = direct.index("func hide(animated: Bool = true)")
-hide_end = direct.index("@objc private func windowDidUpdate", hide_start)
+hide_end = direct.index("func toggleVisibility", hide_start)
 hide_body = direct[hide_start:hide_end]
 if "snapSearchAdjacentChromeForSettingsHandoffRestore()" not in hide_body:
     fail("immediate hide with non-empty query must snap search-adjacent chrome")

@@ -17,11 +17,12 @@ need("folderCloseGridFocusID" in core, "Core missing folderCloseGridFocusID")
 need("testFolderCloseGridFocusPrefersFolderThenDissolvedNeighbor" in tests, "Core test missing")
 need("pendingFolderCloseFocusPreviousEntries" in direct, "must park previous entries on close")
 need("focusMainGridEntry" in direct, "must focus main grid (not search divert)")
-need("folderCloseGridFocusID" in direct, "land/dissolve must resolve via Core")
+need("folderCloseFocusIDAfterExtract" in direct, "land/dissolve must resolve via Core extract-aware focus")
+need("folderCloseGridFocusID" in core[core.index("func folderCloseFocusIDAfterExtract"):core.index("func folderCloseFocusIDAfterExtract")+800], "extract close focus must fall back to folderCloseGridFocusID")
 
 land = direct[direct.index("func finishFolderCloseChromeLand"):direct.index("func focusedOpenFolderMember")]
 need("focusMainGridEntry" in land, "finish land must use focusMainGridEntry")
-need("folderCloseGridFocusID" in land, "finish land must use folderCloseGridFocusID")
+need("folderCloseFocusIDAfterExtract" in land, "finish land must use folderCloseFocusIDAfterExtract")
 need("pendingFolderCloseFocusPreviousEntries" in land, "land must consume previous snapshot")
 
 esc = direct[direct.index("func handleEscape() -> Bool"):direct.index("var highlightedLaunchKey")]

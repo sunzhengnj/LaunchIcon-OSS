@@ -25,8 +25,11 @@ dis = body(core, "public static func dissolveFolder(", "public static func focus
 need("replaceSubrange(index...index" in dis, "dissolve must put members in the folder slot")
 need("state.folders[folderID] = nil" in dis, "dissolve must drop the folder record")
 foc = body(core, "public static func focusIDAfterMenuDissolve(", "dissolveFolderToastMessageFormatKey")
-need("pageIndex(containingEntryAt: index) == pageIndex(containingEntryAt: folderIndex)" in foc,
-     "menu dissolve focus must stay on the folder's page")
+need(
+    "pageIndex(containingEntryAt: index, capacity: capacity) == pageIndex(containingEntryAt: folderIndex, capacity: capacity)" in foc,
+    "menu dissolve focus must stay on the folder's page",
+)
+need("capacity: Int = pageCapacity" in foc, "dissolve focus must honor live grid capacity")
 need("testMenuDissolveFolderKeepsMembersInPlaceAndFocusOnPage" in tests, "Core test missing")
 
 ds = body(direct, "case .folder(let folder, let preview):", "if pendingMergeAnimation")
@@ -51,6 +54,7 @@ dfn = body(direct, "private func dissolveFolderFromMenu(", "/// Context menu「�
 need("guard isLayoutEditingEnabled, acceptsIconContextMenuAction() else { return }" in dfn, "dissolve respects lock/dismiss")
 need("guard openedFolderID == nil, !isSearching" in dfn, "dissolve only from the main grid")
 need("LauncherLayout.focusIDAfterMenuDissolve(" in dfn, "dissolve focus must use same-page policy")
+need("capacity: gridGeometry.capacity" in dfn, "dissolve focus must pass live grid capacity")
 for banned in ("showPage", "focusGridEntry", "PagingCollectionView", "scrollToPage", "playFolderDissolveScatter", "currentPage"):
     need(banned not in ren + dfn, f"folder menu must not touch paging/scatter ({banned})")
 
@@ -76,12 +80,58 @@ for key, en in (("重命名文件夹…", "Rename Folder…"), ("解散文件夹
                 ("已解散「%@」", "Ungrouped “%@”"), ("留空会保留原名称。", "Leave empty to keep the current name.")):
     need(f'"{key}"' in strings and f'"{en}"' in strings, f"localization missing: {key}")
 
+need("func commandOptionNSortsFocusedFolder(" in core, "Core command-option-n sort gate missing")
+need("func sortFocusedFolderByNameFromCommandOption(" in direct, "Direct command-option-n sort missing")
+need("sortFocusedFolderByNameFromCommandOption(" in direct, "panel must ask to sort the folder")
+need("testCommandOptionNSortsTheFocusedFolderByName" in tests, "Core command-option-n sort test missing")
+sort_key = body(direct, "func sortFocusedFolderByNameFromCommandOption(", "/// Context menu「移到文件夹」")
+need("commandOptionNSortsFocusedFolder(" in sort_key, "sort shortcut must ask Core")
+need("sortFolderByNameFromMenu(" in sort_key, "sort shortcut must use the folder menu action")
+for banned in ("showPage", "transitionToPage", "completePageTransition", "movePage", "focusGridEntry", "currentPage"):
+    need(banned not in sort_key, f"folder sort shortcut must not page ({banned})")
+
+need("func commandOptionNSortsOpenFolder(" in core, "Core open-folder name sort gate missing")
+need("func sortOpenFolderByNameFromCommandOption(" in direct, "Direct open-folder name sort missing")
+need("sortOpenFolderByNameFromCommandOption(" in direct, "panel must ask to sort the open folder")
+need("testCommandOptionNSortsTheOpenFolderByName" in tests, "Core open-folder name sort test missing")
+open_sort = body(direct, "func sortOpenFolderByNameFromCommandOption(", "func sortFocusedFolderByColorFromCommandOption(")
+need("commandOptionNSortsOpenFolder(" in open_sort, "open-folder sort must ask Core")
+need("sortingFolderMembersByName(" in open_sort, "open-folder sort must use the member sort")
+need("return true" in open_sort, "open-folder sort must consume the key")
+for banned in ("showPage", "transitionToPage", "completePageTransition", "movePage", "focusGridEntry", "currentPage"):
+    need(banned not in open_sort, f"open-folder sort must not page ({banned})")
+
 need("sortFolderByNameAccessibilityHelp" in direct, "Direct missing sortFolderByNameAccessibilityHelp")
 need("sortFolderByColorAccessibilityHelp" in direct, "Direct missing sortFolderByColorAccessibilityHelp")
 need('L("只调整这个文件夹内的顺序' not in direct, "Direct still hardcodes folder-sort name AX help")
 need('L("只按图标颜色调整这个文件夹' not in direct, "Direct still hardcodes folder-sort color AX help")
 need("sortFolderByNameAccessibilityHelpKey" in core, "Core missing folder-sort name AX help key")
 need("sortFolderByColorAccessibilityHelpKey" in core, "Core missing folder-sort color AX help key")
+
+need("func f2RenamesFocusedClosedFolder(" in core, "Core F2 rename gate missing")
+need("func renameFocusedFolderFromF2(" in direct, "Direct F2 rename missing")
+need("onRenameFocusedFolderFromF2" in direct, "tile F2 callback missing")
+need("testF2RenamesTheFocusedClosedFolder" in tests, "Core F2 rename test missing")
+f2 = body(direct, "func renameFocusedFolderFromF2(", "/// Context menu「移到文件夹」")
+need("f2RenamesFocusedClosedFolder(" in f2, "F2 rename must ask Core")
+need("promptForFolderName(" in f2, "F2 rename must use the folder menu action")
+for banned in ("showPage", "transitionToPage", "completePageTransition", "movePage", "focusGridEntry", "currentPage"):
+    need(banned not in f2, f"F2 rename must not page ({banned})")
+need("func f2RenamesFocusedAppAlias(" in core, "Core F2 alias gate missing")
+need("func renameFocusedAppAliasFromF2(" in direct, "Direct F2 alias rename missing")
+need("renameFocusedAppAliasFromF2(" in direct, "tile must ask to rename an app alias")
+need("testF2RenamesTheFocusedAppAlias" in tests, "Core F2 alias test missing")
+alias_f2 = body(direct, "func renameFocusedAppAliasFromF2(", "/// Context menu「移到文件夹」")
+need("f2RenamesFocusedAppAlias(" in alias_f2, "F2 alias rename must ask Core")
+need("promptForAlias(" in alias_f2, "F2 alias rename must use the icon menu sheet")
+for banned in ("showPage", "transitionToPage", "completePageTransition", "movePage", "focusGridEntry", "currentPage"):
+    need(banned not in alias_f2, f"F2 alias rename must not page ({banned})")
+tile_key = body(direct, "override func keyDown(with event: NSEvent) {\n        // NSView.keyDown", "override func insertTab")
+need("onRenameFocusedFolderFromF2?(" in tile_key, "tile keyDown must offer F2 rename")
+need(
+    tile_key.index("onRenameFocusedFolderFromF2?(") < tile_key.index("case 123, 116, 126:"),
+    "F2 rename must run before the tile pages",
+)
 
 if failures:
     print("FAIL: folder context menu")

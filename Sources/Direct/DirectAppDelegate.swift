@@ -1,6 +1,17 @@
 import AppKit
 import LaunchIconCore
+import ObjectiveC
 import OSLog
+
+/// STATUS-ITEM-AX-SHOW-MENU-01: `NSStatusItem` owns the button, and Show Menu
+/// is delivered only to that instance. This subclass stores nothing, so
+/// `object_setClass` keeps the same size. Left click still uses the action.
+final class LaunchIconStatusButton: NSStatusBarButton {
+    override func accessibilityPerformShowMenu() -> Bool {
+        guard let owner = target as? DirectAppDelegate else { return false }
+        return owner.presentStatusItemMenuForAccessibility()
+    }
+}
 
 func L(_ key: String) -> String {
     Bundle.main.localizedString(forKey: key, value: key, table: "Localizable")
@@ -56,6 +67,9 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
     )
     private let diagnosticsQueue = DispatchQueue(label: "LaunchIcon.Direct.Diagnostics", qos: .utility)
     private let folderLifecycleLogger = Logger(subsystem: "com.sunzheng.LaunchIcon", category: "FolderLifecycle")
+    /// Process-local origin for bootstrap / first-catalog diagnostic timings.
+    private let processTimingOrigin = CFAbsoluteTimeGetCurrent()
+    private var hasRecordedFirstCatalogReady = false
     private var preferences = LauncherPreferences()
     private var preferencesSaveTask: Task<Void, Never>?
     private var hotKeyRegistered = false
@@ -101,15 +115,16 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
             return NSSize(width: width, height: height)
         }()
         let layoutStore: JSONLayoutStore
+        let backupFailureLogURL = Self.layoutBackupFailureLogURL()
         if let testLayoutURL {
-            layoutStore = JSONLayoutStore(fileURL: testLayoutURL)
+            layoutStore = JSONLayoutStore(fileURL: testLayoutURL, backupFailureLogURL: backupFailureLogURL)
         } else if testRoot != nil {
             let automaticTestLayoutURL = FileManager.default.temporaryDirectory
                 .appendingPathComponent("LaunchIcon-empty-state-\(ProcessInfo.processInfo.processIdentifier)")
                 .appendingPathComponent("layout-v1.json")
-            layoutStore = JSONLayoutStore(fileURL: automaticTestLayoutURL)
+            layoutStore = JSONLayoutStore(fileURL: automaticTestLayoutURL, backupFailureLogURL: backupFailureLogURL)
         } else {
-            layoutStore = JSONLayoutStore(fileURL: JSONLayoutStore.defaultFileURL)
+            layoutStore = JSONLayoutStore(fileURL: JSONLayoutStore.defaultFileURL, backupFailureLogURL: backupFailureLogURL)
         }
         launcherController = LauncherWindowController(
             catalogRoots: testRoot.map { [$0] } ?? AppCatalogScanner.standardRoots,
@@ -131,9 +146,24 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
            let override = LauncherReopenPageBehavior(rawValue: raw) {
             preferences.reopenPageBehavior = override
         }
+        // UI tests cannot push a suite UserDefaults value into this process
+        // reliably. Honor a test-only pair so a fixture can boot at 5×3 / 10×8.
+        if ProcessInfo.processInfo.environment["LAUNCHICON_TEST_LAYOUT_PATH"] != nil,
+           let columns = Int(ProcessInfo.processInfo.environment["LAUNCHICON_TEST_GRID_COLUMNS"] ?? ""),
+           let rows = Int(ProcessInfo.processInfo.environment["LAUNCHICON_TEST_GRID_ROWS"] ?? "") {
+            preferences.gridGeometry = GridGeometryPreference(columns: columns, rows: rows)
+        }
         launcherController?.setReopenPageBehavior(preferences.reopenPageBehavior)
+        launcherController?.setPageFlipDirection(preferences.pageFlipDirection)
+        launcherController?.setGridGeometry(preferences.gridGeometry)
         launcherController?.setPinchToDismissEnabled(preferences.pinchToDismiss)
         launcherController?.onSettingsRequested = { [weak self] in self?.showSettings() }
+        launcherController?.onPageFlipDirectionChangeRequested = { [weak self] direction in
+            guard let self else { return }
+            var next = self.preferences
+            next.pageFlipDirection = direction
+            _ = self.applyPreferences(next)
+        }
         launcherController?.onVisibilityChanged = { [weak self] in
             self?.refreshStatusItemToggleTitle()
             self?.clearSettingsLauncherRestoreIfLauncherVisible()
@@ -151,10 +181,27 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
             }
         }
         launcherController?.onCatalogReloadFinished = { [weak self] canEditLayout in
-            self?.settingsController?.completeRescan(canEditLayout: canEditLayout)
+            guard let self else { return }
+            self.settingsController?.completeRescan(canEditLayout: canEditLayout)
             // SETTINGS-HIDDEN-REFRESH-ON-SCAN-01: mid-scan Settings open must
             // see hidden apps once the catalog exists (not only on becomeKey).
-            self?.settingsController?.refreshHiddenApplicationsFromLauncher()
+            self.settingsController?.refreshHiddenApplicationsFromLauncher()
+            if !self.hasRecordedFirstCatalogReady {
+                self.hasRecordedFirstCatalogReady = true
+                self.record(
+                    "Bootstrap: first catalog ready after \(self.elapsedSinceProcessTimingOriginMs()) ms; persistable=\(canEditLayout)"
+                )
+            }
+        }
+        // SETTINGS-HIDDEN-REFRESH-ON-LAYOUT-01: hide/restore while Settings stays
+        // open (launcher brought back) refreshes without waiting for becomeKey.
+        launcherController?.onHiddenApplicationsChanged = { [weak self] in
+            guard let self else { return }
+            let visible = self.settingsController?.window?.isVisible == true
+            guard LauncherLayout.shouldRefreshSettingsHiddenAppsOnLayoutChange(
+                settingsWindowVisible: visible
+            ) else { return }
+            self.settingsController?.refreshHiddenApplicationsFromLauncher()
         }
         launcherController?.onCatalogSnapshotSaveFailed = { [weak self] error in
             let nsError = error as NSError
@@ -215,6 +262,7 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
         }
         #endif
         if shortcutError == nil {
+            record("Bootstrap: initial show requested after \(elapsedSinceProcessTimingOriginMs()) ms")
             launcherController?.show()
         }
         #if DEBUG
@@ -251,15 +299,12 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
         let hasVisibleWindows = flag
         Task { @MainActor in
             guard let controller = self.launcherController else { return }
-            // A Dock click never hides. During the dismiss animation the
-            // window is still visible, and the same choice as the hotkey
-            // brings it back.
-            if LauncherLayout.visibilityToggle(
-                isVisible: hasVisibleWindows,
-                isDismissing: controller.isDismissing
-            ) == .show {
-                controller.show()
-            }
+            // DOCK-REOPEN-SUPPRESS-WHEN-SETTINGS-OR-MODAL-01
+            let settingsIsKey = self.settingsController?.window?.isKeyWindow == true
+            controller.respondToDockReopen(
+                hasVisibleWindows: hasVisibleWindows,
+                settingsIsKey: settingsIsKey
+            )
         }
         return true
     }
@@ -318,13 +363,21 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
             item.button?.title = "LI"
         }
         item.button?.toolTip = L(LauncherLayout.statusItemToggleTitle(isVisible: false, isDismissing: false))
-        item.button?.setAccessibilityLabel("LaunchIcon")
+        // STATUS-ITEM-BUTTON-AX-01: label tracks show/hide via refreshStatusItemToggleTitle.
+        item.button?.setAccessibilityLabel(
+            L(LauncherLayout.statusItemToggleTitle(isVisible: false, isDismissing: false))
+        )
         // STATUS-ITEM-CLICK-01 — left click toggles the launcher; right /
         // Control-click opens the same menu. Do not assign `item.menu` or
         // primary click would only open the menu.
         item.button?.target = self
         item.button?.action = #selector(statusItemButtonActivated(_:))
         item.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        // STATUS-ITEM-AX-SHOW-MENU-01: do not assign item.menu (that steals
+        // the left click). Install the Show Menu override on the existing button.
+        if let button = item.button {
+            object_setClass(button, LaunchIconStatusButton.self)
+        }
 
         let menu = NSMenu()
         menu.delegate = self
@@ -399,9 +452,29 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
     @MainActor
     private func presentStatusMenu(from button: NSStatusBarButton?) {
         guard let menu = statusMenu, let button else { return }
+        // STATUS-ITEM-MENU-SUPPRESS-WHEN-MODAL-01
+        guard launcherController?.shouldPresentStatusItemMenu() != false else { return }
         refreshStatusItemToggleTitle()
         let point = NSPoint(x: 0, y: button.bounds.height)
         menu.popUp(positioning: nil, at: point, in: button)
+    }
+
+    /// STATUS-ITEM-AX-SHOW-MENU-01: VoiceOver Show Menu. Not the left-click toggle.
+    @MainActor
+    func presentStatusItemMenuForAccessibility() -> Bool {
+        guard LauncherLayout.statusItemActionForAccessibilityShowMenu() == .showMenu else {
+            return false
+        }
+        // STATUS-ITEM-AX-SHOW-MENU-SUPPRESSED-01: alias / uninstall sheets
+        // keep the menu down. Report that to VoiceOver instead of success.
+        let presentationAllowed = launcherController?.shouldPresentStatusItemMenu() != false
+        guard LauncherLayout.statusItemAccessibilityShowMenuPerformed(
+            hasButton: statusItem?.button != nil,
+            hasMenu: statusMenu != nil,
+            presentationAllowed: presentationAllowed
+        ) else { return false }
+        presentStatusMenu(from: statusItem?.button)
+        return true
     }
 
     @MainActor
@@ -429,7 +502,10 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
         hotCornerMonitor.update(corner: corner) { [weak self] in
             // Presence fade via show/hide(animated:) — not settings snappy hide,
             // and not page indicator/arrow snaps.
-            self?.launcherController?.respondToHotCornerTrigger()
+            // HOT-CORNER-SUPPRESS-WHEN-SETTINGS-OR-MODAL-01
+            guard let self else { return }
+            let settingsIsKey = self.settingsController?.window?.isKeyWindow == true
+            self.launcherController?.respondToHotCornerTrigger(settingsIsKey: settingsIsKey)
         }
         if corner.isEnabled {
             record("Hot corner \(corner.title): enabled")
@@ -444,7 +520,12 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
             return .failure(.registrationFailed(-1))
         }
         let pressed: @Sendable () -> Void = { [weak self] in
-            Task { @MainActor in self?.launcherController?.toggleVisibility() }
+            Task { @MainActor in
+                guard let self else { return }
+                // HOTKEY-STATUS-SUPPRESS-WHEN-SETTINGS-OR-MODAL-01
+                let settingsIsKey = self.settingsController?.window?.isKeyWindow == true
+                self.launcherController?.toggleVisibility(settingsIsKey: settingsIsKey)
+            }
         }
         return hotKeyService.register(shortcut, onPressed: pressed)
     }
@@ -476,6 +557,8 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
         launcherController?.setBackgroundDim(proposed.backgroundDim)
         launcherController?.setBlursBackground(proposed.blursBackground)
         launcherController?.setReopenPageBehavior(proposed.reopenPageBehavior)
+        launcherController?.setPageFlipDirection(proposed.pageFlipDirection)
+        launcherController?.setGridGeometry(proposed.gridGeometry)
         launcherController?.setPinchToDismissEnabled(proposed.pinchToDismiss)
         launcherController?.setAdditionalAppDirectories(proposed.additionalAppDirectories)
         configureHotCornerMonitor(proposed.hotCorner)
@@ -507,6 +590,11 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
                 animated: LauncherLayout.shouldAnimateLauncherHideForSettingsHandoff()
             )
             didHideLauncherToShowSettings = true
+        } else {
+            // SETTINGS-OPEN-DEDUPE-CALLS-01: hide() cancels icon loads when the
+            // launcher is visible. A hidden launcher skips hide(), but a catalog
+            // refresh may still be prefetching. Cancel once on that path only.
+            launcherController?.cancelIconLoadsForSettingsWhileLauncherHidden()
         }
         let hiddenApplications = launcherController?.hiddenApplications() ?? []
         if settingsController == nil {
@@ -604,7 +692,9 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
 
     @objc private func toggleLauncher() {
         Task { @MainActor in
-            self.launcherController?.toggleVisibility()
+            // HOTKEY-STATUS-SUPPRESS-WHEN-SETTINGS-OR-MODAL-01
+            let settingsIsKey = self.settingsController?.window?.isKeyWindow == true
+            self.launcherController?.toggleVisibility(settingsIsKey: settingsIsKey)
         }
     }
 
@@ -612,6 +702,18 @@ final class DirectAppDelegate: NSObject, NSApplicationDelegate, @unchecked Senda
         Task { @MainActor in
             self.launcherController?.reloadCatalog()
         }
+    }
+
+    /// User diagnostics only. A test layout or preferences suite must not append there.
+    private static func layoutBackupFailureLogURL() -> URL? {
+        let environment = ProcessInfo.processInfo.environment
+        guard !LocalDiagnostics.keepsUserEvidenceUntouched(environment) else { return nil }
+        let bundleIdentifier = Bundle.main.bundleIdentifier ?? "com.sunzheng.LaunchIcon"
+        return LocalDiagnostics.fileURL(for: bundleIdentifier)
+    }
+
+    private func elapsedSinceProcessTimingOriginMs() -> Int {
+        Int((CFAbsoluteTimeGetCurrent() - processTimingOrigin) * 1000)
     }
 
     private func record(_ line: String) {
@@ -651,5 +753,8 @@ extension DirectAppDelegate: NSMenuDelegate {
         // Keep VoiceOver / help in sync with the same visibilityToggle choice.
         toggleMenuItem?.setAccessibilityTitle(L(title))
         statusItem?.button?.toolTip = L(title)
+        // STATUS-ITEM-BUTTON-AX-01: button label was stuck on「LaunchIcon」.
+        statusItem?.button?.setAccessibilityLabel(L(title))
+        statusItem?.button?.setAccessibilityHelp(L(title))
     }
 }

@@ -5,10 +5,15 @@ import Darwin
 /// Watches standard Applications folders with the public FSEvents API.
 /// New installs, deletions, and replacements coalesce into one callback.
 public final class ApplicationDirectoryWatcher: @unchecked Sendable {
+    /// FSEvents latency and the Dispatch debounce share this window so a burst
+    /// of installs, deletes, or renames becomes one callback.
+    public static let defaultEventCoalescingInterval: TimeInterval = 0.8
+
     private var stream: FSEventStreamRef?
     private var debounceWork: DispatchWorkItem?
     private let onChange: @Sendable () -> Void
     private let onRootChanged: @Sendable () -> Void
+    private let eventCoalescingInterval: TimeInterval
     private var watchedDirectoryPaths: [String] = []
     private var rebindingRootPaths: Set<String> = []
     private var rootChangePending = false
@@ -16,10 +21,12 @@ public final class ApplicationDirectoryWatcher: @unchecked Sendable {
 
     public init(
         onChange: @escaping @Sendable () -> Void,
-        onRootChanged: @escaping @Sendable () -> Void = {}
+        onRootChanged: @escaping @Sendable () -> Void = {},
+        eventCoalescingInterval: TimeInterval = ApplicationDirectoryWatcher.defaultEventCoalescingInterval
     ) {
         self.onChange = onChange
         self.onRootChanged = onRootChanged
+        self.eventCoalescingInterval = eventCoalescingInterval
     }
 
     deinit {
@@ -71,7 +78,7 @@ public final class ApplicationDirectoryWatcher: @unchecked Sendable {
             &context,
             paths,
             FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
-            0.8,
+            eventCoalescingInterval,
             flags
         )
         guard let stream else { return false }
@@ -96,11 +103,19 @@ public final class ApplicationDirectoryWatcher: @unchecked Sendable {
         self.stream = nil
     }
 
-    private func handleEvents(at paths: [String], rootChanged rootWasMoved: Bool) {
-        let rootChanged = rootWasMoved || paths.contains { path in
+    /// Visible for Core tests so debounce can be exercised without a live FSEvents burst.
+    func handleEvents(at paths: [String], rootChanged rootWasMoved: Bool) {
+        // FSEvents and test callers may pass /var/... while start() stored
+        // realpath /private/var/.... Compare both the raw and canonical forms
+        // so a rename/move event is not dropped.
+        let eventPaths = paths.flatMap { path -> [String] in
+            let canonical = Self.canonicalPath(path)
+            return canonical == path ? [path] : [path, canonical]
+        }
+        let rootChanged = rootWasMoved || eventPaths.contains { path in
             rebindingRootPaths.contains { root in root == path || root.hasPrefix(path + "/") }
         }
-        let changed = paths.contains { path in
+        let changed = eventPaths.contains { path in
             watchedDirectoryPaths.contains { path == $0 || path.hasPrefix($0 + "/") }
         }
         guard rootChanged || changed else { return }
@@ -114,7 +129,7 @@ public final class ApplicationDirectoryWatcher: @unchecked Sendable {
             if rootChanged { self.onRootChanged() }
         }
         debounceWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + eventCoalescingInterval, execute: work)
     }
 
     private static func canonicalPath(_ path: String) -> String {

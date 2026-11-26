@@ -43,7 +43,7 @@ public enum LocalDiagnostics {
         append(line, to: fileURL(for: bundleIdentifier))
     }
 
-    private static func append(_ line: String, to url: URL) {
+    static func append(_ line: String, to url: URL) {
         appendLock.lock()
         defer { appendLock.unlock() }
         do {

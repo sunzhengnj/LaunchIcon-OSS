@@ -47,19 +47,59 @@ for key in ("浅", "标准", "深", "背景暗度", "调整启动器背后壁纸
     if key not in strings:
         fail(f"xcstrings missing {key!r}")
 
-# BACKGROUND-BLUR-01
+# BACKGROUND-BLUR-01 + REDUCE-TRANSPARENCY-BLUR-01
+layout = (ROOT / "Sources/Core/LauncherLayout.swift").read_text(encoding="utf-8")
 for needle in ('prefix + "blursBackground"', "blursBackground: Bool = true"):
     if needle not in prefs:
         fail(f"Core missing {needle!r}")
+if "func shouldBlurDesktopBackground(" not in layout:
+    fail("Core missing shouldBlurDesktopBackground")
+if "blurs: !reducesMotion && !reducesTransparency" not in layout:
+    fail("folder veil blur must follow reduce transparency")
 if "NSVisualEffectView(frame: .zero)\n        effect.material" in direct:
     fail("blur view must be the stored backgroundBlurView")
-bstart = direct.find("    func setBlursBackground(_ blurs: Bool) {\n        guard backgroundBlurView")
+if "REDUCE-TRANSPARENCY-BLUR-01" not in direct:
+    fail("missing reduce-transparency tag")
+if direct.count("refreshReducedTransparencyForSystemChange()") < 2:
+    fail("display options must refresh transparency")
+bstart = direct.find("    func setBlursBackground(_ blurs: Bool) {\n        blursBackgroundPreference = blurs")
 if bstart < 0:
     fail("root view setBlursBackground missing")
 bbody = direct[bstart:direct.find("\n    }\n", bstart)]
-for bad in ("reload", "currentPage", "layoutSubtreeIfNeeded", "needsLayout", "scrollTo", "makeFirstResponder"):
+for bad in (
+    "reload",
+    "currentPage",
+    "layoutSubtreeIfNeeded",
+    "needsLayout",
+    "scrollTo",
+    "makeFirstResponder",
+    "showPage",
+    "transitionToPage",
+    "completePageTransition",
+):
     if bad in bbody:
         fail(f"setBlursBackground must not touch {bad} (paging red line)")
+if "applyDesktopBackgroundBlur()" not in bbody:
+    fail("setBlursBackground must apply the stored preference")
+rstart = direct.find("    func refreshReducedTransparencyForSystemChange()")
+if rstart < 0:
+    fail("refreshReducedTransparencyForSystemChange missing")
+rbody = direct[rstart:direct.find("\n    }\n", rstart)]
+if "blursBackgroundPreference" in rbody:
+    fail("system transparency must not rewrite the blur preference")
+for signature in (
+    "    private func applyDesktopBackgroundBlur()",
+    "    private func applyFolderBackdropBlurForTransparencyChange()",
+):
+    start = direct.find(signature)
+    if start < 0:
+        fail(f"missing {signature.strip()}")
+    body = direct[start:direct.find("\n    }\n", start)]
+    for bad in ("showPage", "transitionToPage", "completePageTransition", "scrollToPage"):
+        if bad in body:
+            fail(f"{signature.strip()} must not page ({bad})")
+if "shouldBlurDesktopBackground(" not in direct:
+    fail("wallpaper blur must use the Core gate")
 if delegate.count("setBlursBackground(") != 2:
     fail("DirectAppDelegate must apply blur at boot and on settings change")
 for needle in ("backgroundBlurCheckbox", "settings-background-blur", "proposed.blursBackground"):

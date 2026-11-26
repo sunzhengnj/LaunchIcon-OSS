@@ -227,6 +227,39 @@ public enum AppDirectoryCopy {
     }
 }
 
+// MARK: - Settings scroll document (SETTINGS-TAB-LAYOUT-ON-SHOW-01)
+
+/// Pure height rules for settings tab panes. A 1pt placeholder frame is what
+/// unselected tab items start with; writing it onto the selected pane is the
+/// blank-tab bug. Document height must clear both the clip and a 1pt stub
+/// once the form has been measured.
+public enum SettingsScrollDocument {
+    /// SETTINGS-TAB-SCROLL-TO-TOP-01: switching tabs starts the selected pane
+    /// at the top of its document (AppKit clip origin y = 0).
+    public static func scrollOriginForTabSelectReset() -> CGPoint {
+        .zero
+    }
+
+    public static func selectedPaneFrameIsUsable(_ frame: CGRect) -> Bool {
+        frame.width > 32 && frame.height > 1
+    }
+
+    public static func documentHeight(
+        viewportHeight: CGFloat,
+        contentFittingHeight: CGFloat,
+        stackTopInset: CGFloat,
+        stackBottomInset: CGFloat,
+        laidOutContentHeight: CGFloat = 0
+    ) -> CGFloat {
+        // fittingSize stays 0 until the stack has a frame. The laid-out
+        // bounds are the other measurement. The short one must not hide the
+        // taller form, or the maintenance section cannot scroll into view.
+        let content = max(max(contentFittingHeight, 0), max(laidOutContentHeight, 0))
+        let required = ceil(stackTopInset + content + stackBottomInset)
+        return max(max(viewportHeight, 0), required)
+    }
+}
+
 // MARK: - Settings section chrome (SETTINGS-SECTION-CHROME-01)
 
 /// Window title, page header, section titles, and version line in Settings.
@@ -467,6 +500,100 @@ public enum LauncherReopenPageBehavior: String, CaseIterable, Codable, Sendable 
 }
 
 /// Settings label + help for the reopen-page popup (REOPEN-PAGE-BEHAVIOR-01).
+
+// MARK: - Page flip direction (PAGE-FLIP-DIRECTION-01)
+
+/// Main-grid page turn axis. Default stays horizontal so existing gesture,
+/// animation, and indicator paths keep their Launchpad-style behavior.
+public enum LauncherPageFlipDirection: String, CaseIterable, Codable, Sendable {
+    case horizontal
+    case vertical
+
+    public var title: String {
+        switch self {
+        case .horizontal: "左右滑动"
+        case .vertical: "上下滑动"
+        }
+    }
+
+    public var isHorizontal: Bool { self == .horizontal }
+
+    /// The other browse axis. Horizontal becomes vertical, and vertical becomes horizontal.
+    public var toggled: LauncherPageFlipDirection {
+        switch self {
+        case .horizontal: .vertical
+        case .vertical: .horizontal
+        }
+    }
+}
+
+/// GRID-GEOMETRY-SETTINGS-01: Settings row for the main-grid column/row pair.
+public enum GridGeometryCopy {
+    public static let rowTitleKey = "网格大小"
+    public static let columnsLabelKey = "列"
+    public static let rowsLabelKey = "行"
+    public static let columnsItemFormatKey = "%d 列"
+    public static let rowsItemFormatKey = "%d 行"
+    public static let columnsPopupIdentifier = "settings-grid-columns"
+    public static let rowsPopupIdentifier = "settings-grid-rows"
+    public static let accessibilityHelpKey =
+        "设置主界面每页的列数和行数，范围列 5 到 10、行 3 到 8；默认 7×5。文件夹网格不变。不影响翻页动画"
+
+    public static func rowTitle(localize: (String) -> String = { $0 }) -> String {
+        localize(rowTitleKey)
+    }
+
+    public static func columnsLabel(localize: (String) -> String = { $0 }) -> String {
+        localize(columnsLabelKey)
+    }
+
+    public static func rowsLabel(localize: (String) -> String = { $0 }) -> String {
+        localize(rowsLabelKey)
+    }
+
+    public static func columnsItemTitle(_ columns: Int, localize: (String) -> String = { $0 }) -> String {
+        String(format: localize(columnsItemFormatKey), columns)
+    }
+
+    public static func rowsItemTitle(_ rows: Int, localize: (String) -> String = { $0 }) -> String {
+        String(format: localize(rowsItemFormatKey), rows)
+    }
+
+    public static func accessibilityHelp(localize: (String) -> String = { $0 }) -> String {
+        localize(accessibilityHelpKey)
+    }
+}
+
+/// Settings label + help for the page-flip-direction popup (PAGE-FLIP-DIRECTION-01).
+public enum PageFlipDirectionCopy {
+    public static let labelKey = "翻页方向"
+    public static let accessibilityHelpKey =
+        "主界面翻页用手势左右或上下滑动；默认左右，与 Launchpad 一致。不影响文件夹内滚动"
+
+    public static func label(localize: (String) -> String = { $0 }) -> String {
+        localize(labelKey)
+    }
+
+    public static func accessibilityHelp(localize: (String) -> String = { $0 }) -> String {
+        localize(accessibilityHelpKey)
+    }
+}
+
+/// Blank-area menu submenu for switching page-flip axis (BLANK-BROWSE-MODE-01).
+public enum BlankBrowseModeCopy {
+    public static let menuTitleKey = "浏览模式"
+    public static let accessibilityHelpKey =
+        "切换主界面左右或上下翻页；与设置中的翻页方向相同"
+
+    public static func menuTitle(localize: (String) -> String = { $0 }) -> String {
+        localize(menuTitleKey)
+    }
+
+    public static func accessibilityHelp(localize: (String) -> String = { $0 }) -> String {
+        localize(accessibilityHelpKey)
+    }
+}
+
 public enum ReopenPageCopy {
     public static let labelKey = "打开时页面"
     public static let accessibilityHelpKey =
@@ -650,9 +777,10 @@ public enum PinchDismissPolicy {
 /// Preferred main-grid columns and rows (GRID-GEOMETRY-CONFIG-01).
 ///
 /// Clamped math, persisted on `LauncherPreferences` (GRID-GEOMETRY-PREFS-01).
-/// Direct still lays the grid out with `LauncherLayout.pageColumns` /
-/// `pageRows` / `pageCapacity`. `preservedPageIndex` must not drive a page
-/// turn until that apply slice has its own guard.
+/// Direct and Settings apply this for main-grid layout. Default 7×5 matches
+/// `LauncherLayout.pageColumns` / `pageRows` / `pageCapacity`. A change
+/// remaps the logical page with `preservedPageIndex` and a non-animated
+/// snap; it must not call `showPage`.
 /// Folder grids stay on `LauncherLayout.folderColumns` and are not this preference.
 public struct GridGeometryPreference: Equatable, Sendable, Codable {
     public static let defaultColumns = 7
@@ -667,6 +795,24 @@ public struct GridGeometryPreference: Equatable, Sendable, Codable {
     public var rows: Int
 
     public var capacity: Int { columns * rows }
+
+    public static var columnChoices: [Int] { Array(columnBounds) }
+    public static var rowChoices: [Int] { Array(rowBounds) }
+
+    public static func choiceIndex(forColumns columns: Int) -> Int {
+        let clamped = GridGeometryPreference(columns: columns, rows: defaultRows).columns
+        return columnChoices.firstIndex(of: clamped)
+            ?? columnChoices.firstIndex(of: defaultColumns)
+            ?? 0
+    }
+
+    public static func choiceIndex(forRows rows: Int) -> Int {
+        let clamped = GridGeometryPreference(columns: defaultColumns, rows: rows).rows
+        return rowChoices.firstIndex(of: clamped)
+            ?? rowChoices.firstIndex(of: defaultRows)
+            ?? 0
+    }
+
 
     public static var standard: GridGeometryPreference {
         GridGeometryPreference(columns: defaultColumns, rows: defaultRows)
@@ -744,9 +890,11 @@ public struct LauncherPreferences: Equatable, Sendable {
     public var blursBackground: Bool
     /// Where the grid opens after dismiss (REOPEN-PAGE-BEHAVIOR-01).
     public var reopenPageBehavior: LauncherReopenPageBehavior
+    /// Main-grid page-turn axis (PAGE-FLIP-DIRECTION-01); default horizontal.
+    public var pageFlipDirection: LauncherPageFlipDirection
     /// Pinch-in while visible hides the launcher (PINCH-TO-DISMISS-01); default on.
     public var pinchToDismiss: Bool
-    /// Preferred main-grid size. Direct does not read this for layout yet.
+    /// Preferred main-grid size. Direct and Settings apply this clamped pair.
     public var gridGeometry: GridGeometryPreference
 
     public init(
@@ -762,6 +910,7 @@ public struct LauncherPreferences: Equatable, Sendable {
         backgroundDim: LauncherBackgroundDim = .standard,
         blursBackground: Bool = true,
         reopenPageBehavior: LauncherReopenPageBehavior = .rememberLast,
+        pageFlipDirection: LauncherPageFlipDirection = .horizontal,
         pinchToDismiss: Bool = true,
         gridGeometry: GridGeometryPreference = .standard
     ) {
@@ -777,6 +926,7 @@ public struct LauncherPreferences: Equatable, Sendable {
         self.backgroundDim = backgroundDim
         self.blursBackground = blursBackground
         self.reopenPageBehavior = reopenPageBehavior
+        self.pageFlipDirection = pageFlipDirection
         self.pinchToDismiss = pinchToDismiss
         self.gridGeometry = gridGeometry
     }
@@ -794,13 +944,13 @@ public actor LauncherPreferencesStore {
         LauncherPreferences(
             shortcut: defaults.string(forKey: prefix + "shortcut")
                 .flatMap(LauncherShortcut.init(rawValue:)) ?? .optionSpace,
-            showsStatusItem: defaults.object(forKey: prefix + "showsStatusItem") as? Bool ?? true,
-            hidesAfterLaunch: defaults.object(forKey: prefix + "hidesAfterLaunch") as? Bool ?? true,
-            reducesMotion: defaults.bool(forKey: prefix + "reducesMotion"),
+            showsStatusItem: Self.storedBool(defaults.object(forKey: prefix + "showsStatusItem"), default: true),
+            hidesAfterLaunch: Self.storedBool(defaults.object(forKey: prefix + "hidesAfterLaunch"), default: true),
+            reducesMotion: Self.storedBool(defaults.object(forKey: prefix + "reducesMotion"), default: false),
             hotCorner: defaults.string(forKey: prefix + "hotCorner")
                 .flatMap(LauncherHotCorner.init(rawValue:)) ?? .off,
-            hidesAppNames: defaults.bool(forKey: prefix + "hidesAppNames"),
-            hidesFolderNames: defaults.bool(forKey: prefix + "hidesFolderNames"),
+            hidesAppNames: Self.storedBool(defaults.object(forKey: prefix + "hidesAppNames"), default: false),
+            hidesFolderNames: Self.storedBool(defaults.object(forKey: prefix + "hidesFolderNames"), default: false),
             displayTarget: defaults.string(forKey: prefix + "displayTarget")
                 .flatMap(LauncherDisplayTarget.init(rawValue:)) ?? .active,
             additionalAppDirectories: AppCatalogScanner.sanitizedAdditionalAppDirectories(
@@ -808,22 +958,44 @@ public actor LauncherPreferencesStore {
             ),
             backgroundDim: defaults.string(forKey: prefix + "backgroundDim")
                 .flatMap(LauncherBackgroundDim.init(rawValue:)) ?? .standard,
-            blursBackground: defaults.object(forKey: prefix + "blursBackground") as? Bool ?? true,
+            blursBackground: Self.storedBool(defaults.object(forKey: prefix + "blursBackground"), default: true),
             reopenPageBehavior: defaults.string(forKey: prefix + "reopenPageBehavior")
                 .flatMap(LauncherReopenPageBehavior.init(rawValue:)) ?? .rememberLast,
-            pinchToDismiss: defaults.object(forKey: prefix + "pinchToDismiss") as? Bool ?? true,
+            pageFlipDirection: defaults.string(forKey: prefix + "pageFlipDirection")
+                .flatMap(LauncherPageFlipDirection.init(rawValue:)) ?? .horizontal,
+            pinchToDismiss: Self.storedBool(defaults.object(forKey: prefix + "pinchToDismiss"), default: true),
             gridGeometry: Self.storedGridGeometry(
-                columns: defaults.object(forKey: prefix + "gridColumns") as? Int,
-                rows: defaults.object(forKey: prefix + "gridRows") as? Int
+                columns: Self.storedInt(defaults.object(forKey: prefix + "gridColumns")),
+                rows: Self.storedInt(defaults.object(forKey: prefix + "gridRows"))
             )
         )
     }
 
     /// GRID-GEOMETRY-PREFS-01. Missing either key stays 7×5 so a half write
     /// cannot change page capacity. Both keys are clamped by the preference type.
+    /// Numeric strings and NSNumber values still count so a typo'd plist
+    /// cannot silently drop a valid pair.
     private static func storedGridGeometry(columns: Int?, rows: Int?) -> GridGeometryPreference {
         guard let columns, let rows else { return .standard }
         return GridGeometryPreference(columns: columns, rows: rows)
+    }
+
+    /// Missing or junk values fall back to `default`. Booleans stored as
+    /// NSNumber (UserDefaults' usual form) still decode.
+    private static func storedBool(_ object: Any?, default defaultValue: Bool) -> Bool {
+        if let bool = object as? Bool { return bool }
+        if let number = object as? NSNumber { return number.boolValue }
+        return defaultValue
+    }
+
+    private static func storedInt(_ object: Any?) -> Int? {
+        if let int = object as? Int { return int }
+        if let number = object as? NSNumber { return number.intValue }
+        if let string = object as? String {
+            let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+            return Int(trimmed)
+        }
+        return nil
     }
 
     public func save(_ preferences: LauncherPreferences) {
@@ -842,6 +1014,7 @@ public actor LauncherPreferencesStore {
         defaults.set(preferences.backgroundDim.rawValue, forKey: prefix + "backgroundDim")
         defaults.set(preferences.blursBackground, forKey: prefix + "blursBackground")
         defaults.set(preferences.reopenPageBehavior.rawValue, forKey: prefix + "reopenPageBehavior")
+        defaults.set(preferences.pageFlipDirection.rawValue, forKey: prefix + "pageFlipDirection")
         defaults.set(preferences.pinchToDismiss, forKey: prefix + "pinchToDismiss")
         defaults.set(preferences.gridGeometry.columns, forKey: prefix + "gridColumns")
         defaults.set(preferences.gridGeometry.rows, forKey: prefix + "gridRows")

@@ -49,22 +49,6 @@
         }
       }
     },
-    "减少动态效果（合并只保留短淡入）": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Reduce Motion (short fade for merges)"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "减少动态效果（合并只保留短淡入）"
-          }
-        }
-      }
-    },
     "恢复": {
       "localizations": {
         "en": {
@@ -993,22 +977,6 @@
         }
       }
     },
-    "未找到匹配的应用，按 Esc 清除搜索": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "No matching apps. Press Esc to clear the search."
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "未找到匹配的应用，按 Esc 清除搜索"
-          }
-        }
-      }
-    },
     "不能将文件夹放入另一个文件夹": {
       "localizations": {
         "en": {
@@ -1697,22 +1665,6 @@
         }
       }
     },
-    "系统未在 10 秒内回应启动请求；应用可能仍在启动。": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "macOS did not respond within 10 seconds. The app may still be opening."
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "系统未在 10 秒内回应启动请求；应用可能仍在启动。"
-          }
-        }
-      }
-    },
     "卸载应用…": {
       "localizations": {
         "en": {
@@ -1741,22 +1693,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "卸载“%@”？"
-          }
-        }
-      }
-    },
-    "应用将被移到废纸篓。不会删除用户数据文件。": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "The app will be moved to the Trash. User data files will not be deleted."
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "应用将被移到废纸篓。不会删除用户数据文件。"
           }
         }
       }
@@ -1969,22 +1905,6 @@
         }
       }
     },
-    "无法正常退出。要强制退出后再卸载吗？": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "It didn’t quit cleanly. Force quit and uninstall anyway?"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "无法正常退出。要强制退出后再卸载吗？"
-          }
-        }
-      }
-    },
     "强制退出并卸载": {
       "localizations": {
         "en": {
@@ -2017,22 +1937,6 @@
         }
       }
     },
-    "默认全选。取消勾选可保留；这些项目也会移到废纸篓。未登记且未运行的根外副本可能无法发现，请确认不需要保留其数据。": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "All are selected by default. Uncheck to keep; selected items move to the Trash. Unregistered copies outside scanned folders may go undetected; confirm that you do not need their data."
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "默认全选。取消勾选可保留；这些项目也会移到废纸篓。未登记且未运行的根外副本可能无法发现，请确认不需要保留其数据。"
-          }
-        }
-      }
-    },
     "已移到废纸篓（含 %d 项相关文件）": {
       "localizations": {
         "en": {
@@ -2045,22 +1949,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "已移到废纸篓（含 %d 项相关文件）"
-          }
-        }
-      }
-    },
-    "应用已移到废纸篓，部分相关文件失败": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "App moved to Trash; some related files failed"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "应用已移到废纸篓，部分相关文件失败"
           }
         }
       }
@@ -2317,22 +2205,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "正在查找相关文件…"
-          }
-        }
-      }
-    },
-    "正在结束上次查找…": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Finishing the previous search…"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "正在结束上次查找…"
           }
         }
       }
@@ -6529,6 +6401,70 @@
         }
       }
     },
+    "文件夹内应用已按类型排列": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Folder is already sorted by kind"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "文件夹内应用已按类型排列"
+          }
+        }
+      }
+    },
+    "已按类型排列文件夹内应用": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Folder sorted by kind"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "已按类型排列文件夹内应用"
+          }
+        }
+      }
+    },
+    "已按分类排列文件夹内应用": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Folder sorted by category"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "已按分类排列文件夹内应用"
+          }
+        }
+      }
+    },
+    "文件夹内应用已按分类排列": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Folder is already sorted by category"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "文件夹内应用已按分类排列"
+          }
+        }
+      }
+    },
     "只按图标颜色调整这个文件夹内的顺序，主屏幕不变": {
       "localizations": {
         "en": {
@@ -7257,6 +7193,12 @@
             "state": "translated",
             "value": "Move Selected Folders to Front"
           }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "所选文件夹移到最前"
+          }
         }
       }
     },
@@ -7267,6 +7209,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Move Selected Folders to Back"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "所选文件夹移到最后"
           }
         }
       }
@@ -7279,6 +7227,12 @@
             "state": "translated",
             "value": "Moved %d Folders to Front"
           }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "已将 %d 个文件夹移到最前"
+          }
         }
       }
     },
@@ -7290,6 +7244,12 @@
             "state": "translated",
             "value": "Moved %d Folders to Back"
           }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "已将 %d 个文件夹移到最后"
+          }
         }
       }
     },
@@ -7300,6 +7260,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Moves only the selected folders; other icons keep their relative order"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "只移动选中的文件夹，其它图标相对顺序不变"
           }
         }
       }
@@ -8084,6 +8050,342 @@
           "stringUnit": {
             "state": "translated",
             "value": "左键切换启动器，右键打开菜单，按住 Option 再左键打开设置。关闭后仍可用快捷键呼出；从启动器顶部设置按钮或按 Command-逗号可再次打开设置"
+          }
+        }
+      }
+    },
+    "翻页方向": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Page Flip Direction"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "翻页方向"
+          }
+        }
+      }
+    },
+    "主界面翻页用手势左右或上下滑动；默认左右，与 Launchpad 一致。不影响文件夹内滚动": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Swipe left/right or up/down to turn pages on the main grid. Default is left/right like Launchpad. Does not change scrolling inside folders."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "主界面翻页用手势左右或上下滑动；默认左右，与 Launchpad 一致。不影响文件夹内滚动"
+          }
+        }
+      }
+    },
+    "左右滑动": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Horizontal"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "左右滑动"
+          }
+        }
+      }
+    },
+    "上下滑动": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Vertical"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "上下滑动"
+          }
+        }
+      }
+    },
+    "↑ ↓ 翻页 · Esc 返回": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "↑ ↓ Pages · Esc Back"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "↑ ↓ 翻页 · Esc 返回"
+          }
+        }
+      }
+    },
+    "浏览模式": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Browse Mode"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "浏览模式"
+          }
+        }
+      }
+    },
+    "切换主界面左右或上下翻页；与设置中的翻页方向相同": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Switch between horizontal and vertical page flipping; same as Settings."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "切换主界面左右或上下翻页；与设置中的翻页方向相同"
+          }
+        }
+      }
+    },
+    "1 个项目": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "1 item"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "1 个项目"
+          }
+        }
+      }
+    },
+    "当前页": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Current page"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "当前页"
+          }
+        }
+      }
+    },
+    "页码": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Pages"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "页码"
+          }
+        }
+      }
+    },
+    "向上翻页": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Page Up"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "向上翻页"
+          }
+        }
+      }
+    },
+    "向下翻页": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Page Down"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "向下翻页"
+          }
+        }
+      }
+    },
+    "网格大小": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Grid Size"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "网格大小"
+          }
+        }
+      }
+    },
+    "列": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Columns"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "列"
+          }
+        }
+      }
+    },
+    "行": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Rows"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "行"
+          }
+        }
+      }
+    },
+    "设置主界面每页的列数和行数，范围列 5 到 10、行 3 到 8；默认 7×5。文件夹网格不变。不影响翻页动画": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Set how many columns and rows each main-grid page uses, from 5 to 10 columns and 3 to 8 rows; the default is 7×5. Folder grids stay the same. This does not change the page-turn animation."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "设置主界面每页的列数和行数，范围列 5 到 10、行 3 到 8；默认 7×5。文件夹网格不变。不影响翻页动画"
+          }
+        }
+      }
+    },
+    "%d 列": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%d Columns"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%d 列"
+          }
+        }
+      }
+    },
+    "%d 行": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%d Rows"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%d 行"
+          }
+        }
+      }
+    },
+    "更早的页面": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Earlier pages"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "更早的页面"
+          }
+        }
+      }
+    },
+    "更后的页面": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Later pages"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "更后的页面"
+          }
+        }
+      }
+    },
+    "跳到第 %d 页": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Go to page %d"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "跳到第 %d 页"
           }
         }
       }

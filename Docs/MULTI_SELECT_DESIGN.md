@@ -1,6 +1,6 @@
 # Multi-select design (foundation)
 
-Status: Core selection + ⌘/Shift-click + ⌘A + prune + context-menu batch + drag into existing folder / drop on app → new folder (same page) + blank-area marquee (MARQUEE-WIRE-01).
+Status: Core selection + ⌘/Shift-click + Shift+arrow range (SHIFT-ARROW-RANGE-01) + ⌘A + prune + context-menu batch + drag into existing folder / drop on app → new folder (same page) + blank-area marquee (MARQUEE-WIRE-01).
 
 ## Goal (behavior only)
 
@@ -13,6 +13,7 @@ Align with Launchpad/LaunchOS **behavior**: select several icons, then batch mov
 | Plain click | `.replace` then activate | Selection becomes that one item (or clears before activate in Direct); app/folder opens as today |
 | Command-click | `.toggle` | Add/remove that id; **no** activate / open |
 | Shift-click | `applyingRange` | Contiguous ids from range anchor through click target in **presented** order only; **no** activate / page turn |
+| Shift+arrow | `gridKeyboardShiftStep` | Same anchor and presented order, one neighbor at a time. Folder and search walk all four directions. Main grid walks up/down only; left/right do not consume the key, so the existing page turn still runs. An edge consumes the key and keeps the selection. Command, Option, or Control do not take this path |
 | Command-A | `selectingAll` + `itemIDs(onPage:)` | All icons on **current page** only (open folder → members; search → visible hits); **no** page turn |
 | Escape (selection non-empty) | Direct clear | Clears multi-select chrome; does not dismiss until selection empty |
 | Opening Settings | `shouldClearSelectionWhenOpeningSettings` | Clears multi-select before Settings covers the grid (app menu / gear / blank / panel). No paging |
@@ -191,7 +192,7 @@ Core: `LauncherMarquee` (geometry + policy, unit-tested). Direct: `LauncherRootV
 ### SETTINGS-CLEAR-SELECTION-01 (done)
 
 - Core: `shouldClearSelectionWhenOpeningSettings` — clear when selection non-empty.
-- Direct: gear / blank「设置…」/ panel settings handoff / AppDelegate `showSettings` call `clearSelectionBeforeOpeningSettings` (`announce: false`). No paging.
+- Direct: gear / blank「设置…」/ panel settings handoff only forward `onSettingsRequested`. AppDelegate `showSettings` calls `clearSelectionBeforeOpeningSettings` once (`announce: false`). No paging.
 
 ### REORGANIZE-CLEAR-SELECTION-01 (done)
 

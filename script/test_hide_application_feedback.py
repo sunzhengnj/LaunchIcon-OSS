@@ -24,6 +24,16 @@ need("hideApplication(candidate, focusID: representedID, in: collectionView)" in
 body = direct[direct.index("private func hideApplication("):]
 body = body[: body.index("private func uninstallDecision")]
 need("showPage" not in body and "pageTransition" not in body, "hideApplication must not touch paging")
+need("func commandShiftHHidesFocusedApp(" in core, "Core command-shift-h hide gate missing")
+need("func hideFocusedAppFromCommandShiftH(" in direct, "Direct command-shift-h hide missing")
+need("hideFocusedAppFromCommandShiftH(" in direct, "panel must ask to hide the focused app")
+tests = (root / "Tests/CoreTests/LaunchIconCoreTests.swift").read_text()
+need("testCommandShiftHHidesTheFocusedApp" in tests, "Core command-shift-h test missing")
+hide_key = direct[direct.index("func hideFocusedAppFromCommandShiftH("):direct.index("private func hideApplication(")]
+need("commandShiftHHidesFocusedApp(" in hide_key, "hide shortcut must ask Core")
+need("hideApplication(" in hide_key and "hideSelectedApplications(" in hide_key, "hide shortcut must use the menu actions")
+for banned in ("showPage", "transitionToPage", "completePageTransition", "movePage", "currentPage"):
+    need(banned not in hide_key, f"hide shortcut must not page ({banned})")
 
 if failures:
     for f in failures:

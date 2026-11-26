@@ -5,7 +5,7 @@ import sys
 
 root = Path(__file__).resolve().parents[1]
 core = (root / "Sources/Core/LauncherLayout.swift").read_text()
-direct = (root / "Sources/Direct/LauncherWindowController.swift").read_text()
+direct = "".join(p.read_text() for p in [root / "Sources/Direct/LauncherWindowController.swift", *sorted((root / "Sources/Direct").glob("LauncherWindowController+*.swift"))])
 tests = (root / "Tests/CoreTests/LaunchIconCoreTests.swift").read_text()
 failures = []
 
@@ -42,8 +42,8 @@ need("!snapLift && presentation.shadowOpacity > 0" in direct, "showsLift must be
 
 # fadeLiftShadow must pass real reduced (not false) and consult snap
 fade = direct[
-    direct.index("private func fadeLiftShadow(on flyer:") : direct.index(
-        "private func topLevelSourceIndex("
+    direct.index("func fadeLiftShadow(on flyer:") : direct.index(
+        "func topLevelSourceIndex("
     )
 ]
 need("shouldSnapDragLiftForReducedMotion" in fade, "fadeLiftShadow must consult snap")
@@ -56,8 +56,8 @@ need("dropLandingShadowFadeDuration" in fade, "fadeLiftShadow must use shadow fa
 
 
 fade_chunk = direct[
-    direct.index("private func fadeLiftShadow(on flyer:") : direct.index(
-        "private func topLevelSourceIndex("
+    direct.index("func fadeLiftShadow(on flyer:") : direct.index(
+        "func topLevelSourceIndex("
     )
 ]
 for label, chunk in (("Core", fn[:500]), ("drop", drop), ("fadeLiftShadow", fade_chunk[:600])):

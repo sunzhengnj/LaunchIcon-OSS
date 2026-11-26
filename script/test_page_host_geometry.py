@@ -82,6 +82,8 @@ enum LauncherLayout {
     func focusLeftOnDepartingPage() -> Bool { false }
     func applyGridFocusAfterPageTurn(from slot: Int) {}
     func moveFocusOffDepartedGridTile() {}
+    var pageFlipDirection = false // unused; extent stub keeps horizontal default path
+    func pageAxisExtent(for bounds: CGRect) -> CGFloat { max(bounds.width, 1) }
     func pageTravelDistance(for width: CGFloat, discrete: Bool) -> CGFloat { width }
     func positionPages(activeX: CGFloat, stagingX: CGFloat?, activeAlpha: CGFloat = 1,
                        stagingAlpha: CGFloat? = nil, animated: Bool = false,

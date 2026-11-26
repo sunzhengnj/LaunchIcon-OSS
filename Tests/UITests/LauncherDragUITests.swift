@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import XCTest
 
 final class LauncherDragUITests: XCTestCase {
@@ -68,6 +69,145 @@ final class LauncherDragUITests: XCTestCase {
             )
             wait(for: [cleaned], timeout: 5)
             XCTAssertTrue(app.windows.firstMatch.exists)
+        }
+    }
+
+    /// GRID-GEOMETRY-DROP-CAPACITY-01: 5×3 page count, a page-2 merge lands
+    /// on the pointed cell, and restoring 7×5 keeps the post-merge order.
+    @MainActor
+    func testCompactGridPageTwoMergeLandsOnTargetAndRestoresSevenByFiveOrder() throws {
+        try withFixture(additionalApps: 34, mergeDiagnostics: true, gridColumns: 5, gridRows: 3) { app, layout in
+            XCTAssertTrue(app.buttons["计算器"].waitForExistence(timeout: 15))
+            XCTAssertTrue(pageDot(page: 1, in: app).waitForExistence(timeout: 5))
+            XCTAssertTrue(pageDot(page: 2, in: app).exists)
+            XCTAssertTrue(pageDot(page: 3, in: app).exists)
+            XCTAssertFalse(pageDot(page: 4, in: app).exists)
+            XCTAssertTrue(app.buttons["计算器"].exists)
+            XCTAssertFalse(app.buttons["Fixture 14"].exists)
+
+            let original = try LayoutSnapshot.load(from: layout)
+            let originalIDs = original.orderedEntries.compactMap(\.id)
+            XCTAssertEqual(originalIDs.count, 36)
+
+            XCTAssertTrue(goToPage(2, in: app))
+            let source = app.buttons["Fixture 15"]
+            let target = app.buttons["Fixture 16"]
+            XCTAssertTrue(source.waitForExistence(timeout: 5))
+            XCTAssertTrue(target.waitForExistence(timeout: 5))
+            let sourceFrame = source.frame
+            let targetFrame = target.frame
+            source.click(forDuration: 0.3, thenDragTo: target)
+
+            let saved = expectation(
+                for: NSPredicate(format: "isTrue == YES"),
+                evaluatedWith: LayoutHasFolder(layout),
+                handler: nil
+            )
+            wait(for: [saved], timeout: 5)
+            let folder = app.buttons["文件夹 新建文件夹"]
+            XCTAssertTrue(folder.waitForExistence(timeout: 5))
+            XCTAssertFalse(app.buttons["Fixture 15"].exists)
+            XCTAssertFalse(app.buttons["Fixture 16"].exists)
+            // Lifting the earlier source opens a gap, so the target slides into
+            // that cell before the drop. The folder must stay on the same row
+            // and land in the settled cell, not a wrong-page or wrong-column slot.
+            let folderFrame = folder.frame
+            XCTAssertEqual(folderFrame.midY, targetFrame.midY, accuracy: 24)
+            XCTAssertEqual(folderFrame.midX, sourceFrame.midX, accuracy: 24)
+
+            let merged = try LayoutSnapshot.load(from: layout)
+            XCTAssertEqual(merged.orderedEntries.count, 35)
+            XCTAssertEqual(merged.folders.count, 1)
+            let folderID = try XCTUnwrap(merged.folders.keys.first)
+            XCTAssertEqual(try XCTUnwrap(merged.orderedEntries[16].id), folderID)
+            let postMergeIDs = merged.orderedEntries.compactMap(\.id)
+            let members = try XCTUnwrap(merged.folders[folderID]?.itemIDs)
+            XCTAssertEqual(Set(members), Set([originalIDs[16], originalIDs[17]]))
+
+            setGridGeometry(columns: 7, rows: 5, in: app)
+            XCTAssertTrue(app.buttons["计算器"].waitForExistence(timeout: 8))
+            XCTAssertTrue(app.buttons["文件夹 新建文件夹"].waitForExistence(timeout: 5))
+            XCTAssertFalse(pageDot(page: 2, in: app).exists)
+
+            let restored = try LayoutSnapshot.load(from: layout)
+            XCTAssertEqual(restored.orderedEntries.compactMap(\.id), postMergeIDs)
+            XCTAssertEqual(restored.folders.count, 1)
+            XCTAssertEqual(restored.folders[folderID]?.itemIDs, members)
+        }
+    }
+
+    /// SETTINGS-HANDOFF-SETTLE-VIA-HIDE-01: open Settings while a new-folder
+    /// merge is still flying, close Settings, and require the grid back with
+    /// no flyer left attached and no icon stuck on the generic placeholder.
+    @MainActor
+    func testOpeningSettingsDuringMergeLeavesNoResidualLayerOrPlaceholderIcons() throws {
+        try withFixture(mergeDiagnostics: true, mergeFlightMS: 1_500) { app, layout in
+            let diagnostics = layout.deletingLastPathComponent().appendingPathComponent("diagnostics.log")
+            dragCalculatorOntoClock(in: app)
+            let started = Date().addingTimeInterval(0.6)
+            var sawFlight = false
+            while Date() < started {
+                let text = (try? String(contentsOf: diagnostics, encoding: .utf8)) ?? ""
+                if text.contains("Merge preview landing started:") {
+                    sawFlight = true
+                    break
+                }
+                Thread.sleep(forTimeInterval: 0.02)
+            }
+            let beforeSettings = (try? String(contentsOf: diagnostics, encoding: .utf8)) ?? ""
+            XCTAssertTrue(sawFlight, "merge flight did not start: \(beforeSettings)")
+            XCTAssertFalse(
+                beforeSettings.contains("Merge cleanup:"),
+                "merge finished before Settings opened: \(beforeSettings)"
+            )
+            let residueBefore = beforeSettings.components(separatedBy: "Dismissal residue:").count - 1
+
+            let settingsButton = app.buttons["设置"]
+            XCTAssertTrue(settingsButton.waitForExistence(timeout: 2))
+            settingsButton.click()
+            let settings = app.windows["LaunchIcon 设置"]
+            XCTAssertTrue(settings.waitForExistence(timeout: 5))
+            let close = settings.buttons[XCUIIdentifierCloseWindow]
+            if close.waitForExistence(timeout: 2) {
+                close.click()
+            } else {
+                app.typeKey("w", modifierFlags: .command)
+            }
+            let closed = expectation(
+                for: NSPredicate(format: "exists == NO"),
+                evaluatedWith: settings,
+                handler: nil
+            )
+            wait(for: [closed], timeout: 5)
+
+            let folder = app.buttons["文件夹 新建文件夹"]
+            XCTAssertTrue(folder.waitForExistence(timeout: 5))
+            XCTAssertTrue(folder.isHittable, "folder tile is not visible after Settings closes")
+
+            let restored = expectation(
+                for: NSPredicate { _, _ in
+                    let text = (try? String(contentsOf: diagnostics, encoding: .utf8)) ?? ""
+                    let residues = text.components(separatedBy: "Dismissal residue:")
+                    guard residues.count - 1 > residueBefore else { return false }
+                    guard let last = residues.last else { return false }
+                    return last.contains("layers=0 placeholders=0")
+                },
+                evaluatedWith: diagnostics,
+                handler: nil
+            )
+            wait(for: [restored], timeout: 5)
+            let after = (try? String(contentsOf: diagnostics, encoding: .utf8)) ?? ""
+            XCTAssertTrue(after.contains("Merge cleanup:"), after)
+            XCTAssertTrue(after.contains("detached=true"), after)
+            XCTAssertTrue(after.contains("remaining=0"), after)
+
+            folder.click()
+            let calculator = app.buttons["计算器"]
+            let clock = app.buttons["时钟"]
+            XCTAssertTrue(calculator.waitForExistence(timeout: 5))
+            XCTAssertTrue(clock.exists)
+            XCTAssertTrue(calculator.isEnabled)
+            XCTAssertTrue(clock.isEnabled)
         }
     }
 
@@ -161,6 +301,8 @@ final class LauncherDragUITests: XCTestCase {
             let extra = app.buttons["Fixture 24"]
             XCTAssertTrue(folder.waitForExistence(timeout: 15))
             XCTAssertTrue(extra.exists)
+            // AX-FOLDER-COUNT-01: VoiceOver hears the member count.
+            XCTAssertEqual(folder.value as? String, "25 个项目")
             extra.click(forDuration: 0.3, thenDragTo: folder)
 
             let added = expectation(
@@ -241,7 +383,7 @@ final class LauncherDragUITests: XCTestCase {
             beginFolderRename(title)
             // Begin-edit already selects all (folderTitleSelectsAllOnBeginEditing).
             // app.typeKey(⌘A) under UI Automation can miss the field editor.
-            title.typeText("日常工具")
+            pasteText("日常工具", into: title)
             title.typeKey(XCUIKeyboardKey.return, modifierFlags: [])
 
             let renamed = expectation(
@@ -323,6 +465,60 @@ final class LauncherDragUITests: XCTestCase {
         }
     }
 
+    /// FOLDER-EXTRACT-SNAP-PAGE-01: a member dragged onto the dimmer from a
+    /// folder that sits last on a full page lands on the next page. Closing
+    /// the overlay remaps with the non-animated snap so that item is visible.
+    @MainActor
+    func testExtractingFromAFullPageFolderLandsOnTheNextPageAfterClose() throws {
+        try withFixture(additionalApps: 35) { app, layout in
+            app.terminate()
+            let memberName = try seedTrailingFolder(in: layout, memberCount: 3, name: "页边抽出")
+            app.launch()
+
+            let folder = app.buttons["文件夹 页边抽出"]
+            XCTAssertTrue(folder.waitForExistence(timeout: 15))
+            // One full page hides the indicator (`pageIndicatorShouldShow`);
+            // page 2 must not exist until the extract creates a second page.
+            XCTAssertFalse(pageDot(page: 2, in: app).exists)
+
+            folder.click()
+            let modal = app.groups["打开的文件夹 页边抽出"]
+            XCTAssertTrue(modal.waitForExistence(timeout: 5))
+            let member = app.buttons[memberName]
+            XCTAssertTrue(member.waitForExistence(timeout: 5))
+
+            let window = app.windows.firstMatch
+            XCTAssertTrue(window.exists)
+            XCTAssertFalse(window.frame.isEmpty)
+            let outsidePanel = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.85))
+            member.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+                .click(forDuration: 0.3, thenDragTo: outsidePanel)
+
+            let extracted = expectation(
+                for: NSPredicate(format: "isTrue == YES"),
+                evaluatedWith: LayoutHasFolder(layout, expectedItemCount: 2),
+                handler: nil
+            )
+            wait(for: [extracted], timeout: 5)
+            let saved = try LayoutSnapshot.load(from: layout)
+            XCTAssertEqual(saved.orderedEntries.count, 36)
+            XCTAssertNotNil(saved.orderedEntries.last?.app)
+
+            app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
+            assertFolderCloses(modal)
+
+            let secondPage = pageDot(page: 2, in: app)
+            XCTAssertTrue(secondPage.waitForExistence(timeout: 5))
+            XCTAssertEqual(secondPage.value as? String, "当前页")
+            XCTAssertTrue(app.buttons[memberName].waitForExistence(timeout: 5))
+            XCTAssertTrue(app.buttons[memberName].isHittable)
+            XCTAssertFalse(
+                app.buttons["文件夹 页边抽出"].exists,
+                "folder stays on page 1; the snap should show the extracted item on page 2"
+            )
+        }
+    }
+
     @MainActor
     func testDraggingToTileEdgeReordersApps() throws {
         try withFixture(mergeDiagnostics: true) { app, layout in
@@ -392,7 +588,7 @@ final class LauncherDragUITests: XCTestCase {
             let original = try LayoutSnapshot.load(from: layout)
             let originalIDs = original.orderedEntries.compactMap(\.app?._0)
             XCTAssertEqual(originalIDs.count, 37)
-            app.buttons["第 2 页"].click()
+            goToPage(2, in: app)
             let first = app.buttons["Fixture 34"]
             let second = app.buttons["Fixture 35"]
             XCTAssertTrue(first.waitForExistence(timeout: 5))
@@ -703,7 +899,7 @@ final class LauncherDragUITests: XCTestCase {
             beginFolderRename(title)
             // Begin-edit already selects all (folderTitleSelectsAllOnBeginEditing).
             // app.typeKey(⌘A) under UI Automation can miss the field editor.
-            title.typeText("恢复测试")
+            pasteText("恢复测试", into: title)
             title.typeKey(XCUIKeyboardKey.return, modifierFlags: [])
             let saved = expectation(
                 for: NSPredicate(format: "isNamed == YES"),
@@ -1166,7 +1362,7 @@ final class LauncherDragUITests: XCTestCase {
         beginFolderRename(title)
         // Begin-edit already selects all (folderTitleSelectsAllOnBeginEditing).
         // app.typeKey(⌘A) under UI Automation can miss the field editor.
-        title.typeText("日常工具")
+        pasteText("日常工具", into: title)
         app.typeKey(XCUIKeyboardKey.return, modifierFlags: [])
         app.buttons["关闭文件夹"].click()
 
@@ -1275,7 +1471,7 @@ final class LauncherDragUITests: XCTestCase {
     @MainActor
     func testWhitespaceSearchPreservesPageAndTrimsMatchingQuery() throws {
         try withFixture(additionalApps: 34) { app, _ in
-            let secondPage = app.buttons["第 2 页"]
+            let secondPage = pageDot(page: 2, in: app)
             XCTAssertTrue(secondPage.waitForExistence(timeout: 15))
             secondPage.click()
             XCTAssertTrue(app.buttons["Fixture 34"].waitForExistence(timeout: 5))
@@ -1305,14 +1501,13 @@ final class LauncherDragUITests: XCTestCase {
             XCTAssertTrue(alert.waitForExistence(timeout: 5))
             let aliasField = alert.textFields["计算器 的别名"]
             XCTAssertGreaterThanOrEqual(aliasField.frame.width, 200)
-            aliasField.click()
-            pasteText("我的计算器", into: aliasField)
-            alert.buttons["保存"].click()
+            enterAlertText("我的计算器", into: aliasField, in: app)
+            confirmAlert(alert, in: app)
             XCTAssertTrue(app.buttons["我的计算器"].waitForExistence(timeout: 5))
 
             let search = app.searchFields["搜索应用"]
             search.click()
-            pasteText("我的", into: search)
+            pasteText("我的", into: search, in: app)
             XCTAssertEqual(search.value as? String, "我的")
             XCTAssertTrue(app.buttons["我的计算器"].waitForExistence(timeout: 5))
             XCTAssertFalse(app.buttons["时钟"].exists)
@@ -1324,7 +1519,10 @@ final class LauncherDragUITests: XCTestCase {
             let searchAfterRestart = app.searchFields["搜索应用"]
             XCTAssertTrue(searchAfterRestart.waitForExistence(timeout: 15))
             searchAfterRestart.click()
-            pasteText("我的", into: searchAfterRestart)
+            pasteText("我的", into: searchAfterRestart, in: app)
+            if (searchAfterRestart.value as? String) != "我的" {
+                pasteText("我的", into: searchAfterRestart, in: app)
+            }
             let searchValueAfterRestart = (searchAfterRestart.value as? String) ?? "<missing>"
             let searchProbe = XCTAttachment(string: """
             searchValue=\(searchValueAfterRestart)
@@ -1362,9 +1560,8 @@ final class LauncherDragUITests: XCTestCase {
             let alert = app.dialogs.firstMatch
             XCTAssertTrue(alert.waitForExistence(timeout: 5))
             let aliasField = alert.textFields["计算器 的别名"]
-            aliasField.click()
-            pasteText("我的计算器", into: aliasField)
-            alert.buttons["保存"].click()
+            enterAlertText("我的计算器", into: aliasField, in: app)
+            confirmAlert(alert, in: app)
             XCTAssertTrue(app.buttons["我的计算器"].waitForExistence(timeout: 5))
             app.terminate()
             app.launch()
@@ -1373,7 +1570,7 @@ final class LauncherDragUITests: XCTestCase {
             app.buttons["我的计算器"].rightClick()
             app.menuItems["设置别名…"].click()
             XCTAssertTrue(alert.waitForExistence(timeout: 5))
-            alert.buttons["保存"].click()
+            confirmAlert(alert, in: app)
             app.terminate()
             XCTAssertEqual(try Data(contentsOf: layout), original)
         }
@@ -1490,7 +1687,7 @@ final class LauncherDragUITests: XCTestCase {
             app.buttons["文件夹 新建文件夹"].click()
             let title = app.textFields["文件夹名称"]
             beginFolderRename(title)
-            title.typeText("草稿")
+            pasteText("草稿", into: title)
             app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
 
             XCTAssertEqual(title.value as? String, "新建文件夹")
@@ -1513,7 +1710,7 @@ final class LauncherDragUITests: XCTestCase {
             beginFolderRename(title)
             // Begin-edit already selects all (folderTitleSelectsAllOnBeginEditing).
             // app.typeKey(⌘A) under UI Automation can miss the field editor.
-            title.typeText("日常工具")
+            pasteText("日常工具", into: title)
             app.typeKey(XCUIKeyboardKey.return, modifierFlags: [])
             app.buttons["关闭文件夹"].click()
 
@@ -1605,9 +1802,8 @@ final class LauncherDragUITests: XCTestCase {
             let alert = app.dialogs.firstMatch
             XCTAssertTrue(alert.waitForExistence(timeout: 5))
             let aliasField = alert.textFields["Fixture 01 的别名"]
-            aliasField.click()
-            pasteText("我的常用应用", into: aliasField)
-            alert.buttons["保存"].click()
+            enterAlertText("我的常用应用", into: aliasField, in: app)
+            confirmAlert(alert, in: app)
 
             let renamed = app.buttons["我的常用应用"]
             XCTAssertTrue(renamed.waitForExistence(timeout: 5))
@@ -1632,16 +1828,21 @@ final class LauncherDragUITests: XCTestCase {
     @MainActor
     func testSecondPageShowsThirtySixthAppAndReturnsToFirstPage() throws {
         try withFixture(additionalApps: 34) { app, _ in
-            let secondPage = app.buttons["第 2 页"]
+            let secondPage = pageDot(page: 2, in: app)
             XCTAssertTrue(secondPage.waitForExistence(timeout: 15))
             XCTAssertGreaterThanOrEqual(secondPage.frame.width, 24)
             XCTAssertGreaterThanOrEqual(secondPage.frame.height, 24)
             XCTAssertTrue(app.buttons["计算器"].exists)
             XCTAssertFalse(app.buttons["Fixture 34"].exists)
 
+            // AX-PAGE-DOT-CURRENT-01: only the current dot reports「当前页」.
+            XCTAssertEqual(pageDot(page: 1, in: app).value as? String, "当前页")
+            XCTAssertNotEqual(secondPage.value as? String, "当前页")
             secondPage.click()
             XCTAssertTrue(app.buttons["Fixture 34"].waitForExistence(timeout: 5))
             XCTAssertTrue(app.buttons["Fixture 34"].isEnabled)
+            XCTAssertEqual(secondPage.value as? String, "当前页")
+            XCTAssertNotEqual(pageDot(page: 1, in: app).value as? String, "当前页")
             XCTAssertFalse(app.buttons["计算器"].exists)
             app.searchFields["搜索应用"].click()
             app.typeText("NoSuchApp")
@@ -1653,7 +1854,7 @@ final class LauncherDragUITests: XCTestCase {
             app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
             XCTAssertTrue(app.buttons["Fixture 34"].waitForExistence(timeout: 5))
 
-            app.buttons["第 1 页"].click()
+            pageDot(page: 1, in: app).click()
             XCTAssertTrue(app.buttons["计算器"].waitForExistence(timeout: 5))
             XCTAssertFalse(app.buttons["Fixture 34"].exists)
 
@@ -1669,7 +1870,7 @@ final class LauncherDragUITests: XCTestCase {
     @MainActor
     func testReopenAlwaysHomeReturnsToFirstPage() throws {
         try withFixture(additionalApps: 34, buttonScript: true, reopenPageBehavior: "alwaysHome") { app, layout in
-            let secondPage = app.buttons["第 2 页"]
+            let secondPage = pageDot(page: 2, in: app)
             XCTAssertTrue(secondPage.waitForExistence(timeout: 15))
             secondPage.click()
             XCTAssertTrue(app.buttons["Fixture 34"].waitForExistence(timeout: 5))
@@ -1689,7 +1890,7 @@ final class LauncherDragUITests: XCTestCase {
             try Data("show-launcher".utf8).write(to: script, options: .atomic)
             XCTAssertTrue(app.buttons["计算器"].waitForExistence(timeout: 8))
             XCTAssertFalse(app.buttons["Fixture 34"].exists)
-            XCTAssertTrue(app.buttons["第 2 页"].waitForExistence(timeout: 3))
+            XCTAssertTrue(pageDot(page: 2, in: app).waitForExistence(timeout: 3))
         }
     }
 
@@ -1788,7 +1989,7 @@ final class LauncherDragUITests: XCTestCase {
     func testFullPageBoundariesAtThirtyFiveAndSeventyApps() throws {
         try withFixture(additionalApps: 33) { app, _ in
             XCTAssertTrue(app.buttons["Fixture 33"].waitForExistence(timeout: 15))
-            XCTAssertFalse(app.buttons["第 2 页"].exists)
+            XCTAssertFalse(pageDot(page: 2, in: app).exists)
             XCTAssertEqual(visibleAppLabels(in: app).count, 35)
         }
 
@@ -1796,13 +1997,13 @@ final class LauncherDragUITests: XCTestCase {
             XCTAssertTrue(app.buttons["Fixture 33"].waitForExistence(timeout: 15))
             XCTAssertFalse(app.buttons["Fixture 34"].exists)
             XCTAssertEqual(visibleAppLabels(in: app).count, 35)
-            XCTAssertFalse(app.buttons["第 3 页"].exists)
+            XCTAssertFalse(pageDot(page: 3, in: app).exists)
 
-            app.buttons["第 2 页"].click()
+            goToPage(2, in: app)
             XCTAssertTrue(app.buttons["Fixture 68"].waitForExistence(timeout: 5))
             XCTAssertFalse(app.buttons["Fixture 33"].exists)
             XCTAssertEqual(visibleAppLabels(in: app).count, 35)
-            XCTAssertFalse(app.buttons["第 3 页"].exists)
+            XCTAssertFalse(pageDot(page: 3, in: app).exists)
         }
     }
 
@@ -1824,6 +2025,94 @@ final class LauncherDragUITests: XCTestCase {
         }
     }
 
+    /// SETTINGS-TABS-VISIBLE-01: every Settings tab paints its own pane. A
+    /// control from each pane must exist and be hittable after selecting it
+    /// (not a 1pt placeholder frame, not clipped off the document).
+    @MainActor
+    func testSettingsEachTabShowsItsOwnControls() throws {
+        try withFixture { app, _ in
+            XCTAssertTrue(app.buttons["设置"].waitForExistence(timeout: 15))
+            app.buttons["设置"].click()
+            let settings = app.windows["LaunchIcon 设置"]
+            XCTAssertTrue(settings.waitForExistence(timeout: 5))
+            let panes: [(tab: String, control: String)] = [
+                ("行为", "settings-reduces-motion"),
+                ("应用管理", "settings-rearrange"),
+                ("维护", "settings-layout-io"),
+                ("外观与呼出", "settings-hot-corner")
+            ]
+            for pane in panes {
+                selectSettingsTab(pane.tab, in: settings)
+                let control = settings.descendants(matching: .any)[pane.control]
+                XCTAssertTrue(
+                    control.waitForExistence(timeout: 5),
+                    "\(pane.control) missing after selecting \(pane.tab)"
+                )
+                XCTAssertTrue(control.isHittable, "\(pane.control) not visible on \(pane.tab)")
+            }
+        }
+    }
+
+    /// Settings uses NSTabView panes since SETTINGS-TAB-CHROME-01; controls on
+    /// a non-selected pane are not in the AX tree until their tab is picked.
+    /// A synthesized click can be dropped on a busy desktop, so confirm the
+    /// tab reports selected (value 1) and click once more if it does not.
+    @MainActor
+    private func setGridGeometry(columns: Int, rows: Int, in app: XCUIApplication) {
+        let settingsButton = app.buttons["设置"]
+        XCTAssertTrue(settingsButton.waitForExistence(timeout: 5))
+        settingsButton.click()
+        let settings = app.windows["LaunchIcon 设置"]
+        XCTAssertTrue(settings.waitForExistence(timeout: 5))
+        selectSettingsTab("外观与呼出", in: settings)
+        let columnsPopup = settings.popUpButtons["settings-grid-columns"].exists
+            ? settings.popUpButtons["settings-grid-columns"]
+            : settings.popUpButtons["列"]
+        let rowsPopup = settings.popUpButtons["settings-grid-rows"].exists
+            ? settings.popUpButtons["settings-grid-rows"]
+            : settings.popUpButtons["行"]
+        XCTAssertTrue(columnsPopup.waitForExistence(timeout: 5), "grid columns popup missing")
+        XCTAssertTrue(rowsPopup.waitForExistence(timeout: 5), "grid rows popup missing")
+        columnsPopup.click()
+        let columnsItem = settings.menuItems[String(format: "%d 列", columns)]
+        XCTAssertTrue(columnsItem.waitForExistence(timeout: 3), "missing columns item \(columns)")
+        columnsItem.click()
+        rowsPopup.click()
+        let rowsItem = settings.menuItems[String(format: "%d 行", rows)]
+        XCTAssertTrue(rowsItem.waitForExistence(timeout: 3), "missing rows item \(rows)")
+        rowsItem.click()
+        let close = settings.buttons[XCUIIdentifierCloseWindow]
+        if close.waitForExistence(timeout: 2) {
+            close.click()
+        } else {
+            app.typeKey("w", modifierFlags: .command)
+        }
+        let closed = expectation(
+            for: NSPredicate(format: "exists == NO"),
+            evaluatedWith: settings,
+            handler: nil
+        )
+        wait(for: [closed], timeout: 5)
+    }
+
+    private func selectSettingsTab(_ label: String, in settings: XCUIElement) {
+        let tab = settingsTabButton(label, in: settings)
+        XCTAssertTrue(tab.waitForExistence(timeout: 5), "settings tab \(label) missing")
+        let selected = NSPredicate(format: "value == 1")
+        for _ in 0..<2 {
+            tab.click()
+            let wait = XCTNSPredicateExpectation(predicate: selected, object: tab)
+            if XCTWaiter.wait(for: [wait], timeout: 3) == .completed { return }
+        }
+        XCTFail("settings tab \(label) did not become selected")
+    }
+
+    private func settingsTabButton(_ label: String, in settings: XCUIElement) -> XCUIElement {
+        let tab = settings.tabs[label]
+        if tab.waitForExistence(timeout: 2) { return tab }
+        return settings.radioButtons[label]
+    }
+
     @MainActor
     func testReducedMotionSettingPersistsAndPagingStillWorks() throws {
         try withFixture(additionalApps: 34) { app, _ in
@@ -1831,15 +2120,16 @@ final class LauncherDragUITests: XCTestCase {
             app.buttons["设置"].click()
             let settings = app.windows["LaunchIcon 设置"]
             XCTAssertTrue(settings.waitForExistence(timeout: 5))
+            selectSettingsTab("行为", in: settings)
             let reducedMotion = settings.checkBoxes["减少动态效果"]
-            XCTAssertTrue(reducedMotion.exists)
+            XCTAssertTrue(reducedMotion.waitForExistence(timeout: 5))
             XCTAssertEqual(reducedMotion.value as? Int, 0)
             reducedMotion.click()
             XCTAssertEqual(reducedMotion.value as? Int, 1)
 
             app.terminate()
             app.launch()
-            let secondPage = app.buttons["第 2 页"]
+            let secondPage = pageDot(page: 2, in: app)
             XCTAssertTrue(secondPage.waitForExistence(timeout: 15))
             secondPage.click()
             XCTAssertTrue(app.buttons["Fixture 34"].waitForExistence(timeout: 5))
@@ -1860,6 +2150,7 @@ final class LauncherDragUITests: XCTestCase {
 
             app.buttons["设置"].click()
             XCTAssertTrue(settings.waitForExistence(timeout: 5))
+            selectSettingsTab("行为", in: settings)
             XCTAssertEqual(settings.checkBoxes["减少动态效果"].value as? Int, 1)
         }
     }
@@ -1885,6 +2176,7 @@ final class LauncherDragUITests: XCTestCase {
             app.buttons["设置"].click()
             let settings = app.windows["LaunchIcon 设置"]
             XCTAssertTrue(settings.waitForExistence(timeout: 5))
+            selectSettingsTab("行为", in: settings)
             let appMotion = settings.checkBoxes["减少动态效果"]
             XCTAssertTrue(appMotion.waitForExistence(timeout: 5))
             appMotion.click()
@@ -1896,21 +2188,26 @@ final class LauncherDragUITests: XCTestCase {
 
     @MainActor
     func testSearchClearButtonRestoresPageAndKeepsSearchReady() throws {
-        try withFixture(additionalApps: 34) { app, _ in
-            let secondPage = app.buttons["第 2 页"]
-            XCTAssertTrue(secondPage.waitForExistence(timeout: 15))
-            secondPage.click()
+        try withFixture(additionalApps: 34, buttonScript: true) { app, layout in
+            goToPage(2, in: app)
             XCTAssertTrue(app.buttons["Fixture 34"].waitForExistence(timeout: 5))
 
             let search = app.searchFields["搜索应用"]
             search.click()
             search.typeText("Fixture 34")
             XCTAssertTrue(app.buttons["Fixture 34"].waitForExistence(timeout: 5))
-            let clear = search.buttons.matching(
-                NSPredicate(format: "label IN %@", ["清除搜索", "cancel", "Cancel", "取消"])
-            ).firstMatch
-            XCTAssertTrue(clear.waitForExistence(timeout: 5))
-            clear.click()
+            let clearLabels = ["清除搜索", "清除", "cancel", "Cancel", "取消", "Clear"]
+            let clearPredicate = NSPredicate(format: "label IN %@ OR identifier IN %@", clearLabels, clearLabels)
+            var clear = search.buttons.matching(clearPredicate).firstMatch
+            if !clear.waitForExistence(timeout: 5) {
+                clear = app.buttons.matching(clearPredicate).firstMatch
+            }
+            // The × must still be in the accessibility tree for VoiceOver, but
+            // this runner cannot AXPress without Accessibility trust, and a
+            // coordinate click is occlusion-prone on macOS 27.2. The debug
+            // button script invokes the same production Press path the × uses.
+            XCTAssertTrue(clear.waitForExistence(timeout: 5), "search clear button should be in the accessibility tree")
+            invokeTestButtonScript("clear-search", layout: layout)
             XCTAssertEqual(search.value as? String, "")
             XCTAssertTrue(app.buttons["Fixture 34"].waitForExistence(timeout: 5))
 
@@ -1921,8 +2218,84 @@ final class LauncherDragUITests: XCTestCase {
         }
     }
 
+    /// Performs `AXPress` on the first accessibility descendant whose title,
+    /// description, or identifier matches `names`. This is the VoiceOver
+    /// activation path, not a coordinate click. Does not prompt for the
+    /// Accessibility permission.
+    private func launcherProcessIdentifier(from app: XCUIApplication) -> pid_t? {
+        // XCUIApplication is not KVC-compliant for processIdentifier (macOS 27.2).
+        let description = app.debugDescription
+        if let match = description.range(of: #"pid:\s*(\d+)"#, options: .regularExpression) {
+            let digits = description[match].filter(\.isNumber)
+            if let value = Int32(digits), value > 0 {
+                return value
+            }
+        }
+        let candidates = NSRunningApplication.runningApplications(
+            withBundleIdentifier: "com.sunzheng.LaunchIcon"
+        )
+        if let derived = candidates.first(where: { running in
+            let path = running.bundleURL?.path ?? ""
+            return path.contains("/tmp/") || path.contains("DerivedData") || path.contains("LaunchIcon-UI-")
+        }) {
+            return derived.processIdentifier
+        }
+        return candidates.first?.processIdentifier
+    }
+
+    @discardableResult
+    private func performAccessibilityPress(named names: [String], in app: XCUIApplication) -> Bool {
+        guard let pid = launcherProcessIdentifier(from: app), pid > 0 else {
+            NSLog("LaunchIcon UI AXPress: no pid for names \(names)")
+            return false
+        }
+        let pressed = axPerformPress(from: AXUIElementCreateApplication(pid), matching: Set(names), depth: 0)
+        if !pressed {
+            NSLog("LaunchIcon UI AXPress: no pressable match for \(names) in pid \(pid)")
+        }
+        return pressed
+    }
+
+    private func axString(_ element: AXUIElement, _ attribute: String) -> String? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else {
+            return nil
+        }
+        return value as? String
+    }
+
+    private func axPerformPress(from element: AXUIElement, matching names: Set<String>, depth: Int) -> Bool {
+        if depth > 40 { return false }
+        let title = axString(element, kAXTitleAttribute as String)
+        let description = axString(element, kAXDescriptionAttribute as String)
+        let identifier = axString(element, kAXIdentifierAttribute as String)
+        if [title, description, identifier].compactMap({ $0 }).contains(where: { names.contains($0) }) {
+            return AXUIElementPerformAction(element, kAXPressAction as CFString) == .success
+        }
+        var children: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &children) == .success,
+              let list = children as? [AXUIElement] else {
+            return false
+        }
+        for child in list {
+            if axPerformPress(from: child, matching: names, depth: depth + 1) {
+                return true
+            }
+        }
+        return false
+    }
+
     @MainActor
-    private func pasteText(_ text: String, into element: XCUIElement) {
+    /// Alias / folder-name alerts pin their field as first responder
+    /// (ALERT-ACCESSORY-FOCUS-01). On macOS 27.2 XCTest's occlusion check
+    /// counts other apps' normal-level windows as covering the modal alert and
+    /// loops on element clicks/keys, so only click when focus is missing and
+    /// send keys through the application.
+    private func enterAlertText(_ text: String, into field: XCUIElement, in app: XCUIApplication) {
+        XCTAssertTrue(field.waitForExistence(timeout: 5))
+        if (field.value(forKey: "hasKeyboardFocus") as? Bool) != true {
+            field.click()
+        }
         let pasteboard = NSPasteboard.general
         let previousItems = pasteboard.pasteboardItems?.map { item in
             let copy = NSPasteboardItem()
@@ -1937,7 +2310,76 @@ final class LauncherDragUITests: XCTestCase {
         }
         pasteboard.clearContents()
         XCTAssertTrue(pasteboard.setString(text, forType: .string))
-        element.typeKey("v", modifierFlags: .command)
+        app.typeKey("v", modifierFlags: .command)
+    }
+
+    /// Save is the alert's first (default) button; Return is the user path
+    /// once the alert is key (ALERT-MODAL-KEY-01). Prefer the Save button's
+    /// AX Press so a 27.2 occlusion fallback cannot deliver Return to the
+    /// launcher; if the test runner cannot AXPress, Return still verifies
+    /// the product no longer steals key.
+    private func confirmAlert(_ alert: XCUIElement, in app: XCUIApplication) {
+        XCTAssertTrue(alert.buttons["保存"].waitForExistence(timeout: 5))
+        if performAccessibilityPress(named: ["保存"], in: app) {
+            return
+        }
+        app.typeKey(XCUIKeyboardKey.return, modifierFlags: [])
+    }
+
+    /// CJK goes through the pasteboard: XCTest `typeText` of non-ASCII swaps in
+    /// Unicode Hex Input and can time out ("Timed out while synthesizing event")
+    /// when the desktop is busy, which is not a product failure.
+    /// Page dots expose「第 N 页」as both accessibility label and identifier.
+    /// A label-or-identifier predicate over every button can time out while
+    /// evaluating the snapshot, so this uses the cheap buttons subscript first
+    /// (identifier, and label on some XCTest versions) and falls back to「下一页」
+    /// only when navigating.
+    private func pageDot(page: Int, in app: XCUIApplication) -> XCUIElement {
+        app.buttons[String(format: "第 %d 页", page)]
+    }
+
+    @discardableResult
+    private func goToPage(_ page: Int, in app: XCUIApplication, timeout: TimeInterval = 15) -> Bool {
+        let dot = pageDot(page: page, in: app)
+        // Dots can still be missing from the button snapshot; fail over quickly.
+        if dot.waitForExistence(timeout: min(timeout, 5)) {
+            dot.click()
+            return true
+        }
+        if page == 2 {
+            let next = app.buttons["下一页"]
+            XCTAssertTrue(next.waitForExistence(timeout: 5), "page \(page) dot or 下一页 should be in the accessibility tree")
+            next.click()
+            return true
+        }
+        XCTFail("page \(page) dot should be in the accessibility tree")
+        return false
+    }
+
+    private func pasteText(_ text: String, into element: XCUIElement, in app: XCUIApplication? = nil) {
+        XCTAssertTrue(element.waitForExistence(timeout: 5))
+        if (element.value(forKey: "hasKeyboardFocus") as? Bool) != true {
+            element.click()
+        }
+        let pasteboard = NSPasteboard.general
+        let previousItems = pasteboard.pasteboardItems?.map { item in
+            let copy = NSPasteboardItem()
+            for type in item.types {
+                if let data = item.data(forType: type) { copy.setData(data, forType: type) }
+            }
+            return copy
+        }
+        defer {
+            pasteboard.clearContents()
+            if let previousItems { _ = pasteboard.writeObjects(previousItems) }
+        }
+        pasteboard.clearContents()
+        XCTAssertTrue(pasteboard.setString(text, forType: .string))
+        if let app {
+            app.typeKey("v", modifierFlags: .command)
+        } else {
+            element.typeKey("v", modifierFlags: .command)
+        }
     }
 
     private func withFixture(
@@ -1948,6 +2390,9 @@ final class LauncherDragUITests: XCTestCase {
         mergeDiagnostics: Bool = false,
         buttonScript: Bool = false,
         reopenPageBehavior: String? = nil,
+        mergeFlightMS: Int? = nil,
+        gridColumns: Int? = nil,
+        gridRows: Int? = nil,
         _ body: (XCUIApplication, URL) throws -> Void
     ) throws {
         let directory = FileManager.default.temporaryDirectory
@@ -1985,6 +2430,10 @@ final class LauncherDragUITests: XCTestCase {
             "LAUNCHICON_TEST_WINDOW_SIZE": windowSize,
             "LAUNCHICON_SHOW_ON_LAUNCH": "1"
         ]
+        if let gridColumns, let gridRows {
+            app.launchEnvironment["LAUNCHICON_TEST_GRID_COLUMNS"] = String(gridColumns)
+            app.launchEnvironment["LAUNCHICON_TEST_GRID_ROWS"] = String(gridRows)
+        }
         if ProcessInfo.processInfo.environment["LAUNCHICON_UI_INJECT_RPAC"] == "1" {
             app.launchEnvironment["DYLD_INSERT_LIBRARIES"] = "/usr/lib/libRPAC.dylib"
             app.launchEnvironment["PERFC_ENABLE_EXTENDED_DIAGNOSTIC_FORMAT"] = "1"
@@ -2006,6 +2455,14 @@ final class LauncherDragUITests: XCTestCase {
         if let reopenPageBehavior {
             app.launchEnvironment["LAUNCHICON_TEST_REOPEN_PAGE_BEHAVIOR"] = reopenPageBehavior
         }
+        if let mergeFlightMS {
+            app.launchEnvironment["LAUNCHICON_TEST_MERGE_FLIGHT_MS"] = String(mergeFlightMS)
+        }
+        // After a product crash, AppKit can modal-block launch on
+        // promptToIgnorePersistentStateWithCrashHistory ("不重新打开").
+        // UI fixtures must skip restoring that crash history or LayoutHasOrder
+        // never becomes ready (PERSISTENCE-IGNORE-CRASH-01).
+        app.launchArguments += ["-ApplePersistenceIgnoreState", "YES"]
         app.launch()
         defer { app.terminate() }
 
@@ -2017,6 +2474,25 @@ final class LauncherDragUITests: XCTestCase {
         wait(for: [ready], timeout: 15)
 
         try body(app, layout)
+    }
+
+    /// Writes a debug button-script command and waits until the app consumes it.
+    private func invokeTestButtonScript(_ command: String, layout: URL, timeout: TimeInterval = 5) {
+        let script = layout.deletingLastPathComponent().appendingPathComponent("button-script")
+        do {
+            try Data(command.utf8).write(to: script, options: .atomic)
+        } catch {
+            XCTFail("could not write button script \(command): \(error)")
+            return
+        }
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            let pending = ((try? String(contentsOf: script, encoding: .utf8)) ?? command)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if pending.isEmpty { return }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        XCTFail("test button script \(command) was not consumed")
     }
 
     @MainActor
@@ -2044,6 +2520,7 @@ final class LauncherDragUITests: XCTestCase {
         app.buttons["设置"].click()
         let settings = app.windows["LaunchIcon 设置"]
         XCTAssertTrue(settings.waitForExistence(timeout: 5))
+        selectSettingsTab("行为", in: settings)
         let reducedMotion = settings.checkBoxes["减少动态效果"]
         XCTAssertTrue(reducedMotion.waitForExistence(timeout: 5))
         reducedMotion.click()
@@ -2108,9 +2585,13 @@ final class LauncherDragUITests: XCTestCase {
             )
             _ = XCTWaiter.wait(for: [focusedRetry], timeout: 1.2)
         }
+        // Re-select via ⌘A after begin-edit. Panel routes ⌘A to the field
+        // editor whenever a FolderTitleField still has one, so icon-select
+        // cannot steal focus (FOLDER-TITLE-AM-FOCUS-02).
         if (title.value(forKey: "hasKeyboardFocus") as? Bool) == true {
             title.typeKey("a", modifierFlags: .command)
         }
+
     }
 
     @MainActor
@@ -2157,7 +2638,49 @@ final class LauncherDragUITests: XCTestCase {
         }
     }
 
+    private func seedTrailingFolder(in layout: URL, memberCount: Int, name: String) throws -> String {
+        let snapshot = try LayoutSnapshot.load(from: layout)
+        XCTAssertGreaterThan(snapshot.orderedEntries.count, memberCount)
+        let memberIDs = try snapshot.orderedEntries.suffix(memberCount).map { entry in
+            try XCTUnwrap(entry.app?._0)
+        }
+        let firstKey = try XCTUnwrap(snapshot.appKeys[memberIDs[0]])
+        let memberName = try XCTUnwrap(
+            uiTestDisplayName(forAppKey: firstKey),
+            "missing label for \(firstKey)"
+        )
+
+        var document = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: layout)) as? [String: Any]
+        )
+        let entries = try XCTUnwrap(document["orderedEntries"] as? [[String: Any]])
+        let folderID = UUID().uuidString
+        document["orderedEntries"] = Array(entries.dropLast(memberCount)) + [["folder": ["_0": folderID]]]
+        document["folders"] = [folderID, [
+            "id": folderID,
+            "name": name,
+            "itemIDs": memberIDs.map(\.uuidString),
+            "createdAt": 0.0
+        ]]
+        let seeded = try JSONSerialization.data(withJSONObject: document, options: [.sortedKeys])
+        try seeded.write(to: layout, options: .atomic)
+        let seededSnapshot = try LayoutSnapshot.load(from: layout)
+        XCTAssertEqual(seededSnapshot.folders.count, 1)
+        XCTAssertEqual(seededSnapshot.folders.values.first?.itemIDs.count, memberCount)
+        XCTAssertEqual(seededSnapshot.orderedEntries.count, entries.count - memberCount + 1)
+        XCTAssertNotNil(seededSnapshot.orderedEntries.last?.folder)
+        return memberName
+    }
+
+    private func uiTestDisplayName(forAppKey key: String) -> String? {
+        if key.contains("com.apple.calculator") { return "计算器" }
+        if key.contains("com.apple.clock") { return "时钟" }
+        guard let range = key.range(of: "Fixture", options: .caseInsensitive) else { return nil }
+        return Int(key[range.upperBound...]).map { String(format: "Fixture %02d", $0) }
+    }
+
     private func seedLeadingFolder(in layout: URL, memberCount: Int, name: String) throws {
+
         let data = try Data(contentsOf: layout)
         var document = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         let entries = try XCTUnwrap(document["orderedEntries"] as? [[String: Any]])

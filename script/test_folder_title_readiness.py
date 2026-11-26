@@ -13,7 +13,7 @@ root = Path(__file__).resolve().parents[1]
 source = (Path(sys.argv[1]) if len(sys.argv) > 1 else
           root / 'Sources/Direct/LauncherWindowController.swift').read_text()
 start = source.index('@MainActor\nprivate final class FolderTitleField:')
-end = source.index('\n@MainActor\nprivate final class FolderOverlayView:', start)
+end = source.index('\n@MainActor\nfinal class FolderOverlayView:', start)
 field = source[start:end].replace('private final class', 'final class', 1)
 # Old source has no callback: it exposes the field throughout the same fixture
 # states. Keep it executable so baseline failures are assertions, not compiler errors.
@@ -52,4 +52,9 @@ with tempfile.TemporaryDirectory(prefix='LaunchIcon-TitleReadiness-') as directo
     core_sources = sorted((root / 'Sources/Core').glob('*.swift'))
     subprocess.run(['xcrun', 'swiftc', '-swift-version', '6', *map(str, core_sources),
                     str(path / 'main.swift'), '-o', str(path / 'test')], check=True)
-    sys.exit(subprocess.run([str(path / 'test')], check=False).returncode)
+    # Host shells may leak LAUNCHICON_TEST_LAYOUT_PATH from UI probes;
+    # that env intentionally bypasses chrome gating in FolderTitleField.
+    # Clear fixture env so this snap asserts production traveling semantics.
+    clean_env = {k: v for k, v in __import__('os').environ.items()
+                 if not k.startswith('LAUNCHICON_TEST_')}
+    sys.exit(subprocess.run([str(path / 'test')], check=False, env=clean_env).returncode)

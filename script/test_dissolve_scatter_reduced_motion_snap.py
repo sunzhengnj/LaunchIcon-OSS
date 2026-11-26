@@ -43,7 +43,7 @@ need("shouldSnapDissolveScatterForReducedMotion" in seeds, "seeds must consult s
 
 play_d = direct[
     direct.index("private func playFolderDissolveScatter(") : direct.index(
-        "private func tileForPresentedItem("
+        "func tileForPresentedItem("
     )
 ]
 need("shouldSnapDissolveScatterForReducedMotion" in play_d, "play must consult snap")

@@ -4,16 +4,38 @@ import LaunchIconCore
 import ServiceManagement
 import UniformTypeIdentifiers
 
-@MainActor
 /// Esc closes settings like other preference windows. A modal alert or open
 /// popup menu consumes Escape first, so this only fires on the bare window.
+
+/// Shared settings chrome metrics (SETTINGS-TAB-CHROME-01 / OpenAI 6.1-sol-high).
+/// Tabbed preferences: shorter per-pane form, unified label column.
+private enum SettingsWindowChrome {
+    static let contentWidth: CGFloat = 560
+    static let defaultContentHeight: CGFloat = 560
+    static let minimumContentHeight: CGFloat = 480
+    /// Inset applied on each edge of `visibleFrame` when fitting the window.
+    static let screenMargin: CGFloat = 16
+    static let contentInset: CGFloat = 20
+    static let stackTopInset: CGFloat = 12
+    static let stackBottomInset: CGFloat = 16
+    static let sectionGap: CGFloat = 12
+    static let sectionHeaderGap: CGFloat = 6
+    static let cardCornerRadius: CGFloat = 10
+    static let cardPadding: CGFloat = 16
+    static let cardVerticalInset: CGFloat = 4
+    static let rowHeight: CGFloat = 32
+    static let labelWidth: CGFloat = 112
+    static let titleFontSize: CGFloat = 13
+    static let tabContentInset: CGFloat = 16
+}
+
 
 /// Rounded settings card; refreshes fill when the effective appearance flips.
 private final class SettingsCardView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        layer?.cornerRadius = 10
+        layer?.cornerRadius = SettingsWindowChrome.cardCornerRadius
         layer?.masksToBounds = true
         applyCardFill()
     }
@@ -34,6 +56,12 @@ private final class SettingsCardView: NSView {
             : NSColor(calibratedWhite: 1.0, alpha: 0.62)
         layer?.backgroundColor = fill.cgColor
     }
+}
+
+
+/// Flipped settings document so Auto Layout stacks grow downward in the scroll view.
+private final class SettingsDocumentView: NSView {
+    override var isFlipped: Bool { true }
 }
 
 private final class SettingsWindow: NSWindow {
@@ -63,7 +91,8 @@ private final class SettingsWindow: NSWindow {
     }
 }
 
-final class SettingsWindowController: NSWindowController {
+@MainActor
+final class SettingsWindowController: NSWindowController, NSTabViewDelegate {
     var onPreferencesChanged: ((LauncherPreferences) -> String?)?
     var onRestoreHiddenApplication: ((String) -> Bool)?
     var onRestoreAllHiddenApplications: (() -> Int?)?
@@ -100,11 +129,15 @@ final class SettingsWindowController: NSWindowController {
     /// BACKGROUND-DIM-01
     private let backgroundDimPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let reopenPagePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let pageFlipDirectionPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    /// GRID-GEOMETRY-SETTINGS-01
+    private let gridColumnsPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let gridRowsPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     /// BACKGROUND-BLUR-01
     private let backgroundBlurCheckbox = NSButton(checkboxWithTitle: "", target: nil, action: nil)
     private let loginCheckbox = NSButton(checkboxWithTitle: "", target: nil, action: nil)
     private let statusCheckbox = NSButton(checkboxWithTitle: "", target: nil, action: nil)
-    // One form row「隐藏名称」holds both, so the fixed-height window grows by one row only.
+    // One form row「隐藏名称」holds both app + folder toggles (keeps one row of height).
     private let appNamesCheckbox = NSButton(checkboxWithTitle: "", target: nil, action: nil)
     private let folderNamesCheckbox = NSButton(checkboxWithTitle: "", target: nil, action: nil)
     private let hideCheckbox = NSButton(checkboxWithTitle: "", target: nil, action: nil)
@@ -148,20 +181,49 @@ final class SettingsWindowController: NSWindowController {
     private var leftoversTask: Task<Void, Never>?
     /// Bumped on every `setMessage` so an older fade cannot wipe a newer line.
     private var messageFadeGeneration: UInt64 = 0
+    /// Crossfade destination. The completion applies it after opacity hits 0.
+    /// Close uses it when that completion never runs.
+    private var messageFadeReplacement: String?
     /// Bumped on every presence fade so an older hide cannot orderOut a newer show.
     private var settingsPresenceGeneration: UInt64 = 0
+    // SETTINGS-COMPACT-SCROLL-02: frame-managed scroll document + measurable form root.
+    private let settingsScrollView = NSScrollView()
+    private let settingsDocumentView = SettingsDocumentView()
+    // SETTINGS-TAB-SCROLL-03: retain measurable roots for every tab, not only Appearance.
+    private var settingsScrollPanes: [
+        (scrollView: NSScrollView, document: SettingsDocumentView, content: NSView)
+    ] = []
+    /// SETTINGS-TAB-LAYOUT-ON-SHOW-01: show/resize must lay out the selected tab,
+    /// not only `tabView(_:didSelect:)`.
+    private var settingsTabView: NSTabView?
+    private var refreshingSettingsDocument = false
 
     init(preferences: LauncherPreferences, hiddenApplications: [HiddenApplication]) {
         self.preferences = preferences
         self.hiddenApplications = hiddenApplications
         let window = SettingsWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 540, height: 880),
-            styleMask: [.titled, .closable, .miniaturizable],
+            contentRect: NSRect(
+                x: 0,
+                y: 0,
+                width: SettingsWindowChrome.contentWidth,
+                height: SettingsWindowChrome.defaultContentHeight
+            ),
+            // SETTINGS-COMPACT-SCROLL-02: vertical resize; width locked via content min/max.
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         // SETTINGS-SECTION-CHROME-01
         window.title = SettingsSectionChromeCopy.windowTitle(localize: { L($0) })
+        window.contentMinSize = NSSize(
+            width: SettingsWindowChrome.contentWidth,
+            height: SettingsWindowChrome.minimumContentHeight
+        )
+        window.contentMaxSize = NSSize(
+            width: SettingsWindowChrome.contentWidth,
+            height: 12_000
+        )
+        Self.fitSettingsWindowToVisibleScreen(window)
         window.center()
         // Reused by showSettings; closing must not release the window out from
         // under the retained controller (and the next gear/⌘, open).
@@ -189,6 +251,27 @@ final class SettingsWindowController: NSWindowController {
         updateControls()
         refreshLoginStatus()
         refreshLayoutBackupControls()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(settingsScreenParametersDidChange(_:)),
+            name: NSApplication.didChangeScreenParametersNotification,
+            object: nil
+        )
+        // SETTINGS-TAB-SCROLL-03: keep every tab's document height current during resize.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(settingsWindowDidResize(_:)),
+            name: NSWindow.didResizeNotification,
+            object: window
+        )
+        // Initial document height needs a laid-out clip width. The first tab
+        // does not receive didSelect (delegate is attached after the items).
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let window = self.window else { return }
+            self.relayoutSettingsChrome()
+            Self.fitSettingsWindowToVisibleScreen(window, initial: true)
+            self.relayoutSettingsChrome()
+        }
     }
 
     // SETTINGS-WILLCLOSE-01: delegate hook (SDK may not expose override).
@@ -208,8 +291,10 @@ final class SettingsWindowController: NSWindowController {
         // against duplicate cancel/callback if both delegate + notification fire.
         guard !didHandleSettingsWindowWillClose else { return }
         didHandleSettingsWindowWillClose = true
+        finishSettingsMessageFadeForClose()
         leftoversTask?.cancel()
         leftoversTask = nil
+        cancelSettingsMissingScreenFollowUp()
         restoreLeftoversButtonIdle()
         onWindowWillClose?()
     }
@@ -233,6 +318,10 @@ final class SettingsWindowController: NSWindowController {
     @available(*, unavailable)
     required init?(coder: NSCoder) { nil }
 
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
     func show(preferences: LauncherPreferences, hiddenApplications: [HiddenApplication]) {
         didHandleSettingsWindowWillClose = false
         self.preferences = preferences
@@ -245,7 +334,14 @@ final class SettingsWindowController: NSWindowController {
         updateControls()
         refreshLoginStatus()
         refreshLayoutBackupControls()
+        if let window {
+            Self.fitSettingsWindowToVisibleScreen(window, initial: false)
+        }
+        relayoutSettingsChrome()
         presentSettingsWindowPresence()
+        DispatchQueue.main.async { [weak self] in
+            self?.relayoutSettingsChrome()
+        }
     }
 
     func presentShortcutRegistrationError(_ message: String) {
@@ -267,43 +363,278 @@ final class SettingsWindowController: NSWindowController {
     }
 
     /// Shared metrics for form rows / cards (LaunchIcon settings chrome).
+    /// Keep literals in sync with `SettingsWindowChrome` (guards read the file-level enum).
     private enum SettingsChrome {
-        // SETTINGS-FORM-DENSITY-01: tighter native-form metrics
-        static let contentInset: CGFloat = 28
-        static let sectionGap: CGFloat = 18
-        static let cardCornerRadius: CGFloat = 10
-        static let cardPadding: CGFloat = 16
-        static let rowHeight: CGFloat = 30
-        static let labelWidth: CGFloat = 120
+        // SETTINGS-TAB-CHROME-01 / SETTINGS-COMPACT-SCROLL-02: tab panes + scroll safety
+        static let contentInset: CGFloat = SettingsWindowChrome.contentInset
+        static let sectionGap: CGFloat = SettingsWindowChrome.sectionGap
+        static let cardCornerRadius: CGFloat = SettingsWindowChrome.cardCornerRadius
+        static let cardPadding: CGFloat = SettingsWindowChrome.cardPadding
+        static let rowHeight: CGFloat = SettingsWindowChrome.rowHeight
+        static let labelWidth: CGFloat = SettingsWindowChrome.labelWidth
+        static let stackTopInset: CGFloat = SettingsWindowChrome.stackTopInset
+        static let stackBottomInset: CGFloat = SettingsWindowChrome.stackBottomInset
+        static let sectionHeaderGap: CGFloat = SettingsWindowChrome.sectionHeaderGap
+        static let cardVerticalInset: CGFloat = SettingsWindowChrome.cardVerticalInset
+        static let titleFontSize: CGFloat = SettingsWindowChrome.titleFontSize
+        static let tabContentInset: CGFloat = SettingsWindowChrome.tabContentInset
+    }
+
+
+    /// Keep the settings window inside `visibleFrame` (Dock / menu bar excluded).
+    /// SETTINGS-COMPACT-SCROLL-02 / OpenAI: convert work area via contentRect; never sit under Dock.
+    /// SETTINGS-SCREEN-FIT-OFFSCREEN-01: a closed window's `screen` is nil.
+    /// Do not treat that as the main screen, or every reopen jumps displays.
+    private static func fitSettingsWindowToVisibleScreen(_ window: NSWindow, initial: Bool = true) {
+        let margin = SettingsWindowChrome.screenMargin
+        guard let screen = screenForSettingsFit(window, initial: initial) else { return }
+        let work = screen.visibleFrame.insetBy(dx: margin, dy: margin)
+        let capacity = window.contentRect(forFrameRect: work).size
+        guard capacity.width > 0, capacity.height > 0 else { return }
+
+        let minHeight = min(SettingsWindowChrome.minimumContentHeight, capacity.height)
+        window.contentMinSize = NSSize(width: SettingsWindowChrome.contentWidth, height: minHeight)
+        window.contentMaxSize = NSSize(width: SettingsWindowChrome.contentWidth, height: 12_000)
+
+        let current = window.contentRect(forFrameRect: window.frame).size
+        let targetHeight: CGFloat
+        if initial {
+            targetHeight = min(SettingsWindowChrome.defaultContentHeight, capacity.height)
+        } else {
+            // Preserve user resize, but clamp into the current work area.
+            targetHeight = min(max(current.height, minHeight), capacity.height)
+        }
+        let wanted = NSSize(width: SettingsWindowChrome.contentWidth, height: max(minHeight, targetHeight))
+        var frame = window.frameRect(forContentRect: NSRect(origin: .zero, size: wanted))
+        // Keep the top edge stable when shrinking so the title bar does not jump under the menu bar.
+        frame.origin = NSPoint(x: window.frame.minX, y: window.frame.maxY - frame.height)
+        frame.origin.x = min(max(frame.minX, work.minX), max(work.minX, work.maxX - frame.width))
+        frame.origin.y = min(max(frame.minY, work.minY), max(work.minY, work.maxY - frame.height))
+        if frame.size != window.frame.size || frame.origin != window.frame.origin {
+            window.setFrame(frame, display: true)
+        }
+    }
+
+    /// SETTINGS-SCREEN-FIT-OFFSCREEN-01: attached windows use their screen.
+    /// A closed window keeps the display under its frame. The first
+    /// appearance, or a frame that meets no display, may use the main screen.
+    private static func screenForSettingsFit(_ window: NSWindow, initial: Bool) -> NSScreen? {
+        let screens = NSScreen.screens
+        let choice = LauncherLayout.settingsFitScreenChoice(
+            windowFrame: window.frame,
+            hasAttachedScreen: window.screen != nil,
+            preferFrameIntersection: !initial,
+            candidateScreenFrames: screens.map(\.frame),
+            hasMainScreen: NSScreen.main != nil
+        )
+        switch choice {
+        case .attached:
+            return window.screen
+        case .candidate(let index):
+            guard screens.indices.contains(index) else { return nil }
+            return screens[index]
+        case .main:
+            return NSScreen.main
+        case nil:
+            return nil
+        }
+    }
+
+    @objc private func settingsScreenParametersDidChange(_ notification: Notification) {
+        refreshSettingsScreenFit()
+    }
+
+    /// SETTINGS-SCREEN-NIL-HOLD-01: a parameter notification can arrive
+    /// before AppKit attaches this window to a screen. Fitting in that gap
+    /// can clamp the window onto the main screen when its frame does not yet
+    /// meet the display it is moving to. Look once on the next turn, then
+    /// wait for the next notification. The first appearance may still use
+    /// the main screen inside `fit`.
+    private func refreshSettingsScreenFit() {
+        guard let window else { return }
+        if LauncherLayout.shouldHoldSettingsScreenFitForMissingScreen(
+            screenAvailable: window.screen != nil
+        ) {
+            armSettingsMissingScreenFollowUpIfNeeded()
+            return
+        }
+        cancelSettingsMissingScreenFollowUp()
+        Self.fitSettingsWindowToVisibleScreen(window, initial: false)
+        relayoutSettingsChrome()
+    }
+
+    private var settingsMissingScreenFollowUp: DispatchWorkItem?
+    private var settingsMissingScreenFollowUpIsRunning = false
+
+    private func armSettingsMissingScreenFollowUpIfNeeded() {
+        if settingsMissingScreenFollowUpIsRunning || settingsMissingScreenFollowUp != nil { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.settingsMissingScreenFollowUp = nil
+            self.settingsMissingScreenFollowUpIsRunning = true
+            self.refreshSettingsScreenFit()
+            self.settingsMissingScreenFollowUpIsRunning = false
+        }
+        settingsMissingScreenFollowUp = work
+        DispatchQueue.main.async(execute: work)
+    }
+
+    private func cancelSettingsMissingScreenFollowUp() {
+        settingsMissingScreenFollowUp?.cancel()
+        settingsMissingScreenFollowUp = nil
+    }
+
+    @objc private func settingsWindowDidResize(_ notification: Notification) {
+        // SETTINGS-TAB-SCROLL-03 / LAYOUT-ON-SHOW-01: measure against the resized
+        // clip, and give the selected pane the new content rect first.
+        relayoutSettingsChrome()
+        DispatchQueue.main.async { [weak self] in
+            self?.relayoutSettingsChrome()
+        }
+    }
+
+    /// Selected tab frame, then every pane's document height. Show, resize,
+    /// screen changes, and tab selection all share this so a 1pt placeholder
+    /// is not the last layout a pane receives.
+    private func relayoutSettingsChrome() {
+        if let settingsTabView {
+            layoutSelectedSettingsTab(in: settingsTabView)
+        }
+        refreshSettingsDocumentSize()
+    }
+
+    /// Measure every form at its clip width and publish document heights to NSScrollView.
+    private func refreshSettingsDocumentSize() {
+        guard !refreshingSettingsDocument else { return }
+        refreshingSettingsDocument = true
+        defer { refreshingSettingsDocument = false }
+
+        window?.contentView?.layoutSubtreeIfNeeded()
+
+        for pane in settingsScrollPanes {
+            let scrollView = pane.scrollView
+            let document = pane.document
+            let content = pane.content
+
+            scrollView.layoutSubtreeIfNeeded()
+            scrollView.tile()
+            scrollView.layoutSubtreeIfNeeded()
+
+            let clip = scrollView.contentView
+            let viewport = clip.bounds.size
+            guard viewport.width > 32, viewport.height > 0 else { continue }
+
+            let oldOrigin = clip.bounds.origin
+
+            // Resolve wrapping at the actual clip width before measuring height.
+            document.setFrameSize(
+                NSSize(width: viewport.width, height: max(document.frame.height, 1))
+            )
+            document.needsLayout = true
+            document.layoutSubtreeIfNeeded()
+            content.layoutSubtreeIfNeeded()
+
+            let requiredHeight = SettingsScrollDocument.documentHeight(
+                viewportHeight: viewport.height,
+                contentFittingHeight: content.fittingSize.height,
+                stackTopInset: SettingsChrome.stackTopInset,
+                stackBottomInset: SettingsChrome.stackBottomInset,
+                laidOutContentHeight: content.bounds.height
+            )
+            document.setFrameSize(
+                NSSize(
+                    width: viewport.width,
+                    height: requiredHeight
+                )
+            )
+            document.needsLayout = true
+            document.layoutSubtreeIfNeeded()
+
+            // Keep each tab's position, clamped to its newly measured document.
+            let proposed = NSRect(
+                origin: NSPoint(x: 0, y: oldOrigin.y),
+                size: viewport
+            )
+            clip.scroll(to: clip.constrainBoundsRect(proposed).origin)
+            scrollView.reflectScrolledClipView(clip)
+
+            document.needsDisplay = true
+            clip.needsDisplay = true
+            scrollView.needsDisplay = true
+        }
+    }
+
+    // SETTINGS-TAB-SCROLL-03: a newly selected pane may only now have its final clip size.
+    private func layoutSelectedSettingsTab(in tabView: NSTabView) {
+        window?.contentView?.layoutSubtreeIfNeeded()
+        tabView.layoutSubtreeIfNeeded()
+
+        guard let paneView = tabView.selectedTabViewItem?.view else { return }
+
+        paneView.translatesAutoresizingMaskIntoConstraints = true
+        paneView.autoresizingMask = [.width, .height]
+
+        // Also handle selection callbacks delivered before AppKit installs the pane.
+        let targetFrame: NSRect
+        if let parent = paneView.superview {
+            targetFrame = tabView.convert(tabView.contentRect, to: parent)
+        } else {
+            targetFrame = tabView.contentRect
+        }
+
+        // A 1pt placeholder (the frame unselected tab items start with) must
+        // not be written onto the selected scroll view.
+        guard SettingsScrollDocument.selectedPaneFrameIsUsable(targetFrame) else { return }
+
+        if paneView.frame != targetFrame {
+            paneView.frame = targetFrame
+        }
+        paneView.needsLayout = true
+        paneView.layoutSubtreeIfNeeded()
+        paneView.needsDisplay = true
+    }
+
+    func tabView(_ tabView: NSTabView, didSelect tabViewItem: NSTabViewItem?) {
+        relayoutSettingsChrome()
+        // SETTINGS-TAB-SCROLL-TO-TOP-01: newly selected pane starts at top.
+        scrollSelectedSettingsTabToTop(in: tabView)
+
+        // SETTINGS-TAB-SCROLL-04: repeat after AppKit finishes installing the selected pane.
+        DispatchQueue.main.async { [weak self] in
+            self?.relayoutSettingsChrome()
+            self?.scrollSelectedSettingsTabToTop(in: tabView)
+        }
+    }
+
+    /// SETTINGS-TAB-SCROLL-TO-TOP-01
+    private func scrollSelectedSettingsTabToTop(in tabView: NSTabView) {
+        guard let selected = tabView.selectedTabViewItem else { return }
+        let index = tabView.indexOfTabViewItem(selected)
+        guard index != NSNotFound, index >= 0, index < settingsScrollPanes.count else { return }
+        let scrollView = settingsScrollPanes[index].scrollView
+        let clip = scrollView.contentView
+        let origin = SettingsScrollDocument.scrollOriginForTabSelectReset()
+        clip.scroll(to: origin)
+        scrollView.reflectScrolledClipView(clip)
     }
 
     private func buildContent(in window: NSWindow) {
         let root = NSView()
         window.contentView = root
 
-        let stack = NSStackView()
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = SettingsChrome.sectionGap
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        root.addSubview(stack)
-        NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: SettingsChrome.contentInset),
-            stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -SettingsChrome.contentInset),
-            stack.topAnchor.constraint(equalTo: root.topAnchor, constant: 22),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: root.bottomAnchor, constant: -22)
-        ])
-
-        // Header: page title + version (own brand, not System Settings chrome).
+        // Header: version only (tabs replace the old "通用" page title).
         let titleRow = NSStackView()
         titleRow.orientation = .horizontal
         titleRow.alignment = .firstBaseline
         titleRow.spacing = 12
-        // SETTINGS-SECTION-CHROME-01
+        titleRow.translatesAutoresizingMaskIntoConstraints = false
+        // SETTINGS-SECTION-CHROME-01 — pageTitle retained as AX label for the tab strip.
         let title = NSTextField(
             labelWithString: SettingsSectionChromeCopy.pageTitle(localize: { L($0) })
         )
-        title.font = .systemFont(ofSize: 20, weight: .semibold)
+        title.font = .systemFont(ofSize: SettingsChrome.titleFontSize, weight: .semibold)
+        title.textColor = .secondaryLabelColor
+        title.isHidden = true
         titleRow.addArrangedSubview(title)
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -339,10 +670,28 @@ final class SettingsWindowController: NSWindowController {
             )
         }
         titleRow.addArrangedSubview(versionLabel)
-        stack.addArrangedSubview(titleRow)
-        pinFullWidth(titleRow, in: stack)
+        root.addSubview(titleRow)
 
-        // --- 外观与呼出 ---
+        // SETTINGS-TAB-CHROME-01 / OpenAI: NSTabView top tabs (外观/行为/应用/维护).
+        let tabView = NSTabView()
+        settingsTabView = tabView
+        tabView.tabViewType = .topTabsBezelBorder
+        tabView.drawsBackground = false
+        tabView.setAccessibilityLabel(SettingsSectionChromeCopy.pageTitle(localize: { L($0) }))
+        tabView.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(tabView)
+
+        NSLayoutConstraint.activate([
+            titleRow.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: SettingsChrome.contentInset),
+            titleRow.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -SettingsChrome.contentInset),
+            titleRow.topAnchor.constraint(equalTo: root.topAnchor, constant: 8),
+            tabView.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 8),
+            tabView.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -8),
+            tabView.topAnchor.constraint(equalTo: titleRow.bottomAnchor, constant: 4),
+            tabView.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -8)
+        ])
+
+        // --- Wire controls (appearance) ---
         shortcutPopup.addItems(withTitles: LauncherShortcut.allCases.map(\.title))
         shortcutPopup.setAccessibilityLabel(SettingsAppearanceChromeCopy.shortcutLabel(localize: { L($0) }))
         window.initialFirstResponder = shortcutPopup
@@ -409,23 +758,62 @@ final class SettingsWindowController: NSWindowController {
         let namesToggles = NSStackView(views: [appNamesCheckbox, folderNamesCheckbox])
         namesToggles.orientation = .horizontal
         namesToggles.spacing = 16
-        stack.addArrangedSubview(makeSection(
-            title: SettingsSectionChromeCopy.appearanceSectionTitle(localize: { L($0) }),
-            rows: [
-                makeFormRow(title: SettingsAppearanceChromeCopy.shortcutLabel(localize: { L($0) }), control: shortcutPopup),
-                makeFormRow(title: SettingsAppearanceChromeCopy.hotCornerLabel(localize: { L($0) }), control: hotCornerPopup),
-                makeFormRow(
-                    title: DisplayTargetCopy.label(localize: { L($0) }),
-                    control: displayTargetPopup
-                ),
-                makeFormRow(
-                    title: BackgroundDimCopy.rowTitle(localize: { L($0) }),
-                    control: backgroundControls
-                ),
-                makeToggleRow(statusCheckbox),
-                makeFormRow(title: SettingsAppearanceChromeCopy.hideNamesRowTitle(localize: { L($0) }), control: namesToggles)
-            ]
-        ))
+
+        func fillGridGeometryPopup(_ popup: NSPopUpButton, titles: [String], identifier: String, label: String) {
+            popup.removeAllItems()
+            popup.addItems(withTitles: titles)
+            popup.setAccessibilityIdentifier(identifier)
+            popup.setAccessibilityLabel(label)
+            popup.setAccessibilityHelp(GridGeometryCopy.accessibilityHelp(localize: { L($0) }))
+            popup.target = self
+            popup.action = #selector(preferencesChanged)
+        }
+        fillGridGeometryPopup(
+            gridColumnsPopup,
+            titles: GridGeometryPreference.columnChoices.map { GridGeometryCopy.columnsItemTitle($0, localize: { L($0) }) },
+            identifier: GridGeometryCopy.columnsPopupIdentifier,
+            label: GridGeometryCopy.columnsLabel(localize: { L($0) })
+        )
+        fillGridGeometryPopup(
+            gridRowsPopup,
+            titles: GridGeometryPreference.rowChoices.map { GridGeometryCopy.rowsItemTitle($0, localize: { L($0) }) },
+            identifier: GridGeometryCopy.rowsPopupIdentifier,
+            label: GridGeometryCopy.rowsLabel(localize: { L($0) })
+        )
+        let gridColumnLabel = NSTextField(labelWithString: GridGeometryCopy.columnsLabel(localize: { L($0) }))
+        gridColumnLabel.font = .systemFont(ofSize: 13)
+        // The popups already expose "列" / "行"; hide the visible captions from AX
+        // so VoiceOver does not hear the name twice.
+        gridColumnLabel.setAccessibilityElement(false)
+        let gridRowLabel = NSTextField(labelWithString: GridGeometryCopy.rowsLabel(localize: { L($0) }))
+        gridRowLabel.font = .systemFont(ofSize: 13)
+        gridRowLabel.setAccessibilityElement(false)
+        let gridGeometryControls = NSStackView(views: [
+            gridColumnLabel, gridColumnsPopup, gridRowLabel, gridRowsPopup
+        ])
+        gridGeometryControls.orientation = .horizontal
+        gridGeometryControls.alignment = .centerY
+        gridGeometryControls.spacing = 8
+
+        let appearanceRows: [NSView] = [
+            makeFormRow(title: SettingsAppearanceChromeCopy.shortcutLabel(localize: { L($0) }), control: shortcutPopup),
+            makeFormRow(title: SettingsAppearanceChromeCopy.hotCornerLabel(localize: { L($0) }), control: hotCornerPopup),
+            makeFormRow(
+                title: DisplayTargetCopy.label(localize: { L($0) }),
+                control: displayTargetPopup
+            ),
+            makeFormRow(
+                title: BackgroundDimCopy.rowTitle(localize: { L($0) }),
+                control: backgroundControls
+            ),
+            makeToggleRow(statusCheckbox),
+            makeFormRow(title: SettingsAppearanceChromeCopy.hideNamesRowTitle(localize: { L($0) }), control: namesToggles),
+            makeFormRow(
+                title: GridGeometryCopy.rowTitle(localize: { L($0) }),
+                control: gridGeometryControls,
+                controlWidth: nil
+            )
+        ]
 
         // --- 行为 ---
         for checkbox in [hideCheckbox, motionCheckbox, pinchDismissCheckbox] {
@@ -454,6 +842,13 @@ final class SettingsWindowController: NSWindowController {
         reopenPagePopup.setAccessibilityHelp(ReopenPageCopy.accessibilityHelp(localize: { L($0) }))
         reopenPagePopup.target = self
         reopenPagePopup.action = #selector(preferencesChanged)
+        // PAGE-FLIP-DIRECTION-01
+        pageFlipDirectionPopup.addItems(withTitles: LauncherPageFlipDirection.allCases.map { L($0.title) })
+        pageFlipDirectionPopup.setAccessibilityIdentifier("settings-page-flip-direction")
+        pageFlipDirectionPopup.setAccessibilityLabel(PageFlipDirectionCopy.label(localize: { L($0) }))
+        pageFlipDirectionPopup.setAccessibilityHelp(PageFlipDirectionCopy.accessibilityHelp(localize: { L($0) }))
+        pageFlipDirectionPopup.target = self
+        pageFlipDirectionPopup.action = #selector(preferencesChanged)
         loginCheckbox.target = self
         loginCheckbox.action = #selector(loginChanged)
         loginCheckbox.title = SettingsBehaviorTogglesCopy.loginTitle(localize: { L($0) })
@@ -468,19 +863,20 @@ final class SettingsWindowController: NSWindowController {
         systemButton.bezelStyle = .inline
         systemButton.setAccessibilityIdentifier("settings-open-login-settings")
         systemButton.setAccessibilityLabel(SettingsBehaviorTogglesCopy.openLoginSettingsLabel(localize: { L($0) }))
-        stack.addArrangedSubview(makeSection(
-            title: SettingsSectionChromeCopy.behaviorSectionTitle(localize: { L($0) }),
-            rows: [
-                makeToggleRow(hideCheckbox),
-                makeToggleRow(motionCheckbox),
-                makeToggleRow(pinchDismissCheckbox),
-                makeFormRow(
-                    title: ReopenPageCopy.label(localize: { L($0) }),
-                    control: reopenPagePopup
-                ),
-                makeLoginRow(loginCheckbox, systemButton)
-            ]
-        ))
+        let behaviorRows: [NSView] = [
+            makeToggleRow(hideCheckbox),
+            makeToggleRow(motionCheckbox),
+            makeToggleRow(pinchDismissCheckbox),
+            makeFormRow(
+                title: ReopenPageCopy.label(localize: { L($0) }),
+                control: reopenPagePopup
+            ),
+            makeFormRow(
+                title: PageFlipDirectionCopy.label(localize: { L($0) }),
+                control: pageFlipDirectionPopup
+            ),
+            makeLoginRow(loginCheckbox, systemButton)
+        ]
 
         // --- 应用管理 ---
         hiddenApplicationsPopup.setAccessibilityLabel(
@@ -585,10 +981,7 @@ final class SettingsWindowController: NSWindowController {
             title: SettingsSectionChromeCopy.rearrangeRowTitle(localize: { L($0) }),
             control: rearrangePopup
         )
-        stack.addArrangedSubview(makeSection(
-            title: SettingsSectionChromeCopy.appsSectionTitle(localize: { L($0) }),
-            rows: [hiddenRow, rearrangeRow]
-        ))
+        let appsRows: [NSView] = [hiddenRow, rearrangeRow]
 
         // --- 维护 ---
         // SETTINGS-FORM-DENSITY-01: form rows + one layout pull-down (not a button wall)
@@ -733,15 +1126,119 @@ final class SettingsWindowController: NSWindowController {
         messageLabel.alphaValue = 1
         messageLabel.wantsLayer = true
         let messageRow = makePaddedRow(messageLabel, minHeight: nil, expandContent: true)
+        let maintenanceRows: [NSView] = [directoriesRow, actionsRow, layoutBackupRow, messageRow]
 
-        stack.addArrangedSubview(makeSection(
-            title: SettingsSectionChromeCopy.maintenanceSectionTitle(localize: { L($0) }),
-            rows: [directoriesRow, actionsRow, layoutBackupRow, messageRow]
+        // SETTINGS-COMPACT-SCROLL-02: primary pane still uses frame-managed scroll document.
+        let appearancePane = makeTabScrollPane(
+            rows: appearanceRows,
+            usePrimaryScroll: true
+        )
+        let behaviorPane = makeTabScrollPane(rows: behaviorRows, usePrimaryScroll: false)
+        let appsPane = makeTabScrollPane(rows: appsRows, usePrimaryScroll: false)
+        let maintenancePane = makeTabScrollPane(rows: maintenanceRows, usePrimaryScroll: false)
+
+        // Tab labels reuse section chrome (SETTINGS-SECTION-CHROME-01).
+        let tabs: [(String, NSView)] = [
+            (SettingsSectionChromeCopy.appearanceSectionTitle(localize: { L($0) }), appearancePane),
+            (SettingsSectionChromeCopy.behaviorSectionTitle(localize: { L($0) }), behaviorPane),
+            (SettingsSectionChromeCopy.appsSectionTitle(localize: { L($0) }), appsPane),
+            (SettingsSectionChromeCopy.maintenanceSectionTitle(localize: { L($0) }), maintenancePane)
+        ]
+        for (label, view) in tabs {
+            let item = NSTabViewItem(identifier: label as NSString)
+            item.label = label
+            item.view = view
+            tabView.addTabViewItem(item)
+        }
+        // SETTINGS-TAB-SCROLL-03: a newly selected pane may only now have its final clip size.
+        // Delegate is attached after the items, so the first tab does not get didSelect.
+        tabView.delegate = self
+        relayoutSettingsChrome()
+
+    }
+
+    /// SETTINGS-TAB-CHROME-01: one inset card inside a scroll pane (primary reuses SETTINGS-COMPACT-SCROLL-02 chrome).
+    // SETTINGS-TAB-SCROLL-04: autoresizing tab roots + post-select layout so secondary panes paint.
+    private func makeTabScrollPane(rows: [NSView], usePrimaryScroll: Bool) -> NSView {
+        let scrollView: NSScrollView
+        let document: SettingsDocumentView
+        if usePrimaryScroll {
+            scrollView = settingsScrollView
+            document = settingsDocumentView
+        } else {
+            scrollView = NSScrollView()
+            document = SettingsDocumentView()
+        }
+
+        // NSTabView owns this root's frame; there are no external Auto Layout constraints.
+        scrollView.translatesAutoresizingMaskIntoConstraints = true
+        scrollView.autoresizingMask = [.width, .height]
+        scrollView.frame = NSRect(
+            x: 0,
+            y: 0,
+            width: SettingsWindowChrome.contentWidth,
+            height: 1
+        )
+        scrollView.borderType = .noBorder
+        scrollView.drawsBackground = false
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = false
+        scrollView.scrollerStyle = .legacy
+        scrollView.horizontalScrollElasticity = .none
+        scrollView.verticalScrollElasticity = .allowed
+        scrollView.automaticallyAdjustsContentInsets = false
+
+        // SETTINGS-COMPACT-SCROLL-02: width follows the clip; height is measured explicitly.
+        document.translatesAutoresizingMaskIntoConstraints = true
+        document.autoresizingMask = [.width]
+        document.frame = NSRect(
+            x: 0,
+            y: 0,
+            width: SettingsWindowChrome.contentWidth,
+            height: 1
+        )
+
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = SettingsChrome.sectionGap
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        document.addSubview(stack)
+
+        let card = makeCard(rows: rows)
+        stack.addArrangedSubview(card)
+        pinFullWidth(card, in: stack)
+
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(
+                equalTo: document.leadingAnchor,
+                constant: SettingsChrome.tabContentInset
+            ),
+            stack.trailingAnchor.constraint(
+                equalTo: document.trailingAnchor,
+                constant: -SettingsChrome.tabContentInset
+            ),
+            stack.topAnchor.constraint(
+                equalTo: document.topAnchor,
+                constant: SettingsChrome.stackTopInset
+            ),
+            stack.widthAnchor.constraint(
+                equalTo: document.widthAnchor,
+                constant: -(SettingsChrome.tabContentInset * 2)
+            )
+        ])
+
+        scrollView.documentView = document
+
+        // SETTINGS-TAB-SCROLL-03/04: measure primary and secondary documents identically.
+        settingsScrollPanes.append((
+            scrollView: scrollView,
+            document: document,
+            content: stack
         ))
 
-        for section in stack.arrangedSubviews.dropFirst() {
-            pinFullWidth(section, in: stack)
-        }
+        return scrollView
     }
 
     /// Section title above a rounded card of equal-height form rows.
@@ -749,7 +1246,7 @@ final class SettingsWindowController: NSWindowController {
         let wrap = NSStackView()
         wrap.orientation = .vertical
         wrap.alignment = .leading
-        wrap.spacing = 8
+        wrap.spacing = SettingsChrome.sectionHeaderGap
         wrap.addArrangedSubview(makeSectionHeader(title))
         let card = makeCard(rows: rows)
         wrap.addArrangedSubview(card)
@@ -778,8 +1275,8 @@ final class SettingsWindowController: NSWindowController {
         NSLayoutConstraint.activate([
             column.leadingAnchor.constraint(equalTo: card.leadingAnchor),
             column.trailingAnchor.constraint(equalTo: card.trailingAnchor),
-            column.topAnchor.constraint(equalTo: card.topAnchor, constant: 4),
-            column.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -4)
+            column.topAnchor.constraint(equalTo: card.topAnchor, constant: SettingsChrome.cardVerticalInset),
+            column.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -SettingsChrome.cardVerticalInset)
         ])
 
         for (index, row) in rows.enumerated() {
@@ -870,7 +1367,7 @@ final class SettingsWindowController: NSWindowController {
         if let minHeight {
             row.heightAnchor.constraint(equalToConstant: minHeight).isActive = true
         } else {
-            row.heightAnchor.constraint(greaterThanOrEqualToConstant: 28).isActive = true
+            row.heightAnchor.constraint(greaterThanOrEqualToConstant: SettingsChrome.rowHeight).isActive = true
         }
         return row
     }
@@ -1081,6 +1578,7 @@ final class SettingsWindowController: NSWindowController {
     /// call bumps `messageFadeGeneration` so rapid rescan/login completions
     /// cannot clear or replace a newer line.
     private func setMessage(_ text: String, animated: Bool = true) {
+        messageFadeReplacement = nil
         if LauncherLayout.settingsMessageShouldAnnounce(
             text: text,
             previous: messageLabel.isHidden ? "" : messageLabel.stringValue
@@ -1164,12 +1662,14 @@ final class SettingsWindowController: NSWindowController {
                     CATransaction.commit()
                 }
             } else if shouldAnimate {
+                messageFadeReplacement = text
                 fadeMessageOpacity(to: 0, generation: generation) { [weak self] in
                     guard let self,
                           LauncherLayout.settingsMessageFadeShouldApply(
                             generation: self.messageFadeGeneration,
                             expected: generation
                           ) else { return }
+                    self.messageFadeReplacement = nil
                     self.messageLabel.stringValue = text
                     self.fadeMessageOpacity(to: 1, generation: generation, completion: nil)
                 }
@@ -1255,6 +1755,39 @@ final class SettingsWindowController: NSWindowController {
         CATransaction.commit()
     }
 
+    /// SETTINGS-MESSAGE-FADE-FINISH-ON-CLOSE-01: orderOut can drop the fade
+    /// before its completion. Read a layer that already exists.
+    private func finishSettingsMessageFadeForClose() {
+        let layer = messageLabel.layer
+        let landing = LauncherLayout.settingsMessageFadeLandingOnClose(
+            animationStillAttached: layer?.animation(
+                forKey: LauncherLayout.settingsMessageFadeAnimationKey
+            ) != nil,
+            modelOpacity: layer?.opacity ?? Float(messageLabel.alphaValue),
+            hasReplacement: messageFadeReplacement != nil,
+            labelHidden: messageLabel.isHidden
+        )
+        if landing == .leave { return }
+        messageFadeGeneration &+= 1
+        let replacement = messageFadeReplacement
+        messageFadeReplacement = nil
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer?.removeAnimation(forKey: LauncherLayout.settingsMessageFadeAnimationKey)
+        if landing == .showReplacement {
+            if let replacement {
+                messageLabel.stringValue = replacement
+            }
+            messageLabel.isHidden = false
+        } else if landing == .parkHidden {
+            messageLabel.isHidden = true
+            messageLabel.stringValue = ""
+        }
+        messageLabel.alphaValue = 1
+        layer?.opacity = 1
+        CATransaction.commit()
+    }
+
     private func updateControls() {
         shortcutPopup.selectItem(at: LauncherShortcut.allCases.firstIndex(of: preferences.shortcut) ?? 0)
         hotCornerPopup.selectItem(at: LauncherHotCorner.allCases.firstIndex(of: preferences.hotCorner) ?? 0)
@@ -1271,6 +1804,15 @@ final class SettingsWindowController: NSWindowController {
         pinchDismissCheckbox.state = preferences.pinchToDismiss ? .on : .off
         reopenPagePopup.selectItem(
             at: LauncherReopenPageBehavior.allCases.firstIndex(of: preferences.reopenPageBehavior) ?? 0
+        )
+        pageFlipDirectionPopup.selectItem(
+            at: LauncherPageFlipDirection.allCases.firstIndex(of: preferences.pageFlipDirection) ?? 0
+        )
+        gridColumnsPopup.selectItem(
+            at: GridGeometryPreference.choiceIndex(forColumns: preferences.gridGeometry.columns)
+        )
+        gridRowsPopup.selectItem(
+            at: GridGeometryPreference.choiceIndex(forRows: preferences.gridGeometry.rows)
         )
         updateHiddenApplications()
         updateAppDirectoriesMenu()
@@ -1441,6 +1983,19 @@ final class SettingsWindowController: NSWindowController {
         let reopenIndex = reopenPagePopup.indexOfSelectedItem
         if LauncherReopenPageBehavior.allCases.indices.contains(reopenIndex) {
             proposed.reopenPageBehavior = LauncherReopenPageBehavior.allCases[reopenIndex]
+        }
+        let flipIndex = pageFlipDirectionPopup.indexOfSelectedItem
+        if LauncherPageFlipDirection.allCases.indices.contains(flipIndex) {
+            proposed.pageFlipDirection = LauncherPageFlipDirection.allCases[flipIndex]
+        }
+        let gridColumnIndex = gridColumnsPopup.indexOfSelectedItem
+        let gridRowIndex = gridRowsPopup.indexOfSelectedItem
+        if GridGeometryPreference.columnChoices.indices.contains(gridColumnIndex),
+           GridGeometryPreference.rowChoices.indices.contains(gridRowIndex) {
+            proposed.gridGeometry = GridGeometryPreference(
+                columns: GridGeometryPreference.columnChoices[gridColumnIndex],
+                rows: GridGeometryPreference.rowChoices[gridRowIndex]
+            )
         }
         if let error = onPreferencesChanged?(proposed) {
             shortcutRegistrationError = error
@@ -1620,7 +2175,8 @@ final class SettingsWindowController: NSWindowController {
 
     private func refreshLayoutBackupControls() {
         let available = layoutBackupAvailable?() ?? false
-        restoreLayoutBackupMenuItem?.isEnabled = available
+        restoreLayoutBackupMenuItem?.isEnabled = LauncherLayout.SettingsLayoutIOChromeCopy
+            .shouldEnableRestoreBackupControl(hasBackupFile: available)
         restoreLayoutBackupMenuItem?.toolTip = LauncherLayout.SettingsLayoutIOChromeCopy.restoreBackupToolTip(
             available: available,
             localize: { L($0) }
@@ -1720,6 +2276,14 @@ final class SettingsWindowController: NSWindowController {
     }
 
     @objc private func restoreLayoutBackup() {
+        let available = layoutBackupAvailable?() ?? false
+        guard LauncherLayout.SettingsLayoutIOChromeCopy.shouldEnableRestoreBackupControl(
+            hasBackupFile: available
+        ) else {
+            setMessage(LauncherLayout.LayoutIOOutcomeCopy.restoreNoBackup(localize: { L($0) }))
+            refreshLayoutBackupControls()
+            return
+        }
         guard confirmLayoutRestoreBackup() else { return }
         Task { @MainActor in
             guard let onRestoreLayoutBackup else {

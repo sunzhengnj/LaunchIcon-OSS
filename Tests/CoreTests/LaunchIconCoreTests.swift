@@ -6,6 +6,19 @@ import XCTest
 import SQLite3
 @testable import LaunchIconCore
 
+private final class CallbackCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    func increment() {
+        lock.withLock { value += 1 }
+    }
+
+    var count: Int {
+        lock.withLock { value }
+    }
+}
+
 private final class IconDecodeCounter: @unchecked Sendable {
     private let lock = NSLock()
     private var value = 0
@@ -98,6 +111,48 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertEqual(
             Set(LauncherLayout.deferredVisualStateOrder),
             Set(LauncherLayout.DeferredVisualSlot.allCases)
+        )
+    }
+
+    func testDismissalSettleOrderMatchesHistoricalRegistry() {
+        XCTAssertEqual(
+            LauncherLayout.dismissalSettleOrder,
+            [
+                .reorderSlide,
+                .folderLanding,
+                .mergeFlight,
+                .dropLanding,
+                .folderChrome,
+                .searchChrome,
+                .dissolvedGridFade,
+                .launchFeedback,
+                .pageButtonHover,
+                .toastFade
+            ]
+        )
+        XCTAssertEqual(
+            Set(LauncherLayout.dismissalSettleOrder),
+            Set(LauncherLayout.DismissalSettleSlot.allCases)
+        )
+    }
+
+    func testHiddenChromeFinishOrderMatchesHistoricalRegistry() {
+        XCTAssertEqual(
+            LauncherLayout.hiddenChromeFinishOrder,
+            [
+                .pageIndicator,
+                .footerFades,
+                .statusFades,
+                .tileChromeFills,
+                .folderTitleUnderline,
+                .launcherPresence,
+                .previewPlateClock,
+                .folderTileFlights
+            ]
+        )
+        XCTAssertEqual(
+            Set(LauncherLayout.hiddenChromeFinishOrder),
+            Set(LauncherLayout.HiddenChromeFinishSlot.allCases)
         )
     }
 
@@ -659,6 +714,65 @@ final class LaunchIconCoreTests: XCTestCase {
         _ = externalApp
     }
 
+    func testReconcileKeepsIdentityWhenBundledAppMovesOrRenames() {
+        let id = UUID()
+        let before = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Volumes/Disk/Old Name.app"),
+            bundleIdentifier: "com.example.travel",
+            displayName: "Old Name",
+            sourcePriority: 1,
+            discoveredAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        let after = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/New Name.app"),
+            bundleIdentifier: "com.example.Travel",
+            displayName: "New Name",
+            sourcePriority: 0,
+            discoveredAt: Date(timeIntervalSince1970: 1_700_000_100)
+        )
+        XCTAssertEqual(before.deduplicationKey, after.deduplicationKey)
+        let stored = LayoutState(
+            orderedEntries: [.app(id)],
+            appKeys: [id: before.deduplicationKey],
+            appAliases: [before.deduplicationKey: "Trip"],
+            updatedAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        let reconciled = LauncherLayout.reconcile(candidates: [after], into: stored)
+        XCTAssertEqual(reconciled.orderedEntries, [.app(id)])
+        XCTAssertEqual(reconciled.appKeys[id], after.deduplicationKey)
+        XCTAssertEqual(reconciled.appAliases[after.deduplicationKey], "Trip")
+        XCTAssertTrue(LauncherLayout.newlyAddedAppKeys(previous: stored, reconciled: reconciled).isEmpty)
+    }
+
+    func testRetainingCandidatesDoesNotDuplicateMovedAppWithSameBundleID() {
+        let old = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Volumes/Disk/Old.app"),
+            bundleIdentifier: "com.example.travel",
+            displayName: "Old",
+            sourcePriority: 1,
+            discoveredAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        let moved = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Volumes/Disk/New.app"),
+            bundleIdentifier: "com.example.travel",
+            displayName: "New",
+            sourcePriority: 1,
+            discoveredAt: Date(timeIntervalSince1970: 1_700_000_100)
+        )
+        let remounted = CatalogScanReport(candidates: [moved], skippedPaths: [])
+        let retained = remounted.retainingCandidates(from: [old])
+        XCTAssertEqual(retained.candidates.count, 1)
+        XCTAssertEqual(retained.candidates[0].canonicalURL, moved.canonicalURL)
+
+        let stillOffline = CatalogScanReport(
+            candidates: [],
+            skippedPaths: [],
+            unavailableRequiredRootPaths: [URL(fileURLWithPath: "/Volumes/Disk", isDirectory: true)]
+        )
+        let held = stillOffline.retainingCandidates(from: [old], bundleExists: { _ in false })
+        XCTAssertEqual(held.candidates.map(\.displayName), ["Old"])
+    }
+
     func testMissingRootWithoutRetentionSourceDoesNotPersist() {
         // MISSING-ROOT-NO-CACHE-01: unavailable root + nothing to retain must not
         // persist a reconcile that deletes the saved folder. Editing stays read-only
@@ -775,6 +889,69 @@ final class LaunchIconCoreTests: XCTestCase {
                 .candidates.contains { $0.displayName == "Ext" }
         )
         XCTAssertTrue(report.confirmedAbsentTruncatedKeys(from: [local, ext], bundleExists: { _ in false }).isEmpty)
+    }
+
+    func testTrustedRootDeletionPersistsWhileOfflineRootUnavailable() {
+        // MISSING-ROOT-TRUSTED-DELETE-01: uninstall from /Applications must still
+        // persist even when an external custom root is offline. Only keys under
+        // the unavailable/truncated root stay blocked.
+        let local = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Local.app"),
+            bundleIdentifier: "com.example.Local",
+            displayName: "Local",
+            sourcePriority: 0,
+            discoveredAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        let keptLocal = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Kept.app"),
+            bundleIdentifier: "com.example.Kept",
+            displayName: "Kept",
+            sourcePriority: 0,
+            discoveredAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        let ext = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Volumes/Missing/Ext.app"),
+            bundleIdentifier: "com.example.Ext",
+            displayName: "Ext",
+            sourcePriority: 1,
+            discoveredAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        let missingRoot = URL(fileURLWithPath: "/Volumes/Missing", isDirectory: true)
+        let report = CatalogScanReport(
+            candidates: [keptLocal],
+            skippedPaths: [],
+            unavailableRequiredRootPaths: [missingRoot]
+        )
+        let localID = UUID()
+        let keptID = UUID()
+        let extID = UUID()
+        let layout = LayoutState(
+            orderedEntries: [.app(keptID), .app(localID), .app(extID)],
+            appKeys: [
+                keptID: keptLocal.deduplicationKey,
+                localID: local.deduplicationKey,
+                extID: ext.deduplicationKey
+            ],
+            updatedAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        let previous = [keptLocal, local, ext]
+        // Local is gone from /Applications; Ext is retained via the offline root.
+        // Missing keys = {local} only after retention — trusted delete must persist.
+        let retained = report.retainingCandidates(from: previous)
+        XCTAssertEqual(Set(retained.candidates.map(\.displayName)), ["Kept", "Ext"])
+        XCTAssertTrue(report.allowsPersistingReconcile(retainingFrom: previous, into: layout))
+
+        // Ext still missing from live candidates with empty previous → refuse.
+        XCTAssertFalse(report.allowsPersistingReconcile(retainingFrom: [keptLocal], into: layout))
+
+        // Dropping only the offline-root key without retention still refuses.
+        let offlineOnly = LayoutState(
+            orderedEntries: [.app(keptID), .app(extID)],
+            appKeys: [keptID: keptLocal.deduplicationKey, extID: ext.deduplicationKey],
+            updatedAt: layout.updatedAt
+        )
+        XCTAssertFalse(report.allowsPersistingReconcile(retainingFrom: [keptLocal], into: offlineOnly))
+        XCTAssertTrue(report.allowsPersistingReconcile(retainingFrom: [keptLocal, ext], into: offlineOnly))
     }
 
     func testCustomRootScanRespectsDepthAndAppCountCaps() async throws {
@@ -1070,7 +1247,111 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertEqual(BackgroundDimCopy.rowTitle(localize: { $0 }), "背景")
     }
 
-    func testReopenPageBehaviorDefaultsAndPolicy() async {
+    
+    func testPageFlipDirectionDefaultsHorizontal() {
+        // PAGE-FLIP-DIRECTION-01: default must stay horizontal.
+        XCTAssertEqual(LauncherPreferences().pageFlipDirection, .horizontal)
+        XCTAssertTrue(LauncherPageFlipDirection.horizontal.isHorizontal)
+        XCTAssertFalse(LauncherPageFlipDirection.vertical.isHorizontal)
+        let h = LauncherLayout.pageFlipFrameOffset(distance: 120, direction: .horizontal)
+        XCTAssertEqual(h.x, 120)
+        XCTAssertEqual(h.y, 0)
+        let v = LauncherLayout.pageFlipFrameOffset(distance: 120, direction: .vertical)
+        XCTAssertEqual(v.x, 0)
+        XCTAssertEqual(v.y, 120)
+        XCTAssertEqual(
+            LauncherLayout.pageFlipExtent(boundsSize: CGSize(width: 800, height: 600), direction: .horizontal),
+            800
+        )
+        XCTAssertEqual(
+            LauncherLayout.pageFlipExtent(boundsSize: CGSize(width: 800, height: 600), direction: .vertical),
+            600
+        )
+        XCTAssertTrue(
+            LauncherLayout.pageFlipLocksHorizontalAxis(preferredHorizontal: true, dx: 10, dy: 10)
+        )
+        XCTAssertFalse(
+            LauncherLayout.pageFlipLocksHorizontalAxis(preferredHorizontal: false, dx: 10, dy: 10)
+        )
+        XCTAssertEqual(
+            LauncherLayout.SearchFieldChromeCopy.footerNavigationText(
+                isSearching: false, pageCount: 3, pageFlipDirection: .horizontal
+            ),
+            "← → 翻页 · Esc 返回"
+        )
+        XCTAssertEqual(
+            LauncherLayout.SearchFieldChromeCopy.footerNavigationText(
+                isSearching: false, pageCount: 3, pageFlipDirection: .vertical
+            ),
+            "↑ ↓ 翻页 · Esc 返回"
+        )
+    }
+
+    func testMouseSideButtonPagingMapsBackForwardButtons() {
+        // MOUSE-SIDE-BUTTON-PAGING-01: independent of gesture axis lock.
+        XCTAssertEqual(LauncherLayout.MouseSideButtonPaging.backButtonNumber, 3)
+        XCTAssertEqual(LauncherLayout.MouseSideButtonPaging.forwardButtonNumber, 4)
+        XCTAssertEqual(
+            LauncherLayout.MouseSideButtonPaging.pageTurnDirection(
+                buttonNumber: 3,
+                hasMultiplePages: true,
+                isSearching: false,
+                folderOpen: false,
+                isDragging: false,
+                isPaging: false,
+                isDismissing: false
+            ),
+            -1
+        )
+        XCTAssertEqual(
+            LauncherLayout.MouseSideButtonPaging.pageTurnDirection(
+                buttonNumber: 4,
+                hasMultiplePages: true,
+                isSearching: false,
+                folderOpen: false,
+                isDragging: false,
+                isPaging: false,
+                isDismissing: false
+            ),
+            1
+        )
+        XCTAssertNil(
+            LauncherLayout.MouseSideButtonPaging.pageTurnDirection(
+                buttonNumber: 0,
+                hasMultiplePages: true,
+                isSearching: false,
+                folderOpen: false,
+                isDragging: false,
+                isPaging: false,
+                isDismissing: false
+            )
+        )
+        XCTAssertNil(
+            LauncherLayout.MouseSideButtonPaging.pageTurnDirection(
+                buttonNumber: 3,
+                hasMultiplePages: false,
+                isSearching: false,
+                folderOpen: false,
+                isDragging: false,
+                isPaging: false,
+                isDismissing: false
+            )
+        )
+        XCTAssertNil(
+            LauncherLayout.MouseSideButtonPaging.pageTurnDirection(
+                buttonNumber: 4,
+                hasMultiplePages: true,
+                isSearching: true,
+                folderOpen: false,
+                isDragging: false,
+                isPaging: false,
+                isDismissing: false
+            )
+        )
+        XCTAssertEqual(BlankBrowseModeCopy.menuTitleKey, "浏览模式")
+    }
+
+func testReopenPageBehaviorDefaultsAndPolicy() async {
         // REOPEN-PAGE-BEHAVIOR-01
         XCTAssertEqual(LauncherPreferences().reopenPageBehavior, .rememberLast)
         XCTAssertNil(LauncherReopenPageBehavior.rememberLast.homeResetDelaySeconds)
@@ -1108,6 +1389,162 @@ final class LaunchIconCoreTests: XCTestCase {
         let fallback = await store.load()
         XCTAssertEqual(fallback.reopenPageBehavior, .rememberLast)
     }
+
+    func testPagingArrowEdgeLayoutFollowsPageFlipAxis() {
+        // DRAG-EDGE-AUTO-PAGE-AXIS-01
+        XCTAssertEqual(
+            LauncherLayout.pagingArrowEdgeLayout(direction: .horizontal),
+            .leadingTrailing
+        )
+        XCTAssertEqual(
+            LauncherLayout.pagingArrowEdgeLayout(direction: .vertical),
+            .topBottom
+        )
+    }
+
+    func testPagingGridViewportSideGutterCollapsesWhenVertical() {
+        // DRAG-EDGE-VIEWPORT-INSET-01
+        XCTAssertEqual(
+            LauncherLayout.pagingGridViewportSideGutter(direction: .horizontal),
+            96
+        )
+        XCTAssertEqual(
+            LauncherLayout.pagingGridViewportSideGutter(direction: .vertical),
+            0
+        )
+    }
+
+    func testPagingGridViewportEndInsetLightWhenVertical() {
+        // DRAG-EDGE-VIEWPORT-END-INSET-01
+        let horizontal = LauncherLayout.pagingGridViewportEndInset(direction: .horizontal)
+        XCTAssertEqual(horizontal.top, 28)
+        XCTAssertEqual(horizontal.bottom, 18)
+        let vertical = LauncherLayout.pagingGridViewportEndInset(direction: .vertical)
+        XCTAssertEqual(vertical.top, 76)   // 28 + 48 light
+        XCTAssertEqual(vertical.bottom, 66) // 18 + 48 light
+        // Must stay lighter than the 96pt arrow band.
+        XCTAssertLessThan(vertical.top - horizontal.top, 96)
+        XCTAssertLessThan(vertical.bottom - horizontal.bottom, 96)
+    }
+
+    func testCommandArrowPagingLaunchpadParity() {
+        // KEYBOARD-COMMAND-ARROW-PAGING-01
+        XCTAssertEqual(
+            LauncherLayout.CommandArrowPaging.pageTurnDirection(
+                keyCode: 123, commandOnly: true, pageFlipHorizontal: true
+            ),
+            -1
+        )
+        XCTAssertEqual(
+            LauncherLayout.CommandArrowPaging.pageTurnDirection(
+                keyCode: 124, commandOnly: true, pageFlipHorizontal: true
+            ),
+            1
+        )
+        XCTAssertNil(
+            LauncherLayout.CommandArrowPaging.pageTurnDirection(
+                keyCode: 126, commandOnly: true, pageFlipHorizontal: true
+            )
+        )
+        XCTAssertEqual(
+            LauncherLayout.CommandArrowPaging.pageTurnDirection(
+                keyCode: 126, commandOnly: true, pageFlipHorizontal: false
+            ),
+            -1
+        )
+        XCTAssertEqual(
+            LauncherLayout.CommandArrowPaging.pageTurnDirection(
+                keyCode: 125, commandOnly: true, pageFlipHorizontal: false
+            ),
+            1
+        )
+        XCTAssertNil(
+            LauncherLayout.CommandArrowPaging.pageTurnDirection(
+                keyCode: 123, commandOnly: false, pageFlipHorizontal: true
+            )
+        )
+    }
+
+    func testWheelPageWhileItemDraggingIsDiscreteAndAxisAgnostic() {
+        // WHEEL-PAGE-WHILE-ITEM-DRAG-01
+        XCTAssertNil(
+            LauncherLayout.WheelPageWhileItemDragging.pageTurnDirection(
+                isItemDragging: false, dominantDelta: -10
+            )
+        )
+        XCTAssertEqual(
+            LauncherLayout.WheelPageWhileItemDragging.pageTurnDirection(
+                isItemDragging: true, dominantDelta: -10
+            ),
+            1
+        )
+        XCTAssertEqual(
+            LauncherLayout.WheelPageWhileItemDragging.pageTurnDirection(
+                isItemDragging: true, dominantDelta: 10
+            ),
+            -1
+        )
+        XCTAssertNil(
+            LauncherLayout.WheelPageWhileItemDragging.pageTurnDirection(
+                isItemDragging: true, dominantDelta: 1
+            )
+        )
+    }
+
+    func testMouseSideButtonPagingAxisAgnostic() {
+        // Side buttons stay previous/next on either page-flip axis.
+        XCTAssertEqual(
+            LauncherLayout.MouseSideButtonPaging.pageTurnDirection(
+                buttonNumber: 3,
+                hasMultiplePages: true,
+                isSearching: false,
+                folderOpen: false,
+                isDragging: false,
+                isPaging: false,
+                isDismissing: false
+            ),
+            -1
+        )
+        XCTAssertEqual(
+            LauncherLayout.MouseSideButtonPaging.pageTurnDirection(
+                buttonNumber: 4,
+                hasMultiplePages: true,
+                isSearching: false,
+                folderOpen: false,
+                isDragging: false,
+                isPaging: false,
+                isDismissing: false
+            ),
+            1
+        )
+    }
+
+
+    func testPagingScrollDeltaPreservesNaturalScrolling() {
+        // NATURAL-SCROLLING-PASS-THROUGH-01: never flip by the inverted flag.
+        XCTAssertEqual(
+            LauncherLayout.pagingScrollDeltaPreservingNaturalScrolling(
+                deviceDelta: 12,
+                isDirectionInvertedFromDevice: true
+            ),
+            12
+        )
+        XCTAssertEqual(
+            LauncherLayout.pagingScrollDeltaPreservingNaturalScrolling(
+                deviceDelta: -8,
+                isDirectionInvertedFromDevice: false
+            ),
+            -8
+        )
+        XCTAssertEqual(
+            LauncherLayout.pagingScrollDeltaPreservingNaturalScrolling(
+                deviceDelta: .nan,
+                isDirectionInvertedFromDevice: true
+            ),
+            0
+        )
+    }
+
 
     func testDeferredGridRearrangeSkipsHiddenLauncher() {
         XCTAssertTrue(LauncherLayout.shouldApplyDeferredGridRearrange(
@@ -1215,6 +1652,1091 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertNil(LauncherDisplayTarget.screenIndex(for: .pointer, screenFrames: [], activeIndex: 0, pointer: .zero))
     }
 
+    func testSearchChromeTopInsetClearsNotchAndKeepsClassicMenuBarOffset() {
+        // Classic 24 pt menu bar: 24 + 10 gap = historical 34. Unchanged.
+        let classic = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let classicVisible = CGRect(x: 0, y: 0, width: 1440, height: 876)
+        XCTAssertEqual(classic.height - classicVisible.height, 24)
+        XCTAssertEqual(
+            LauncherLayout.searchChromeTopInset(screenFrame: classic, visibleFrame: classicVisible),
+            LauncherLayout.searchChromeDefaultTopInset
+        )
+        // MacBook-like notched menu bar (~38 pt) must raise the field.
+        let builtin = CGRect(x: 0, y: 0, width: 1512, height: 982)
+        let builtinVisible = CGRect(x: 0, y: 0, width: 1512, height: 944)
+        XCTAssertEqual(
+            LauncherLayout.searchChromeTopInset(screenFrame: builtin, visibleFrame: builtinVisible),
+            48
+        )
+        XCTAssertGreaterThan(
+            LauncherLayout.searchChromeTopInset(screenFrame: builtin, visibleFrame: builtinVisible),
+            LauncherLayout.searchChromeDefaultTopInset
+        )
+        // A full-frame visible area (tests / already-inset window) stays at 34.
+        XCTAssertEqual(
+            LauncherLayout.searchChromeTopInset(screenFrame: builtin, visibleFrame: builtin),
+            LauncherLayout.searchChromeDefaultTopInset
+        )
+        // A centered 1024×768 fixture window sits inside the visible frame, so
+        // it must not inherit the notched fullscreen inset (48).
+        let testWindow = LauncherLayout.launcherWindowFrame(
+            for: builtin,
+            testSize: CGSize(width: 1024, height: 768)
+        )
+        XCTAssertLessThan(testWindow.maxY, builtinVisible.maxY)
+        XCTAssertEqual(
+            LauncherLayout.searchChromeTopInset(
+                screenFrame: builtin,
+                visibleFrame: builtinVisible,
+                windowFrame: testWindow
+            ),
+            LauncherLayout.searchChromeDefaultTopInset
+        )
+        // Fullscreen on the same notched bar still rises to 48.
+        XCTAssertEqual(
+            LauncherLayout.searchChromeTopInset(
+                screenFrame: builtin,
+                visibleFrame: builtinVisible,
+                windowFrame: builtin
+            ),
+            48
+        )
+        // Secondary display beside/below the primary: frames share that
+        // screen's (possibly offset) coordinate space. Count only the
+        // obstruction the window covers there, not the primary origin.
+        let secondary = CGRect(x: 1920, y: -200, width: 1920, height: 1080)
+        let secondaryClassicVisible = CGRect(x: 1920, y: -200, width: 1920, height: 1056)
+        XCTAssertEqual(secondary.maxY - secondaryClassicVisible.maxY, 24)
+        XCTAssertEqual(
+            LauncherLayout.searchChromeTopInset(
+                screenFrame: secondary,
+                visibleFrame: secondaryClassicVisible,
+                windowFrame: secondary
+            ),
+            LauncherLayout.searchChromeDefaultTopInset
+        )
+        let secondaryCentered = LauncherLayout.launcherWindowFrame(
+            for: secondary,
+            testSize: CGSize(width: 1024, height: 768)
+        )
+        XCTAssertLessThan(secondaryCentered.maxY, secondaryClassicVisible.maxY)
+        XCTAssertEqual(
+            LauncherLayout.searchChromeTopInset(
+                screenFrame: secondary,
+                visibleFrame: secondaryClassicVisible,
+                windowFrame: secondaryCentered
+            ),
+            LauncherLayout.searchChromeDefaultTopInset
+        )
+        let secondaryNotchedVisible = CGRect(x: 1920, y: -200, width: 1920, height: 1042)
+        XCTAssertEqual(secondary.maxY - secondaryNotchedVisible.maxY, 38)
+        XCTAssertEqual(
+            LauncherLayout.searchChromeTopInset(
+                screenFrame: secondary,
+                visibleFrame: secondaryNotchedVisible,
+                windowFrame: secondary
+            ),
+            48
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchChromeTopInset(
+                screenFrame: secondary,
+                visibleFrame: secondaryNotchedVisible,
+                windowFrame: secondaryCentered
+            ),
+            LauncherLayout.searchChromeDefaultTopInset
+        )
+        // SEARCH-CHROME-GRID-OVERLAP-01: taller chrome must not collide with
+        // the paging grid or footer at the fixture or fullscreen sizes.
+        for (size, inset) in [
+            (CGSize(width: 1024, height: 768), LauncherLayout.searchChromeDefaultTopInset),
+            (CGSize(width: 1512, height: 982), CGFloat(48))
+        ] {
+            for direction in [LauncherPageFlipDirection.horizontal, .vertical] {
+                let layout = LauncherLayout.searchChromeLayout(
+                    windowSize: size,
+                    topInset: inset,
+                    pageFlipDirection: direction
+                )
+                let endInset = LauncherLayout.pagingGridViewportEndInset(direction: direction)
+                XCTAssertEqual(layout.searchChrome.minY, inset)
+                XCTAssertEqual(layout.searchChrome.height, LauncherLayout.searchFieldHeight)
+                XCTAssertEqual(
+                    layout.gridViewport.minY,
+                    inset + LauncherLayout.searchFieldHeight + endInset.top
+                )
+                XCTAssertFalse(
+                    LauncherLayout.searchChromeOverlapsGridOrFooter(layout),
+                    "\(size) inset=\(inset) \(direction)"
+                )
+                XCTAssertGreaterThan(layout.gridViewport.height, 100)
+            }
+        }
+        // Arrangement change: same size, origin shifts — cache must invalidate.
+        let moved = builtin.offsetBy(dx: 1920, dy: -200)
+        XCTAssertTrue(
+            LauncherLayout.shouldInvalidateGridViewportCacheOnScreenChange(
+                previousScreenFrame: builtin,
+                newScreenFrame: moved
+            )
+        )
+        // Preferred screen unplugged: out-of-range active index falls back to 0.
+        let remaining = [CGRect(x: 1920, y: 0, width: 1920, height: 1080)]
+        XCTAssertEqual(
+            LauncherDisplayTarget.screenIndex(
+                for: .active, screenFrames: remaining, activeIndex: 1, pointer: .zero
+            ),
+            0
+        )
+        XCTAssertEqual(
+            LauncherDisplayTarget.screenIndex(
+                for: .primary, screenFrames: remaining, activeIndex: 1, pointer: .zero
+            ),
+            0
+        )
+        // Hidden / dismissing windows wait for the next show; they must not
+        // resize under a fade or while off-screen after a display is pulled.
+        XCTAssertFalse(
+            LauncherLayout.shouldRefreshVisibleScreenGeometry(
+                isVisible: false, isPaging: false, isDismissing: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldRefreshVisibleScreenGeometry(
+                isVisible: true, isPaging: false, isDismissing: true
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldRefreshVisibleScreenGeometry(
+                isVisible: true, isPaging: false, isDismissing: false
+            )
+        )
+    }
+
+    /// Auto-hiding the menu bar lifts `visibleFrame` to the screen top, so the
+    /// menu-bar estimate becomes 0. A 32 pt notch the fullscreen window covers
+    /// still has to clear the field (32 + 10 pt gap = 42). A classic 24 pt bar
+    /// with no notch stays at 34. A centered window that does not enter the
+    /// notch band does not pick up the safe area.
+    func testSearchChromeTopInsetCountsNotchSafeAreaWhenTheWindowCoversIt() {
+        let notched = CGRect(x: 0, y: 0, width: 1512, height: 982)
+        let autoHiddenMenuBar = notched
+        XCTAssertEqual(notched.maxY, autoHiddenMenuBar.maxY)
+        XCTAssertGreaterThanOrEqual(
+            LauncherLayout.searchChromeTopInset(
+                screenFrame: notched,
+                visibleFrame: autoHiddenMenuBar,
+                windowFrame: notched,
+                safeAreaTop: 32
+            ),
+            42
+        )
+
+        let classic = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let classicVisible = CGRect(x: 0, y: 0, width: 1440, height: 876)
+        XCTAssertEqual(
+            LauncherLayout.searchChromeTopInset(
+                screenFrame: classic,
+                visibleFrame: classicVisible,
+                windowFrame: classic,
+                safeAreaTop: 0
+            ),
+            34
+        )
+
+        let centered = LauncherLayout.launcherWindowFrame(
+            for: notched,
+            testSize: CGSize(width: 1024, height: 768)
+        )
+        XCTAssertLessThanOrEqual(centered.maxY, notched.maxY - 32)
+        XCTAssertEqual(
+            LauncherLayout.searchChromeTopInset(
+                screenFrame: notched,
+                visibleFrame: autoHiddenMenuBar,
+                windowFrame: centered,
+                safeAreaTop: 32
+            ),
+            LauncherLayout.searchChromeDefaultTopInset
+        )
+    }
+
+    func testSecondaryDisplayLayoutInvalidatesViewportAndWallpaper() {
+        let primary = CGRect(x: 0, y: 0, width: 1512, height: 982)
+        let secondary = CGRect(x: 1512, y: 0, width: 1920, height: 1200)
+        XCTAssertEqual(
+            LauncherLayout.launcherWindowFrame(for: secondary, testSize: nil),
+            secondary
+        )
+        let test = CGSize(width: 800, height: 600)
+        let centered = LauncherLayout.launcherWindowFrame(for: secondary, testSize: test)
+        XCTAssertEqual(centered.size, test)
+        XCTAssertEqual(centered.origin.x, secondary.midX - test.width / 2, accuracy: 0.5)
+        XCTAssertTrue(
+            LauncherLayout.shouldInvalidateGridViewportCacheOnScreenChange(
+                previousScreenFrame: primary,
+                newScreenFrame: secondary
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldInvalidateGridViewportCacheOnScreenChange(
+                previousScreenFrame: secondary,
+                newScreenFrame: secondary
+            )
+        )
+        // Sticky case: same numeric viewport but dirty flag still forces update.
+        XCTAssertTrue(
+            LauncherLayout.shouldUpdateGridMetrics(
+                geometryDirty: true,
+                viewport: CGSize(width: 1200, height: 800),
+                lastViewport: CGSize(width: 1200, height: 800)
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldUpdateGridMetrics(
+                geometryDirty: false,
+                viewport: CGSize(width: 1200, height: 800),
+                lastViewport: CGSize(width: 1200, height: 800)
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldUpdateGridMetrics(
+                geometryDirty: false,
+                viewport: CGSize(width: 1800, height: 1000),
+                lastViewport: CGSize(width: 1200, height: 800)
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldUpdateGridMetrics(
+                geometryDirty: false,
+                viewport: .zero,
+                lastViewport: .zero
+            )
+        )
+        let urlA = URL(fileURLWithPath: "/Library/Desktop Pictures/A.jpg")
+        let urlB = URL(fileURLWithPath: "/Library/Desktop Pictures/B.jpg")
+        XCTAssertTrue(
+            LauncherLayout.shouldReloadDesktopBackgroundImage(
+                previousURL: nil,
+                newURL: urlA,
+                previousScreenSize: nil,
+                newScreenSize: secondary.size
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldReloadDesktopBackgroundImage(
+                previousURL: urlA,
+                newURL: urlA,
+                previousScreenSize: secondary.size,
+                newScreenSize: secondary.size
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldReloadDesktopBackgroundImage(
+                previousURL: urlA,
+                newURL: urlA,
+                previousScreenSize: primary.size,
+                newScreenSize: secondary.size
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldReloadDesktopBackgroundImage(
+                previousURL: urlA,
+                newURL: urlB,
+                previousScreenSize: secondary.size,
+                newScreenSize: secondary.size
+            )
+        )
+        // Same points, different backing scale: still reload and invalidate.
+        XCTAssertTrue(
+            LauncherLayout.shouldReloadDesktopBackgroundImage(
+                previousURL: urlA,
+                newURL: urlA,
+                previousScreenSize: primary.size,
+                newScreenSize: primary.size,
+                previousBackingScale: 2,
+                newBackingScale: 1
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldReloadDesktopBackgroundImage(
+                previousURL: urlA,
+                newURL: urlA,
+                previousScreenSize: primary.size,
+                newScreenSize: primary.size,
+                previousBackingScale: 2,
+                newBackingScale: 2
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldInvalidateGridViewportCacheOnScreenChange(
+                previousScreenFrame: primary,
+                newScreenFrame: primary,
+                previousBackingScale: 2,
+                newBackingScale: 1
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldInvalidateGridViewportCacheOnScreenChange(
+                previousScreenFrame: primary,
+                newScreenFrame: primary,
+                previousBackingScale: 2,
+                newBackingScale: 2
+            )
+        )
+        XCTAssertEqual(
+            LauncherLayout.desktopBackgroundMaximumPixelSize(
+                screenSize: primary.size,
+                backingScale: 2
+            ),
+            3024
+        )
+        XCTAssertEqual(
+            LauncherLayout.desktopBackgroundMaximumPixelSize(
+                screenSize: primary.size,
+                backingScale: 0
+            ),
+            1512
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldInstallDecodedDesktopBackground(
+                requestedScreenSize: primary.size,
+                requestedBackingScale: 2,
+                currentScreenSize: primary.size,
+                currentBackingScale: 1
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldInstallDecodedDesktopBackground(
+                requestedScreenSize: primary.size,
+                requestedBackingScale: 2,
+                currentScreenSize: secondary.size,
+                currentBackingScale: 2
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldInstallDecodedDesktopBackground(
+                requestedScreenSize: secondary.size,
+                requestedBackingScale: 1,
+                currentScreenSize: secondary.size,
+                currentBackingScale: 1
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldInstallDecodedDesktopBackground(
+                requestedScreenSize: secondary.size,
+                requestedBackingScale: 1,
+                currentScreenSize: nil,
+                currentBackingScale: nil
+            )
+        )
+        XCTAssertTrue(LauncherLayout.shouldForgetFailedDesktopBackgroundRequest(producedImage: false))
+        XCTAssertFalse(LauncherLayout.shouldForgetFailedDesktopBackgroundRequest(producedImage: true))
+        XCTAssertTrue(LauncherLayout.shouldRetryDesktopBackgroundAfterFailedDecode(alreadyRetried: false))
+        XCTAssertFalse(LauncherLayout.shouldRetryDesktopBackgroundAfterFailedDecode(alreadyRetried: true))
+        XCTAssertTrue(
+            LauncherLayout.shouldStartDesktopBackgroundDecodeRetry(
+                alreadyRetried: false,
+                hasScreen: true,
+                hasDesktopImageURL: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldStartDesktopBackgroundDecodeRetry(
+                alreadyRetried: true,
+                hasScreen: true,
+                hasDesktopImageURL: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldStartDesktopBackgroundDecodeRetry(
+                alreadyRetried: false,
+                hasScreen: false,
+                hasDesktopImageURL: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldStartDesktopBackgroundDecodeRetry(
+                alreadyRetried: false,
+                hasScreen: true,
+                hasDesktopImageURL: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldBlurDesktopBackground(
+                preferenceEnabled: true,
+                systemReducesTransparency: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldBlurDesktopBackground(
+                preferenceEnabled: true,
+                systemReducesTransparency: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldBlurDesktopBackground(
+                preferenceEnabled: false,
+                systemReducesTransparency: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldBlurDesktopBackground(
+                preferenceEnabled: false,
+                systemReducesTransparency: true
+            )
+        )
+        XCTAssertEqual(LauncherLayout.desktopBackgroundLayerContentsScale(backingScale: 2), 2)
+        XCTAssertEqual(LauncherLayout.desktopBackgroundLayerContentsScale(backingScale: 0), 1)
+        XCTAssertEqual(LauncherLayout.desktopBackgroundLayerContentsScale(backingScale: -1), 1)
+        XCTAssertTrue(
+            LauncherLayout.shouldRefreshVisibleScreenGeometry(
+                isVisible: true,
+                isPaging: false,
+                isDismissing: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldRefreshVisibleScreenGeometry(
+                isVisible: false,
+                isPaging: false,
+                isDismissing: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldRefreshVisibleScreenGeometry(
+                isVisible: true,
+                isPaging: true,
+                isDismissing: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldRefreshVisibleScreenGeometry(
+                isVisible: true,
+                isPaging: false,
+                isDismissing: true
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldDeferVisibleScreenGeometry(
+                isVisible: true,
+                isPaging: true,
+                isDismissing: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldDeferVisibleScreenGeometry(
+                isVisible: true,
+                isPaging: false,
+                isDismissing: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldDeferVisibleScreenGeometry(
+                isVisible: true,
+                isPaging: true,
+                isDismissing: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldDeferVisibleScreenGeometry(
+                isVisible: false,
+                isPaging: true,
+                isDismissing: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldApplyDeferredVisibleScreenGeometry(
+                deferred: true,
+                isVisible: true,
+                isPaging: false,
+                isDismissing: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldApplyDeferredVisibleScreenGeometry(
+                deferred: true,
+                isVisible: true,
+                isPaging: true,
+                isDismissing: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldApplyDeferredVisibleScreenGeometry(
+                deferred: false,
+                isVisible: true,
+                isPaging: false,
+                isDismissing: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldDropDeferredVisibleScreenGeometry(
+                deferred: true,
+                isVisible: false,
+                isPaging: false,
+                isDismissing: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldDropDeferredVisibleScreenGeometry(
+                deferred: true,
+                isVisible: true,
+                isPaging: false,
+                isDismissing: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldDropDeferredVisibleScreenGeometry(
+                deferred: true,
+                isVisible: true,
+                isPaging: true,
+                isDismissing: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldDropDeferredVisibleScreenGeometry(
+                deferred: false,
+                isVisible: false,
+                isPaging: false,
+                isDismissing: false
+            )
+        )
+        XCTAssertEqual(LauncherLayout.deferredVisibleScreenGeometryRetryDelay, 0.05, accuracy: 0.001)
+        XCTAssertTrue(
+            LauncherLayout.shouldScheduleDeferredVisibleScreenGeometryApply(
+                deferred: true,
+                isPaging: false,
+                applyAlreadyScheduled: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldScheduleDeferredVisibleScreenGeometryApply(
+                deferred: true,
+                isPaging: true,
+                applyAlreadyScheduled: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldScheduleDeferredVisibleScreenGeometryApply(
+                deferred: true,
+                isPaging: false,
+                applyAlreadyScheduled: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldScheduleDeferredVisibleScreenGeometryApply(
+                deferred: false,
+                isPaging: false,
+                applyAlreadyScheduled: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldPauseDeferredVisibleScreenGeometryApply(
+                deferred: true,
+                screenAvailable: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldPauseDeferredVisibleScreenGeometryApply(
+                deferred: true,
+                screenAvailable: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldPauseDeferredVisibleScreenGeometryApply(
+                deferred: false,
+                screenAvailable: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldHoldVisibleScreenGeometryForMissingScreen(
+                isVisible: true,
+                isPaging: false,
+                isDismissing: false,
+                screenAvailable: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldHoldVisibleScreenGeometryForMissingScreen(
+                isVisible: true,
+                isPaging: false,
+                isDismissing: false,
+                screenAvailable: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldHoldVisibleScreenGeometryForMissingScreen(
+                isVisible: true,
+                isPaging: true,
+                isDismissing: false,
+                screenAvailable: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldHoldVisibleScreenGeometryForMissingScreen(
+                isVisible: true,
+                isPaging: false,
+                isDismissing: true,
+                screenAvailable: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldHoldVisibleScreenGeometryForMissingScreen(
+                isVisible: false,
+                isPaging: false,
+                isDismissing: false,
+                screenAvailable: false
+            )
+        )
+        XCTAssertTrue(LauncherLayout.shouldHoldSettingsScreenFitForMissingScreen(screenAvailable: false))
+        XCTAssertFalse(LauncherLayout.shouldHoldSettingsScreenFitForMissingScreen(screenAvailable: true))
+        XCTAssertTrue(
+            LauncherLayout.shouldInstallHeldDesktopBackgroundOnAppearance(
+                holdsDecodedImage: true,
+                isDismissing: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldInstallHeldDesktopBackgroundOnAppearance(
+                holdsDecodedImage: true,
+                isDismissing: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldInstallHeldDesktopBackgroundOnAppearance(
+                holdsDecodedImage: false,
+                isDismissing: false
+            )
+        )
+    }
+
+    func testDesktopBackgroundUsesAppearanceFrame() {
+        let url = URL(fileURLWithPath: "/Library/Desktop Pictures/A.heic")
+        let size = CGSize(width: 1512, height: 982)
+        XCTAssertEqual(LauncherLayout.desktopBackgroundAppearanceIdentity(isDark: false), "light")
+        XCTAssertEqual(LauncherLayout.desktopBackgroundAppearanceIdentity(isDark: true), "dark")
+        XCTAssertTrue(LauncherLayout.desktopBackgroundAppearanceIsDark("dark"))
+        XCTAssertFalse(LauncherLayout.desktopBackgroundAppearanceIsDark("light"))
+        XCTAssertTrue(
+            LauncherLayout.shouldReloadDesktopBackgroundImage(
+                previousURL: url,
+                newURL: url,
+                previousScreenSize: size,
+                newScreenSize: size,
+                previousBackingScale: 2,
+                newBackingScale: 2,
+                previousAppearance: "light",
+                newAppearance: "dark"
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldReloadDesktopBackgroundImage(
+                previousURL: url,
+                newURL: url,
+                previousScreenSize: size,
+                newScreenSize: size,
+                previousBackingScale: 2,
+                newBackingScale: 2,
+                previousAppearance: "dark",
+                newAppearance: "dark"
+            )
+        )
+        // A caller that has not recorded an appearance must not reload forever.
+        XCTAssertFalse(
+            LauncherLayout.shouldReloadDesktopBackgroundImage(
+                previousURL: url,
+                newURL: url,
+                previousScreenSize: size,
+                newScreenSize: size,
+                previousBackingScale: 2,
+                newBackingScale: 2
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldInstallDecodedDesktopBackground(
+                requestedScreenSize: size,
+                requestedBackingScale: 2,
+                currentScreenSize: size,
+                currentBackingScale: 2,
+                requestedAppearance: "light",
+                currentAppearance: "dark"
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldInstallDecodedDesktopBackground(
+                requestedScreenSize: size,
+                requestedBackingScale: 2,
+                currentScreenSize: size,
+                currentBackingScale: 2,
+                requestedAppearance: "dark",
+                currentAppearance: "dark"
+            )
+        )
+        XCTAssertTrue(LauncherLayout.shouldRefreshDesktopBackgroundForPictureChange(isVisible: true))
+        XCTAssertFalse(LauncherLayout.shouldRefreshDesktopBackgroundForPictureChange(isVisible: false))
+
+        let pair = LauncherLayout.DesktopBackgroundAppearanceIndices(light: 0, dark: 1)
+        let apr = ["l": 0, "d": 1] as NSDictionary
+        XCTAssertEqual(
+            LauncherLayout.desktopBackgroundAppearanceIndices(
+                appearanceDictionary: apr,
+                solarDictionary: ["ap": ["l": 8, "d": 9]] as NSDictionary
+            ),
+            pair
+        )
+        XCTAssertEqual(
+            LauncherLayout.desktopBackgroundImageIndex(
+                indices: pair,
+                appearanceIsDark: true,
+                imageCount: 2
+            ),
+            1
+        )
+        XCTAssertEqual(
+            LauncherLayout.desktopBackgroundImageIndex(
+                indices: pair,
+                appearanceIsDark: false,
+                imageCount: 2
+            ),
+            0
+        )
+        let solar = ["ap": ["l": NSNumber(value: 4), "d": NSNumber(value: 7)]] as NSDictionary
+        XCTAssertEqual(
+            LauncherLayout.desktopBackgroundAppearanceIndices(
+                appearanceDictionary: nil,
+                solarDictionary: solar
+            ),
+            LauncherLayout.DesktopBackgroundAppearanceIndices(light: 4, dark: 7)
+        )
+        XCTAssertEqual(
+            LauncherLayout.desktopBackgroundImageIndex(
+                indices: LauncherLayout.DesktopBackgroundAppearanceIndices(light: 4, dark: 7),
+                appearanceIsDark: true,
+                imageCount: 16
+            ),
+            7
+        )
+        // An index the file does not contain stays on the first frame.
+        XCTAssertEqual(
+            LauncherLayout.desktopBackgroundImageIndex(
+                indices: pair,
+                appearanceIsDark: true,
+                imageCount: 1
+            ),
+            0
+        )
+        XCTAssertNil(
+            LauncherLayout.desktopBackgroundAppearanceIndices(
+                appearanceDictionary: ["l": true, "d": 1] as NSDictionary,
+                solarDictionary: nil
+            )
+        )
+        XCTAssertNil(
+            LauncherLayout.desktopBackgroundAppearanceIndices(
+                appearanceDictionary: ["l": -1, "d": 2] as NSDictionary,
+                solarDictionary: nil
+            )
+        )
+        XCTAssertNil(
+            LauncherLayout.desktopBackgroundAppearanceIndices(
+                appearanceDictionary: nil,
+                solarDictionary: nil
+            )
+        )
+        XCTAssertEqual(
+            LauncherLayout.desktopBackgroundImageIndex(
+                indices: nil,
+                appearanceIsDark: true,
+                imageCount: 5
+            ),
+            0
+        )
+    }
+
+    func testDesktopBackgroundDescriptorUsesThumbnail() {
+        let descriptor = URL(fileURLWithPath: "/System/Library/Desktop Pictures/Big Sur.madesktop")
+        let thumb = URL(fileURLWithPath: "/System/Library/Desktop Pictures/.thumbnails/Big Sur.heic")
+        let jpeg = URL(fileURLWithPath: "/Library/Desktop Pictures/Photo.jpg")
+        XCTAssertEqual(
+            LauncherLayout.desktopBackgroundImageURLToDecode(
+                desktopImageURL: jpeg,
+                descriptorThumbnailPath: thumb.path
+            ),
+            jpeg
+        )
+        XCTAssertEqual(
+            LauncherLayout.desktopBackgroundImageURLToDecode(
+                desktopImageURL: descriptor,
+                descriptorThumbnailPath: thumb.path
+            ).standardizedFileURL.path,
+            thumb.standardizedFileURL.path
+        )
+        XCTAssertEqual(
+            LauncherLayout.desktopBackgroundImageURLToDecode(
+                desktopImageURL: descriptor,
+                descriptorThumbnailPath: ".thumbnails/Big Sur.heic"
+            ).standardizedFileURL.path,
+            thumb.standardizedFileURL.path
+        )
+        XCTAssertEqual(
+            LauncherLayout.desktopBackgroundImageURLToDecode(
+                desktopImageURL: descriptor,
+                descriptorThumbnailPath: "file:///System/Library/Desktop%20Pictures/.thumbnails/Big%20Sur.heic"
+            ).standardizedFileURL.path,
+            thumb.standardizedFileURL.path
+        )
+        XCTAssertEqual(
+            LauncherLayout.desktopBackgroundImageURLToDecode(
+                desktopImageURL: descriptor,
+                descriptorThumbnailPath: "  "
+            ),
+            descriptor
+        )
+        XCTAssertEqual(
+            LauncherLayout.desktopBackgroundImageURLToDecode(
+                desktopImageURL: descriptor,
+                descriptorThumbnailPath: nil
+            ),
+            descriptor
+        )
+        XCTAssertEqual(
+            LauncherLayout.desktopBackgroundImageURLToDecode(
+                desktopImageURL: descriptor,
+                descriptorThumbnailPath: "../Outside.heic"
+            ),
+            descriptor
+        )
+        XCTAssertEqual(
+            LauncherLayout.desktopBackgroundImageURLToDecode(
+                desktopImageURL: descriptor,
+                descriptorThumbnailPath: "https://example.com/picture.heic"
+            ),
+            descriptor
+        )
+        XCTAssertEqual(
+            LauncherLayout.desktopBackgroundDescriptorThumbnailPath(
+                ["thumbnailPath": "  /Pictures/A.heic  "] as NSDictionary
+            ),
+            "/Pictures/A.heic"
+        )
+        XCTAssertNil(
+            LauncherLayout.desktopBackgroundDescriptorThumbnailPath(
+                ["thumbnailPath": "   "] as NSDictionary
+            )
+        )
+        XCTAssertNil(
+            LauncherLayout.desktopBackgroundDescriptorThumbnailPath(
+                ["thumbnailPath": 3] as NSDictionary
+            )
+        )
+        XCTAssertNil(LauncherLayout.desktopBackgroundDescriptorThumbnailPath(nil))
+
+        let light = LauncherLayout.desktopBackgroundAppearanceVariantURL(
+            imageURL: thumb,
+            appearanceIsDark: false
+        )
+        let dark = LauncherLayout.desktopBackgroundAppearanceVariantURL(
+            imageURL: thumb,
+            appearanceIsDark: true
+        )
+        XCTAssertEqual(light.lastPathComponent, "Big Sur Light.heic")
+        XCTAssertEqual(dark.lastPathComponent, "Big Sur Dark.heic")
+        XCTAssertEqual(
+            LauncherLayout.desktopBackgroundAppearanceVariantURL(
+                imageURL: light,
+                appearanceIsDark: true
+            ).lastPathComponent,
+            "Big Sur Dark.heic"
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldUseDesktopBackgroundAppearanceVariant(
+                variantURL: dark,
+                baseURL: thumb,
+                variantExists: true,
+                variantIsDirectory: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldUseDesktopBackgroundAppearanceVariant(
+                variantURL: dark,
+                baseURL: thumb,
+                variantExists: false,
+                variantIsDirectory: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldUseDesktopBackgroundAppearanceVariant(
+                variantURL: dark,
+                baseURL: thumb,
+                variantExists: true,
+                variantIsDirectory: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldUseDesktopBackgroundAppearanceVariant(
+                variantURL: thumb,
+                baseURL: thumb,
+                variantExists: true,
+                variantIsDirectory: false
+            )
+        )
+    }
+
+    func testItemDragEscapeCancelSuppressesPointerRelease() {
+        XCTAssertTrue(
+            LauncherLayout.suppressesPointerReleaseSideEffects(escapeCancelInFlight: true)
+        )
+        XCTAssertFalse(
+            LauncherLayout.suppressesPointerReleaseSideEffects(escapeCancelInFlight: false)
+        )
+        XCTAssertTrue(LauncherLayout.shouldAcceptLayoutDrop(isDismissing: false))
+        XCTAssertFalse(LauncherLayout.shouldAcceptLayoutDrop(isDismissing: true))
+    }
+
+    func testSettingsScrollDocumentRejectsPlaceholderPane() {
+        XCTAssertFalse(
+            SettingsScrollDocument.selectedPaneFrameIsUsable(
+                CGRect(x: 0, y: 0, width: 540, height: 1)
+            )
+        )
+        XCTAssertFalse(
+            SettingsScrollDocument.selectedPaneFrameIsUsable(
+                CGRect(x: 0, y: 0, width: 20, height: 400)
+            )
+        )
+        XCTAssertTrue(
+            SettingsScrollDocument.selectedPaneFrameIsUsable(
+                CGRect(x: 0, y: 0, width: 540, height: 480)
+            )
+        )
+        let document = SettingsScrollDocument.documentHeight(
+            viewportHeight: 400,
+            contentFittingHeight: 900,
+            stackTopInset: 12,
+            stackBottomInset: 16
+        )
+        XCTAssertGreaterThan(document, 400)
+        XCTAssertGreaterThan(document, 1)
+        XCTAssertEqual(document, 928, accuracy: 0.001)
+        let stub = SettingsScrollDocument.documentHeight(
+            viewportHeight: 1,
+            contentFittingHeight: 0,
+            stackTopInset: 12,
+            stackBottomInset: 16
+        )
+        XCTAssertGreaterThan(stub, 1)
+        // fittingSize can still be 0 after the stack has a real frame.
+        let fromLayout = SettingsScrollDocument.documentHeight(
+            viewportHeight: 400,
+            contentFittingHeight: 0,
+            stackTopInset: 12,
+            stackBottomInset: 16,
+            laidOutContentHeight: 900
+        )
+        XCTAssertEqual(fromLayout, 928, accuracy: 0.001)
+        let tallerLayout = SettingsScrollDocument.documentHeight(
+            viewportHeight: 400,
+            contentFittingHeight: 100,
+            stackTopInset: 12,
+            stackBottomInset: 16,
+            laidOutContentHeight: 900
+        )
+        XCTAssertEqual(tallerLayout, 928, accuracy: 0.001)
+    }
+
+    func testSettingsFitScreenChoiceKeepsTheScreenUnderAClosedWindow() {
+        let main = CGRect(x: 0, y: 0, width: 1512, height: 982)
+        let secondary = CGRect(x: 1512, y: 0, width: 1920, height: 1200)
+        let left = CGRect(x: -1440, y: 0, width: 1440, height: 900)
+        let screens = [main, secondary, left]
+        let onSecondary = CGRect(x: 1800, y: 80, width: 540, height: 680)
+        let onPrimary = CGRect(x: 40, y: 40, width: 540, height: 680)
+        XCTAssertEqual(
+            LauncherLayout.settingsFitScreenChoice(
+                windowFrame: onPrimary,
+                hasAttachedScreen: false,
+                preferFrameIntersection: true,
+                candidateScreenFrames: screens,
+                hasMainScreen: true
+            ),
+            .candidate(0)
+        )
+        XCTAssertEqual(
+            LauncherLayout.settingsFitScreenChoice(
+                windowFrame: onSecondary,
+                hasAttachedScreen: false,
+                preferFrameIntersection: true,
+                candidateScreenFrames: screens,
+                hasMainScreen: true
+            ),
+            .candidate(1)
+        )
+        let onLeft = CGRect(x: -1200, y: 40, width: 540, height: 680)
+        XCTAssertEqual(
+            LauncherLayout.settingsFitScreenChoice(
+                windowFrame: onLeft,
+                hasAttachedScreen: false,
+                preferFrameIntersection: true,
+                candidateScreenFrames: screens,
+                hasMainScreen: true
+            ),
+            .candidate(2)
+        )
+        // Visible window: the attached screen wins even if the frame sits elsewhere.
+        XCTAssertEqual(
+            LauncherLayout.settingsFitScreenChoice(
+                windowFrame: onSecondary,
+                hasAttachedScreen: true,
+                preferFrameIntersection: true,
+                candidateScreenFrames: screens,
+                hasMainScreen: true
+            ),
+            .attached
+        )
+        // First appearance does not hunt for an overlap. It may use the main screen.
+        XCTAssertEqual(
+            LauncherLayout.settingsFitScreenChoice(
+                windowFrame: onSecondary,
+                hasAttachedScreen: false,
+                preferFrameIntersection: false,
+                candidateScreenFrames: screens,
+                hasMainScreen: true
+            ),
+            .main
+        )
+        // The display that held the window is gone.
+        XCTAssertEqual(
+            LauncherLayout.settingsFitScreenChoice(
+                windowFrame: onSecondary,
+                hasAttachedScreen: false,
+                preferFrameIntersection: true,
+                candidateScreenFrames: [main],
+                hasMainScreen: true
+            ),
+            .main
+        )
+        XCTAssertNil(
+            LauncherLayout.settingsFitScreenChoice(
+                windowFrame: onSecondary,
+                hasAttachedScreen: false,
+                preferFrameIntersection: true,
+                candidateScreenFrames: [],
+                hasMainScreen: false
+            )
+        )
+        // Equal overlap across x=1512: the screen that contains the center wins.
+        let split = CGRect(x: 1112, y: 0, width: 800, height: 400)
+        XCTAssertEqual(
+            LauncherLayout.settingsFitScreenChoice(
+                windowFrame: split,
+                hasAttachedScreen: false,
+                preferFrameIntersection: true,
+                candidateScreenFrames: [main, secondary],
+                hasMainScreen: true
+            ),
+            .candidate(1)
+        )
+    }
+
     func testHotCornerGeometryAndEdgeTrigger() {
         let screen = CGRect(x: 100, y: 200, width: 800, height: 600)
         XCTAssertEqual(
@@ -1285,6 +2807,424 @@ final class LaunchIconCoreTests: XCTestCase {
             LauncherLayout.shouldAnimateLauncherPresenceForHotCorner(),
             LauncherLayout.shouldAnimateLauncherShowForSettingsHandoff()
         )
+    }
+
+    func testHotCornerSuppressesWhenSettingsOrModal() {
+        // HOT-CORNER-SUPPRESS-WHEN-SETTINGS-OR-MODAL-01
+        XCTAssertTrue(
+            LauncherLayout.shouldAcceptHotCornerPresenceToggle(
+                isPromptingForAlias: false,
+                isPromptingForUninstall: false,
+                settingsIsKey: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldAcceptHotCornerPresenceToggle(
+                isPromptingForAlias: true,
+                isPromptingForUninstall: false,
+                settingsIsKey: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldAcceptHotCornerPresenceToggle(
+                isPromptingForAlias: false,
+                isPromptingForUninstall: true,
+                settingsIsKey: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldAcceptHotCornerPresenceToggle(
+                isPromptingForAlias: false,
+                isPromptingForUninstall: false,
+                settingsIsKey: true
+            )
+        )
+    }
+
+    func testHotkeyPresenceToggleSharesSettingsOrModalGate() {
+        // HOTKEY-STATUS-SUPPRESS-WHEN-SETTINGS-OR-MODAL-01
+        XCTAssertTrue(
+            LauncherLayout.shouldAcceptHotkeyPresenceToggle(
+                isPromptingForAlias: false,
+                isPromptingForUninstall: false,
+                settingsIsKey: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldAcceptHotkeyPresenceToggle(
+                isPromptingForAlias: true,
+                isPromptingForUninstall: false,
+                settingsIsKey: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldAcceptHotkeyPresenceToggle(
+                isPromptingForAlias: false,
+                isPromptingForUninstall: true,
+                settingsIsKey: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldAcceptHotkeyPresenceToggle(
+                isPromptingForAlias: false,
+                isPromptingForUninstall: false,
+                settingsIsKey: true
+            )
+        )
+        XCTAssertEqual(
+            LauncherLayout.shouldAcceptHotkeyPresenceToggle(
+                isPromptingForAlias: false,
+                isPromptingForUninstall: false,
+                settingsIsKey: true
+            ),
+            LauncherLayout.shouldAcceptHotCornerPresenceToggle(
+                isPromptingForAlias: false,
+                isPromptingForUninstall: false,
+                settingsIsKey: true
+            )
+        )
+    }
+
+    func testSettingsOpenChromeActionsFollowOneChecklist() {
+        // SETTINGS-OPEN-CHROME-POLICY-01
+        let idle = LauncherLayout.settingsOpenChromeActions(for: .init())
+        XCTAssertEqual(
+            idle,
+            [
+                .invalidateDeferredGridRearrange,
+                .clearIconSampling,
+                .cancelPendingPageInput,
+            ]
+        )
+
+        let busy = LauncherLayout.SettingsOpenChromeSnapshot(
+            toastVisible: true,
+            folderOpen: true,
+            marqueeArmed: true,
+            itemDragInFlight: true,
+            iconMenuTracking: true,
+            pinchAccumulated: false,
+            pinchTriggered: true,
+            dropHighlightNeedsClear: true,
+            searchKeyboardHighlight: true,
+            searchFieldEditing: true,
+            dockRevealActive: true
+        )
+        XCTAssertEqual(
+            LauncherLayout.settingsOpenChromeActions(for: busy),
+            [
+                .dismissToast,
+                .closeFolder,
+                .cancelMarquee,
+                .cancelItemDrag,
+                .cancelIconContextMenu,
+                .resetPinchDismiss,
+                .clearDropHighlight,
+                .clearSearchKeyboardHighlight,
+                .abortSearchField,
+                .invalidateDeferredGridRearrange,
+                .clearIconSampling,
+                .resetExternalDragDockReveal,
+                .cancelPendingPageInput,
+            ]
+        )
+
+        let pinchOnly = LauncherLayout.settingsOpenChromeActions(
+            for: .init(pinchAccumulated: true, pinchTriggered: true)
+        )
+        XCTAssertEqual(pinchOnly.filter { $0 == .resetPinchDismiss }.count, 1)
+        XCTAssertFalse(pinchOnly.contains(.dismissToast))
+        XCTAssertFalse(pinchOnly.contains(.resetExternalDragDockReveal))
+
+        let names = Set(LauncherLayout.SettingsOpenChromeAction.allCases.map(\.rawValue))
+        for forbidden in [
+            "reorderSlide",
+            "mergeFlight",
+            "dropLanding",
+            "folderLanding",
+            "searchChrome",
+            "dissolvedGridFade",
+            "folderChrome",
+            "launchFeedback",
+            "pageButtonHover",
+            "toastFade",
+            "iconPrefetch",
+            "tileIconLoad",
+        ] {
+            XCTAssertFalse(names.contains(forbidden), forbidden)
+        }
+        XCTAssertEqual(
+            names.count,
+            LauncherLayout.SettingsOpenChromeAction.allCases.count
+        )
+    }
+
+    func testSettingsOpenCancelsMarqueeAndItemDrag() {
+        // MARQUEE-CANCEL-ON-SETTINGS-OPEN-01 / DRAG-CANCEL-ON-SETTINGS-OPEN-01
+        XCTAssertTrue(LauncherLayout.shouldCancelMarqueeWhenOpeningSettings(isArmed: true))
+        XCTAssertFalse(LauncherLayout.shouldCancelMarqueeWhenOpeningSettings(isArmed: false))
+        XCTAssertTrue(LauncherLayout.shouldCancelItemDragWhenOpeningSettings(isDragging: true))
+        XCTAssertFalse(LauncherLayout.shouldCancelItemDragWhenOpeningSettings(isDragging: false))
+    }
+
+    func testOpenFolderClearsSearchKeyboardHighlight() {
+        // SEARCH-KEYBOARD-HIGHLIGHT-CLEAR-ON-OPEN-FOLDER-01
+        XCTAssertTrue(
+            LauncherLayout.shouldClearSearchKeyboardHighlightWhenOpeningFolder(hasHighlight: true)
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldClearSearchKeyboardHighlightWhenOpeningFolder(hasHighlight: false)
+        )
+    }
+
+    func testDockReopenSuppressesWhenSettingsOrModal() {
+        // DOCK-REOPEN-SUPPRESS-WHEN-SETTINGS-OR-MODAL-01
+        XCTAssertTrue(
+            LauncherLayout.shouldAcceptDockReopenShow(
+                isPromptingForAlias: false,
+                isPromptingForUninstall: false,
+                settingsIsKey: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldAcceptDockReopenShow(
+                isPromptingForAlias: true,
+                isPromptingForUninstall: false,
+                settingsIsKey: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldAcceptDockReopenShow(
+                isPromptingForAlias: false,
+                isPromptingForUninstall: true,
+                settingsIsKey: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldAcceptDockReopenShow(
+                isPromptingForAlias: false,
+                isPromptingForUninstall: false,
+                settingsIsKey: true
+            )
+        )
+    }
+
+    func testIconMenuCancelAndCatalogReloadModalGates() {
+        // ICON-MENU-CANCEL-ON-SETTINGS-OPEN-01 / RELOAD-CATALOG-SUPPRESS-WHEN-MODAL-01
+        XCTAssertTrue(LauncherLayout.shouldCancelIconContextMenuWhenOpeningSettings(isTracking: true))
+        XCTAssertFalse(LauncherLayout.shouldCancelIconContextMenuWhenOpeningSettings(isTracking: false))
+        XCTAssertTrue(
+            LauncherLayout.shouldAcceptCatalogReload(
+                isPromptingForAlias: false,
+                isPromptingForUninstall: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldAcceptCatalogReload(
+                isPromptingForAlias: true,
+                isPromptingForUninstall: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldAcceptCatalogReload(
+                isPromptingForAlias: false,
+                isPromptingForUninstall: true
+            )
+        )
+        // Hidden vs visible is not a gate: a watcher event while the launcher
+        // is hidden still reloads so install/remove/rename are current on show.
+        XCTAssertEqual(
+            LauncherLayout.shouldAcceptCatalogReload(
+                isPromptingForAlias: false, isPromptingForUninstall: false
+            ),
+            true
+        )
+    }
+
+    func testCloseFolderResyncsSearchKeyboardHighlightWhenSearching() {
+        // SEARCH-KEYBOARD-HIGHLIGHT-RESYNC-ON-CLOSE-FOLDER-01
+        XCTAssertTrue(
+            LauncherLayout.shouldResyncSearchKeyboardHighlightWhenClosingFolder(isSearching: true)
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldResyncSearchKeyboardHighlightWhenClosingFolder(isSearching: false)
+        )
+    }
+
+    func testSettingsOpenResetsPinchClearsDropSearchAndLaunchHighlight() {
+        // PINCH-RESET / DROP-HIGHLIGHT-CLEAR / SEARCH-HL-CLEAR / LAUNCH-HL-CLEAR ON-SETTINGS-OPEN
+        XCTAssertTrue(
+            LauncherLayout.shouldResetPinchDismissWhenOpeningSettings(
+                hasAccumulated: true,
+                wasTriggered: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldResetPinchDismissWhenOpeningSettings(
+                hasAccumulated: false,
+                wasTriggered: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldResetPinchDismissWhenOpeningSettings(
+                hasAccumulated: false,
+                wasTriggered: false
+            )
+        )
+        XCTAssertTrue(LauncherLayout.shouldClearDropHighlightWhenOpeningSettings(needsClear: true))
+        XCTAssertFalse(LauncherLayout.shouldClearDropHighlightWhenOpeningSettings(needsClear: false))
+        XCTAssertTrue(
+            LauncherLayout.shouldClearSearchKeyboardHighlightWhenOpeningSettings(hasHighlight: true)
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldClearSearchKeyboardHighlightWhenOpeningSettings(hasHighlight: false)
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldClearLaunchHighlightWhenOpeningSettings(
+                hasHighlight: true,
+                launchesInFlightEmpty: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldClearLaunchHighlightWhenOpeningSettings(
+                hasHighlight: true,
+                launchesInFlightEmpty: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldClearLaunchHighlightWhenOpeningSettings(
+                hasHighlight: false,
+                launchesInFlightEmpty: true
+            )
+        )
+    }
+
+
+    func testPresenceToggleSuppressesWhenEditingText() {
+        // PRESENCE-TOGGLE-SUPPRESS-WHEN-EDITING-TEXT-01
+        XCTAssertFalse(
+            LauncherLayout.shouldAcceptHotCornerPresenceToggle(
+                isPromptingForAlias: false,
+                isPromptingForUninstall: false,
+                settingsIsKey: false,
+                folderTitleEditing: true,
+                searchFieldEditing: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldAcceptHotkeyPresenceToggle(
+                isPromptingForAlias: false,
+                isPromptingForUninstall: false,
+                settingsIsKey: false,
+                folderTitleEditing: false,
+                searchFieldEditing: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldAcceptDockReopenShow(
+                isPromptingForAlias: false,
+                isPromptingForUninstall: false,
+                settingsIsKey: false,
+                folderTitleEditing: true,
+                searchFieldEditing: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldAcceptHotkeyPresenceToggle(
+                isPromptingForAlias: false,
+                isPromptingForUninstall: false,
+                settingsIsKey: false,
+                folderTitleEditing: false,
+                searchFieldEditing: false
+            )
+        )
+    }
+
+    func testSelectAllScrollStatusMenuAndSearchAbortGates() {
+        // SELECT-ALL-SCROLL-INTO-VIEW-01 / STATUS-ITEM-MENU-SUPPRESS /
+        // SEARCH-FIELD-ABORT-ON-SETTINGS-OPEN-01
+        XCTAssertTrue(LauncherLayout.shouldScrollSelectionIntoViewAfterSelectAll(itemCount: 3))
+        XCTAssertFalse(LauncherLayout.shouldScrollSelectionIntoViewAfterSelectAll(itemCount: 0))
+        XCTAssertTrue(
+            LauncherLayout.shouldPresentStatusItemMenu(
+                isPromptingForAlias: false,
+                isPromptingForUninstall: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldPresentStatusItemMenu(
+                isPromptingForAlias: true,
+                isPromptingForUninstall: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldPresentStatusItemMenu(
+                isPromptingForAlias: false,
+                isPromptingForUninstall: true
+            )
+        )
+        XCTAssertTrue(LauncherLayout.shouldAbortSearchFieldWhenOpeningSettings(hasFieldEditor: true))
+        XCTAssertFalse(LauncherLayout.shouldAbortSearchFieldWhenOpeningSettings(hasFieldEditor: false))
+    }
+
+
+    func testSelectionScrollAndLayoutFlushOnSettingsGates() {
+        // SHIFT-SELECT / CMD-TOGGLE / MARQUEE-END SCROLL + LAYOUT-FLUSH-ON-SETTINGS
+        XCTAssertTrue(LauncherLayout.shouldScrollSelectionIntoViewAfterShiftSelect(hasSelection: true))
+        XCTAssertFalse(LauncherLayout.shouldScrollSelectionIntoViewAfterShiftSelect(hasSelection: false))
+        XCTAssertTrue(LauncherLayout.shouldScrollSelectionIntoViewAfterCommandToggle(itemIsSelected: true))
+        XCTAssertFalse(LauncherLayout.shouldScrollSelectionIntoViewAfterCommandToggle(itemIsSelected: false))
+        XCTAssertTrue(
+            LauncherLayout.shouldScrollSelectionIntoViewAfterMarquee(activated: true, selectionCount: 2)
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldScrollSelectionIntoViewAfterMarquee(activated: false, selectionCount: 2)
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldScrollSelectionIntoViewAfterMarquee(activated: true, selectionCount: 0)
+        )
+        XCTAssertTrue(LauncherLayout.shouldFlushLayoutWhenOpeningSettings(hasPendingSave: true))
+        XCTAssertFalse(LauncherLayout.shouldFlushLayoutWhenOpeningSettings(hasPendingSave: false))
+    }
+
+
+    func testSettingsOpenRearrangeSamplingDockPageInputGates() {
+        // DEFERRED rearrange / ICON sampling+toast / DOCK reveal / PENDING page input
+        XCTAssertTrue(LauncherLayout.shouldInvalidateDeferredGridRearrangeWhenOpeningSettings())
+        XCTAssertTrue(
+            LauncherLayout.shouldClearIconSamplingWhenOpeningSettings(
+                isSamplingIconColors: false,
+                isSamplingAppDates: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldClearIconSamplingWhenOpeningSettings(
+                isSamplingIconColors: true,
+                isSamplingAppDates: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldResetExternalDragDockRevealWhenOpeningSettings(
+                dockRevealActive: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldResetExternalDragDockRevealWhenOpeningSettings(
+                dockRevealActive: false
+            )
+        )
+        XCTAssertTrue(LauncherLayout.shouldCancelPendingPageInputWhenOpeningSettings())
+    }
+
+
+    func testSettingsOpenSearchChromeHoverPrefetchCancelGates() {
+        XCTAssertTrue(
+            LauncherLayout.shouldCancelIconPrefetchWhenOpeningSettings(hasPrefetchTask: true)
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldCancelIconPrefetchWhenOpeningSettings(hasPrefetchTask: false)
+        )
+        XCTAssertTrue(LauncherLayout.shouldCancelTileIconLoadsWhenOpeningSettings())
     }
 
 
@@ -1549,6 +3489,31 @@ final class LaunchIconCoreTests: XCTestCase {
         )
     }
 
+    func testLayoutSaveKeepsPrimaryWhenBackupWriteFails() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let logURL = directory.appendingPathComponent("diagnostics.log")
+        let store = JSONLayoutStore(
+            fileURL: directory.appendingPathComponent("layout-v1.json"),
+            backupFailureLogURL: logURL
+        )
+        let first = LayoutState(orderedEntries: [.app(UUID())])
+        try await store.save(first)
+        // The backup path is a directory, so the rotation write throws after
+        // the new primary is already in place.
+        try FileManager.default.createDirectory(at: store.backupURL, withIntermediateDirectories: true)
+        let second = LayoutState(orderedEntries: [.folder(UUID())])
+        try await store.save(second)
+
+        let loaded = try await store.load()
+        XCTAssertEqual(loaded, second)
+        let decoded = try JSONDecoder().decode(LayoutState.self, from: Data(contentsOf: store.fileURL))
+        XCTAssertEqual(decoded, second)
+        let log = try String(contentsOf: logURL, encoding: .utf8)
+        XCTAssertTrue(log.contains("Layout backup write failed:"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: store.fileURL.path))
+    }
+
     func testLayoutStoreRoundTripsAndCreatesBackup() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -1586,6 +3551,46 @@ final class LaunchIconCoreTests: XCTestCase {
         let imported = try await store.importLayout(from: exportURL)
         XCTAssertEqual(imported, exported)
         XCTAssertEqual(try Data(contentsOf: liveURL), liveData, "importLayout must not write live primary")
+    }
+
+    func testLayoutExportEncodesHiddenKeysInStableOrderAndRoundTrips() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let store = JSONLayoutStore(fileURL: directory.appendingPathComponent("layout-v1.json"))
+        let folderID = UUID()
+        let appID = UUID()
+        let state = LayoutState(
+            orderedEntries: [.folder(folderID), .app(appID)],
+            folders: [
+                folderID: LauncherFolder(
+                    id: folderID,
+                    name: "工具",
+                    itemIDs: [appID],
+                    createdAt: Date(timeIntervalSinceReferenceDate: 7)
+                )
+            ],
+            appKeys: [appID: "bundle:tools.one"],
+            hiddenAppKeys: ["bundle:z", "bundle:a", "bundle:m"],
+            appAliases: ["bundle:tools.one": "One"],
+            updatedAt: Date(timeIntervalSinceReferenceDate: 42)
+        )
+        let firstURL = directory.appendingPathComponent("export-1.json")
+        let secondURL = directory.appendingPathComponent("export-2.json")
+        try await store.export(state, to: firstURL)
+        try await store.export(state, to: secondURL)
+        let firstData = try Data(contentsOf: firstURL)
+        XCTAssertEqual(firstData, try Data(contentsOf: secondURL), "export must be byte-stable")
+        let text = try XCTUnwrap(String(data: firstData, encoding: .utf8))
+        XCTAssertTrue(text.contains("\"schemaVersion\" : 1"))
+        let a = try XCTUnwrap(text.range(of: "bundle:a"))
+        let m = try XCTUnwrap(text.range(of: "bundle:m"))
+        let z = try XCTUnwrap(text.range(of: "bundle:z"))
+        XCTAssertTrue(a.lowerBound < m.lowerBound && m.lowerBound < z.lowerBound)
+        let imported = try await store.importLayout(from: firstURL)
+        XCTAssertEqual(imported, state)
+        XCTAssertFalse(store.hasBackupFile)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.fileURL.path))
     }
 
     func testLayoutImportSanitizesNamesAndAssessesCatalogMatch() async throws {
@@ -1733,6 +3738,8 @@ final class LaunchIconCoreTests: XCTestCase {
 
         let empty = LayoutState(updatedAt: Date(timeIntervalSinceReferenceDate: 123_456))
         XCTAssertEqual(LauncherLayout.setAlias("   ", forApplicationKey: key, in: empty), empty)
+        let multiLine = LauncherLayout.setAlias("常用\n应用\t", forApplicationKey: key, in: empty)
+        XCTAssertEqual(multiLine.appAliases[key], "常用 应用")
 
         let changed = LauncherLayout.setAlias("新别名", forApplicationKey: key, in: stored)
         XCTAssertEqual(changed.appAliases[key], "新别名")
@@ -1975,6 +3982,164 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: url), second)
     }
 
+    func testTruncatedLayoutJSONRestoresBackupAndPreservesPrimary() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("layout-v1.json")
+        let store = JSONLayoutStore(fileURL: url)
+        let first = LayoutState(orderedEntries: [.app(UUID()), .app(UUID())])
+        let second = LayoutState(orderedEntries: [.folder(UUID()), .app(UUID())])
+        try await store.save(first)
+        try await store.save(second)
+
+        let complete = try Data(contentsOf: url)
+        XCTAssertGreaterThan(complete.count, 40)
+        let truncated = Data(complete.prefix(max(24, complete.count / 3)))
+        try truncated.write(to: url)
+
+        // A cut-off object must not decode as a valid empty (or partial) layout.
+        XCTAssertThrowsError(try JSONDecoder().decode(LayoutState.self, from: truncated))
+
+        let loaded = try await store.load()
+        XCTAssertEqual(loaded, first)
+        XCTAssertEqual(try Data(contentsOf: url), truncated)
+        let preserved = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            .filter { $0.lastPathComponent.hasPrefix("layout-v1.invalid-") }
+        XCTAssertEqual(preserved.count, 1)
+        XCTAssertEqual(try Data(contentsOf: preserved[0]), truncated)
+    }
+
+    func testRapidSuccessiveSavesRotateSingleBackupAndIgnoreNoOp() async throws {
+        // Drag, then rename, then a geometry-style no-op (identical state): last
+        // distinct write wins, the backup slot holds the previous distinct state,
+        // and an unchanged save must not rotate the undo copy away.
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("layout-v1.json")
+        let store = JSONLayoutStore(fileURL: url)
+        let appA = UUID(), appB = UUID(), folderID = UUID()
+        let initial = LayoutState(orderedEntries: [.app(appA), .app(appB)])
+        let afterDrag = LayoutState(orderedEntries: [.app(appB), .app(appA)])
+        let afterRename = LayoutState(
+            orderedEntries: [.folder(folderID), .app(appA)],
+            folders: [folderID: LauncherFolder(id: folderID, name: "工作", itemIDs: [appB])],
+            appKeys: [appA: "bundle:a", appB: "bundle:b"]
+        )
+        try await store.save(initial)
+        try await store.save(afterDrag)
+        try await store.save(afterRename)
+        try await store.save(afterRename)
+
+        let loaded = try await store.load()
+        let backup = try await store.loadBackup()
+        XCTAssertEqual(loaded, afterRename)
+        XCTAssertEqual(backup, afterDrag)
+        let leftoverTemps = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            .filter { $0.lastPathComponent.hasPrefix(".layout-") && $0.pathExtension == "tmp" }
+        XCTAssertTrue(leftoverTemps.isEmpty)
+    }
+
+    func testOverlappingSavesLeaveNoTemporaryFilesAndAConsistentPair() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("layout-v1.json")
+        let store = JSONLayoutStore(fileURL: url)
+        let states = (0..<6).map { LayoutState(orderedEntries: [.app(UUID())], updatedAt: Date(timeIntervalSince1970: TimeInterval($0))) }
+        try await store.save(states[0])
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for state in states.dropFirst() {
+                group.addTask { try await store.save(state) }
+            }
+            try await group.waitForAll()
+        }
+
+        let loaded = try await store.load()
+        XCTAssertNotNil(loaded)
+        let resolved = try XCTUnwrap(loaded)
+        XCTAssertTrue(states.contains(resolved))
+        if let backup = try await store.loadBackup() {
+            XCTAssertTrue(states.contains(backup))
+            XCTAssertNotEqual(backup, resolved)
+        }
+        let leftoverTemps = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            .filter { $0.lastPathComponent.hasPrefix(".layout-") && $0.pathExtension == "tmp" }
+        XCTAssertTrue(leftoverTemps.isEmpty)
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: directory.path).filter { $0.hasPrefix(".layout-") }.count,
+            0
+        )
+    }
+
+    func testFailedLayoutReplacementDoesNotRotateBackup() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let url = directory.appendingPathComponent("layout-v1.json")
+        defer {
+            try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: url.path)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let store = JSONLayoutStore(fileURL: url)
+        let first = LayoutState(orderedEntries: [.app(UUID())])
+        let second = LayoutState(orderedEntries: [.folder(UUID())])
+        try await store.save(first)
+        try await store.save(second)
+        let backupURL = store.backupURL
+        let backupBefore = try Data(contentsOf: backupURL)
+        let primaryBefore = try Data(contentsOf: url)
+        XCTAssertEqual(try JSONDecoder().decode(LayoutState.self, from: backupBefore), first)
+
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: url.path)
+        await XCTAssertThrowsErrorAsync(try await store.save(LayoutState(orderedEntries: [.app(UUID())]))) { _ in }
+        XCTAssertEqual(try Data(contentsOf: url), primaryBefore)
+        XCTAssertEqual(try Data(contentsOf: backupURL), backupBefore)
+        let leftoverTemps = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            .filter { $0.lastPathComponent.hasPrefix(".layout-") && $0.pathExtension == "tmp" }
+        XCTAssertTrue(leftoverTemps.isEmpty)
+    }
+
+    func testFixtureSizedLayoutSaveAndLoadStayUnderPersistedWriteBudget() async throws {
+        // Same shape as the UI fixture (36 apps) plus a folder; uses the existing
+        // JSONLayoutStore path and the P0-7 80 ms write budget. Prints timings
+        // for the batch report; does not add a new harness.
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = JSONLayoutStore(fileURL: directory.appendingPathComponent("layout-v1.json"))
+        let appIDs = (0..<36).map { _ in UUID() }
+        let folderID = UUID()
+        let state = LayoutState(
+            orderedEntries: [.folder(folderID)] + appIDs.dropFirst(2).map { .app($0) },
+            folders: [folderID: LauncherFolder(id: folderID, name: "系统", itemIDs: [appIDs[0], appIDs[1]])],
+            appKeys: Dictionary(uniqueKeysWithValues: appIDs.enumerated().map { index, id in
+                (id, "bundle:fixture.\(index)")
+            }),
+            updatedAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+
+        var saveSamples: [TimeInterval] = []
+        var loadSamples: [TimeInterval] = []
+        try await store.save(state)
+        for index in 0..<20 {
+            var next = state
+            next.updatedAt = Date(timeIntervalSince1970: 1_700_000_000 + TimeInterval(index + 1))
+            let saveStarted = CFAbsoluteTimeGetCurrent()
+            try await store.save(next)
+            saveSamples.append(CFAbsoluteTimeGetCurrent() - saveStarted)
+            let loadStarted = CFAbsoluteTimeGetCurrent()
+            let loaded = try await store.load()
+            loadSamples.append(CFAbsoluteTimeGetCurrent() - loadStarted)
+            XCTAssertEqual(loaded, next)
+        }
+        func millis(_ samples: [TimeInterval]) -> (p50: Double, max: Double) {
+            let sorted = samples.sorted()
+            return (sorted[sorted.count / 2] * 1000, sorted[sorted.count - 1] * 1000)
+        }
+        let save = millis(saveSamples)
+        let load = millis(loadSamples)
+        print(String(format: "Fixture layout save P50 %.3f ms max %.3f ms; load P50 %.3f ms max %.3f ms", save.p50, save.max, load.p50, load.max))
+        XCTAssertLessThan(save.max, 80, "layout save exceeded the 80 ms P0-7 budget")
+        XCTAssertLessThan(load.max, 80, "layout load exceeded the 80 ms P0-7 budget")
+    }
+
     func testCurrentMachineStandardCatalogProducesAnIcon() async throws {
         let report = await AppCatalogScanner().scan(roots: AppCatalogScanner.standardRoots)
         let firstCandidate = try XCTUnwrap(report.candidates.first)
@@ -2086,6 +4251,162 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertFalse(versioned === refreshed)
         XCTAssertTrue(cache.cachedIcon(for: updated) === refreshed)
         XCTAssertTrue(cache.cachedIcon(for: candidate) === versioned)
+    }
+
+    func testIconCacheStampUsesTheNewestBundleOrResourceDate() throws {
+        let older = Date(timeIntervalSinceReferenceDate: 1_000)
+        let newer = Date(timeIntervalSinceReferenceDate: 2_000)
+        XCTAssertEqual(WorkspaceIconCache.iconCacheStamp(dates: [older, nil, newer]), newer)
+        XCTAssertNil(WorkspaceIconCache.iconCacheStamp(dates: [nil, nil]))
+
+        let previous = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Stamp.app"),
+            bundleIdentifier: "com.example.stamp",
+            displayName: "Stamp",
+            sourcePriority: 0,
+            discoveredAt: Date(timeIntervalSince1970: 0),
+            modificationDate: older
+        )
+        let same = AppCandidate(
+            canonicalURL: previous.canonicalURL,
+            bundleIdentifier: previous.bundleIdentifier,
+            displayName: previous.displayName,
+            sourcePriority: previous.sourcePriority,
+            discoveredAt: previous.discoveredAt,
+            modificationDate: older
+        )
+        let updated = AppCandidate(
+            canonicalURL: previous.canonicalURL,
+            bundleIdentifier: previous.bundleIdentifier,
+            displayName: previous.displayName,
+            sourcePriority: previous.sourcePriority,
+            discoveredAt: previous.discoveredAt,
+            modificationDate: newer
+        )
+        XCTAssertTrue(
+            WorkspaceIconCache.candidatesNeedingIconInvalidation(previous: [previous], current: [same]).isEmpty
+        )
+        let stale = WorkspaceIconCache.candidatesNeedingIconInvalidation(
+            previous: [previous],
+            current: [updated]
+        )
+        XCTAssertEqual(stale.map(\.modificationDate), [older])
+
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let bundle = root.appendingPathComponent("Fake.app")
+        let resources = bundle.appendingPathComponent("Contents/Resources", isDirectory: true)
+        try FileManager.default.createDirectory(at: resources, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let info = bundle.appendingPathComponent("Contents/Info.plist")
+        try Data("<plist></plist>".utf8).write(to: info)
+        try FileManager.default.setAttributes([.modificationDate: older], ofItemAtPath: bundle.path)
+        try FileManager.default.setAttributes([.modificationDate: older], ofItemAtPath: info.path)
+        try FileManager.default.setAttributes([.modificationDate: newer], ofItemAtPath: resources.path)
+        let stamp = try XCTUnwrap(
+            WorkspaceIconCache.iconCacheModificationDate(
+                ofBundleAt: bundle,
+                bundleModificationDate: older
+            )
+        )
+        XCTAssertEqual(stamp.timeIntervalSinceReferenceDate, newer.timeIntervalSinceReferenceDate, accuracy: 1)
+        XCTAssertGreaterThan(stamp, older)
+    }
+
+    func testIconCacheStampUsesCFBundleIconNameWhenTheIcnsIsReplacedInPlace() throws {
+        let older = Date(timeIntervalSinceReferenceDate: 1_000)
+        let newer = Date(timeIntervalSinceReferenceDate: 2_000)
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let bundle = root.appendingPathComponent("NamedIcon.app")
+        let resources = bundle.appendingPathComponent("Contents/Resources", isDirectory: true)
+        try FileManager.default.createDirectory(at: resources, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let info = bundle.appendingPathComponent("Contents/Info.plist")
+        let assets = resources.appendingPathComponent("Assets.car")
+        let icns = resources.appendingPathComponent("AppIcon.icns")
+        try Data("<plist></plist>".utf8).write(to: info)
+        try Data("car".utf8).write(to: assets)
+        try Data("icon".utf8).write(to: icns)
+        for path in [bundle.path, info.path, resources.path, assets.path] {
+            try FileManager.default.setAttributes([.modificationDate: older], ofItemAtPath: path)
+        }
+        try FileManager.default.setAttributes([.modificationDate: newer], ofItemAtPath: icns.path)
+
+        // Without IconName / IconFile, an in-place icns replace is invisible.
+        let unnoticed = try XCTUnwrap(
+            WorkspaceIconCache.iconCacheModificationDate(
+                ofBundleAt: bundle,
+                bundleModificationDate: older
+            )
+        )
+        XCTAssertEqual(
+            unnoticed.timeIntervalSinceReferenceDate,
+            older.timeIntervalSinceReferenceDate,
+            accuracy: 1
+        )
+
+        let stamp = try XCTUnwrap(
+            WorkspaceIconCache.iconCacheModificationDate(
+                ofBundleAt: bundle,
+                bundleModificationDate: older,
+                info: ["CFBundleIconName": "AppIcon"]
+            )
+        )
+        XCTAssertEqual(stamp.timeIntervalSinceReferenceDate, newer.timeIntervalSinceReferenceDate, accuracy: 1)
+        XCTAssertGreaterThan(stamp, older)
+
+        let padded = try XCTUnwrap(
+            WorkspaceIconCache.iconCacheModificationDate(
+                ofBundleAt: bundle,
+                bundleModificationDate: older,
+                info: ["CFBundleIconName": "  AppIcon  "]
+            )
+        )
+        XCTAssertEqual(padded.timeIntervalSinceReferenceDate, newer.timeIntervalSinceReferenceDate, accuracy: 1)
+
+        let blankName = try XCTUnwrap(
+            WorkspaceIconCache.iconCacheModificationDate(
+                ofBundleAt: bundle,
+                bundleModificationDate: older,
+                info: ["CFBundleIconName": "   "]
+            )
+        )
+        XCTAssertEqual(
+            blankName.timeIntervalSinceReferenceDate,
+            older.timeIntervalSinceReferenceDate,
+            accuracy: 1
+        )
+    }
+
+    func testIconCacheInvalidationAllowsReloadingTheSameStamp() async throws {
+        let queue = OperationQueue()
+        queue.maxConcurrentOperationCount = 1
+        var loadCount = 0
+        let cache = WorkspaceIconCache(iconQueue: queue) { _ in
+            loadCount += 1
+            return NSImage(size: NSSize(width: loadCount, height: 1))
+        }
+        let candidate = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Reload.app"),
+            bundleIdentifier: "com.example.reload",
+            displayName: "Reload",
+            sourcePriority: 0,
+            discoveredAt: Date(timeIntervalSince1970: 0),
+            modificationDate: Date(timeIntervalSinceReferenceDate: 50)
+        )
+        let first = try await cache.loadIcon(for: candidate)
+        XCTAssertEqual(loadCount, 1)
+        XCTAssertTrue(cache.cachedIcon(for: candidate) === first)
+        let again = try await cache.loadIcon(for: candidate)
+        XCTAssertEqual(loadCount, 1)
+        XCTAssertTrue(again === first)
+
+        cache.invalidateIcons(for: candidate)
+        XCTAssertNil(cache.cachedIcon(for: candidate))
+        XCTAssertNil(cache.cachedIcon(for: candidate.canonicalURL))
+        let reloaded = try await cache.loadIcon(for: candidate)
+        XCTAssertEqual(loadCount, 2)
+        XCTAssertFalse(reloaded === first)
+        XCTAssertTrue(cache.cachedIcon(for: candidate) === reloaded)
     }
 
     func testCancellingIconLoadSkipsQueuedDecode() async throws {
@@ -2801,13 +5122,18 @@ final class LaunchIconCoreTests: XCTestCase {
             "watcher-noise",
             unrelated.path
         ]
+        let writerFinished = expectation(description: "Noise writer exits")
+        // Set before launch. After the await below, this test can resume off
+        // the run loop that owns the process, and waitUntilExit then never
+        // sees the exit. The handler is queued instead.
+        writer.terminationHandler = { _ in
+            writerFinished.fulfill()
+        }
         try writer.run()
         await fulfillment(of: [changed, rebound], timeout: 4)
         // CI runners can take >4s for the 40-touch burst; the inverted wait already
         // proved no rescan/rebind during that window. Drain the writer before asserting.
-        if writer.isRunning {
-            writer.waitUntilExit()
-        }
+        await fulfillment(of: [writerFinished], timeout: 8)
         XCTAssertEqual(writer.terminationStatus, 0)
     }
 
@@ -2873,6 +5199,58 @@ final class LaunchIconCoreTests: XCTestCase {
         await fulfillment(of: [changed, rebound], timeout: 8)
         XCTAssertTrue(watcher.start(roots: [root]))
         XCTAssertTrue(watcher.watchesAllRoots)
+    }
+
+    func testDirectoryWatcherCoalescesRapidEventsIntoOneCallback() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let changes = CallbackCounter()
+        let rootsChanged = CallbackCounter()
+        let interval: TimeInterval = 0.05
+        let watcher = ApplicationDirectoryWatcher(
+            onChange: { changes.increment() },
+            onRootChanged: { rootsChanged.increment() },
+            eventCoalescingInterval: interval
+        )
+        XCTAssertTrue(watcher.start(roots: [root]))
+        defer { watcher.stop() }
+
+        let path = root.path
+        for _ in 0..<5 {
+            watcher.handleEvents(at: [path], rootChanged: false)
+        }
+        try await Task.sleep(for: .milliseconds(20))
+        XCTAssertEqual(changes.count, 0, "events inside the debounce window must not fire yet")
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertEqual(changes.count, 1)
+        XCTAssertEqual(rootsChanged.count, 0)
+
+        watcher.handleEvents(at: [path], rootChanged: false)
+        watcher.handleEvents(at: [path], rootChanged: false)
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(changes.count, 2)
+        XCTAssertEqual(rootsChanged.count, 0)
+    }
+
+    func testDirectoryWatcherStopCancelsPendingDebouncedCallback() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let changes = CallbackCounter()
+        let watcher = ApplicationDirectoryWatcher(
+            onChange: { changes.increment() },
+            eventCoalescingInterval: 0.08
+        )
+        XCTAssertTrue(watcher.start(roots: [root]))
+        watcher.handleEvents(at: [root.path], rootChanged: false)
+        watcher.stop()
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertEqual(changes.count, 0)
     }
 
     func testShouldTurnPageUsesDistanceOrVelocity() {
@@ -3943,6 +6321,33 @@ final class LaunchIconCoreTests: XCTestCase {
             LauncherLayout.statusItemToggleTitle(isVisible: false, isDismissing: true),
             "显示 LaunchIcon"
         )
+        // Re-entrancy: a toggle mid-appear (window already visible, fade
+        // running) hides; mid-dismiss shows again. Dock reopen never hides.
+        XCTAssertEqual(
+            LauncherLayout.visibilityToggle(isVisible: true, isDismissing: false),
+            .hide
+        )
+        XCTAssertEqual(
+            LauncherLayout.visibilityToggle(isVisible: true, isDismissing: true),
+            .show
+        )
+        XCTAssertEqual(
+            LauncherLayout.visibilityToggle(isVisible: false, isDismissing: false),
+            .show
+        )
+        func dockShouldShow(isVisible: Bool, isDismissing: Bool) -> Bool {
+            LauncherLayout.visibilityToggle(isVisible: isVisible, isDismissing: isDismissing) == .show
+        }
+        XCTAssertFalse(dockShouldShow(isVisible: true, isDismissing: false))
+        XCTAssertTrue(dockShouldShow(isVisible: true, isDismissing: true))
+        XCTAssertTrue(dockShouldShow(isVisible: false, isDismissing: false))
+        XCTAssertTrue(
+            LauncherLayout.shouldAcceptHotkeyPresenceToggle(
+                isPromptingForAlias: false,
+                isPromptingForUninstall: false,
+                settingsIsKey: false
+            )
+        )
     }
 
 
@@ -3973,6 +6378,43 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertEqual(
             LauncherLayout.statusItemButtonAction(for: .nonPointer, optionDown: true),
             .showMenu
+        )
+        // STATUS-ITEM-AX-SHOW-MENU-01: Show Menu is its own action, still a menu.
+        XCTAssertEqual(
+            LauncherLayout.statusItemActionForAccessibilityShowMenu(),
+            .showMenu
+        )
+    }
+
+    func testStatusItemAccessibilityShowMenuFailsWhenSuppressed() {
+        // STATUS-ITEM-AX-SHOW-MENU-SUPPRESSED-01
+        XCTAssertTrue(
+            LauncherLayout.statusItemAccessibilityShowMenuPerformed(
+                hasButton: true,
+                hasMenu: true,
+                presentationAllowed: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.statusItemAccessibilityShowMenuPerformed(
+                hasButton: true,
+                hasMenu: true,
+                presentationAllowed: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.statusItemAccessibilityShowMenuPerformed(
+                hasButton: false,
+                hasMenu: true,
+                presentationAllowed: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.statusItemAccessibilityShowMenuPerformed(
+                hasButton: true,
+                hasMenu: false,
+                presentationAllowed: true
+            )
         )
     }
 
@@ -4138,6 +6580,190 @@ final class LaunchIconCoreTests: XCTestCase {
         )
         XCTAssertTrue(LauncherLayout.shouldApplyLoadedIcon(isDismissing: false))
         XCTAssertFalse(LauncherLayout.shouldApplyLoadedIcon(isDismissing: true))
+        // TILE-ICON-RESTART-AFTER-CANCEL-ON-SHOW-01
+        XCTAssertTrue(
+            LauncherLayout.shouldRestartCancelledTileIconLoad(
+                cancelledForDismissal: true, hasInFlightLoad: false, holdsDeferredIcon: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldRestartCancelledTileIconLoad(
+                cancelledForDismissal: false, hasInFlightLoad: false, holdsDeferredIcon: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldRestartCancelledTileIconLoad(
+                cancelledForDismissal: true, hasInFlightLoad: true, holdsDeferredIcon: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldRestartCancelledTileIconLoad(
+                cancelledForDismissal: true, hasInFlightLoad: false, holdsDeferredIcon: true
+            )
+        )
+        // ICON-PREFETCH-RESTART-ON-SHOW-01
+        XCTAssertTrue(
+            LauncherLayout.shouldRestartIconPrefetchAfterAppearance(
+                cancelledForDismissal: true, catalogIsEmpty: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldRestartIconPrefetchAfterAppearance(
+                cancelledForDismissal: false, catalogIsEmpty: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldRestartIconPrefetchAfterAppearance(
+                cancelledForDismissal: true, catalogIsEmpty: true
+            )
+        )
+        // SEARCH-KEYBOARD-HIGHLIGHT-CLEAR-ON-HIDE-01
+        XCTAssertTrue(LauncherLayout.shouldClearSearchKeyboardHighlightOnHide(hasHighlight: true))
+        XCTAssertFalse(LauncherLayout.shouldClearSearchKeyboardHighlightOnHide(hasHighlight: false))
+        // UNAVAILABLE-ROOT-TOAST-DEDUP-01
+        let rootA = URL(fileURLWithPath: "/Volumes/A/Apps")
+        let rootB = URL(fileURLWithPath: "/Volumes/B/Apps")
+        XCTAssertTrue(
+            LauncherLayout.shouldAnnounceUnavailableRootsToast(
+                previouslyAnnouncedPaths: [],
+                currentUnavailablePaths: [rootA]
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldAnnounceUnavailableRootsToast(
+                previouslyAnnouncedPaths: [rootA.path],
+                currentUnavailablePaths: [rootA]
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldAnnounceUnavailableRootsToast(
+                previouslyAnnouncedPaths: [rootA.path],
+                currentUnavailablePaths: [rootA, rootB]
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldAnnounceUnavailableRootsToast(
+                previouslyAnnouncedPaths: [rootA.path],
+                currentUnavailablePaths: []
+            )
+        )
+        XCTAssertEqual(
+            LauncherLayout.announcedUnavailableRootPaths(afterObserving: [rootA, rootB]),
+            Set([rootA.path, rootB.path])
+        )
+        XCTAssertEqual(
+            LauncherLayout.announcedUnavailableRootPaths(afterObserving: []),
+            Set<String>()
+        )
+        // TRUNCATED-ROOT-TOAST-DEDUP-01
+        XCTAssertTrue(
+            LauncherLayout.shouldAnnounceTruncatedRootsToast(
+                previouslyAnnouncedPaths: [],
+                currentTruncatedPaths: [rootA]
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldAnnounceTruncatedRootsToast(
+                previouslyAnnouncedPaths: [rootA.path],
+                currentTruncatedPaths: [rootA]
+            )
+        )
+        XCTAssertEqual(
+            LauncherLayout.announcedTruncatedRootPaths(afterObserving: [rootB]),
+            Set([rootB.path])
+        )
+        // SAMPLING-FLAG-CLEAR-ON-HIDE-01
+        XCTAssertTrue(
+            LauncherLayout.shouldClearIconSamplingFlagsOnHide(
+                isSamplingIconColors: true, isSamplingAppDates: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldClearIconSamplingFlagsOnHide(
+                isSamplingIconColors: false, isSamplingAppDates: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldClearIconSamplingFlagsOnHide(
+                isSamplingIconColors: false, isSamplingAppDates: false
+            )
+        )
+        // REARRANGE-PROGRESS-TOAST-CLEAR-ON-HIDE/SKIP-01
+        XCTAssertTrue(LauncherLayout.shouldClearRearrangeProgressToast(progressToastVisible: true))
+        XCTAssertFalse(LauncherLayout.shouldClearRearrangeProgressToast(progressToastVisible: false))
+        // WALLPAPER-DECODE-LIVE-SCREEN-01
+        XCTAssertTrue(
+            LauncherLayout.shouldDiscardDecodedDesktopBackgroundForLiveScreen(
+                requestedScreenSize: CGSize(width: 100, height: 100),
+                requestedBackingScale: 2,
+                liveScreenSize: CGSize(width: 200, height: 100),
+                liveBackingScale: 2
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldDiscardDecodedDesktopBackgroundForLiveScreen(
+                requestedScreenSize: CGSize(width: 100, height: 100),
+                requestedBackingScale: 2,
+                liveScreenSize: CGSize(width: 100, height: 100),
+                liveBackingScale: 1
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldDiscardDecodedDesktopBackgroundForLiveScreen(
+                requestedScreenSize: CGSize(width: 100, height: 100),
+                requestedBackingScale: 2,
+                liveScreenSize: CGSize(width: 100, height: 100),
+                liveBackingScale: 2
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldDiscardDecodedDesktopBackgroundForLiveScreen(
+                requestedScreenSize: CGSize(width: 100, height: 100),
+                requestedBackingScale: 2,
+                liveScreenSize: nil,
+                liveBackingScale: nil
+            )
+        )
+        // WINDOW-DID-CHANGE-SCREEN-01
+        XCTAssertTrue(
+            LauncherLayout.shouldRefreshGeometryOnWindowScreenChange(
+                isVisible: true, isPaging: false, isDismissing: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldRefreshGeometryOnWindowScreenChange(
+                isVisible: true, isPaging: true, isDismissing: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldRefreshGeometryOnWindowScreenChange(
+                isVisible: false, isPaging: false, isDismissing: false
+            )
+        )
+        // DISPLAY-TARGET-APPLY-WHILE-VISIBLE-01
+        XCTAssertTrue(
+            LauncherLayout.shouldApplyDisplayTargetWhileVisible(
+                isVisible: true, isDismissing: false, targetChanged: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldApplyDisplayTargetWhileVisible(
+                isVisible: true, isDismissing: false, targetChanged: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldApplyDisplayTargetWhileVisible(
+                isVisible: true, isDismissing: true, targetChanged: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldApplyDisplayTargetWhileVisible(
+                isVisible: false, isDismissing: false, targetChanged: true
+            )
+        )
+        // SETTINGS-HIDDEN-REFRESH-ON-LAYOUT-01
+        XCTAssertTrue(LauncherLayout.shouldRefreshSettingsHiddenAppsOnLayoutChange(settingsWindowVisible: true))
+        XCTAssertFalse(LauncherLayout.shouldRefreshSettingsHiddenAppsOnLayoutChange(settingsWindowVisible: false))
         XCTAssertTrue(LauncherLayout.shouldApplyDesktopBackground(isDismissing: false))
         XCTAssertFalse(LauncherLayout.shouldApplyDesktopBackground(isDismissing: true))
         XCTAssertEqual(
@@ -4625,6 +7251,22 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertEqual(reducedBackdrop.opacity, openBackdrop.opacity, accuracy: 0.001)
         XCTAssertEqual(reducedBackdrop.scale, 1, accuracy: 0.001)
         XCTAssertFalse(reducedBackdrop.blurs)
+        // Reduce transparency keeps the recede and drops only the blur.
+        let clearBackdrop = LauncherLayout.folderBackdropStyle(
+            open: true,
+            reducesMotion: false,
+            reducesTransparency: true
+        )
+        XCTAssertEqual(clearBackdrop.opacity, openBackdrop.opacity, accuracy: 0.001)
+        XCTAssertEqual(clearBackdrop.scale, openBackdrop.scale, accuracy: 0.001)
+        XCTAssertFalse(clearBackdrop.blurs)
+        XCTAssertFalse(
+            LauncherLayout.folderBackdropStyle(
+                open: true,
+                reducesMotion: true,
+                reducesTransparency: true
+            ).blurs
+        )
         let closedBackdrop = LauncherLayout.folderBackdropStyle(open: false, reducesMotion: false)
         XCTAssertEqual(closedBackdrop.opacity, 1, accuracy: 0.001)
         XCTAssertEqual(closedBackdrop.scale, 1, accuracy: 0.001)
@@ -5444,6 +8086,38 @@ final class LaunchIconCoreTests: XCTestCase {
                 searchHoldsKeyboardFocus: false
             )
         )
+        XCTAssertTrue(
+            LauncherLayout.searchCancelRequiresForcedEmpty(committed: "Clock", editing: nil)
+        )
+        XCTAssertTrue(
+            LauncherLayout.searchCancelRequiresForcedEmpty(committed: "", editing: "\u{F700}"),
+            "empty stringValue with leftover editor tofu still needs a forced clear"
+        )
+        XCTAssertTrue(
+            LauncherLayout.searchCancelRequiresForcedEmpty(committed: "a", editing: "ab")
+        )
+        XCTAssertFalse(
+            LauncherLayout.searchCancelRequiresForcedEmpty(committed: "", editing: nil)
+        )
+        XCTAssertFalse(
+            LauncherLayout.searchCancelRequiresForcedEmpty(committed: "", editing: "")
+        )
+        XCTAssertFalse(
+            LauncherLayout.searchCancelRequiresForcedEmpty(
+                committed: "",
+                editing: "ni",
+                editingHasMarkedText: true
+            ),
+            "IME composition over an empty committed query is not leftover"
+        )
+        XCTAssertTrue(
+            LauncherLayout.searchCancelRequiresForcedEmpty(
+                committed: "Saf",
+                editing: "Safni",
+                editingHasMarkedText: true
+            ),
+            "a committed query still clears on cancel even while composing"
+        )
     }
 
     func testSearchKeyboardHighlightPinsFirstHitWithoutStealingFieldFocusPolicy() {
@@ -5538,6 +8212,3105 @@ final class LaunchIconCoreTests: XCTestCase {
             )
         )
     }
+
+    func testSearchFieldArrowMovesHighlightByGridRow() {
+        // SEARCH-FIELD-ARROW-ROW-01. Down from the first hit lands on the icon
+        // below, not the icon to its right. A short last row stays put.
+        let ids = (0..<10).map { _ in UUID() }
+        XCTAssertEqual(
+            LauncherLayout.searchKeyboardHighlightIDMovingByRow(
+                from: ids[0], in: ids, columns: 7, downward: true
+            ),
+            ids[7]
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchKeyboardHighlightIDMovingByRow(
+                from: ids[7], in: ids, columns: 7, downward: false
+            ),
+            ids[0]
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchKeyboardHighlightIDMovingByRow(
+                from: ids[8], in: ids, columns: 7, downward: true
+            ),
+            ids[8]
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchKeyboardHighlightIDMovingByRow(
+                from: ids[0], in: ids, columns: 10, downward: true
+            ),
+            ids[0]
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchKeyboardHighlightIDMovingByRow(
+                from: nil, in: ids, columns: 7, downward: true
+            ),
+            ids[0]
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchKeyboardHighlightIDMovingByRow(
+                from: nil, in: ids, columns: 7, downward: false
+            ),
+            ids[9]
+        )
+        XCTAssertNil(
+            LauncherLayout.searchKeyboardHighlightIDMovingByRow(
+                from: nil, in: [], columns: 7, downward: true
+            )
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchKeyboardHighlightIDMoving(from: ids[0], in: ids, by: 1),
+            ids[1]
+        )
+    }
+
+    func testCommandDownOpensTheFocusedFolder() {
+        // FOLDER-COMMAND-DOWN-OPEN-01. ⌘↓ opens a focused folder tile.
+        // An app, a search, or a folder that is already open does not.
+        XCTAssertTrue(LauncherLayout.commandDownOpensFocusedFolder(
+            keyCode: 125, commandOnly: true, focusedIsFolder: true,
+            folderAlreadyOpen: false, isSearching: false))
+        XCTAssertFalse(LauncherLayout.commandDownOpensFocusedFolder(
+            keyCode: 126, commandOnly: true, focusedIsFolder: true,
+            folderAlreadyOpen: false, isSearching: false))
+        XCTAssertFalse(LauncherLayout.commandDownOpensFocusedFolder(
+            keyCode: 125, commandOnly: true, focusedIsFolder: false,
+            folderAlreadyOpen: false, isSearching: false))
+        XCTAssertFalse(LauncherLayout.commandDownOpensFocusedFolder(
+            keyCode: 125, commandOnly: false, focusedIsFolder: true,
+            folderAlreadyOpen: false, isSearching: false))
+        XCTAssertFalse(LauncherLayout.commandDownOpensFocusedFolder(
+            keyCode: 125, commandOnly: true, focusedIsFolder: true,
+            folderAlreadyOpen: true, isSearching: false))
+        XCTAssertFalse(LauncherLayout.commandDownOpensFocusedFolder(
+            keyCode: 125, commandOnly: true, focusedIsFolder: true,
+            folderAlreadyOpen: false, isSearching: true))
+    }
+
+    func testCommandShiftNCreatesAFolderFromTheSelection() {
+        // FOLDER-COMMAND-SHIFT-N-01. ⌘⇧N needs two top-level apps, editing on,
+        // and no search, open folder, or text field. N alone does not.
+        XCTAssertTrue(LauncherLayout.commandShiftNCreatesFolder(
+            character: "n", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, selectedTopLevelAppCount: 2))
+        XCTAssertTrue(LauncherLayout.commandShiftNCreatesFolder(
+            character: "N", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, selectedTopLevelAppCount: 3))
+        XCTAssertFalse(LauncherLayout.commandShiftNCreatesFolder(
+            character: "n", command: true, shift: false, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, selectedTopLevelAppCount: 2))
+        XCTAssertFalse(LauncherLayout.commandShiftNCreatesFolder(
+            character: "n", command: true, shift: true, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, selectedTopLevelAppCount: 2))
+        XCTAssertFalse(LauncherLayout.commandShiftNCreatesFolder(
+            character: "n", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, selectedTopLevelAppCount: 1))
+        XCTAssertFalse(LauncherLayout.commandShiftNCreatesFolder(
+            character: "n", command: true, shift: true, option: false, control: false,
+            isSearching: true, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, selectedTopLevelAppCount: 2))
+        XCTAssertFalse(LauncherLayout.commandShiftNCreatesFolder(
+            character: "n", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, selectedTopLevelAppCount: 2))
+        XCTAssertFalse(LauncherLayout.commandShiftNCreatesFolder(
+            character: "n", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: true,
+            layoutEditingEnabled: true, selectedTopLevelAppCount: 2))
+        XCTAssertFalse(LauncherLayout.commandShiftNCreatesFolder(
+            character: "n", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: false, selectedTopLevelAppCount: 2))
+        XCTAssertFalse(LauncherLayout.commandShiftNCreatesFolder(
+            character: "m", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, selectedTopLevelAppCount: 2))
+        XCTAssertFalse(LauncherLayout.commandShiftNCreatesFolder(
+            character: nil, command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, selectedTopLevelAppCount: 2))
+    }
+
+    func testCommandShiftMMovesSelectedAppsIntoTheFolder() {
+        // FOLDER-COMMAND-SHIFT-M-MOVE-01. The folder in the selection receives
+        // the selected top-level apps. Two folders without a focused folder
+        // stay put. ⌘⇧N still needs N.
+        let a = UUID(), b = UUID(), folderID = UUID(), otherFolder = UUID(), member = UUID()
+        let state = LayoutState(
+            orderedEntries: [.app(a), .app(b), .folder(folderID), .folder(otherFolder)],
+            folders: [
+                folderID: LauncherFolder(id: folderID, name: "Work", itemIDs: [member]),
+                otherFolder: LauncherFolder(id: otherFolder, name: "Other", itemIDs: [])
+            ]
+        )
+        let both = LauncherItemSelection(orderedIDs: [b, a, folderID], rangeAnchorID: folderID)
+        let intoFocus = LauncherLayout.moveIntoFolderRequest(
+            focusedID: folderID, selection: both, in: state)
+        XCTAssertEqual(intoFocus, LauncherLayout.MoveIntoFolderRequest(folderID: folderID, appIDs: [b, a]))
+        if let intoFocus,
+           case .success(let moved) = LauncherLayout.moveTopLevelApps(
+            intoFocus.appIDs, intoFolder: intoFocus.folderID, in: state) {
+            XCTAssertEqual(moved.orderedEntries.map(\.id), [folderID, otherFolder])
+            XCTAssertEqual(moved.folders[folderID]?.itemIDs, [member, b, a])
+            XCTAssertEqual(moved.folders[otherFolder]?.itemIDs, [])
+        } else {
+            XCTFail("selected apps should move into the focused folder")
+        }
+        let one = LauncherItemSelection(orderedIDs: [a, folderID], rangeAnchorID: a)
+        let intoOnly = LauncherLayout.moveIntoFolderRequest(
+            focusedID: a, selection: one, in: state)
+        XCTAssertEqual(intoOnly, LauncherLayout.MoveIntoFolderRequest(folderID: folderID, appIDs: [a]))
+        if let intoOnly, let only = intoOnly.appIDs.first,
+           case .success(let moved) = LauncherLayout.moveTopLevelApp(only, toFolder: intoOnly.folderID, in: state) {
+            XCTAssertEqual(moved.folders[folderID]?.itemIDs, [member, a])
+            XCTAssertFalse(moved.orderedEntries.contains(.app(a)))
+        } else {
+            XCTFail("one selected app should move into the only folder")
+        }
+        let ambiguous = LauncherItemSelection(
+            orderedIDs: [a, folderID, otherFolder], rangeAnchorID: a)
+        XCTAssertNil(LauncherLayout.moveIntoFolderRequest(
+            focusedID: a, selection: ambiguous, in: state))
+        XCTAssertEqual(
+            LauncherLayout.moveIntoFolderRequest(
+                focusedID: folderID, selection: ambiguous, in: state
+            )?.folderID,
+            folderID
+        )
+        XCTAssertNil(LauncherLayout.moveIntoFolderRequest(
+            focusedID: a, selection: LauncherItemSelection(orderedIDs: [a, b], rangeAnchorID: a), in: state))
+        XCTAssertNil(LauncherLayout.moveIntoFolderRequest(
+            focusedID: UUID(), selection: both, in: state))
+        XCTAssertTrue(LauncherLayout.commandShiftMMovesSelectionIntoFolder(
+            character: "m", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandShiftMMovesSelectionIntoFolder(
+            character: "n", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandShiftMMovesSelectionIntoFolder(
+            character: "m", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandShiftMMovesSelectionIntoFolder(
+            character: "m", command: true, shift: true, option: false, control: false,
+            isSearching: true, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandShiftMMovesSelectionIntoFolder(
+            character: "m", command: true, shift: false, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandShiftMMovesSelectionIntoFolder(
+            character: "m", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: true,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandShiftMMovesSelectionIntoFolder(
+            character: "m", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: false, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandShiftMMovesSelectionIntoFolder(
+            character: "m", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: false, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandShiftMMovesSelectionIntoFolder(
+            character: "m", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: true))
+    }
+
+    func testCommandDeleteRemovesMembersFromTheOpenFolder() {
+        // FOLDER-COMMAND-DELETE-REMOVE-01. ⌘⌫ removes a member, or a batch
+        // when that batch can leave two behind. Forward delete does not.
+        XCTAssertEqual(
+            LauncherLayout.commandDeleteFolderRemoval(
+                keyCode: 51, command: true, shift: false, option: false, control: false,
+                folderOpen: true, isEditingText: false, layoutEditingEnabled: true,
+                acceptsAction: true, focusedIsRemovableMember: true,
+                selectedMemberCount: 1, batchRemovalAllowed: false
+            ),
+            .single
+        )
+        XCTAssertEqual(
+            LauncherLayout.commandDeleteFolderRemoval(
+                keyCode: 51, command: true, shift: false, option: false, control: false,
+                folderOpen: true, isEditingText: false, layoutEditingEnabled: true,
+                acceptsAction: true, focusedIsRemovableMember: true,
+                selectedMemberCount: 2, batchRemovalAllowed: true
+            ),
+            .batch
+        )
+        XCTAssertNil(LauncherLayout.commandDeleteFolderRemoval(
+            keyCode: 51, command: true, shift: false, option: false, control: false,
+            folderOpen: true, isEditingText: false, layoutEditingEnabled: true,
+            acceptsAction: true, focusedIsRemovableMember: true,
+            selectedMemberCount: 2, batchRemovalAllowed: false
+        ))
+        XCTAssertNil(LauncherLayout.commandDeleteFolderRemoval(
+            keyCode: 117, command: true, shift: false, option: false, control: false,
+            folderOpen: true, isEditingText: false, layoutEditingEnabled: true,
+            acceptsAction: true, focusedIsRemovableMember: true,
+            selectedMemberCount: 1, batchRemovalAllowed: false
+        ))
+        XCTAssertNil(LauncherLayout.commandDeleteFolderRemoval(
+            keyCode: 51, command: true, shift: true, option: false, control: false,
+            folderOpen: true, isEditingText: false, layoutEditingEnabled: true,
+            acceptsAction: true, focusedIsRemovableMember: true,
+            selectedMemberCount: 1, batchRemovalAllowed: false
+        ))
+        XCTAssertNil(LauncherLayout.commandDeleteFolderRemoval(
+            keyCode: 51, command: true, shift: false, option: false, control: false,
+            folderOpen: false, isEditingText: false, layoutEditingEnabled: true,
+            acceptsAction: true, focusedIsRemovableMember: false,
+            selectedMemberCount: 0, batchRemovalAllowed: false
+        ))
+        XCTAssertNil(LauncherLayout.commandDeleteFolderRemoval(
+            keyCode: 51, command: true, shift: false, option: false, control: false,
+            folderOpen: true, isEditingText: true, layoutEditingEnabled: true,
+            acceptsAction: true, focusedIsRemovableMember: true,
+            selectedMemberCount: 1, batchRemovalAllowed: false
+        ))
+        XCTAssertNil(LauncherLayout.commandDeleteFolderRemoval(
+            keyCode: 51, command: false, shift: false, option: false, control: false,
+            folderOpen: true, isEditingText: false, layoutEditingEnabled: true,
+            acceptsAction: true, focusedIsRemovableMember: true,
+            selectedMemberCount: 1, batchRemovalAllowed: false
+        ))
+        XCTAssertNil(LauncherLayout.commandDeleteFolderRemoval(
+            keyCode: 51, command: true, shift: false, option: false, control: false,
+            folderOpen: true, isEditingText: false, layoutEditingEnabled: false,
+            acceptsAction: true, focusedIsRemovableMember: true,
+            selectedMemberCount: 1, batchRemovalAllowed: false
+        ))
+    }
+
+    func testCommandShiftVerticalMovesTheSelectionToTheEdge() {
+        // SELECTION-COMMAND-SHIFT-VERTICAL-EDGE-01. ⌘⇧↑ is the front,
+        // ⌘⇧↓ is the back. Command alone still pages. One item does not move.
+        XCTAssertEqual(
+            LauncherLayout.commandShiftVerticalSelectionEdge(
+                keyCode: 126, command: true, shift: true, option: false, control: false,
+                isSearching: false, folderOpen: false, isEditingText: false,
+                layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+                selectedTopLevelCount: 2
+            ),
+            .start
+        )
+        XCTAssertEqual(
+            LauncherLayout.commandShiftVerticalSelectionEdge(
+                keyCode: 125, command: true, shift: true, option: false, control: false,
+                isSearching: false, folderOpen: false, isEditingText: false,
+                layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+                selectedTopLevelCount: 3
+            ),
+            .end
+        )
+        XCTAssertNil(LauncherLayout.commandShiftVerticalSelectionEdge(
+            keyCode: 126, command: true, shift: false, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            selectedTopLevelCount: 2
+        ))
+        XCTAssertNil(LauncherLayout.commandShiftVerticalSelectionEdge(
+            keyCode: 123, command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            selectedTopLevelCount: 2
+        ))
+        XCTAssertNil(LauncherLayout.commandShiftVerticalSelectionEdge(
+            keyCode: 126, command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            selectedTopLevelCount: 1
+        ))
+        XCTAssertNil(LauncherLayout.commandShiftVerticalSelectionEdge(
+            keyCode: 125, command: true, shift: true, option: false, control: false,
+            isSearching: true, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            selectedTopLevelCount: 2
+        ))
+        XCTAssertNil(LauncherLayout.commandShiftVerticalSelectionEdge(
+            keyCode: 125, command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            selectedTopLevelCount: 2
+        ))
+        XCTAssertNil(LauncherLayout.commandShiftVerticalSelectionEdge(
+            keyCode: 126, command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: true,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            selectedTopLevelCount: 2
+        ))
+        XCTAssertNil(LauncherLayout.commandShiftVerticalSelectionEdge(
+            keyCode: 126, command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: true,
+            selectedTopLevelCount: 2
+        ))
+        XCTAssertNil(LauncherLayout.commandShiftVerticalSelectionEdge(
+            keyCode: 126, command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: false, acceptsAction: true, isPaging: false,
+            selectedTopLevelCount: 2
+        ))
+    }
+
+    func testCommandDeleteDissolvesTheFocusedFolderWhenNoneIsOpen() {
+        // FOLDER-COMMAND-DELETE-DISSOLVE-01. A closed grid dissolves the
+        // focused folder. Two selected folders ask as a batch. An open
+        // folder keeps the remove-member path instead.
+        XCTAssertEqual(
+            LauncherLayout.commandDeleteDissolvesClosedFolder(
+                keyCode: 51, command: true, shift: false, option: false, control: false,
+                folderOpen: false, isSearching: false, isEditingText: false,
+                layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+                focusedIsFolder: true, selectedFolderCount: 1, batchDissolveAllowed: false
+            ),
+            .one
+        )
+        XCTAssertEqual(
+            LauncherLayout.commandDeleteDissolvesClosedFolder(
+                keyCode: 51, command: true, shift: false, option: false, control: false,
+                folderOpen: false, isSearching: false, isEditingText: false,
+                layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+                focusedIsFolder: true, selectedFolderCount: 2, batchDissolveAllowed: true
+            ),
+            .batch
+        )
+        XCTAssertNil(LauncherLayout.commandDeleteDissolvesClosedFolder(
+            keyCode: 51, command: true, shift: false, option: false, control: false,
+            folderOpen: false, isSearching: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            focusedIsFolder: true, selectedFolderCount: 2, batchDissolveAllowed: false
+        ))
+        XCTAssertNil(LauncherLayout.commandDeleteDissolvesClosedFolder(
+            keyCode: 51, command: true, shift: false, option: false, control: false,
+            folderOpen: true, isSearching: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            focusedIsFolder: true, selectedFolderCount: 1, batchDissolveAllowed: false
+        ))
+        XCTAssertNil(LauncherLayout.commandDeleteDissolvesClosedFolder(
+            keyCode: 51, command: true, shift: false, option: false, control: false,
+            folderOpen: false, isSearching: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            focusedIsFolder: false, selectedFolderCount: 0, batchDissolveAllowed: false
+        ))
+        XCTAssertNil(LauncherLayout.commandDeleteDissolvesClosedFolder(
+            keyCode: 51, command: true, shift: true, option: false, control: false,
+            folderOpen: false, isSearching: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            focusedIsFolder: true, selectedFolderCount: 1, batchDissolveAllowed: false
+        ))
+        XCTAssertNil(LauncherLayout.commandDeleteDissolvesClosedFolder(
+            keyCode: 51, command: true, shift: false, option: false, control: false,
+            folderOpen: false, isSearching: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            focusedIsFolder: true, selectedFolderCount: 1, batchDissolveAllowed: false
+        ))
+        XCTAssertNil(LauncherLayout.commandDeleteDissolvesClosedFolder(
+            keyCode: 117, command: true, shift: false, option: false, control: false,
+            folderOpen: false, isSearching: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            focusedIsFolder: true, selectedFolderCount: 1, batchDissolveAllowed: false
+        ))
+    }
+
+    func testCommandShiftDeleteUninstallsTheFocusedApp() {
+        // APP-COMMAND-SHIFT-DELETE-UNINSTALL-01. ⌘⇧⌫ asks to uninstall.
+        // ⌘⌫ without Shift stays remove / dissolve.
+        XCTAssertEqual(LauncherLayout.commandShiftDeleteUninstallsFocusedApp(
+            keyCode: 51, command: true, shift: true, option: false, control: false,
+            isEditingText: false, layoutEditingEnabled: true, acceptsAction: true,
+            isPaging: false, focusedIsApp: true, focusedIsInSelection: false,
+            selectedAppCount: 0), .one)
+        XCTAssertEqual(LauncherLayout.commandShiftDeleteUninstallsFocusedApp(
+            keyCode: 51, command: true, shift: true, option: false, control: false,
+            isEditingText: false, layoutEditingEnabled: true, acceptsAction: true,
+            isPaging: false, focusedIsApp: true, focusedIsInSelection: true,
+            selectedAppCount: 2), .batch)
+        XCTAssertNil(LauncherLayout.commandShiftDeleteUninstallsFocusedApp(
+            keyCode: 51, command: true, shift: false, option: false, control: false,
+            isEditingText: false, layoutEditingEnabled: true, acceptsAction: true,
+            isPaging: false, focusedIsApp: true, focusedIsInSelection: false,
+            selectedAppCount: 0))
+        XCTAssertNil(LauncherLayout.commandShiftDeleteUninstallsFocusedApp(
+            keyCode: 117, command: true, shift: true, option: false, control: false,
+            isEditingText: false, layoutEditingEnabled: true, acceptsAction: true,
+            isPaging: false, focusedIsApp: true, focusedIsInSelection: false,
+            selectedAppCount: 0))
+        XCTAssertNil(LauncherLayout.commandShiftDeleteUninstallsFocusedApp(
+            keyCode: 51, command: true, shift: true, option: true, control: false,
+            isEditingText: false, layoutEditingEnabled: true, acceptsAction: true,
+            isPaging: false, focusedIsApp: true, focusedIsInSelection: false,
+            selectedAppCount: 0))
+        XCTAssertNil(LauncherLayout.commandShiftDeleteUninstallsFocusedApp(
+            keyCode: 51, command: true, shift: true, option: false, control: false,
+            isEditingText: true, layoutEditingEnabled: true, acceptsAction: true,
+            isPaging: false, focusedIsApp: true, focusedIsInSelection: false,
+            selectedAppCount: 0))
+        XCTAssertNil(LauncherLayout.commandShiftDeleteUninstallsFocusedApp(
+            keyCode: 51, command: true, shift: true, option: false, control: false,
+            isEditingText: false, layoutEditingEnabled: false, acceptsAction: true,
+            isPaging: false, focusedIsApp: true, focusedIsInSelection: false,
+            selectedAppCount: 0))
+        XCTAssertNil(LauncherLayout.commandShiftDeleteUninstallsFocusedApp(
+            keyCode: 51, command: true, shift: true, option: false, control: false,
+            isEditingText: false, layoutEditingEnabled: true, acceptsAction: true,
+            isPaging: true, focusedIsApp: true, focusedIsInSelection: false,
+            selectedAppCount: 0))
+        XCTAssertNil(LauncherLayout.commandShiftDeleteUninstallsFocusedApp(
+            keyCode: 51, command: true, shift: true, option: false, control: false,
+            isEditingText: false, layoutEditingEnabled: true, acceptsAction: true,
+            isPaging: false, focusedIsApp: false, focusedIsInSelection: false,
+            selectedAppCount: 0))
+        XCTAssertNil(LauncherLayout.commandShiftDeleteUninstallsFocusedApp(
+            keyCode: 51, command: true, shift: true, option: false, control: false,
+            isEditingText: false, layoutEditingEnabled: true, acceptsAction: true,
+            isPaging: false, focusedIsApp: false, focusedIsInSelection: false,
+            selectedAppCount: 2))
+    }
+
+    func testCommandOptionNSortsTheFocusedFolderByName() {
+        // FOLDER-COMMAND-OPTION-N-SORT-01. ⌘⌥N sorts one focused folder.
+        // Shift is the new-folder shortcut. An open folder does not sort.
+        XCTAssertTrue(LauncherLayout.commandOptionNSortsFocusedFolder(
+            character: "n", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            focusedIsFolder: true))
+        XCTAssertTrue(LauncherLayout.commandOptionNSortsFocusedFolder(
+            character: "N", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            focusedIsFolder: true))
+        XCTAssertFalse(LauncherLayout.commandOptionNSortsFocusedFolder(
+            character: "n", command: true, shift: true, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            focusedIsFolder: true))
+        XCTAssertFalse(LauncherLayout.commandOptionNSortsFocusedFolder(
+            character: "n", command: true, shift: false, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            focusedIsFolder: true))
+        XCTAssertFalse(LauncherLayout.commandOptionNSortsFocusedFolder(
+            character: "n", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            focusedIsFolder: true))
+        XCTAssertFalse(LauncherLayout.commandOptionNSortsFocusedFolder(
+            character: "n", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            focusedIsFolder: false))
+        XCTAssertFalse(LauncherLayout.commandOptionNSortsFocusedFolder(
+            character: "n", command: true, shift: false, option: true, control: false,
+            isSearching: true, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            focusedIsFolder: true))
+        XCTAssertFalse(LauncherLayout.commandOptionNSortsFocusedFolder(
+            character: "m", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            focusedIsFolder: true))
+    }
+
+    func testCommandOptionNSortsTheOpenFolderByName() {
+        // FOLDER-COMMAND-OPTION-N-OPEN-SORT-01. An open folder takes ⌘⌥N.
+        // A closed folder stays on the focused-tile shortcut. Shift still
+        // makes a new folder.
+        XCTAssertTrue(LauncherLayout.commandOptionNSortsOpenFolder(
+            character: "n", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertTrue(LauncherLayout.commandOptionNSortsOpenFolder(
+            character: "N", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionNSortsOpenFolder(
+            character: "n", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionNSortsOpenFolder(
+            character: "n", command: true, shift: true, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionNSortsOpenFolder(
+            character: "n", command: true, shift: false, option: false, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionNSortsOpenFolder(
+            character: "n", command: true, shift: false, option: true, control: true,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionNSortsOpenFolder(
+            character: "n", command: false, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionNSortsOpenFolder(
+            character: "c", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionNSortsOpenFolder(
+            character: "n", command: true, shift: false, option: true, control: false,
+            isSearching: true, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionNSortsOpenFolder(
+            character: "n", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: true,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionNSortsOpenFolder(
+            character: "n", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: false, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionNSortsOpenFolder(
+            character: "n", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: false, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionNSortsOpenFolder(
+            character: "n", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: true))
+    }
+
+    func testCommandOptionCSortsTheFocusedFolderByColor() {
+        // FOLDER-COMMAND-OPTION-C-SORT-01. ⌘⌥C sorts one focused folder by
+        // icon color. ⌘⌥N stays the name sort. A running sample does not start.
+        XCTAssertTrue(LauncherLayout.commandOptionCSortsFocusedFolderByColor(
+            character: "c", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            samplingInFlight: false, focusedIsFolder: true))
+        XCTAssertTrue(LauncherLayout.commandOptionCSortsFocusedFolderByColor(
+            character: "C", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            samplingInFlight: false, focusedIsFolder: true))
+        XCTAssertFalse(LauncherLayout.commandOptionCSortsFocusedFolderByColor(
+            character: "n", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            samplingInFlight: false, focusedIsFolder: true))
+        XCTAssertFalse(LauncherLayout.commandOptionCSortsFocusedFolderByColor(
+            character: "c", command: true, shift: false, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            samplingInFlight: false, focusedIsFolder: true))
+        XCTAssertFalse(LauncherLayout.commandOptionCSortsFocusedFolderByColor(
+            character: "c", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            samplingInFlight: true, focusedIsFolder: true))
+        XCTAssertFalse(LauncherLayout.commandOptionCSortsFocusedFolderByColor(
+            character: "c", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            samplingInFlight: false, focusedIsFolder: true))
+        XCTAssertFalse(LauncherLayout.commandOptionCSortsFocusedFolderByColor(
+            character: "c", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            samplingInFlight: false, focusedIsFolder: false))
+        XCTAssertFalse(LauncherLayout.commandOptionCSortsFocusedFolderByColor(
+            character: "c", command: true, shift: true, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            samplingInFlight: false, focusedIsFolder: true))
+    }
+
+    func testCommandOptionCSortsTheOpenFolderByColor() {
+        // FOLDER-COMMAND-OPTION-C-OPEN-SORT-01. An open folder takes ⌘⌥C.
+        // A closed folder stays on the focused-tile shortcut. A running
+        // sample does not start another one.
+        XCTAssertTrue(LauncherLayout.commandOptionCSortsOpenFolderByColor(
+            character: "c", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            samplingInFlight: false))
+        XCTAssertTrue(LauncherLayout.commandOptionCSortsOpenFolderByColor(
+            character: "C", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            samplingInFlight: false))
+        XCTAssertFalse(LauncherLayout.commandOptionCSortsOpenFolderByColor(
+            character: "c", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            samplingInFlight: false))
+        XCTAssertFalse(LauncherLayout.commandOptionCSortsOpenFolderByColor(
+            character: "n", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            samplingInFlight: false))
+        XCTAssertFalse(LauncherLayout.commandOptionCSortsOpenFolderByColor(
+            character: "c", command: true, shift: false, option: false, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            samplingInFlight: false))
+        XCTAssertFalse(LauncherLayout.commandOptionCSortsOpenFolderByColor(
+            character: "c", command: true, shift: true, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            samplingInFlight: false))
+        XCTAssertFalse(LauncherLayout.commandOptionCSortsOpenFolderByColor(
+            character: "c", command: true, shift: false, option: true, control: true,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            samplingInFlight: false))
+        XCTAssertFalse(LauncherLayout.commandOptionCSortsOpenFolderByColor(
+            character: "c", command: false, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            samplingInFlight: false))
+        XCTAssertFalse(LauncherLayout.commandOptionCSortsOpenFolderByColor(
+            character: "c", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            samplingInFlight: true))
+        XCTAssertFalse(LauncherLayout.commandOptionCSortsOpenFolderByColor(
+            character: "c", command: true, shift: false, option: true, control: false,
+            isSearching: true, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            samplingInFlight: false))
+        XCTAssertFalse(LauncherLayout.commandOptionCSortsOpenFolderByColor(
+            character: "c", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: true,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            samplingInFlight: false))
+        XCTAssertFalse(LauncherLayout.commandOptionCSortsOpenFolderByColor(
+            character: "c", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: false, acceptsAction: true, isPaging: false,
+            samplingInFlight: false))
+        XCTAssertFalse(LauncherLayout.commandOptionCSortsOpenFolderByColor(
+            character: "c", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: false, isPaging: false,
+            samplingInFlight: false))
+        XCTAssertFalse(LauncherLayout.commandOptionCSortsOpenFolderByColor(
+            character: "c", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: true,
+            samplingInFlight: false))
+    }
+
+    func testF2RenamesTheFocusedClosedFolder() {
+        // FOLDER-F2-RENAME-01. Plain F2 renames one focused closed folder.
+        // Modifiers, search, an open folder, and an app tile stay out.
+        XCTAssertTrue(LauncherLayout.f2RenamesFocusedClosedFolder(
+            keyCode: 120, command: false, shift: false, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            focusedIsFolder: true))
+        XCTAssertFalse(LauncherLayout.f2RenamesFocusedClosedFolder(
+            keyCode: 122, command: false, shift: false, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            focusedIsFolder: true))
+        XCTAssertFalse(LauncherLayout.f2RenamesFocusedClosedFolder(
+            keyCode: 120, command: true, shift: false, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            focusedIsFolder: true))
+        XCTAssertFalse(LauncherLayout.f2RenamesFocusedClosedFolder(
+            keyCode: 120, command: false, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            focusedIsFolder: true))
+        XCTAssertFalse(LauncherLayout.f2RenamesFocusedClosedFolder(
+            keyCode: 120, command: false, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            focusedIsFolder: true))
+        XCTAssertFalse(LauncherLayout.f2RenamesFocusedClosedFolder(
+            keyCode: 120, command: false, shift: false, option: false, control: true,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            focusedIsFolder: true))
+        XCTAssertFalse(LauncherLayout.f2RenamesFocusedClosedFolder(
+            keyCode: 120, command: false, shift: false, option: false, control: false,
+            isSearching: true, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            focusedIsFolder: true))
+        XCTAssertFalse(LauncherLayout.f2RenamesFocusedClosedFolder(
+            keyCode: 120, command: false, shift: false, option: false, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            focusedIsFolder: true))
+        XCTAssertFalse(LauncherLayout.f2RenamesFocusedClosedFolder(
+            keyCode: 120, command: false, shift: false, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: true,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            focusedIsFolder: true))
+        XCTAssertFalse(LauncherLayout.f2RenamesFocusedClosedFolder(
+            keyCode: 120, command: false, shift: false, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: false, acceptsAction: true, isPaging: false,
+            focusedIsFolder: true))
+        XCTAssertFalse(LauncherLayout.f2RenamesFocusedClosedFolder(
+            keyCode: 120, command: false, shift: false, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: false, isPaging: false,
+            focusedIsFolder: true))
+        XCTAssertFalse(LauncherLayout.f2RenamesFocusedClosedFolder(
+            keyCode: 120, command: false, shift: false, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: true,
+            focusedIsFolder: true))
+        XCTAssertFalse(LauncherLayout.f2RenamesFocusedClosedFolder(
+            keyCode: 120, command: false, shift: false, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false,
+            focusedIsFolder: false))
+    }
+
+    func testF2RenamesTheFocusedAppAlias() {
+        // APP-F2-ALIAS-01. Plain F2 opens the alias sheet for an app.
+        // A folder stays on the folder rename. Modifiers stay out.
+        XCTAssertTrue(LauncherLayout.f2RenamesFocusedAppAlias(
+            keyCode: 120, command: false, shift: false, option: false, control: false,
+            isEditingText: false, layoutEditingEnabled: true, acceptsAction: true,
+            isPaging: false, focusedIsApp: true))
+        XCTAssertFalse(LauncherLayout.f2RenamesFocusedAppAlias(
+            keyCode: 122, command: false, shift: false, option: false, control: false,
+            isEditingText: false, layoutEditingEnabled: true, acceptsAction: true,
+            isPaging: false, focusedIsApp: true))
+        XCTAssertFalse(LauncherLayout.f2RenamesFocusedAppAlias(
+            keyCode: 120, command: true, shift: false, option: false, control: false,
+            isEditingText: false, layoutEditingEnabled: true, acceptsAction: true,
+            isPaging: false, focusedIsApp: true))
+        XCTAssertFalse(LauncherLayout.f2RenamesFocusedAppAlias(
+            keyCode: 120, command: false, shift: true, option: false, control: false,
+            isEditingText: false, layoutEditingEnabled: true, acceptsAction: true,
+            isPaging: false, focusedIsApp: true))
+        XCTAssertFalse(LauncherLayout.f2RenamesFocusedAppAlias(
+            keyCode: 120, command: false, shift: false, option: true, control: false,
+            isEditingText: false, layoutEditingEnabled: true, acceptsAction: true,
+            isPaging: false, focusedIsApp: true))
+        XCTAssertFalse(LauncherLayout.f2RenamesFocusedAppAlias(
+            keyCode: 120, command: false, shift: false, option: false, control: true,
+            isEditingText: false, layoutEditingEnabled: true, acceptsAction: true,
+            isPaging: false, focusedIsApp: true))
+        XCTAssertFalse(LauncherLayout.f2RenamesFocusedAppAlias(
+            keyCode: 120, command: false, shift: false, option: false, control: false,
+            isEditingText: true, layoutEditingEnabled: true, acceptsAction: true,
+            isPaging: false, focusedIsApp: true))
+        XCTAssertFalse(LauncherLayout.f2RenamesFocusedAppAlias(
+            keyCode: 120, command: false, shift: false, option: false, control: false,
+            isEditingText: false, layoutEditingEnabled: false, acceptsAction: true,
+            isPaging: false, focusedIsApp: true))
+        XCTAssertFalse(LauncherLayout.f2RenamesFocusedAppAlias(
+            keyCode: 120, command: false, shift: false, option: false, control: false,
+            isEditingText: false, layoutEditingEnabled: true, acceptsAction: true,
+            isPaging: true, focusedIsApp: true))
+        XCTAssertFalse(LauncherLayout.f2RenamesFocusedAppAlias(
+            keyCode: 120, command: false, shift: false, option: false, control: false,
+            isEditingText: false, layoutEditingEnabled: true, acceptsAction: true,
+            isPaging: false, focusedIsApp: false))
+    }
+
+    func testCommandEscapeCancelsOrDismisses() {
+        // KEYBOARD-COMMAND-REGISTRY-01. Escape matches the existing
+        // sendEvent path. Modifiers are not part of the gate.
+        XCTAssertTrue(LauncherLayout.commandEscapeCancelsOrDismisses(keyCode: 53))
+        XCTAssertFalse(LauncherLayout.commandEscapeCancelsOrDismisses(keyCode: 49))
+        XCTAssertFalse(LauncherLayout.commandEscapeCancelsOrDismisses(keyCode: 36))
+    }
+
+    func testSpaceActivatesFocusedItem() {
+        // KEYBOARD-COMMAND-REGISTRY-01. Space matches the existing tile
+        // keyDown path. Plain Return stays out of this gate.
+        XCTAssertTrue(LauncherLayout.spaceActivatesFocusedItem(character: " "))
+        XCTAssertFalse(LauncherLayout.spaceActivatesFocusedItem(character: nil))
+        XCTAssertFalse(LauncherLayout.spaceActivatesFocusedItem(character: "a"))
+        XCTAssertFalse(LauncherLayout.spaceActivatesFocusedItem(character: "\r"))
+    }
+
+    func testArrowExtendsSelectionAndWalksGrid() {
+        // KEYBOARD-COMMAND-REGISTRY-01. Plain and Shift arrows match the
+        // existing tile keyDown paths. Page Up/Down stay out. Command
+        // keeps the paging / registry path.
+        XCTAssertTrue(LauncherLayout.arrowWalksGrid(
+            keyCode: 123, command: false, shift: false, option: false, control: false))
+        XCTAssertTrue(LauncherLayout.arrowWalksGrid(
+            keyCode: 126, command: false, shift: false, option: false, control: false))
+        XCTAssertFalse(LauncherLayout.arrowWalksGrid(
+            keyCode: 123, command: true, shift: false, option: false, control: false))
+        XCTAssertFalse(LauncherLayout.arrowWalksGrid(
+            keyCode: 123, command: false, shift: true, option: false, control: false))
+        XCTAssertFalse(LauncherLayout.arrowWalksGrid(
+            keyCode: 116, command: false, shift: false, option: false, control: false))
+        XCTAssertTrue(LauncherLayout.arrowExtendsSelection(
+            keyCode: 124, command: false, shift: true, option: false, control: false))
+        XCTAssertFalse(LauncherLayout.arrowExtendsSelection(
+            keyCode: 124, command: false, shift: false, option: false, control: false))
+        XCTAssertFalse(LauncherLayout.arrowExtendsSelection(
+            keyCode: 124, command: true, shift: true, option: false, control: false))
+        XCTAssertFalse(LauncherLayout.arrowExtendsSelection(
+            keyCode: 116, command: false, shift: true, option: false, control: false))
+    }
+
+
+    func testCommandHomeEndAndShiftHomeEndChords() {
+        // KEYBOARD-COMMAND-REGISTRY-01. Home/End and Shift-Home/End match
+        // the existing tile keyDown paths. Page Up/Down stay out.
+        XCTAssertTrue(LauncherLayout.commandHomeEndJumpsInGrid(
+            keyCode: 115, command: false, shift: false, option: false, control: false))
+        XCTAssertTrue(LauncherLayout.commandHomeEndJumpsInGrid(
+            keyCode: 119, command: false, shift: false, option: false, control: false))
+        XCTAssertFalse(LauncherLayout.commandHomeEndJumpsInGrid(
+            keyCode: 115, command: false, shift: true, option: false, control: false))
+        XCTAssertFalse(LauncherLayout.commandHomeEndJumpsInGrid(
+            keyCode: 116, command: false, shift: false, option: false, control: false))
+        XCTAssertTrue(LauncherLayout.commandShiftHomeEndExtendsSelection(
+            keyCode: 115, command: false, shift: true, option: false, control: false))
+        XCTAssertTrue(LauncherLayout.commandShiftHomeEndExtendsSelection(
+            keyCode: 119, command: false, shift: true, option: false, control: false))
+        XCTAssertFalse(LauncherLayout.commandShiftHomeEndExtendsSelection(
+            keyCode: 115, command: false, shift: false, option: false, control: false))
+        XCTAssertFalse(LauncherLayout.commandShiftHomeEndExtendsSelection(
+            keyCode: 115, command: true, shift: true, option: false, control: false))
+        XCTAssertFalse(LauncherLayout.commandShiftHomeEndExtendsSelection(
+            keyCode: 116, command: false, shift: true, option: false, control: false))
+    }
+
+    func testF2RenamesFocusedFolderThenAppAliasChords() {
+        // KEYBOARD-COMMAND-REGISTRY-01. Plain F2 matches the existing tile
+        // keyDown path: a closed folder first, then an app alias. Search
+        // stays out of the folder rename and in for the app. Page Up/Down
+        // stay on their own path.
+        XCTAssertEqual(
+            LauncherLayout.resolveKeyboardCommand(
+                LauncherLayout.KeyboardProbe(keyCode: 120, focusedIsFolder: true)
+            ),
+            .f2RenamesFocusedClosedFolder
+        )
+        XCTAssertEqual(
+            LauncherLayout.resolveKeyboardCommand(
+                LauncherLayout.KeyboardProbe(keyCode: 120, focusedIsApp: true)
+            ),
+            .f2RenamesFocusedAppAlias
+        )
+        XCTAssertEqual(
+            LauncherLayout.resolveKeyboardCommand(
+                LauncherLayout.KeyboardProbe(
+                    keyCode: 120,
+                    focusedIsFolder: true,
+                    focusedIsApp: true
+                )
+            ),
+            .f2RenamesFocusedClosedFolder
+        )
+        XCTAssertNil(
+            LauncherLayout.resolveKeyboardCommand(
+                LauncherLayout.KeyboardProbe(
+                    keyCode: 120,
+                    isSearching: true,
+                    focusedIsFolder: true
+                )
+            )
+        )
+        XCTAssertEqual(
+            LauncherLayout.resolveKeyboardCommand(
+                LauncherLayout.KeyboardProbe(
+                    keyCode: 120,
+                    isSearching: true,
+                    focusedIsApp: true
+                )
+            ),
+            .f2RenamesFocusedAppAlias
+        )
+        XCTAssertEqual(
+            LauncherLayout.resolveKeyboardCommand(
+                LauncherLayout.KeyboardProbe(keyCode: 116, focusedIsFolder: true)
+            ),
+            .pageUpDownPagesGrid
+        )
+        XCTAssertNil(
+            LauncherLayout.resolveKeyboardCommand(
+                LauncherLayout.KeyboardProbe(
+                    keyCode: 120,
+                    shift: true,
+                    focusedIsFolder: true
+                )
+            )
+        )
+    }
+
+    func testPageUpDownScrollsOpenListOrPagesGrid() {
+        // KEYBOARD-COMMAND-REGISTRY-01. Page Up/Down match the existing
+        // tile keyDown path: an open folder or search list first, then
+        // the main grid. Left/Right stay on their own path.
+        XCTAssertTrue(LauncherLayout.commandPageUpDownPagesGrid(
+            keyCode: 116, isSearching: false, folderOpen: false))
+        XCTAssertTrue(LauncherLayout.commandPageUpDownPagesGrid(
+            keyCode: 121, isSearching: false, folderOpen: false))
+        XCTAssertFalse(LauncherLayout.commandPageUpDownPagesGrid(
+            keyCode: 116, isSearching: true, folderOpen: false))
+        XCTAssertFalse(LauncherLayout.commandPageUpDownPagesGrid(
+            keyCode: 123, isSearching: false, folderOpen: false))
+        XCTAssertTrue(LauncherLayout.commandPageUpDownScrollsOpenList(
+            keyCode: 116, isSearching: true, folderOpen: false))
+        XCTAssertTrue(LauncherLayout.commandPageUpDownScrollsOpenList(
+            keyCode: 121, isSearching: false, folderOpen: true))
+        XCTAssertTrue(LauncherLayout.commandPageUpDownScrollsOpenList(
+            keyCode: 116, isSearching: true, folderOpen: true))
+        XCTAssertFalse(LauncherLayout.commandPageUpDownScrollsOpenList(
+            keyCode: 116, isSearching: false, folderOpen: false))
+        XCTAssertFalse(LauncherLayout.commandPageUpDownScrollsOpenList(
+            keyCode: 123, isSearching: true, folderOpen: false))
+        XCTAssertEqual(
+            LauncherLayout.resolveKeyboardCommand(
+                LauncherLayout.KeyboardProbe(keyCode: 116)
+            ),
+            .pageUpDownPagesGrid
+        )
+        XCTAssertEqual(
+            LauncherLayout.resolveKeyboardCommand(
+                LauncherLayout.KeyboardProbe(keyCode: 121, isSearching: true)
+            ),
+            .pageUpDownScrollsOpenList
+        )
+        XCTAssertEqual(
+            LauncherLayout.resolveKeyboardCommand(
+                LauncherLayout.KeyboardProbe(keyCode: 116, folderOpen: true)
+            ),
+            .pageUpDownScrollsOpenList
+        )
+    }
+
+
+    func testCommandCommaOpensSettings() {
+        // KEYBOARD-COMMAND-REGISTRY-01. ⌘, opens settings. A text field
+        // still consumes the chord. Shift stays free.
+        XCTAssertTrue(LauncherLayout.commandCommaOpensSettings(
+            character: ",", command: true, shift: false, option: false, control: false))
+        XCTAssertFalse(LauncherLayout.commandCommaOpensSettings(
+            character: ",", command: true, shift: true, option: false, control: false))
+        XCTAssertFalse(LauncherLayout.commandCommaOpensSettings(
+            character: ",", command: true, shift: false, option: true, control: false))
+        XCTAssertFalse(LauncherLayout.commandCommaOpensSettings(
+            character: ",", command: false, shift: false, option: false, control: false))
+        XCTAssertFalse(LauncherLayout.commandCommaOpensSettings(
+            character: "f", command: true, shift: false, option: false, control: false))
+    }
+
+    func testCommandFFocusesSearch() {
+        // LAUNCHER-COMMAND-F-SEARCH-01. ⌘F focuses search. A text field
+        // and an open folder still consume the chord. Shift stays free.
+        XCTAssertTrue(LauncherLayout.commandFFocusesSearch(
+            character: "f", command: true, shift: false, option: false, control: false))
+        XCTAssertTrue(LauncherLayout.commandFFocusesSearch(
+            character: "F", command: true, shift: false, option: false, control: false))
+        XCTAssertFalse(LauncherLayout.commandFFocusesSearch(
+            character: "f", command: true, shift: true, option: false, control: false))
+        XCTAssertFalse(LauncherLayout.commandFFocusesSearch(
+            character: "f", command: true, shift: false, option: true, control: false))
+        XCTAssertFalse(LauncherLayout.commandFFocusesSearch(
+            character: "f", command: false, shift: false, option: false, control: false))
+        XCTAssertFalse(LauncherLayout.commandFFocusesSearch(
+            character: "w", command: true, shift: false, option: false, control: false))
+    }
+
+    func testCommandASelectsCurrentPageIcons() {
+        // GRID-COMMAND-A-SELECT-PAGE-01. ⌘A selects the current page.
+        // A text field keeps Select All. Command-Shift-A stays free.
+        XCTAssertTrue(LauncherLayout.commandASelectsCurrentPageIcons(
+            character: "a", command: true, shift: false, option: false, control: false,
+            isEditingText: false))
+        XCTAssertTrue(LauncherLayout.commandASelectsCurrentPageIcons(
+            character: "A", command: true, shift: false, option: false, control: false,
+            isEditingText: false))
+        XCTAssertFalse(LauncherLayout.commandASelectsCurrentPageIcons(
+            character: "a", command: true, shift: false, option: false, control: false,
+            isEditingText: true))
+        XCTAssertFalse(LauncherLayout.commandASelectsCurrentPageIcons(
+            character: "a", command: true, shift: true, option: false, control: false,
+            isEditingText: false))
+        XCTAssertFalse(LauncherLayout.commandASelectsCurrentPageIcons(
+            character: "a", command: false, shift: false, option: false, control: false,
+            isEditingText: false))
+        XCTAssertFalse(LauncherLayout.commandASelectsCurrentPageIcons(
+            character: "w", command: true, shift: false, option: false, control: false,
+            isEditingText: false))
+    }
+
+    func testCommandWDismissesTheLauncher() {
+        // LAUNCHER-COMMAND-W-DISMISS-01. ⌘W closes the launcher. ⌘Q and a
+        // text field stay free. Shift stays free.
+        XCTAssertTrue(LauncherLayout.commandWDismissesLauncher(
+            character: "w", command: true, shift: false, option: false, control: false,
+            isEditingText: false))
+        XCTAssertTrue(LauncherLayout.commandWDismissesLauncher(
+            character: "W", command: true, shift: false, option: false, control: false,
+            isEditingText: false))
+        XCTAssertFalse(LauncherLayout.commandWDismissesLauncher(
+            character: "q", command: true, shift: false, option: false, control: false,
+            isEditingText: false))
+        XCTAssertFalse(LauncherLayout.commandWDismissesLauncher(
+            character: "w", command: false, shift: false, option: false, control: false,
+            isEditingText: false))
+        XCTAssertFalse(LauncherLayout.commandWDismissesLauncher(
+            character: "w", command: true, shift: true, option: false, control: false,
+            isEditingText: false))
+        XCTAssertFalse(LauncherLayout.commandWDismissesLauncher(
+            character: "w", command: true, shift: false, option: true, control: false,
+            isEditingText: false))
+        XCTAssertFalse(LauncherLayout.commandWDismissesLauncher(
+            character: "w", command: true, shift: false, option: false, control: true,
+            isEditingText: false))
+        XCTAssertFalse(LauncherLayout.commandWDismissesLauncher(
+            character: "w", command: true, shift: false, option: false, control: false,
+            isEditingText: true))
+    }
+
+    func testCommandCCopiesTheFocusedApp() {
+        // LAUNCHER-COMMAND-C-COPY-01. ⌘C copies the focused app file.
+        // ⌘⌥C and ⌘⇧C stay on arrange. A text field keeps Copy.
+        XCTAssertTrue(LauncherLayout.commandCCopiesFocusedApp(
+            character: "c", command: true, shift: false, option: false, control: false,
+            isEditingText: false))
+        XCTAssertTrue(LauncherLayout.commandCCopiesFocusedApp(
+            character: "C", command: true, shift: false, option: false, control: false,
+            isEditingText: false))
+        XCTAssertFalse(LauncherLayout.commandCCopiesFocusedApp(
+            character: "w", command: true, shift: false, option: false, control: false,
+            isEditingText: false))
+        XCTAssertFalse(LauncherLayout.commandCCopiesFocusedApp(
+            character: "c", command: false, shift: false, option: false, control: false,
+            isEditingText: false))
+        XCTAssertFalse(LauncherLayout.commandCCopiesFocusedApp(
+            character: "c", command: true, shift: true, option: false, control: false,
+            isEditingText: false))
+        XCTAssertFalse(LauncherLayout.commandCCopiesFocusedApp(
+            character: "c", command: true, shift: false, option: true, control: false,
+            isEditingText: false))
+        XCTAssertFalse(LauncherLayout.commandCCopiesFocusedApp(
+            character: "c", command: true, shift: false, option: false, control: true,
+            isEditingText: false))
+        XCTAssertFalse(LauncherLayout.commandCCopiesFocusedApp(
+            character: "c", command: true, shift: false, option: false, control: false,
+            isEditingText: true))
+    }
+
+    func testCopyingFocusedAppFileURLLeavesAMissingCandidateAlone() {
+        // LAUNCHER-COMMAND-C-COPY-01. A missing catalog entry has no URL, so
+        // the caller does not replace the pasteboard. A folder has none either.
+        let appID = UUID(), folderID = UUID(), missing = UUID()
+        var state = LayoutState()
+        state.orderedEntries = [.app(appID), .folder(folderID), .app(missing)]
+        state.appKeys = [appID: "app", missing: "gone"]
+        state.folders[folderID] = LauncherFolder(id: folderID, name: "F", itemIDs: [])
+        let candidate = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/A.app"),
+            bundleIdentifier: "com.a",
+            displayName: "A",
+            sourcePriority: 0,
+            discoveredAt: .distantPast
+        )
+        let byKey = [candidate.deduplicationKey: candidate]
+        state.appKeys[appID] = candidate.deduplicationKey
+        XCTAssertEqual(
+            LauncherLayout.copyingFocusedAppFileURL(focusedID: appID, in: state, candidatesByKey: byKey)?.path,
+            "/Applications/A.app"
+        )
+        XCTAssertNil(LauncherLayout.copyingFocusedAppFileURL(
+            focusedID: missing, in: state, candidatesByKey: byKey))
+        XCTAssertNil(LauncherLayout.copyingFocusedAppFileURL(
+            focusedID: folderID, in: state, candidatesByKey: byKey))
+        XCTAssertEqual(state.orderedEntries.map(\.id), [appID, folderID, missing])
+    }
+
+    func testCommandCCopiesSelectedAppFileURLs() {
+        // LAUNCHER-COMMAND-C-SELECTION-COPY-01. Two or more selected items
+        // copy each app file, in selection order. One item stays on the
+        // single copy. A folder and a missing bundle are skipped.
+        let a = UUID(), b = UUID(), folderID = UUID(), missing = UUID()
+        var state = LayoutState()
+        state.orderedEntries = [.app(b), .folder(folderID), .app(a)]
+        state.appKeys = [a: "a", b: "b"]
+        state.folders[folderID] = LauncherFolder(id: folderID, name: "F", itemIDs: [])
+        let candA = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/A.app"),
+            bundleIdentifier: "com.a",
+            displayName: "A",
+            sourcePriority: 0,
+            discoveredAt: .distantPast
+        )
+        let candB = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/B.app"),
+            bundleIdentifier: "com.b",
+            displayName: "B",
+            sourcePriority: 0,
+            discoveredAt: .distantPast
+        )
+        let byKey = ["a": candA, "b": candB]
+        let selection = LauncherItemSelection(orderedIDs: [b, folderID, a, missing], rangeAnchorID: b)
+        let urls = LauncherLayout.copyingSelectedAppFileURLs(
+            focusedID: a, selection: selection, in: state, candidatesByKey: byKey)
+        XCTAssertEqual(urls?.map(\.path), ["/Applications/B.app", "/Applications/A.app"])
+        XCTAssertEqual(state.orderedEntries.map(\.id), [b, folderID, a])
+        XCTAssertNil(LauncherLayout.copyingSelectedAppFileURLs(
+            focusedID: UUID(), selection: selection, in: state, candidatesByKey: byKey))
+        let single = LauncherItemSelection(orderedIDs: [a], rangeAnchorID: a)
+        XCTAssertNil(LauncherLayout.copyingSelectedAppFileURLs(
+            focusedID: a, selection: single, in: state, candidatesByKey: byKey))
+        let foldersOnly = LauncherItemSelection(orderedIDs: [folderID, missing], rangeAnchorID: folderID)
+        XCTAssertNil(LauncherLayout.copyingSelectedAppFileURLs(
+            focusedID: folderID, selection: foldersOnly, in: state, candidatesByKey: byKey))
+    }
+
+    func testCommandOptionVerticalMovesFoldersToTheEdge() {
+        // FOLDER-COMMAND-OPTION-VERTICAL-EDGE-01. ⌘⌥↑ / ⌘⌥↓ own the key even
+        // when no folder would move. ⌘↑ without Option stays free to close or page.
+        XCTAssertEqual(LauncherLayout.commandOptionVerticalMovesFoldersToEdge(
+            keyCode: 126, command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false), .start)
+        XCTAssertEqual(LauncherLayout.commandOptionVerticalMovesFoldersToEdge(
+            keyCode: 125, command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false), .end)
+        XCTAssertNil(LauncherLayout.commandOptionVerticalMovesFoldersToEdge(
+            keyCode: 124, command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionVerticalMovesFoldersToEdge(
+            keyCode: 126, command: true, shift: false, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionVerticalMovesFoldersToEdge(
+            keyCode: 126, command: true, shift: true, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionVerticalMovesFoldersToEdge(
+            keyCode: 126, command: false, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionVerticalMovesFoldersToEdge(
+            keyCode: 126, command: true, shift: false, option: true, control: true,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionVerticalMovesFoldersToEdge(
+            keyCode: 126, command: true, shift: false, option: true, control: false,
+            isSearching: true, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionVerticalMovesFoldersToEdge(
+            keyCode: 126, command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionVerticalMovesFoldersToEdge(
+            keyCode: 126, command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: true,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionVerticalMovesFoldersToEdge(
+            keyCode: 126, command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: false, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionVerticalMovesFoldersToEdge(
+            keyCode: 126, command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: false, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionVerticalMovesFoldersToEdge(
+            keyCode: 126, command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: true))
+    }
+
+    func testCommandOptionRRearrangesTheGridByName() {
+        // GRID-COMMAND-OPTION-R-NAME-01. ⌘⌥R asks to arrange by name.
+        // ⌘⌥N stays the folder name sort. Shift stays the new-folder shortcut.
+        XCTAssertTrue(LauncherLayout.commandOptionRRearrangesGridByName(
+            character: "r", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertTrue(LauncherLayout.commandOptionRRearrangesGridByName(
+            character: "R", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionRRearrangesGridByName(
+            character: "n", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionRRearrangesGridByName(
+            character: "r", command: true, shift: false, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionRRearrangesGridByName(
+            character: "r", command: true, shift: true, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionRRearrangesGridByName(
+            character: "r", command: true, shift: false, option: true, control: false,
+            isSearching: true, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionRRearrangesGridByName(
+            character: "r", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionRRearrangesGridByName(
+            character: "r", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: true,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionRRearrangesGridByName(
+            character: "r", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: false, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionRRearrangesGridByName(
+            character: "r", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: true))
+    }
+
+    func testCommandOptionKRearrangesTheGridByKind() {
+        // GRID-COMMAND-OPTION-K-KIND-01. ⌘⌥K asks to arrange by kind.
+        // ⌘⌥R stays the name arrange. A plain letter does not take it.
+        XCTAssertTrue(LauncherLayout.commandOptionKRearrangesGridByKind(
+            character: "k", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertTrue(LauncherLayout.commandOptionKRearrangesGridByKind(
+            character: "K", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionKRearrangesGridByKind(
+            character: "r", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionKRearrangesGridByKind(
+            character: "k", command: true, shift: false, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionKRearrangesGridByKind(
+            character: "k", command: true, shift: true, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionKRearrangesGridByKind(
+            character: "k", command: true, shift: false, option: true, control: false,
+            isSearching: true, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionKRearrangesGridByKind(
+            character: "k", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionKRearrangesGridByKind(
+            character: "k", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: true,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionKRearrangesGridByKind(
+            character: "k", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: false, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionKRearrangesGridByKind(
+            character: "k", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: true))
+    }
+
+    func testCommandOptionKSortsTheOpenFolderByKind() {
+        // FOLDER-COMMAND-OPTION-K-OPEN-SORT-01. An open folder takes ⌘⌥K.
+        // A closed folder stays on the grid confirm. System apps lead.
+        XCTAssertTrue(LauncherLayout.commandOptionKSortsOpenFolderByKind(
+            character: "k", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertTrue(LauncherLayout.commandOptionKSortsOpenFolderByKind(
+            character: "K", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionKSortsOpenFolderByKind(
+            character: "k", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionKSortsOpenFolderByKind(
+            character: "g", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionKSortsOpenFolderByKind(
+            character: "k", command: true, shift: false, option: false, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionKSortsOpenFolderByKind(
+            character: "k", command: true, shift: true, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionKSortsOpenFolderByKind(
+            character: "k", command: true, shift: false, option: true, control: true,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionKSortsOpenFolderByKind(
+            character: "k", command: false, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionKSortsOpenFolderByKind(
+            character: "k", command: true, shift: false, option: true, control: false,
+            isSearching: true, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionKSortsOpenFolderByKind(
+            character: "k", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: true,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionKSortsOpenFolderByKind(
+            character: "k", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: false, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionKSortsOpenFolderByKind(
+            character: "k", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: false, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionKSortsOpenFolderByKind(
+            character: "k", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: true))
+
+        func app(_ name: String, system: Bool) -> AppCandidate {
+            let root = system ? "/System/Applications" : "/Applications"
+            return AppCandidate(
+                canonicalURL: URL(fileURLWithPath: "\(root)/\(name).app"),
+                bundleIdentifier: "com.example.\(name)",
+                displayName: name,
+                sourcePriority: system ? 0 : 1,
+                discoveredAt: .now
+            )
+        }
+        let zebra = app("Zebra", system: false)
+        let notes = app("Notes", system: true)
+        let calendar = app("Calendar", system: true)
+        let zebraID = UUID(), notesID = UUID(), calendarID = UUID(), unknownID = UUID()
+        let otherID = UUID()
+        let folderID = UUID(), otherFolderID = UUID()
+        let state = LayoutState(
+            orderedEntries: [.folder(folderID), .app(otherID), .folder(otherFolderID)],
+            folders: [
+                folderID: LauncherFolder(id: folderID, name: "F", itemIDs: [zebraID, notesID, unknownID, calendarID]),
+                otherFolderID: LauncherFolder(id: otherFolderID, name: "G", itemIDs: [otherID, zebraID])
+            ],
+            appKeys: [
+                zebraID: zebra.deduplicationKey,
+                notesID: notes.deduplicationKey,
+                calendarID: calendar.deduplicationKey,
+                otherID: zebra.deduplicationKey
+            ]
+        )
+        let catalog = [zebra, notes, calendar]
+        guard let sorted = LauncherLayout.sortingFolderMembersByKind(folderID, in: state, catalog: catalog) else {
+            return XCTFail("expected a reorder")
+        }
+        XCTAssertEqual(sorted.folders[folderID]?.itemIDs, [calendarID, notesID, zebraID, unknownID])
+        XCTAssertEqual(sorted.folders[otherFolderID], state.folders[otherFolderID])
+        XCTAssertEqual(sorted.orderedEntries, state.orderedEntries)
+        XCTAssertNil(LauncherLayout.sortingFolderMembersByKind(folderID, in: sorted, catalog: catalog))
+        XCTAssertNil(LauncherLayout.sortingFolderMembersByKind(UUID(), in: state, catalog: catalog))
+        var one = state
+        one.folders[folderID]?.itemIDs = [zebraID]
+        XCTAssertNil(LauncherLayout.sortingFolderMembersByKind(folderID, in: one, catalog: catalog))
+        var aliased = state
+        aliased.appAliases = [notes.deduplicationKey: "Aaa"]
+        XCTAssertEqual(
+            LauncherLayout.sortingFolderMembersByKind(folderID, in: aliased, catalog: catalog)?.folders[folderID]?.itemIDs,
+            [notesID, calendarID, zebraID, unknownID]
+        )
+        var dup = state
+        dup.folders[folderID]?.itemIDs = [zebraID, notesID, zebraID]
+        XCTAssertEqual(
+            LauncherLayout.sortingFolderMembersByKind(folderID, in: dup, catalog: catalog)?.folders[folderID]?.itemIDs,
+            [notesID, zebraID, zebraID]
+        )
+    }
+
+    func testCommandOptionGRearrangesTheGridByCategory() {
+        // GRID-COMMAND-OPTION-G-CATEGORY-01. ⌘⌥G asks to arrange by category.
+        // ⌘⌥K stays the kind arrange. A plain letter does not take it.
+        XCTAssertTrue(LauncherLayout.commandOptionGRearrangesGridByCategory(
+            character: "g", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertTrue(LauncherLayout.commandOptionGRearrangesGridByCategory(
+            character: "G", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionGRearrangesGridByCategory(
+            character: "k", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionGRearrangesGridByCategory(
+            character: "g", command: true, shift: false, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionGRearrangesGridByCategory(
+            character: "g", command: true, shift: true, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionGRearrangesGridByCategory(
+            character: "g", command: true, shift: false, option: true, control: false,
+            isSearching: true, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionGRearrangesGridByCategory(
+            character: "g", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionGRearrangesGridByCategory(
+            character: "g", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: true,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionGRearrangesGridByCategory(
+            character: "g", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: false, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionGRearrangesGridByCategory(
+            character: "g", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: true))
+    }
+
+    func testCommandOptionGSortsTheOpenFolderByCategory() {
+        // FOLDER-COMMAND-OPTION-G-OPEN-SORT-01. An open folder takes ⌘⌥G.
+        // A closed folder stays on the grid confirm. Category groups lead.
+        XCTAssertTrue(LauncherLayout.commandOptionGSortsOpenFolderByCategory(
+            character: "g", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertTrue(LauncherLayout.commandOptionGSortsOpenFolderByCategory(
+            character: "G", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionGSortsOpenFolderByCategory(
+            character: "g", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionGSortsOpenFolderByCategory(
+            character: "k", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionGSortsOpenFolderByCategory(
+            character: "g", command: true, shift: false, option: false, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionGSortsOpenFolderByCategory(
+            character: "g", command: true, shift: true, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionGSortsOpenFolderByCategory(
+            character: "g", command: true, shift: false, option: true, control: true,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionGSortsOpenFolderByCategory(
+            character: "g", command: false, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionGSortsOpenFolderByCategory(
+            character: "g", command: true, shift: false, option: true, control: false,
+            isSearching: true, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionGSortsOpenFolderByCategory(
+            character: "g", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: true,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionGSortsOpenFolderByCategory(
+            character: "g", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: false, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionGSortsOpenFolderByCategory(
+            character: "g", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: false, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionGSortsOpenFolderByCategory(
+            character: "g", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: true))
+
+        func app(_ name: String) -> AppCandidate {
+            AppCandidate(
+                canonicalURL: URL(fileURLWithPath: "/Applications/\(name).app"),
+                bundleIdentifier: "com.example.\(name)",
+                displayName: name,
+                sourcePriority: 1,
+                discoveredAt: .now
+            )
+        }
+        let notes = app("Notes"), zeta = app("Zeta"), alpha = app("Alpha"), mid = app("Mid")
+        let notesID = UUID(), zetaID = UUID(), alphaID = UUID(), midID = UUID(), unknownID = UUID()
+        let otherID = UUID()
+        let folderID = UUID(), otherFolderID = UUID()
+        let state = LayoutState(
+            orderedEntries: [.folder(folderID), .app(otherID), .folder(otherFolderID)],
+            folders: [
+                folderID: LauncherFolder(
+                    id: folderID, name: "F",
+                    itemIDs: [alphaID, unknownID, zetaID, midID, notesID]
+                ),
+                otherFolderID: LauncherFolder(id: otherFolderID, name: "G", itemIDs: [otherID, alphaID])
+            ],
+            appKeys: [
+                notesID: notes.deduplicationKey,
+                zetaID: zeta.deduplicationKey,
+                alphaID: alpha.deduplicationKey,
+                midID: mid.deduplicationKey,
+                unknownID: "missing",
+                otherID: alpha.deduplicationKey
+            ],
+            appAliases: ["missing": "Zzz"]
+        )
+        let catalog = [notes, zeta, alpha, mid]
+        let types = [
+            "Notes": "public.app-category.productivity",
+            "Zeta": "public.app-category.productivity",
+            "Alpha": "public.app-category.developer-tools"
+        ]
+        var calls: [String] = []
+        guard let sorted = LauncherLayout.sortingFolderMembersByCategory(
+            folderID, in: state, catalog: catalog,
+            categoryType: { candidate in
+                calls.append(candidate.displayName)
+                return types[candidate.displayName]
+            }
+        ) else {
+            return XCTFail("expected a reorder")
+        }
+        XCTAssertEqual(sorted.folders[folderID]?.itemIDs, [notesID, zetaID, alphaID, midID, unknownID])
+        XCTAssertEqual(calls.sorted(), ["Alpha", "Mid", "Notes", "Zeta"])
+        XCTAssertEqual(sorted.folders[otherFolderID], state.folders[otherFolderID])
+        XCTAssertEqual(sorted.orderedEntries, state.orderedEntries)
+        XCTAssertNil(LauncherLayout.sortingFolderMembersByCategory(
+            folderID, in: sorted, catalog: catalog,
+            categoryType: { types[$0.displayName] }
+        ))
+        XCTAssertNil(LauncherLayout.sortingFolderMembersByCategory(
+            UUID(), in: state, catalog: catalog,
+            categoryType: { types[$0.displayName] }
+        ))
+        var one = state
+        one.folders[folderID]?.itemIDs = [alphaID]
+        XCTAssertNil(LauncherLayout.sortingFolderMembersByCategory(
+            folderID, in: one, catalog: catalog,
+            categoryType: { types[$0.displayName] }
+        ))
+        var aliased = state
+        aliased.appAliases["missing"] = "Zzz"
+        aliased.appAliases[zeta.deduplicationKey] = "Aaa"
+        XCTAssertEqual(
+            LauncherLayout.sortingFolderMembersByCategory(
+                folderID, in: aliased, catalog: catalog,
+                categoryType: { types[$0.displayName] }
+            )?.folders[folderID]?.itemIDs,
+            [zetaID, notesID, alphaID, midID, unknownID]
+        )
+        var dup = state
+        dup.folders[folderID]?.itemIDs = [alphaID, notesID, alphaID]
+        var dupCalls: [String] = []
+        XCTAssertEqual(
+            LauncherLayout.sortingFolderMembersByCategory(
+                folderID, in: dup, catalog: catalog,
+                categoryType: { candidate in
+                    dupCalls.append(candidate.displayName)
+                    return types[candidate.displayName]
+                }
+            )?.folders[folderID]?.itemIDs,
+            [notesID, alphaID, alphaID]
+        )
+        XCTAssertEqual(dupCalls.sorted(), ["Alpha", "Notes"])
+    }
+
+    func testCommandShiftCRearrangesTheGridByColor() {
+        // GRID-COMMAND-SHIFT-C-COLOR-01. ⌘⇧C asks to arrange by icon color.
+        // ⌘⌥C stays the folder color sort. A plain letter does not take it.
+        XCTAssertTrue(LauncherLayout.commandShiftCRearrangesGridByColor(
+            character: "c", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertTrue(LauncherLayout.commandShiftCRearrangesGridByColor(
+            character: "C", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandShiftCRearrangesGridByColor(
+            character: "g", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandShiftCRearrangesGridByColor(
+            character: "c", command: true, shift: false, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandShiftCRearrangesGridByColor(
+            character: "c", command: true, shift: true, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandShiftCRearrangesGridByColor(
+            character: "c", command: true, shift: true, option: false, control: false,
+            isSearching: true, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandShiftCRearrangesGridByColor(
+            character: "c", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandShiftCRearrangesGridByColor(
+            character: "c", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: true,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandShiftCRearrangesGridByColor(
+            character: "c", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: false, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandShiftCRearrangesGridByColor(
+            character: "c", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: true))
+    }
+
+    func testCommandShiftURestoresAllHiddenApplications() {
+        // APP-COMMAND-SHIFT-U-UNHIDE-01. ⌘⇧U restores every hidden app.
+        // Command-U without Shift stays free. Search and an open folder stay out.
+        XCTAssertTrue(LauncherLayout.commandShiftURestoresAllHiddenApplications(
+            character: "u", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertTrue(LauncherLayout.commandShiftURestoresAllHiddenApplications(
+            character: "U", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandShiftURestoresAllHiddenApplications(
+            character: "h", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandShiftURestoresAllHiddenApplications(
+            character: "u", command: true, shift: false, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandShiftURestoresAllHiddenApplications(
+            character: "u", command: true, shift: true, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandShiftURestoresAllHiddenApplications(
+            character: "u", command: true, shift: true, option: false, control: false,
+            isSearching: true, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandShiftURestoresAllHiddenApplications(
+            character: "u", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandShiftURestoresAllHiddenApplications(
+            character: "u", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: true,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandShiftURestoresAllHiddenApplications(
+            character: "u", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: false, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandShiftURestoresAllHiddenApplications(
+            character: "u", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: true))
+    }
+
+    func testCommandOptionUUngroupsAllFolders() {
+        // FOLDER-COMMAND-OPTION-U-UNGROUP-01. ⌘⌥U asks to ungroup every folder.
+        // ⌘⇧U still restores hidden apps. ⌘U stays free.
+        XCTAssertTrue(LauncherLayout.commandOptionUUngroupsAllFolders(
+            character: "u", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertTrue(LauncherLayout.commandOptionUUngroupsAllFolders(
+            character: "U", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionUUngroupsAllFolders(
+            character: "n", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionUUngroupsAllFolders(
+            character: "u", command: true, shift: false, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionUUngroupsAllFolders(
+            character: "u", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionUUngroupsAllFolders(
+            character: "u", command: true, shift: true, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionUUngroupsAllFolders(
+            character: "u", command: true, shift: false, option: true, control: true,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionUUngroupsAllFolders(
+            character: "u", command: true, shift: false, option: true, control: false,
+            isSearching: true, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionUUngroupsAllFolders(
+            character: "u", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionUUngroupsAllFolders(
+            character: "u", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: true,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionUUngroupsAllFolders(
+            character: "u", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: false, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionUUngroupsAllFolders(
+            character: "u", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: false, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionUUngroupsAllFolders(
+            character: "u", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: true))
+    }
+
+    func testCommandOptionBTogglesTheBrowseAxis() {
+        // BROWSE-COMMAND-OPTION-B-AXIS-01. ⌘⌥B swaps the page axis.
+        // ⌘B stays free. Search and an open folder stay out.
+        XCTAssertEqual(LauncherPageFlipDirection.horizontal.toggled, .vertical)
+        XCTAssertEqual(LauncherPageFlipDirection.vertical.toggled, .horizontal)
+        XCTAssertTrue(LauncherLayout.commandOptionBTogglesBrowseAxis(
+            character: "b", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            acceptsAction: true, isPaging: false))
+        XCTAssertTrue(LauncherLayout.commandOptionBTogglesBrowseAxis(
+            character: "B", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionBTogglesBrowseAxis(
+            character: "u", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionBTogglesBrowseAxis(
+            character: "b", command: true, shift: false, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionBTogglesBrowseAxis(
+            character: "b", command: true, shift: true, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionBTogglesBrowseAxis(
+            character: "b", command: true, shift: false, option: true, control: true,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionBTogglesBrowseAxis(
+            character: "b", command: true, shift: false, option: true, control: false,
+            isSearching: true, folderOpen: false, isEditingText: false,
+            acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionBTogglesBrowseAxis(
+            character: "b", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionBTogglesBrowseAxis(
+            character: "b", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: true,
+            acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionBTogglesBrowseAxis(
+            character: "b", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            acceptsAction: false, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandOptionBTogglesBrowseAxis(
+            character: "b", command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            acceptsAction: true, isPaging: true))
+    }
+
+    func testCommandRReloadsTheCatalog() {
+        // CATALOG-COMMAND-R-RELOAD-01. ⌘R rescans. ⌘⌥R still arranges by name.
+        // A text field keeps the key.
+        XCTAssertTrue(LauncherLayout.commandRReloadsCatalog(
+            character: "r", command: true, shift: false, option: false, control: false,
+            isEditingText: false, acceptsAction: true, isPaging: false))
+        XCTAssertTrue(LauncherLayout.commandRReloadsCatalog(
+            character: "R", command: true, shift: false, option: false, control: false,
+            isEditingText: false, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandRReloadsCatalog(
+            character: "b", command: true, shift: false, option: false, control: false,
+            isEditingText: false, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandRReloadsCatalog(
+            character: "r", command: true, shift: true, option: false, control: false,
+            isEditingText: false, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandRReloadsCatalog(
+            character: "r", command: true, shift: false, option: true, control: false,
+            isEditingText: false, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandRReloadsCatalog(
+            character: "r", command: true, shift: false, option: false, control: true,
+            isEditingText: false, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandRReloadsCatalog(
+            character: "r", command: false, shift: false, option: false, control: false,
+            isEditingText: false, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandRReloadsCatalog(
+            character: "r", command: true, shift: false, option: false, control: false,
+            isEditingText: true, acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandRReloadsCatalog(
+            character: "r", command: true, shift: false, option: false, control: false,
+            isEditingText: false, acceptsAction: false, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandRReloadsCatalog(
+            character: "r", command: true, shift: false, option: false, control: false,
+            isEditingText: false, acceptsAction: true, isPaging: true))
+    }
+
+    func testCommandShiftASelectsEveryTopLevelEntry() {
+        // GRID-COMMAND-SHIFT-A-SELECT-ALL-01. ⌘⇧A selects every page.
+        // ⌘A stays the current page. Search and an open folder stay out.
+        let a = UUID(), folder = UUID(), b = UUID()
+        let state = LayoutState(orderedEntries: [.app(a), .folder(folder), .app(b)])
+        XCTAssertEqual(LauncherLayout.topLevelEntryIDsForSelectAll(in: state), [a, folder, b])
+        XCTAssertEqual(
+            LauncherLayout.topLevelEntryIDsForSelectAll(in: LayoutState(orderedEntries: [])),
+            []
+        )
+        XCTAssertTrue(LauncherLayout.commandShiftASelectsEveryTopLevelEntry(
+            character: "a", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            acceptsAction: true, isPaging: false))
+        XCTAssertTrue(LauncherLayout.commandShiftASelectsEveryTopLevelEntry(
+            character: "A", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandShiftASelectsEveryTopLevelEntry(
+            character: "a", command: true, shift: false, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandShiftASelectsEveryTopLevelEntry(
+            character: "a", command: true, shift: true, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandShiftASelectsEveryTopLevelEntry(
+            character: "b", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandShiftASelectsEveryTopLevelEntry(
+            character: "a", command: true, shift: true, option: false, control: false,
+            isSearching: true, folderOpen: false, isEditingText: false,
+            acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandShiftASelectsEveryTopLevelEntry(
+            character: "a", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandShiftASelectsEveryTopLevelEntry(
+            character: "a", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: true,
+            acceptsAction: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandShiftASelectsEveryTopLevelEntry(
+            character: "a", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            acceptsAction: false, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandShiftASelectsEveryTopLevelEntry(
+            character: "a", command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            acceptsAction: true, isPaging: true))
+    }
+
+    func testCommandOptionHorizontalNudgeSwapsOnTheSamePage() {
+        // GRID-COMMAND-OPTION-HORIZONTAL-NUDGE-01. One step stays on the page.
+        // The first slot, the page edge, and a multi-select do not move.
+        let a = UUID(), b = UUID(), c = UUID(), d = UUID(), e = UUID()
+        let state = LayoutState(orderedEntries: [.app(a), .app(b), .app(c), .app(d), .app(e)])
+        let moved = LauncherLayout.nudgingFocusedEntryOneStepOnItsPage(
+            focusedID: b, nudge: .next, selectedCount: 0, in: state, capacity: 4)
+        XCTAssertEqual(moved?.orderedEntries.map(\.id), [a, c, b, d, e])
+        XCTAssertNil(LauncherLayout.nudgingFocusedEntryOneStepOnItsPage(
+            focusedID: a, nudge: .previous, selectedCount: 0, in: state, capacity: 4))
+        XCTAssertNil(LauncherLayout.nudgingFocusedEntryOneStepOnItsPage(
+            focusedID: d, nudge: .next, selectedCount: 0, in: state, capacity: 4))
+        XCTAssertNil(LauncherLayout.nudgingFocusedEntryOneStepOnItsPage(
+            focusedID: e, nudge: .previous, selectedCount: 0, in: state, capacity: 4))
+        XCTAssertNil(LauncherLayout.nudgingFocusedEntryOneStepOnItsPage(
+            focusedID: b, nudge: .next, selectedCount: 2, in: state, capacity: 4))
+        XCTAssertNil(LauncherLayout.nudgingFocusedEntryOneStepOnItsPage(
+            focusedID: UUID(), nudge: .next, selectedCount: 0, in: state, capacity: 4))
+        XCTAssertEqual(LauncherLayout.commandOptionHorizontalNudgesFocusedEntry(
+            keyCode: 124, command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false), .next)
+        XCTAssertEqual(LauncherLayout.commandOptionHorizontalNudgesFocusedEntry(
+            keyCode: 123, command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false), .previous)
+        XCTAssertNil(LauncherLayout.commandOptionHorizontalNudgesFocusedEntry(
+            keyCode: 126, command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionHorizontalNudgesFocusedEntry(
+            keyCode: 123, command: true, shift: false, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionHorizontalNudgesFocusedEntry(
+            keyCode: 123, command: true, shift: true, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionHorizontalNudgesFocusedEntry(
+            keyCode: 123, command: true, shift: false, option: true, control: false,
+            isSearching: true, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionHorizontalNudgesFocusedEntry(
+            keyCode: 123, command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionHorizontalNudgesFocusedEntry(
+            keyCode: 123, command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: true,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionHorizontalNudgesFocusedEntry(
+            keyCode: 123, command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: true))
+    }
+
+    func testCommandOptionHorizontalNudgeMovesATopLevelSelection() {
+        // GRID-COMMAND-OPTION-SELECTION-NUDGE-01. A contiguous run steps one
+        // slot and stays on that page. One icon still uses the single swap.
+        let a = UUID(), b = UUID(), c = UUID(), d = UUID(), e = UUID()
+        let folderID = UUID()
+        let state = LayoutState(
+            orderedEntries: [.app(a), .app(b), .app(c), .folder(folderID), .app(d), .app(e)],
+            folders: [folderID: LauncherFolder(id: folderID, name: "F", itemIDs: [d])]
+        )
+        let right = LauncherLayout.nudgingTopLevelSelectionOneStepOnItsPage(
+            focusedID: b, nudge: .next, selectedIDs: [b, c], in: state, capacity: 4)
+        XCTAssertEqual(right?.orderedEntries.map(\.id), [a, folderID, b, c, d, e])
+        XCTAssertEqual(right?.folders[folderID]?.itemIDs, [d])
+        let left = LauncherLayout.nudgingTopLevelSelectionOneStepOnItsPage(
+            focusedID: c, nudge: .previous, selectedIDs: [c, folderID], in: state, capacity: 4)
+        XCTAssertEqual(left?.orderedEntries.map(\.id), [a, c, folderID, b, d, e])
+        XCTAssertNil(LauncherLayout.nudgingTopLevelSelectionOneStepOnItsPage(
+            focusedID: a, nudge: .previous, selectedIDs: [a, b], in: state, capacity: 4))
+        XCTAssertNil(LauncherLayout.nudgingTopLevelSelectionOneStepOnItsPage(
+            focusedID: d, nudge: .next, selectedIDs: [d, e], in: state, capacity: 4))
+        XCTAssertNil(LauncherLayout.nudgingTopLevelSelectionOneStepOnItsPage(
+            focusedID: b, nudge: .next, selectedIDs: [b, folderID], in: state, capacity: 4))
+        XCTAssertNil(LauncherLayout.nudgingTopLevelSelectionOneStepOnItsPage(
+            focusedID: c, nudge: .next, selectedIDs: [b, c], in: state, capacity: 3))
+        XCTAssertNil(LauncherLayout.nudgingTopLevelSelectionOneStepOnItsPage(
+            focusedID: a, nudge: .next, selectedIDs: [b, c], in: state, capacity: 4))
+        XCTAssertNil(LauncherLayout.nudgingTopLevelSelectionOneStepOnItsPage(
+            focusedID: b, nudge: .next, selectedIDs: [b], in: state, capacity: 4))
+        XCTAssertNil(LauncherLayout.nudgingTopLevelSelectionOneStepOnItsPage(
+            focusedID: b, nudge: .next, selectedIDs: [b, b], in: state, capacity: 4))
+        XCTAssertEqual(
+            LauncherLayout.nudgingFocusedEntryOneStepOnItsPage(
+                focusedID: b, nudge: .next, selectedCount: 2, in: state, capacity: 4
+            ),
+            nil
+        )
+    }
+
+    func testCommandShiftHorizontalMovesATopLevelSelectionToTheEdge() {
+        // GRID-COMMAND-SHIFT-SELECTION-EDGE-01. A contiguous run moves to
+        // either end. One icon still uses the single-entry move.
+        let a = UUID(), b = UUID(), c = UUID(), d = UUID()
+        let folderID = UUID()
+        let state = LayoutState(
+            orderedEntries: [.app(a), .app(b), .app(c), .folder(folderID), .app(d)],
+            folders: [folderID: LauncherFolder(id: folderID, name: "F", itemIDs: [d])]
+        )
+        let toStart = LauncherLayout.movingTopLevelSelectionToEdge(
+            focusedID: c, atStart: true, selectedIDs: [b, c], in: state)
+        XCTAssertEqual(toStart?.orderedEntries.map(\.id), [b, c, a, folderID, d])
+        XCTAssertEqual(toStart?.folders[folderID]?.itemIDs, [d])
+        let toEnd = LauncherLayout.movingTopLevelSelectionToEdge(
+            focusedID: b, atStart: false, selectedIDs: [b, c], in: state)
+        XCTAssertEqual(toEnd?.orderedEntries.map(\.id), [a, folderID, d, b, c])
+        XCTAssertNil(LauncherLayout.movingTopLevelSelectionToEdge(
+            focusedID: a, atStart: true, selectedIDs: [a, b], in: state))
+        XCTAssertNil(LauncherLayout.movingTopLevelSelectionToEdge(
+            focusedID: d, atStart: false, selectedIDs: [folderID, d], in: state))
+        XCTAssertNil(LauncherLayout.movingTopLevelSelectionToEdge(
+            focusedID: b, atStart: true, selectedIDs: [b, folderID], in: state))
+        XCTAssertNil(LauncherLayout.movingTopLevelSelectionToEdge(
+            focusedID: a, atStart: true, selectedIDs: [b, c], in: state))
+        XCTAssertNil(LauncherLayout.movingTopLevelSelectionToEdge(
+            focusedID: b, atStart: true, selectedIDs: [b], in: state))
+        XCTAssertNil(LauncherLayout.movingFocusedTopLevelEntryToEdge(
+            focusedID: b, atStart: true, selectedIDs: [b, c], in: state))
+    }
+
+    func testCommandOptionShiftHorizontalMovesTheFocusedEntryToTheAdjacentPage() {
+        // GRID-COMMAND-OPTION-SHIFT-PAGE-MOVE-01. The focused icon moves to
+        // the first slot of a page that already exists. No empty page is added.
+        let a = UUID(), b = UUID(), c = UUID(), d = UUID(), e = UUID(), f = UUID()
+        let folderID = UUID()
+        let state = LayoutState(
+            orderedEntries: [.app(a), .app(b), .app(c), .folder(folderID), .app(d), .app(e)],
+            folders: [folderID: LauncherFolder(id: folderID, name: "F", itemIDs: [f])]
+        )
+        let forward = LauncherLayout.movingFocusedEntryToAdjacentPage(
+            focusedID: a, nudge: .next, selectedCount: 1, in: state, capacity: 4)
+        XCTAssertEqual(forward?.orderedEntries.map(\.id), [b, c, folderID, d, a, e])
+        XCTAssertEqual(forward?.folders[folderID]?.itemIDs, [f])
+        XCTAssertEqual(
+            LauncherLayout.pageCount(forEntryCount: forward?.orderedEntries.count ?? 0, capacity: 4),
+            2
+        )
+        let back = LauncherLayout.movingFocusedEntryToAdjacentPage(
+            focusedID: d, nudge: .previous, selectedCount: 0, in: state, capacity: 4)
+        XCTAssertEqual(back?.orderedEntries.map(\.id), [d, a, b, c, folderID, e])
+        XCTAssertNil(LauncherLayout.movingFocusedEntryToAdjacentPage(
+            focusedID: a, nudge: .previous, selectedCount: 1, in: state, capacity: 4))
+        XCTAssertNil(LauncherLayout.movingFocusedEntryToAdjacentPage(
+            focusedID: e, nudge: .next, selectedCount: 1, in: state, capacity: 4))
+        XCTAssertNil(LauncherLayout.movingFocusedEntryToAdjacentPage(
+            focusedID: a, nudge: .next, selectedCount: 2, in: state, capacity: 4))
+        XCTAssertNil(LauncherLayout.movingFocusedEntryToAdjacentPage(
+            focusedID: UUID(), nudge: .next, selectedCount: 1, in: state, capacity: 4))
+        XCTAssertEqual(LauncherLayout.commandOptionShiftHorizontalMovesFocusedEntryToAdjacentPage(
+            keyCode: 124, command: true, shift: true, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false), .next)
+        XCTAssertEqual(LauncherLayout.commandOptionShiftHorizontalMovesFocusedEntryToAdjacentPage(
+            keyCode: 123, command: true, shift: true, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false), .previous)
+        XCTAssertNil(LauncherLayout.commandOptionShiftHorizontalMovesFocusedEntryToAdjacentPage(
+            keyCode: 124, command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionShiftHorizontalMovesFocusedEntryToAdjacentPage(
+            keyCode: 124, command: true, shift: true, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionShiftHorizontalMovesFocusedEntryToAdjacentPage(
+            keyCode: 126, command: true, shift: true, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+    }
+
+    func testCommandOptionShiftHorizontalMovesATopLevelSelectionToTheAdjacentPage() {
+        // GRID-COMMAND-OPTION-SHIFT-SELECTION-PAGE-MOVE-01. A contiguous run
+        // moves to a page that already exists. The entry count does not grow.
+        let a = UUID(), b = UUID(), c = UUID(), d = UUID()
+        let e = UUID(), f = UUID(), g = UUID(), member = UUID()
+        let folderID = UUID()
+        let state = LayoutState(
+            orderedEntries: [
+                .app(a), .app(b), .app(c), .app(d),
+                .app(e), .app(f), .app(g), .folder(folderID)
+            ],
+            folders: [folderID: LauncherFolder(id: folderID, name: "F", itemIDs: [member])]
+        )
+        let forward = LauncherLayout.movingTopLevelSelectionToAdjacentPage(
+            focusedID: b, nudge: .next, selectedIDs: [b, c], in: state, capacity: 4)
+        XCTAssertEqual(forward?.orderedEntries.map(\.id), [a, d, e, f, b, c, g, folderID])
+        XCTAssertEqual(forward?.folders[folderID]?.itemIDs, [member])
+        XCTAssertEqual(
+            LauncherLayout.pageCount(forEntryCount: forward?.orderedEntries.count ?? 0, capacity: 4),
+            2
+        )
+        let back = LauncherLayout.movingTopLevelSelectionToAdjacentPage(
+            focusedID: g, nudge: .previous, selectedIDs: [f, g], in: state, capacity: 4)
+        XCTAssertEqual(back?.orderedEntries.map(\.id), [f, g, a, b, c, d, e, folderID])
+        XCTAssertEqual(back?.folders[folderID]?.itemIDs, [member])
+        let fitted = LayoutState(
+            orderedEntries: [.app(a), .app(b), .app(c), .app(d), .app(e), .app(f), .app(g)]
+        )
+        let exact = LauncherLayout.movingTopLevelSelectionToAdjacentPage(
+            focusedID: a, nudge: .next, selectedIDs: [a, b, c], in: fitted, capacity: 4)
+        XCTAssertEqual(exact?.orderedEntries.map(\.id), [d, e, f, g, a, b, c])
+        XCTAssertEqual(
+            LauncherLayout.pageCount(forEntryCount: exact?.orderedEntries.count ?? 0, capacity: 4),
+            2
+        )
+        let short = LayoutState(
+            orderedEntries: [.app(a), .app(b), .app(c), .app(d), .app(e), .app(f)]
+        )
+        XCTAssertNil(LauncherLayout.movingTopLevelSelectionToAdjacentPage(
+            focusedID: a, nudge: .next, selectedIDs: [a, b, c], in: short, capacity: 4))
+        XCTAssertNil(LauncherLayout.movingTopLevelSelectionToAdjacentPage(
+            focusedID: a, nudge: .previous, selectedIDs: [a, b], in: state, capacity: 4))
+        XCTAssertNil(LauncherLayout.movingTopLevelSelectionToAdjacentPage(
+            focusedID: e, nudge: .next, selectedIDs: [e, f, g, folderID], in: state, capacity: 4))
+        XCTAssertNil(LauncherLayout.movingTopLevelSelectionToAdjacentPage(
+            focusedID: d, nudge: .next, selectedIDs: [d, e], in: state, capacity: 4))
+        XCTAssertNil(LauncherLayout.movingTopLevelSelectionToAdjacentPage(
+            focusedID: b, nudge: .next, selectedIDs: [b, d], in: state, capacity: 4))
+        XCTAssertNil(LauncherLayout.movingTopLevelSelectionToAdjacentPage(
+            focusedID: a, nudge: .next, selectedIDs: [b, c], in: state, capacity: 4))
+        XCTAssertNil(LauncherLayout.movingTopLevelSelectionToAdjacentPage(
+            focusedID: b, nudge: .next, selectedIDs: [b], in: state, capacity: 4))
+        XCTAssertNil(LauncherLayout.movingFocusedEntryToAdjacentPage(
+            focusedID: b, nudge: .next, selectedCount: 2, in: state, capacity: 4))
+    }
+
+    func testCommandZUndoesTheLastKeyboardLayoutChange() {
+        // GRID-COMMAND-Z-UNDO-01. One arrow reorder can be restored once.
+        // A text field, search, and a second undo stay put.
+        let a = UUID(), b = UUID(), c = UUID(), member = UUID()
+        let folderID = UUID()
+        let original = LayoutState(
+            orderedEntries: [.app(a), .app(b), .folder(folderID)],
+            folders: [folderID: LauncherFolder(id: folderID, name: "F", itemIDs: [member, c])]
+        )
+        var moved = original
+        moved.orderedEntries = [.app(b), .app(a), .folder(folderID)]
+        moved.folders[folderID] = LauncherFolder(id: folderID, name: "F", itemIDs: [c, member])
+        moved.updatedAt = .now
+        let slot = LauncherLayout.recordingKeyboardLayoutUndo(previous: original, next: moved)
+        XCTAssertEqual(slot?.previous.orderedEntries.map(\.id), [a, b, folderID])
+        let once = LauncherLayout.applyingKeyboardLayoutUndo(slot: slot, current: moved)
+        XCTAssertEqual(once?.layout.orderedEntries.map(\.id), [a, b, folderID])
+        XCTAssertEqual(once?.layout.folders[folderID]?.itemIDs, [member, c])
+        XCTAssertNil(once?.slot)
+        XCTAssertNil(LauncherLayout.applyingKeyboardLayoutUndo(slot: once?.slot, current: once?.layout ?? moved))
+        XCTAssertNil(LauncherLayout.recordingKeyboardLayoutUndo(previous: original, next: original))
+        XCTAssertNil(LauncherLayout.applyingKeyboardLayoutUndo(slot: nil, current: moved))
+        XCTAssertTrue(LauncherLayout.commandZUndoesKeyboardLayout(
+            character: "z", command: true, shift: false, option: false, control: false,
+            isSearching: false, isEditingText: false, layoutEditingEnabled: true, isPaging: false))
+        XCTAssertTrue(LauncherLayout.commandZUndoesKeyboardLayout(
+            character: "Z", command: true, shift: false, option: false, control: false,
+            isSearching: false, isEditingText: false, layoutEditingEnabled: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandZUndoesKeyboardLayout(
+            character: "z", command: true, shift: false, option: false, control: false,
+            isSearching: false, isEditingText: true, layoutEditingEnabled: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandZUndoesKeyboardLayout(
+            character: "z", command: true, shift: false, option: false, control: false,
+            isSearching: true, isEditingText: false, layoutEditingEnabled: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandZUndoesKeyboardLayout(
+            character: "z", command: true, shift: true, option: false, control: false,
+            isSearching: false, isEditingText: false, layoutEditingEnabled: true, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandZUndoesKeyboardLayout(
+            character: "z", command: true, shift: false, option: false, control: false,
+            isSearching: false, isEditingText: false, layoutEditingEnabled: false, isPaging: false))
+        XCTAssertFalse(LauncherLayout.commandZUndoesKeyboardLayout(
+            character: "z", command: true, shift: false, option: false, control: false,
+            isSearching: false, isEditingText: false, layoutEditingEnabled: true, isPaging: true))
+        XCTAssertFalse(LauncherLayout.commandZUndoesKeyboardLayout(
+            character: "m", command: true, shift: false, option: false, control: false,
+            isSearching: false, isEditingText: false, layoutEditingEnabled: true, isPaging: false))
+    }
+
+    func testCommandZRestoresAKeyboardFolderChange() {
+        // GRID-COMMAND-Z-UNDO-02. A new folder and a move into a folder
+        // each restore once. The second undo has no slot.
+        let a = UUID(), b = UUID(), c = UUID(), member = UUID()
+        let folderID = UUID()
+        let original = LayoutState(
+            orderedEntries: [.app(a), .app(b), .app(c), .folder(folderID)],
+            folders: [folderID: LauncherFolder(id: folderID, name: "F", itemIDs: [member])]
+        )
+        guard case .success(let created) = LauncherLayout.createFolderFromTopLevelApps(
+            orderedAppIDs: [a, b], in: original, name: "New"
+        ) else {
+            return XCTFail("expected a new folder")
+        }
+        let createdSlot = LauncherLayout.recordingKeyboardLayoutUndo(
+            previous: original, next: created.state)
+        let undoneCreate = LauncherLayout.applyingKeyboardLayoutUndo(
+            slot: createdSlot, current: created.state)
+        XCTAssertEqual(undoneCreate?.layout.orderedEntries.map(\.id), [a, b, c, folderID])
+        XCTAssertNil(undoneCreate?.layout.folders[created.folderID])
+        XCTAssertEqual(undoneCreate?.layout.folders[folderID]?.itemIDs, [member])
+        XCTAssertNil(undoneCreate?.slot)
+        XCTAssertNil(LauncherLayout.applyingKeyboardLayoutUndo(
+            slot: undoneCreate?.slot, current: undoneCreate?.layout ?? created.state))
+
+        guard case .success(let moved) = LauncherLayout.moveTopLevelApps(
+            [b, a], intoFolder: folderID, in: original
+        ) else {
+            return XCTFail("expected the apps to move")
+        }
+        XCTAssertEqual(moved.orderedEntries.map(\.id), [c, folderID])
+        XCTAssertEqual(moved.folders[folderID]?.itemIDs, [member, b, a])
+        let movedSlot = LauncherLayout.recordingKeyboardLayoutUndo(previous: original, next: moved)
+        let undoneMove = LauncherLayout.applyingKeyboardLayoutUndo(slot: movedSlot, current: moved)
+        XCTAssertEqual(undoneMove?.layout.orderedEntries.map(\.id), [a, b, c, folderID])
+        XCTAssertEqual(undoneMove?.layout.folders[folderID]?.itemIDs, [member])
+        XCTAssertNil(undoneMove?.slot)
+    }
+
+    func testCommandZRestoresAKeyboardDeleteChange() {
+        // GRID-COMMAND-Z-UNDO-03. Dissolving a folder and moving members
+        // out each restore once. The second undo has no slot.
+        let a = UUID(), b = UUID(), c = UUID(), d = UUID(), keep = UUID()
+        let folderID = UUID()
+        let closed = LayoutState(
+            orderedEntries: [.app(keep), .folder(folderID)],
+            folders: [folderID: LauncherFolder(id: folderID, name: "F", itemIDs: [a, b])]
+        )
+        guard let dissolved = LauncherLayout.dissolveFolder(folderID, in: closed) else {
+            return XCTFail("expected the folder to dissolve")
+        }
+        XCTAssertEqual(dissolved.orderedEntries.map(\.id), [keep, a, b])
+        XCTAssertNil(dissolved.folders[folderID])
+        let dissolvedSlot = LauncherLayout.recordingKeyboardLayoutUndo(previous: closed, next: dissolved)
+        let undoneDissolve = LauncherLayout.applyingKeyboardLayoutUndo(
+            slot: dissolvedSlot, current: dissolved)
+        XCTAssertEqual(undoneDissolve?.layout.orderedEntries.map(\.id), [keep, folderID])
+        XCTAssertEqual(undoneDissolve?.layout.folders[folderID]?.itemIDs, [a, b])
+        XCTAssertNil(undoneDissolve?.slot)
+        XCTAssertNil(LauncherLayout.applyingKeyboardLayoutUndo(
+            slot: undoneDissolve?.slot, current: undoneDissolve?.layout ?? dissolved))
+
+        let open = LayoutState(
+            orderedEntries: [.folder(folderID)],
+            folders: [folderID: LauncherFolder(id: folderID, name: "F", itemIDs: [a, b, c, d])]
+        )
+        guard let removed = LauncherLayout.removingAppsFromFolder(
+            [b, a], folderID: folderID, in: open
+        ) else {
+            return XCTFail("expected the members to leave")
+        }
+        XCTAssertEqual(removed.orderedEntries.map(\.id), [folderID, a, b])
+        XCTAssertEqual(removed.folders[folderID]?.itemIDs, [c, d])
+        let removedSlot = LauncherLayout.recordingKeyboardLayoutUndo(previous: open, next: removed)
+        let undoneRemove = LauncherLayout.applyingKeyboardLayoutUndo(slot: removedSlot, current: removed)
+        XCTAssertEqual(undoneRemove?.layout.orderedEntries.map(\.id), [folderID])
+        XCTAssertEqual(undoneRemove?.layout.folders[folderID]?.itemIDs, [a, b, c, d])
+        XCTAssertNil(undoneRemove?.slot)
+    }
+
+    func testCommandZDiscardsAStaleKeyboardUndoAfterAnotherLayoutCommit() {
+        // GRID-COMMAND-Z-UNDO-01. A later hide or drop-equivalent commit
+        // makes the keyboard slot stale. ⌘Z must not restore the pre-nudge
+        // layout, and must not put a hidden app back.
+        let a = UUID(), b = UUID(), c = UUID()
+        let original = LayoutState(
+            orderedEntries: [.app(a), .app(b), .app(c)],
+            appKeys: [a: "app.a", b: "app.b", c: "app.c"]
+        )
+        var nudged = original
+        nudged.orderedEntries = [.app(b), .app(a), .app(c)]
+        nudged.updatedAt = .now
+        let slot = LauncherLayout.recordingKeyboardLayoutUndo(previous: original, next: nudged)
+        XCTAssertNotNil(slot)
+
+        let hidden = LauncherLayout.hideApplication(withKey: "app.a", in: nudged)
+        XCTAssertEqual(hidden.orderedEntries.map(\.id), [b, c])
+        XCTAssertTrue(hidden.hiddenAppKeys.contains("app.a"))
+        XCTAssertNil(LauncherLayout.applyingKeyboardLayoutUndo(slot: slot, current: hidden))
+
+        var afterDrop = nudged
+        afterDrop.orderedEntries = [.app(c), .app(b), .app(a)]
+        afterDrop.updatedAt = .now
+        XCTAssertNil(LauncherLayout.applyingKeyboardLayoutUndo(slot: slot, current: afterDrop))
+
+        let fresh = LauncherLayout.applyingKeyboardLayoutUndo(slot: slot, current: nudged)
+        XCTAssertEqual(fresh?.layout.orderedEntries.map(\.id), [a, b, c])
+        XCTAssertNil(fresh?.slot)
+    }
+
+    func testCommandZOnlyUndoesTheLatestOfTwoKeyboardLayoutChanges() {
+        // GRID-COMMAND-Z-UNDO-01. Two arrow reorders keep one slot.
+        // ⌘Z restores only the latest layout, never the first.
+        let a = UUID(), b = UUID(), c = UUID()
+        let first = LayoutState(orderedEntries: [.app(a), .app(b), .app(c)])
+        var second = first
+        second.orderedEntries = [.app(b), .app(a), .app(c)]
+        second.updatedAt = .now
+        var third = second
+        third.orderedEntries = [.app(c), .app(b), .app(a)]
+        third.updatedAt = .now
+        let latest = LauncherLayout.recordingKeyboardLayoutUndo(previous: second, next: third)
+        let once = LauncherLayout.applyingKeyboardLayoutUndo(slot: latest, current: third)
+        XCTAssertEqual(once?.layout.orderedEntries.map(\.id), [b, a, c])
+        XCTAssertNil(once?.slot)
+        XCTAssertNil(LauncherLayout.applyingKeyboardLayoutUndo(slot: once?.slot, current: once?.layout ?? third))
+        XCTAssertNotEqual(once?.layout.orderedEntries.map(\.id), [a, b, c])
+    }
+
+    func testCommandZUndoesAKeyboardVerticalEdgeMove() {
+        // GRID-COMMAND-Z-UNDO-04 / FOLDER-COMMAND-OPTION-VERTICAL-EDGE-01 /
+        // SELECTION-COMMAND-SHIFT-VERTICAL-EDGE-01. A later vertical edge
+        // move keeps one slot. ⌘Z restores that move, not an earlier nudge.
+        // A no-op edge leaves the previous slot alone.
+        let a = UUID(), b = UUID(), folderID = UUID(), member = UUID()
+        let first = LayoutState(
+            orderedEntries: [.app(a), .app(b), .folder(folderID)],
+            folders: [folderID: LauncherFolder(id: folderID, name: "F", itemIDs: [member])]
+        )
+        var nudged = first
+        nudged.orderedEntries = [.app(b), .app(a), .folder(folderID)]
+        nudged.updatedAt = .now
+        let nudgeSlot = LauncherLayout.recordingKeyboardLayoutUndo(previous: first, next: nudged)
+        XCTAssertNotNil(nudgeSlot)
+
+        guard let foldersFirst = LauncherLayout.movingFoldersToEdge(atStart: true, in: nudged) else {
+            return XCTFail("expected folders to move to the start")
+        }
+        XCTAssertEqual(foldersFirst.orderedEntries.map(\.id), [folderID, b, a])
+        let folderSlot = LauncherLayout.recordingKeyboardLayoutUndo(
+            previous: nudged, next: foldersFirst)
+        let undoneFolders = LauncherLayout.applyingKeyboardLayoutUndo(
+            slot: folderSlot, current: foldersFirst)
+        XCTAssertEqual(undoneFolders?.layout.orderedEntries.map(\.id), [b, a, folderID])
+        XCTAssertNotEqual(undoneFolders?.layout.orderedEntries.map(\.id), [a, b, folderID])
+        XCTAssertNil(undoneFolders?.slot)
+
+        guard let selectionMoved = LauncherLayout.movingSelectedTopLevelEntriesToEdge(
+            entryIDs: [b, a], atStart: false, in: nudged
+        ) else {
+            return XCTFail("expected the selection to move to the end")
+        }
+        XCTAssertEqual(selectionMoved.orderedEntries.map(\.id), [folderID, b, a])
+        let selectionSlot = LauncherLayout.recordingKeyboardLayoutUndo(
+            previous: nudged, next: selectionMoved)
+        let undoneSelection = LauncherLayout.applyingKeyboardLayoutUndo(
+            slot: selectionSlot, current: selectionMoved)
+        XCTAssertEqual(undoneSelection?.layout.orderedEntries.map(\.id), [b, a, folderID])
+        XCTAssertNotEqual(undoneSelection?.layout.orderedEntries.map(\.id), [a, b, folderID])
+
+        XCTAssertNil(LauncherLayout.recordingKeyboardLayoutUndo(previous: nudged, next: nudged))
+        XCTAssertEqual(
+            LauncherLayout.applyingKeyboardLayoutUndo(slot: nudgeSlot, current: nudged)?.layout.orderedEntries.map(\.id),
+            [a, b, folderID])
+    }
+
+    func testCommandOptionHorizontalNudgeMovesAFolderSelection() {
+        // FOLDER-COMMAND-OPTION-SELECTION-NUDGE-01. A contiguous member run
+        // steps one slot. One member still uses the single swap.
+        let folderID = UUID(), otherID = UUID()
+        let a = UUID(), b = UUID(), c = UUID(), d = UUID(), outside = UUID()
+        let state = LayoutState(
+            orderedEntries: [.folder(folderID), .folder(otherID)],
+            folders: [
+                folderID: LauncherFolder(id: folderID, name: "F", itemIDs: [a, b, c, d]),
+                otherID: LauncherFolder(id: otherID, name: "G", itemIDs: [outside])
+            ]
+        )
+        let right = LauncherLayout.nudgingFolderMemberSelection(
+            folderID: folderID, focusedID: b, nudge: .next, selectedIDs: [b, c], in: state)
+        XCTAssertEqual(right?.folders[folderID]?.itemIDs, [a, d, b, c])
+        XCTAssertEqual(right?.folders[otherID]?.itemIDs, [outside])
+        XCTAssertEqual(right?.orderedEntries, state.orderedEntries)
+        let left = LauncherLayout.nudgingFolderMemberSelection(
+            folderID: folderID, focusedID: c, nudge: .previous, selectedIDs: [b, c], in: state)
+        XCTAssertEqual(left?.folders[folderID]?.itemIDs, [b, c, a, d])
+        XCTAssertNil(LauncherLayout.nudgingFolderMemberSelection(
+            folderID: folderID, focusedID: a, nudge: .previous, selectedIDs: [a, b], in: state))
+        XCTAssertNil(LauncherLayout.nudgingFolderMemberSelection(
+            folderID: folderID, focusedID: d, nudge: .next, selectedIDs: [c, d], in: state))
+        XCTAssertNil(LauncherLayout.nudgingFolderMemberSelection(
+            folderID: folderID, focusedID: b, nudge: .next, selectedIDs: [b, d], in: state))
+        XCTAssertNil(LauncherLayout.nudgingFolderMemberSelection(
+            folderID: folderID, focusedID: a, nudge: .next, selectedIDs: [b, c], in: state))
+        XCTAssertNil(LauncherLayout.nudgingFolderMemberSelection(
+            folderID: UUID(), focusedID: b, nudge: .next, selectedIDs: [b, c], in: state))
+        XCTAssertNil(LauncherLayout.nudgingFocusedFolderMember(
+            folderID: folderID, memberID: b, nudge: .next, selectedCount: 2, in: state))
+    }
+
+    func testCommandOptionHorizontalNudgeSwapsAFolderMember() {
+        // FOLDER-COMMAND-OPTION-HORIZONTAL-NUDGE-01. An open folder swaps
+        // adjacent members. The ends, a multi-select, and a missing id stay
+        // put. A closed folder leaves the key to the top-level nudge.
+        let folderID = UUID(), otherID = UUID()
+        let a = UUID(), b = UUID(), c = UUID(), d = UUID(), e = UUID(), f = UUID()
+        let outside = UUID()
+        let state = LayoutState(
+            orderedEntries: [.folder(folderID), .folder(otherID), .app(outside)],
+            folders: [
+                folderID: LauncherFolder(id: folderID, name: "Work", itemIDs: [a, b, c, d, e, f]),
+                otherID: LauncherFolder(id: otherID, name: "Other", itemIDs: [outside]),
+            ]
+        )
+        let moved = LauncherLayout.nudgingFocusedFolderMember(
+            folderID: folderID, memberID: b, nudge: .next, selectedCount: 0, in: state)
+        XCTAssertEqual(moved?.folders[folderID]?.itemIDs, [a, c, b, d, e, f])
+        XCTAssertEqual(moved?.folders[otherID]?.itemIDs, [outside])
+        XCTAssertEqual(moved?.orderedEntries.map(\.id), [folderID, otherID, outside])
+        let back = LauncherLayout.nudgingFocusedFolderMember(
+            folderID: folderID, memberID: d, nudge: .previous, selectedCount: 1, in: state)
+        XCTAssertEqual(back?.folders[folderID]?.itemIDs, [a, b, d, c, e, f])
+        XCTAssertNil(LauncherLayout.nudgingFocusedFolderMember(
+            folderID: folderID, memberID: a, nudge: .previous, selectedCount: 0, in: state))
+        XCTAssertNil(LauncherLayout.nudgingFocusedFolderMember(
+            folderID: folderID, memberID: f, nudge: .next, selectedCount: 0, in: state))
+        XCTAssertNil(LauncherLayout.nudgingFocusedFolderMember(
+            folderID: folderID, memberID: c, nudge: .next, selectedCount: 2, in: state))
+        XCTAssertNil(LauncherLayout.nudgingFocusedFolderMember(
+            folderID: folderID, memberID: UUID(), nudge: .next, selectedCount: 0, in: state))
+        XCTAssertNil(LauncherLayout.nudgingFocusedFolderMember(
+            folderID: UUID(), memberID: b, nudge: .next, selectedCount: 0, in: state))
+        XCTAssertEqual(LauncherLayout.commandOptionHorizontalNudgesFocusedFolderMember(
+            keyCode: 124, command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false), .next)
+        XCTAssertEqual(LauncherLayout.commandOptionHorizontalNudgesFocusedFolderMember(
+            keyCode: 123, command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false), .previous)
+        XCTAssertNil(LauncherLayout.commandOptionHorizontalNudgesFocusedFolderMember(
+            keyCode: 126, command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionHorizontalNudgesFocusedFolderMember(
+            keyCode: 123, command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionHorizontalNudgesFocusedFolderMember(
+            keyCode: 123, command: true, shift: false, option: false, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionHorizontalNudgesFocusedFolderMember(
+            keyCode: 123, command: true, shift: true, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionHorizontalNudgesFocusedFolderMember(
+            keyCode: 123, command: true, shift: false, option: true, control: true,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionHorizontalNudgesFocusedFolderMember(
+            keyCode: 123, command: false, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionHorizontalNudgesFocusedFolderMember(
+            keyCode: 123, command: true, shift: false, option: true, control: false,
+            isSearching: true, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionHorizontalNudgesFocusedFolderMember(
+            keyCode: 123, command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: true,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionHorizontalNudgesFocusedFolderMember(
+            keyCode: 123, command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: false, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionHorizontalNudgesFocusedFolderMember(
+            keyCode: 123, command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: false, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionHorizontalNudgesFocusedFolderMember(
+            keyCode: 123, command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: true))
+    }
+
+    func testCommandShiftHorizontalMovesAFolderSelectionToTheEdge() {
+        // FOLDER-COMMAND-SHIFT-SELECTION-EDGE-01. A contiguous member run
+        // moves to either end. One member still uses the single move.
+        let folderID = UUID(), otherID = UUID()
+        let a = UUID(), b = UUID(), c = UUID(), d = UUID(), outside = UUID()
+        let state = LayoutState(
+            orderedEntries: [.folder(folderID), .folder(otherID)],
+            folders: [
+                folderID: LauncherFolder(id: folderID, name: "F", itemIDs: [a, b, c, d]),
+                otherID: LauncherFolder(id: otherID, name: "G", itemIDs: [outside])
+            ]
+        )
+        let toStart = LauncherLayout.movingFolderMemberSelectionToEdge(
+            folderID: folderID, focusedID: c, atStart: true, selectedIDs: [b, c], in: state)
+        XCTAssertEqual(toStart?.folders[folderID]?.itemIDs, [b, c, a, d])
+        XCTAssertEqual(toStart?.folders[otherID]?.itemIDs, [outside])
+        XCTAssertEqual(toStart?.orderedEntries, state.orderedEntries)
+        let toEnd = LauncherLayout.movingFolderMemberSelectionToEdge(
+            folderID: folderID, focusedID: b, atStart: false, selectedIDs: [b, c], in: state)
+        XCTAssertEqual(toEnd?.folders[folderID]?.itemIDs, [a, d, b, c])
+        XCTAssertNil(LauncherLayout.movingFolderMemberSelectionToEdge(
+            folderID: folderID, focusedID: a, atStart: true, selectedIDs: [a, b], in: state))
+        XCTAssertNil(LauncherLayout.movingFolderMemberSelectionToEdge(
+            folderID: folderID, focusedID: d, atStart: false, selectedIDs: [c, d], in: state))
+        XCTAssertNil(LauncherLayout.movingFolderMemberSelectionToEdge(
+            folderID: folderID, focusedID: b, atStart: true, selectedIDs: [b, d], in: state))
+        XCTAssertNil(LauncherLayout.movingFolderMemberSelectionToEdge(
+            folderID: folderID, focusedID: a, atStart: true, selectedIDs: [b, c], in: state))
+        XCTAssertNil(LauncherLayout.movingFolderMemberSelectionToEdge(
+            folderID: UUID(), focusedID: b, atStart: true, selectedIDs: [b, c], in: state))
+        XCTAssertNil(LauncherLayout.movingFolderMemberSelectionToEdge(
+            folderID: folderID, focusedID: b, atStart: true, selectedIDs: [b], in: state))
+        XCTAssertNil(LauncherLayout.movingFocusedFolderMemberToEdge(
+            folderID: folderID, memberID: b, atStart: true, selectedCount: 2, in: state))
+    }
+
+    func testCommandShiftHorizontalMovesAFolderMemberToTheEdge() {
+        // FOLDER-COMMAND-SHIFT-HORIZONTAL-EDGE-01. One focused member goes
+        // to the front or the back of the open folder. The ends and a
+        // multi-select stay put. A closed folder leaves the key to the grid.
+        let folderID = UUID(), otherID = UUID()
+        let a = UUID(), b = UUID(), c = UUID(), d = UUID(), e = UUID(), f = UUID()
+        let outside = UUID()
+        let state = LayoutState(
+            orderedEntries: [.folder(folderID), .folder(otherID), .app(outside)],
+            folders: [
+                folderID: LauncherFolder(id: folderID, name: "Work", itemIDs: [a, b, c, d, e, f]),
+                otherID: LauncherFolder(id: otherID, name: "Other", itemIDs: [outside]),
+            ]
+        )
+        let toStart = LauncherLayout.movingFocusedFolderMemberToEdge(
+            folderID: folderID, memberID: d, atStart: true, selectedCount: 0, in: state)
+        XCTAssertEqual(toStart?.folders[folderID]?.itemIDs, [d, a, b, c, e, f])
+        XCTAssertEqual(toStart?.folders[otherID]?.itemIDs, [outside])
+        XCTAssertEqual(toStart?.orderedEntries.map(\.id), [folderID, otherID, outside])
+        let toEnd = LauncherLayout.movingFocusedFolderMemberToEdge(
+            folderID: folderID, memberID: b, atStart: false, selectedCount: 1, in: state)
+        XCTAssertEqual(toEnd?.folders[folderID]?.itemIDs, [a, c, d, e, f, b])
+        XCTAssertNil(LauncherLayout.movingFocusedFolderMemberToEdge(
+            folderID: folderID, memberID: a, atStart: true, selectedCount: 0, in: state))
+        XCTAssertNil(LauncherLayout.movingFocusedFolderMemberToEdge(
+            folderID: folderID, memberID: f, atStart: false, selectedCount: 0, in: state))
+        XCTAssertNil(LauncherLayout.movingFocusedFolderMemberToEdge(
+            folderID: folderID, memberID: c, atStart: true, selectedCount: 2, in: state))
+        XCTAssertNil(LauncherLayout.movingFocusedFolderMemberToEdge(
+            folderID: folderID, memberID: UUID(), atStart: true, selectedCount: 0, in: state))
+        XCTAssertNil(LauncherLayout.movingFocusedFolderMemberToEdge(
+            folderID: UUID(), memberID: b, atStart: false, selectedCount: 0, in: state))
+        XCTAssertEqual(LauncherLayout.commandShiftHorizontalMovesFocusedFolderMemberToEdge(
+            keyCode: 123, command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false), .start)
+        XCTAssertEqual(LauncherLayout.commandShiftHorizontalMovesFocusedFolderMemberToEdge(
+            keyCode: 124, command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false), .end)
+        XCTAssertNil(LauncherLayout.commandShiftHorizontalMovesFocusedFolderMemberToEdge(
+            keyCode: 126, command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandShiftHorizontalMovesFocusedFolderMemberToEdge(
+            keyCode: 123, command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandShiftHorizontalMovesFocusedFolderMemberToEdge(
+            keyCode: 123, command: true, shift: false, option: false, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandShiftHorizontalMovesFocusedFolderMemberToEdge(
+            keyCode: 123, command: true, shift: true, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandShiftHorizontalMovesFocusedFolderMemberToEdge(
+            keyCode: 123, command: true, shift: true, option: false, control: true,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandShiftHorizontalMovesFocusedFolderMemberToEdge(
+            keyCode: 123, command: false, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandShiftHorizontalMovesFocusedFolderMemberToEdge(
+            keyCode: 123, command: true, shift: true, option: false, control: false,
+            isSearching: true, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandShiftHorizontalMovesFocusedFolderMemberToEdge(
+            keyCode: 123, command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: true, isEditingText: true,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandShiftHorizontalMovesFocusedFolderMemberToEdge(
+            keyCode: 123, command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: false, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandShiftHorizontalMovesFocusedFolderMemberToEdge(
+            keyCode: 123, command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: false, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandShiftHorizontalMovesFocusedFolderMemberToEdge(
+            keyCode: 123, command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: true))
+    }
+
+    func testCommandShiftVerticalMovesAFolderMemberToTheEdge() {
+        // FOLDER-COMMAND-SHIFT-VERTICAL-EDGE-01. One member, or a selected
+        // block that includes the focus, goes to either end. A closed folder
+        // leaves the key to the grid multi-select.
+        let folderID = UUID(), otherID = UUID()
+        let a = UUID(), b = UUID(), c = UUID(), d = UUID(), e = UUID(), f = UUID()
+        let outside = UUID()
+        let state = LayoutState(
+            orderedEntries: [.folder(folderID), .folder(otherID), .app(outside)],
+            folders: [
+                folderID: LauncherFolder(id: folderID, name: "Work", itemIDs: [a, b, c, d, e, f]),
+                otherID: LauncherFolder(id: otherID, name: "Other", itemIDs: [outside]),
+            ]
+        )
+        let one = LauncherLayout.movingFocusedFolderMembersToEdge(
+            folderID: folderID, focusedID: d, atStart: true, selectedIDs: [], in: state)
+        XCTAssertEqual(one?.folders[folderID]?.itemIDs, [d, a, b, c, e, f])
+        XCTAssertEqual(one?.folders[otherID]?.itemIDs, [outside])
+        XCTAssertEqual(one?.orderedEntries.map(\.id), [folderID, otherID, outside])
+        let block = LauncherLayout.movingFocusedFolderMembersToEdge(
+            folderID: folderID, focusedID: d, atStart: false, selectedIDs: [d, b], in: state)
+        XCTAssertEqual(block?.folders[folderID]?.itemIDs, [a, c, e, f, b, d])
+        let already = LayoutState(
+            orderedEntries: state.orderedEntries,
+            folders: [
+                folderID: LauncherFolder(id: folderID, name: "Work", itemIDs: [b, d, a, c]),
+                otherID: state.folders[otherID]!,
+            ]
+        )
+        XCTAssertNil(LauncherLayout.movingFocusedFolderMembersToEdge(
+            folderID: folderID, focusedID: d, atStart: true, selectedIDs: [b, d], in: already))
+        XCTAssertNil(LauncherLayout.movingFocusedFolderMembersToEdge(
+            folderID: folderID, focusedID: a, atStart: true, selectedIDs: [b, d], in: state))
+        XCTAssertNil(LauncherLayout.movingFocusedFolderMembersToEdge(
+            folderID: folderID, focusedID: a, atStart: true, selectedIDs: [], in: state))
+        XCTAssertNil(LauncherLayout.movingFocusedFolderMembersToEdge(
+            folderID: folderID, focusedID: f, atStart: false, selectedIDs: [f], in: state))
+        XCTAssertNil(LauncherLayout.movingFocusedFolderMembersToEdge(
+            folderID: UUID(), focusedID: b, atStart: true, selectedIDs: [], in: state))
+        XCTAssertEqual(LauncherLayout.commandShiftVerticalMovesFocusedFolderMemberToEdge(
+            keyCode: 126, command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false), .start)
+        XCTAssertEqual(LauncherLayout.commandShiftVerticalMovesFocusedFolderMemberToEdge(
+            keyCode: 125, command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false), .end)
+        XCTAssertNil(LauncherLayout.commandShiftVerticalMovesFocusedFolderMemberToEdge(
+            keyCode: 123, command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandShiftVerticalMovesFocusedFolderMemberToEdge(
+            keyCode: 126, command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandShiftVerticalMovesFocusedFolderMemberToEdge(
+            keyCode: 126, command: true, shift: false, option: false, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandShiftVerticalMovesFocusedFolderMemberToEdge(
+            keyCode: 126, command: true, shift: true, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandShiftVerticalMovesFocusedFolderMemberToEdge(
+            keyCode: 126, command: true, shift: true, option: false, control: true,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandShiftVerticalMovesFocusedFolderMemberToEdge(
+            keyCode: 126, command: false, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandShiftVerticalMovesFocusedFolderMemberToEdge(
+            keyCode: 126, command: true, shift: true, option: false, control: false,
+            isSearching: true, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandShiftVerticalMovesFocusedFolderMemberToEdge(
+            keyCode: 126, command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: true, isEditingText: true,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandShiftVerticalMovesFocusedFolderMemberToEdge(
+            keyCode: 126, command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: false, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandShiftVerticalMovesFocusedFolderMemberToEdge(
+            keyCode: 126, command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: false, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandShiftVerticalMovesFocusedFolderMemberToEdge(
+            keyCode: 126, command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: true))
+    }
+
+    func testCommandOptionVerticalNudgeMovesAFolderSelectionByRow() {
+        // FOLDER-COMMAND-OPTION-SELECTION-ROW-NUDGE-01. A contiguous member
+        // run swaps with the row above or below. One member still uses the
+        // single swap.
+        let folderID = UUID(), otherID = UUID()
+        let ids = (0..<8).map { _ in UUID() }
+        let outside = UUID()
+        let state = LayoutState(
+            orderedEntries: [.folder(folderID), .folder(otherID)],
+            folders: [
+                folderID: LauncherFolder(id: folderID, name: "F", itemIDs: ids),
+                otherID: LauncherFolder(id: otherID, name: "G", itemIDs: [outside])
+            ]
+        )
+        let down = LauncherLayout.nudgingFolderMemberSelectionByRow(
+            folderID: folderID, focusedID: ids[1], nudge: .next, columns: 4,
+            selectedIDs: [ids[1], ids[2]], in: state)
+        XCTAssertEqual(down?.folders[folderID]?.itemIDs, [
+            ids[0], ids[5], ids[6], ids[3], ids[4], ids[1], ids[2], ids[7]
+        ])
+        XCTAssertEqual(down?.folders[otherID]?.itemIDs, [outside])
+        XCTAssertEqual(down?.orderedEntries, state.orderedEntries)
+        let up = LauncherLayout.nudgingFolderMemberSelectionByRow(
+            folderID: folderID, focusedID: ids[6], nudge: .previous, columns: 4,
+            selectedIDs: [ids[5], ids[6]], in: state)
+        XCTAssertEqual(up?.folders[folderID]?.itemIDs, [
+            ids[0], ids[5], ids[6], ids[3], ids[4], ids[1], ids[2], ids[7]
+        ])
+        XCTAssertNil(LauncherLayout.nudgingFolderMemberSelectionByRow(
+            folderID: folderID, focusedID: ids[0], nudge: .previous, columns: 4,
+            selectedIDs: [ids[0], ids[1]], in: state))
+        XCTAssertNil(LauncherLayout.nudgingFolderMemberSelectionByRow(
+            folderID: folderID, focusedID: ids[7], nudge: .next, columns: 4,
+            selectedIDs: [ids[6], ids[7]], in: state))
+        XCTAssertNil(LauncherLayout.nudgingFolderMemberSelectionByRow(
+            folderID: folderID, focusedID: ids[1], nudge: .next, columns: 4,
+            selectedIDs: [ids[1], ids[3]], in: state))
+        XCTAssertNil(LauncherLayout.nudgingFolderMemberSelectionByRow(
+            folderID: folderID, focusedID: ids[0], nudge: .next, columns: 4,
+            selectedIDs: [ids[1], ids[2]], in: state))
+        XCTAssertNil(LauncherLayout.nudgingFolderMemberSelectionByRow(
+            folderID: folderID, focusedID: ids[1], nudge: .next, columns: 2,
+            selectedIDs: [ids[1], ids[2], ids[3]], in: state))
+        XCTAssertNil(LauncherLayout.nudgingFolderMemberSelectionByRow(
+            folderID: UUID(), focusedID: ids[1], nudge: .next, columns: 4,
+            selectedIDs: [ids[1], ids[2]], in: state))
+        XCTAssertNil(LauncherLayout.nudgingFolderMemberSelectionByRow(
+            folderID: folderID, focusedID: ids[1], nudge: .next, columns: 4,
+            selectedIDs: [ids[1]], in: state))
+        XCTAssertNil(LauncherLayout.nudgingFocusedFolderMemberByRow(
+            folderID: folderID, memberID: ids[1], nudge: .next, columns: 4,
+            selectedCount: 2, in: state))
+    }
+
+    func testCommandOptionVerticalNudgeSwapsAFolderMemberByRow() {
+        // FOLDER-COMMAND-OPTION-VERTICAL-NUDGE-01. One member swaps with the
+        // member a row away. The row edge, a multi-select, and a closed
+        // folder stay put.
+        let folderID = UUID(), otherID = UUID()
+        let ids = (0..<8).map { _ in UUID() }
+        let outside = UUID()
+        let state = LayoutState(
+            orderedEntries: [.folder(folderID), .folder(otherID), .app(outside)],
+            folders: [
+                folderID: LauncherFolder(id: folderID, name: "Work", itemIDs: ids),
+                otherID: LauncherFolder(id: otherID, name: "Other", itemIDs: [outside]),
+            ]
+        )
+        let down = LauncherLayout.nudgingFocusedFolderMemberByRow(
+            folderID: folderID, memberID: ids[1], nudge: .next, columns: 4,
+            selectedCount: 0, in: state)
+        var expected = ids
+        expected.swapAt(1, 5)
+        XCTAssertEqual(down?.folders[folderID]?.itemIDs, expected)
+        XCTAssertEqual(down?.folders[otherID]?.itemIDs, [outside])
+        XCTAssertEqual(down?.orderedEntries.map(\.id), [folderID, otherID, outside])
+        let up = LauncherLayout.nudgingFocusedFolderMemberByRow(
+            folderID: folderID, memberID: ids[5], nudge: .previous, columns: 4,
+            selectedCount: 1, in: state)
+        var expectedUp = ids
+        expectedUp.swapAt(5, 1)
+        XCTAssertEqual(up?.folders[folderID]?.itemIDs, expectedUp)
+        XCTAssertNil(LauncherLayout.nudgingFocusedFolderMemberByRow(
+            folderID: folderID, memberID: ids[1], nudge: .previous, columns: 4,
+            selectedCount: 0, in: state))
+        XCTAssertNil(LauncherLayout.nudgingFocusedFolderMemberByRow(
+            folderID: folderID, memberID: ids[6], nudge: .next, columns: 4,
+            selectedCount: 0, in: state))
+        XCTAssertNil(LauncherLayout.nudgingFocusedFolderMemberByRow(
+            folderID: folderID, memberID: ids[1], nudge: .next, columns: 4,
+            selectedCount: 2, in: state))
+        XCTAssertNil(LauncherLayout.nudgingFocusedFolderMemberByRow(
+            folderID: folderID, memberID: UUID(), nudge: .next, columns: 4,
+            selectedCount: 0, in: state))
+        XCTAssertNil(LauncherLayout.nudgingFocusedFolderMemberByRow(
+            folderID: UUID(), memberID: ids[1], nudge: .next, columns: 4,
+            selectedCount: 0, in: state))
+        XCTAssertEqual(LauncherLayout.commandOptionVerticalNudgesFocusedFolderMember(
+            keyCode: 126, command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false), .previous)
+        XCTAssertEqual(LauncherLayout.commandOptionVerticalNudgesFocusedFolderMember(
+            keyCode: 125, command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false), .next)
+        XCTAssertNil(LauncherLayout.commandOptionVerticalNudgesFocusedFolderMember(
+            keyCode: 123, command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionVerticalNudgesFocusedFolderMember(
+            keyCode: 126, command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionVerticalNudgesFocusedFolderMember(
+            keyCode: 126, command: true, shift: false, option: false, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionVerticalNudgesFocusedFolderMember(
+            keyCode: 126, command: true, shift: true, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionVerticalNudgesFocusedFolderMember(
+            keyCode: 126, command: true, shift: false, option: true, control: true,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionVerticalNudgesFocusedFolderMember(
+            keyCode: 126, command: false, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionVerticalNudgesFocusedFolderMember(
+            keyCode: 126, command: true, shift: false, option: true, control: false,
+            isSearching: true, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionVerticalNudgesFocusedFolderMember(
+            keyCode: 126, command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: true,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionVerticalNudgesFocusedFolderMember(
+            keyCode: 126, command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: false, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionVerticalNudgesFocusedFolderMember(
+            keyCode: 126, command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: false, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandOptionVerticalNudgesFocusedFolderMember(
+            keyCode: 126, command: true, shift: false, option: true, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: true))
+    }
+
+    func testCommandShiftHorizontalMovesTheFocusedEntryToTheEdge() {
+        // GRID-COMMAND-SHIFT-HORIZONTAL-EDGE-01. One focused entry goes to
+        // the front or the back. The ends, a multi-select, and another
+        // selection stay put. ⌘← still pages.
+        let a = UUID(), b = UUID(), c = UUID(), folder = UUID(), d = UUID()
+        let state = LayoutState(orderedEntries: [.app(a), .app(b), .app(c), .folder(folder), .app(d)])
+        let toStart = LauncherLayout.movingFocusedTopLevelEntryToEdge(
+            focusedID: c, atStart: true, selectedIDs: [], in: state)
+        XCTAssertEqual(toStart?.orderedEntries.map(\.id), [c, a, b, folder, d])
+        let toEnd = LauncherLayout.movingFocusedTopLevelEntryToEdge(
+            focusedID: folder, atStart: false, selectedIDs: [folder], in: state)
+        XCTAssertEqual(toEnd?.orderedEntries.map(\.id), [a, b, c, d, folder])
+        XCTAssertNil(LauncherLayout.movingFocusedTopLevelEntryToEdge(
+            focusedID: a, atStart: true, selectedIDs: [], in: state))
+        XCTAssertNil(LauncherLayout.movingFocusedTopLevelEntryToEdge(
+            focusedID: d, atStart: false, selectedIDs: [], in: state))
+        XCTAssertNil(LauncherLayout.movingFocusedTopLevelEntryToEdge(
+            focusedID: c, atStart: true, selectedIDs: [a, b], in: state))
+        XCTAssertNil(LauncherLayout.movingFocusedTopLevelEntryToEdge(
+            focusedID: c, atStart: true, selectedIDs: [b], in: state))
+        XCTAssertNil(LauncherLayout.movingFocusedTopLevelEntryToEdge(
+            focusedID: UUID(), atStart: true, selectedIDs: [], in: state))
+        XCTAssertEqual(LauncherLayout.commandShiftHorizontalMovesFocusedEntryToEdge(
+            keyCode: 123, command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false), .start)
+        XCTAssertEqual(LauncherLayout.commandShiftHorizontalMovesFocusedEntryToEdge(
+            keyCode: 124, command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false), .end)
+        XCTAssertNil(LauncherLayout.commandShiftHorizontalMovesFocusedEntryToEdge(
+            keyCode: 126, command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandShiftHorizontalMovesFocusedEntryToEdge(
+            keyCode: 123, command: true, shift: false, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandShiftHorizontalMovesFocusedEntryToEdge(
+            keyCode: 123, command: true, shift: true, option: true, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandShiftHorizontalMovesFocusedEntryToEdge(
+            keyCode: 123, command: true, shift: true, option: false, control: true,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandShiftHorizontalMovesFocusedEntryToEdge(
+            keyCode: 123, command: true, shift: true, option: false, control: false,
+            isSearching: true, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandShiftHorizontalMovesFocusedEntryToEdge(
+            keyCode: 123, command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: true, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandShiftHorizontalMovesFocusedEntryToEdge(
+            keyCode: 123, command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: true,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandShiftHorizontalMovesFocusedEntryToEdge(
+            keyCode: 123, command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: false, acceptsAction: true, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandShiftHorizontalMovesFocusedEntryToEdge(
+            keyCode: 123, command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: false, isPaging: false))
+        XCTAssertNil(LauncherLayout.commandShiftHorizontalMovesFocusedEntryToEdge(
+            keyCode: 123, command: true, shift: true, option: false, control: false,
+            isSearching: false, folderOpen: false, isEditingText: false,
+            layoutEditingEnabled: true, acceptsAction: true, isPaging: true))
+    }
+
+    func testCommandShiftHHidesTheFocusedApp() {
+        // APP-COMMAND-SHIFT-H-HIDE-01. ⌘⇧H hides one focused app, or the
+        // selected apps when the focus is in that selection. ⌘H stays free.
+        XCTAssertEqual(LauncherLayout.commandShiftHHidesFocusedApp(
+            character: "h", command: true, shift: true, option: false, control: false,
+            isEditingText: false, layoutEditingEnabled: true, acceptsAction: true,
+            isPaging: false, focusedIsApp: true, focusedIsInSelection: false,
+            batchHideCount: 0), .one)
+        XCTAssertEqual(LauncherLayout.commandShiftHHidesFocusedApp(
+            character: "H", command: true, shift: true, option: false, control: false,
+            isEditingText: false, layoutEditingEnabled: true, acceptsAction: true,
+            isPaging: false, focusedIsApp: true, focusedIsInSelection: true,
+            batchHideCount: 2), .batch)
+        XCTAssertNil(LauncherLayout.commandShiftHHidesFocusedApp(
+            character: "h", command: true, shift: false, option: false, control: false,
+            isEditingText: false, layoutEditingEnabled: true, acceptsAction: true,
+            isPaging: false, focusedIsApp: true, focusedIsInSelection: false,
+            batchHideCount: 0))
+        XCTAssertNil(LauncherLayout.commandShiftHHidesFocusedApp(
+            character: "n", command: true, shift: true, option: false, control: false,
+            isEditingText: false, layoutEditingEnabled: true, acceptsAction: true,
+            isPaging: false, focusedIsApp: true, focusedIsInSelection: false,
+            batchHideCount: 0))
+        XCTAssertNil(LauncherLayout.commandShiftHHidesFocusedApp(
+            character: "h", command: true, shift: true, option: true, control: false,
+            isEditingText: false, layoutEditingEnabled: true, acceptsAction: true,
+            isPaging: false, focusedIsApp: true, focusedIsInSelection: false,
+            batchHideCount: 0))
+        XCTAssertNil(LauncherLayout.commandShiftHHidesFocusedApp(
+            character: "h", command: true, shift: true, option: false, control: false,
+            isEditingText: true, layoutEditingEnabled: true, acceptsAction: true,
+            isPaging: false, focusedIsApp: true, focusedIsInSelection: false,
+            batchHideCount: 0))
+        XCTAssertNil(LauncherLayout.commandShiftHHidesFocusedApp(
+            character: "h", command: true, shift: true, option: false, control: false,
+            isEditingText: false, layoutEditingEnabled: false, acceptsAction: true,
+            isPaging: false, focusedIsApp: true, focusedIsInSelection: false,
+            batchHideCount: 0))
+        XCTAssertNil(LauncherLayout.commandShiftHHidesFocusedApp(
+            character: "h", command: true, shift: true, option: false, control: false,
+            isEditingText: false, layoutEditingEnabled: true, acceptsAction: true,
+            isPaging: true, focusedIsApp: true, focusedIsInSelection: false,
+            batchHideCount: 0))
+        XCTAssertNil(LauncherLayout.commandShiftHHidesFocusedApp(
+            character: "h", command: true, shift: true, option: false, control: false,
+            isEditingText: false, layoutEditingEnabled: true, acceptsAction: true,
+            isPaging: false, focusedIsApp: false, focusedIsInSelection: false,
+            batchHideCount: 0))
+        XCTAssertNil(LauncherLayout.commandShiftHHidesFocusedApp(
+            character: "h", command: true, shift: true, option: false, control: false,
+            isEditingText: false, layoutEditingEnabled: true, acceptsAction: true,
+            isPaging: false, focusedIsApp: false, focusedIsInSelection: false,
+            batchHideCount: 2))
+    }
+
+    func testCommandUpClosesAnOpenFolder() {
+        // FOLDER-COMMAND-UP-CLOSE-01. ⌘↑ leaves an open folder. Down, a closed
+        // folder, a title edit, and marked text do not.
+        XCTAssertTrue(LauncherLayout.commandUpClosesOpenFolder(
+            keyCode: 126, commandOnly: true, folderOpen: true,
+            isEditingFolderTitle: false, hasMarkedText: false))
+        XCTAssertFalse(LauncherLayout.commandUpClosesOpenFolder(
+            keyCode: 125, commandOnly: true, folderOpen: true,
+            isEditingFolderTitle: false, hasMarkedText: false))
+        XCTAssertFalse(LauncherLayout.commandUpClosesOpenFolder(
+            keyCode: 126, commandOnly: true, folderOpen: false,
+            isEditingFolderTitle: false, hasMarkedText: false))
+        XCTAssertFalse(LauncherLayout.commandUpClosesOpenFolder(
+            keyCode: 126, commandOnly: false, folderOpen: true,
+            isEditingFolderTitle: false, hasMarkedText: false))
+        XCTAssertFalse(LauncherLayout.commandUpClosesOpenFolder(
+            keyCode: 126, commandOnly: true, folderOpen: true,
+            isEditingFolderTitle: true, hasMarkedText: false))
+        XCTAssertFalse(LauncherLayout.commandUpClosesOpenFolder(
+            keyCode: 126, commandOnly: true, folderOpen: true,
+            isEditingFolderTitle: false, hasMarkedText: true))
+    }
+
+    func testGridKeyboardShiftHomeEndSelectsToTheEdge() {
+        // GRID-SHIFT-HOME-END-01. Shift-Home selects through the first item.
+        // Shift-End selects through the last. Command does not. Page Up does not.
+        let ids = [UUID(), UUID(), UUID(), UUID(), UUID()]
+        let focused = ids[2]
+        let home = LauncherLayout.gridKeyboardShiftHomeEnd(
+            keyCode: 115, focusedID: focused, presentedOrder: ids,
+            shift: true, command: false, option: false, control: false,
+            current: LauncherItemSelection()
+        )
+        XCTAssertEqual(home?.selection.orderedIDs, Array(ids[0...2]))
+        XCTAssertEqual(home?.focusID, ids[0])
+        XCTAssertEqual(home?.consumesKey, true)
+        let end = LauncherLayout.gridKeyboardShiftHomeEnd(
+            keyCode: 119, focusedID: focused, presentedOrder: ids,
+            shift: true, command: false, option: false, control: false,
+            current: LauncherItemSelection(orderedIDs: [focused], rangeAnchorID: focused)
+        )
+        XCTAssertEqual(end?.selection.orderedIDs, Array(ids[2...4]))
+        XCTAssertEqual(end?.focusID, ids[4])
+        XCTAssertNil(LauncherLayout.gridKeyboardShiftHomeEnd(
+            keyCode: 115, focusedID: focused, presentedOrder: ids,
+            shift: true, command: true, option: false, control: false,
+            current: LauncherItemSelection()
+        ))
+        XCTAssertNil(LauncherLayout.gridKeyboardShiftHomeEnd(
+            keyCode: 116, focusedID: focused, presentedOrder: ids,
+            shift: true, command: false, option: false, control: false,
+            current: LauncherItemSelection()
+        ))
+        XCTAssertNil(LauncherLayout.gridKeyboardShiftHomeEnd(
+            keyCode: 119, focusedID: focused, presentedOrder: [],
+            shift: true, command: false, option: false, control: false,
+            current: LauncherItemSelection()
+        ))
+    }
+
+    func testGridKeyboardHomeEndStaysOnTheCurrentPage() {
+        // GRID-HOME-END-01. Home and End pick the first and last item already
+        // on this grid. Page Up stays on the paging path. Modified keys do not jump.
+        XCTAssertEqual(
+            LauncherLayout.gridKeyboardHomeEndSlot(
+                keyCode: 115, itemCount: 10,
+                command: false, shift: false, option: false, control: false
+            ),
+            0
+        )
+        XCTAssertEqual(
+            LauncherLayout.gridKeyboardHomeEndSlot(
+                keyCode: 119, itemCount: 10,
+                command: false, shift: false, option: false, control: false
+            ),
+            9
+        )
+        XCTAssertNil(
+            LauncherLayout.gridKeyboardHomeEndSlot(
+                keyCode: 115, itemCount: 0,
+                command: false, shift: false, option: false, control: false
+            )
+        )
+        XCTAssertNil(
+            LauncherLayout.gridKeyboardHomeEndSlot(
+                keyCode: 116, itemCount: 10,
+                command: false, shift: false, option: false, control: false
+            )
+        )
+        XCTAssertNil(
+            LauncherLayout.gridKeyboardHomeEndSlot(
+                keyCode: 115, itemCount: 10,
+                command: true, shift: false, option: false, control: false
+            )
+        )
+        XCTAssertNil(
+            LauncherLayout.gridKeyboardHomeEndSlot(
+                keyCode: 119, itemCount: 10,
+                command: false, shift: true, option: false, control: false
+            )
+        )
+    }
+
+    func testSearchFieldArrowAnnouncesTheNewlyHighlightedHit() {
+        // SEARCH-FIELD-ARROW-ANNOUNCE-01. The field keeps the caret, so only
+        // a move onto a named hit is spoken. A short row that stays is quiet.
+        let first = UUID()
+        let second = UUID()
+        XCTAssertEqual(
+            LauncherLayout.searchKeyboardHighlightAnnouncement(
+                previousID: first, nextID: second, name: "日历"
+            ),
+            "日历"
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchKeyboardHighlightAnnouncement(
+                previousID: nil, nextID: first, name: "  Safari  "
+            ),
+            "Safari"
+        )
+        XCTAssertNil(
+            LauncherLayout.searchKeyboardHighlightAnnouncement(
+                previousID: first, nextID: first, name: "Safari"
+            )
+        )
+        XCTAssertNil(
+            LauncherLayout.searchKeyboardHighlightAnnouncement(
+                previousID: nil, nextID: nil, name: "Safari"
+            )
+        )
+        XCTAssertNil(
+            LauncherLayout.searchKeyboardHighlightAnnouncement(
+                previousID: first, nextID: second, name: "   "
+            )
+        )
+    }
+
+    func testShouldScrollSearchKeyboardHighlightOnSync() {
+        // SEARCH-KEYBOARD-HIGHLIGHT-SCROLL-ON-SYNC-01
+        XCTAssertTrue(LauncherLayout.shouldScrollSearchKeyboardHighlightOnSync(hasHighlight: true))
+        XCTAssertFalse(LauncherLayout.shouldScrollSearchKeyboardHighlightOnSync(hasHighlight: false))
+    }
+
 
     func testSearchFieldTabHandoffToHighlightAndBacktabToField() {
         let a = UUID()
@@ -6309,6 +12082,51 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertEqual(missingDecision.blockReason, .missingBundle)
     }
 
+    func testAppUninstallEligibilityBlocksReadOnlyParentAndAllowsAppStoreReceipt() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LaunchIcon-UninstallRO-\(UUID().uuidString)", isDirectory: true)
+        let apps = root.appendingPathComponent("Applications", isDirectory: true)
+        let bundle = apps.appendingPathComponent("Sample.app", isDirectory: true)
+        let receipt = bundle.appendingPathComponent("Contents/_MASReceipt/receipt", isDirectory: false)
+        try FileManager.default.createDirectory(at: receipt.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("receipt".utf8).write(to: receipt)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: apps.path)
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        let candidate = AppCandidate(
+            canonicalURL: bundle,
+            bundleIdentifier: "com.example.Sample",
+            displayName: "Sample",
+            sourcePriority: 0,
+            discoveredAt: Date()
+        )
+        // A writable App Store app (receipt present) stays uninstallable; the
+        // sandboxed-*self* block is a different path.
+        let mas = AppUninstallEligibility.evaluate(
+            candidate: candidate,
+            layoutEditingEnabled: true,
+            selfBundleURL: URL(fileURLWithPath: "/Applications/LaunchIcon.app"),
+            selfBundleIdentifier: "com.sunzheng.LaunchIcon",
+            isSandboxed: false,
+            fileManager: .default
+        )
+        XCTAssertTrue(mas.isAllowed, "\(String(describing: mas.blockReason))")
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: apps.path)
+        let locked = AppUninstallEligibility.evaluate(
+            candidate: candidate,
+            layoutEditingEnabled: true,
+            selfBundleURL: nil,
+            selfBundleIdentifier: nil,
+            isSandboxed: false,
+            fileManager: .default
+        )
+        XCTAssertFalse(locked.isAllowed)
+        XCTAssertEqual(locked.blockReason, .parentNotWritable)
+    }
+
     func testForgetUninstalledApplicationClearsAliasHideAndSlots() {
         let key = "bundle:com.example.Sample"
         var id = UUID()
@@ -6532,6 +12350,159 @@ final class LaunchIconCoreTests: XCTestCase {
             "工具"
         )
     }
+
+    func testFolderNameSanitizeCapsLengthKeepsEmojiAndRejectsBlankCreate() throws {
+        let limit = LauncherLayout.maximumFolderNameLength
+        XCTAssertEqual(limit, 40)
+        let long = String(repeating: "长", count: limit + 8)
+        XCTAssertEqual(LauncherLayout.resolvedFolderName(draft: long, previous: "旧"), String(repeating: "长", count: limit))
+        XCTAssertEqual(LauncherLayout.resolvedNewFolderName(long), String(repeating: "长", count: limit))
+        XCTAssertEqual(LauncherLayout.resolvedNewFolderName("  \n\t  "), "新建文件夹")
+        XCTAssertEqual(LauncherLayout.resolvedNewFolderName(""), "新建文件夹")
+        let emoji = String(repeating: "😀", count: limit) + "🎯"
+        XCTAssertEqual(LauncherLayout.resolvedNewFolderName(emoji), String(repeating: "😀", count: limit))
+        let zwj = "👨\u{200D}💻 工作"
+        XCTAssertEqual(LauncherLayout.resolvedFolderName(draft: "  " + zwj + "  ", previous: "x"), zwj)
+        XCTAssertEqual(LauncherLayout.singleLineDisplayName(zwj).count, zwj.count)
+
+        let a = UUID(), b = UUID(), folderID = UUID()
+        var state = LayoutState(
+            orderedEntries: [.app(a), .app(b)],
+            appKeys: [a: "bundle:a", b: "bundle:b"]
+        )
+        state = try LauncherLayout.applyDrop(
+            LayoutDrop(source: .topLevel(a), destination: .merge(.topLevel(b))),
+            to: state,
+            newFolderName: "开发\n工具\t" + String(repeating: "尾", count: 80)
+        ).get()
+        guard case .folder(let createdID) = state.orderedEntries.first else {
+            return XCTFail("expected a folder")
+        }
+        let stored = try XCTUnwrap(state.folders[createdID]?.name)
+        XCTAssertFalse(stored.contains("\n"))
+        XCTAssertFalse(stored.contains("\t"))
+        XCTAssertLessThanOrEqual(stored.count, limit)
+        XCTAssertTrue(stored.hasPrefix("开发 工具"))
+
+        let created = try LauncherLayout.createFolderFromTopLevelApps(
+            orderedAppIDs: [a, b],
+            in: LayoutState(
+                orderedEntries: [.app(a), .app(b)],
+                appKeys: [a: "bundle:a", b: "bundle:b"]
+            ),
+            name: "  \n"
+        ).get()
+        XCTAssertEqual(created.state.folders[created.folderID]?.name, "新建文件夹")
+        _ = folderID
+    }
+
+    func testMoveToFolderMenuDisambiguatesDuplicateNames() {
+        let app = UUID()
+        let workA = UUID(), workB = UUID(), tools = UUID(), untitled = UUID()
+        let state = LayoutState(
+            orderedEntries: [.app(app), .folder(workA), .folder(workB), .folder(tools), .folder(untitled)],
+            folders: [
+                workA: LauncherFolder(id: workA, name: "工作", itemIDs: [UUID(), UUID()]),
+                workB: LauncherFolder(id: workB, name: " 工作 ", itemIDs: [UUID(), UUID()]),
+                tools: LauncherFolder(id: tools, name: "工具", itemIDs: [UUID(), UUID()]),
+                untitled: LauncherFolder(id: untitled, name: "   ", itemIDs: [UUID(), UUID()]),
+            ],
+            appKeys: [app: "bundle:app"]
+        )
+        let targets = LauncherLayout.moveToFolderMenuTargets(forAppID: app, in: state)
+        XCTAssertEqual(targets.map(\.id), [workA, workB, tools, untitled])
+        XCTAssertEqual(targets.map(\.name), ["工作", "工作（2）", "工具", ""])
+        XCTAssertEqual(
+            LauncherLayout.disambiguatedFolderMenuNames(["工作", "工作", "工作"]),
+            ["工作", "工作（2）", "工作（3）"]
+        )
+        XCTAssertEqual(
+            LauncherLayout.disambiguatedFolderMenuNames(["工作", "工作（2）", "工作"]),
+            ["工作", "工作（2）", "工作（3）"]
+        )
+        XCTAssertEqual(LauncherLayout.disambiguatedFolderMenuNames(["", ""]), ["", ""])
+    }
+
+    func testForgetUninstalledAppDissolvesOneMemberFolderAndReconcileDropsStaleMember() {
+        let goneKey = "bundle:gone"
+        let keptKey = "bundle:kept"
+        let goneID = UUID(), keptID = UUID(), folderID = UUID(), neighbor = UUID()
+        var state = LayoutState(
+            orderedEntries: [.folder(folderID), .app(neighbor)],
+            folders: [folderID: LauncherFolder(id: folderID, name: "组", itemIDs: [goneID, keptID])],
+            appKeys: [goneID: goneKey, keptID: keptKey, neighbor: "bundle:neighbor"]
+        )
+        state = LauncherLayout.forgetUninstalledApplication(withKey: goneKey, in: state)
+        XCTAssertNil(state.folders[folderID])
+        XCTAssertEqual(state.orderedEntries, [.app(keptID), .app(neighbor)])
+        XCTAssertNil(state.appKeys[goneID])
+        XCTAssertEqual(state.appKeys[keptID], keptKey)
+
+        // Menu dissolve of a leftover 1-item folder also lands the member in place.
+        let lone = UUID(), only = UUID()
+        let leftover = LayoutState(
+            orderedEntries: [.folder(lone), .app(neighbor)],
+            folders: [lone: LauncherFolder(id: lone, name: "单", itemIDs: [only])],
+            appKeys: [only: keptKey, neighbor: "bundle:neighbor"]
+        )
+        let dissolved = LauncherLayout.dissolveFolder(lone, in: leftover)
+        XCTAssertEqual(dissolved?.orderedEntries, [.app(only), .app(neighbor)])
+        XCTAssertNil(dissolved?.folders[lone])
+
+        // Catalog reconcile: the uninstalled member disappears and a 1-item folder dissolves.
+        let kept = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Kept.app"),
+            bundleIdentifier: "kept",
+            displayName: "Kept",
+            sourcePriority: 0,
+            discoveredAt: Date(timeIntervalSince1970: 1)
+        )
+        let stale = LayoutState(
+            orderedEntries: [.folder(folderID)],
+            folders: [folderID: LauncherFolder(id: folderID, name: "组", itemIDs: [goneID, keptID])],
+            appKeys: [goneID: goneKey, keptID: kept.deduplicationKey]
+        )
+        let reconciled = LauncherLayout.reconcile(candidates: [kept], into: stale)
+        XCTAssertNil(reconciled.folders[folderID])
+        XCTAssertEqual(reconciled.orderedEntries, [.app(keptID)])
+        XCTAssertNil(reconciled.appKeys[goneID])
+    }
+
+    func testDragOutOfFolderHonorsNonDefaultGridCapacity() throws {
+        // 36 top-level entries would be one page at 7×5 (35), but two pages at 5×3 (15).
+        let folderID = UUID()
+        let kept = UUID(), dragged = UUID()
+        var apps = [kept, dragged]
+        let others = (0..<34).map { _ in UUID() }
+        apps.append(contentsOf: others)
+        var entries: [LauncherEntry] = others.prefix(16).map { .app($0) }
+        entries.append(.folder(folderID))
+        entries.append(contentsOf: others.dropFirst(16).map { .app($0) })
+        let state = LayoutState(
+            orderedEntries: entries,
+            folders: [folderID: LauncherFolder(id: folderID, name: "F", itemIDs: [kept, dragged])],
+            appKeys: Dictionary(uniqueKeysWithValues: apps.enumerated().map { ($1, "bundle:\($0)") })
+        )
+        XCTAssertEqual(LauncherLayout.pageCount(forEntryCount: state.orderedEntries.count, capacity: 15), 3)
+        // Folder sits at index 16 — page 2 of a 5×3 grid, still page 1 of 7×5.
+        XCTAssertEqual(state.orderedEntries.firstIndex(of: .folder(folderID)), 16)
+        XCTAssertEqual(LauncherLayout.pageIndex(containingEntryAt: 16, capacity: 15), 1)
+        XCTAssertEqual(LauncherLayout.pageIndex(containingEntryAt: 16, capacity: 35), 0)
+
+        let drop = LayoutDrop(
+            source: .folderMember(folderID: folderID, itemID: dragged),
+            destination: .topLevelIndex(17)
+        )
+        let moved = try LauncherLayout.applyDrop(drop, to: state).get()
+        XCTAssertNil(moved.folders[folderID])
+        XCTAssertEqual(moved.orderedEntries[16], .app(kept))
+        XCTAssertEqual(moved.orderedEntries[17], .app(dragged))
+        XCTAssertEqual(LauncherLayout.pageContainingDrop(drop, in: moved, capacity: 15), 1)
+        XCTAssertEqual(LauncherLayout.pageContainingDrop(drop, in: moved, capacity: 35), 0)
+        XCTAssertEqual(LauncherLayout.pageCount(forEntryCount: moved.orderedEntries.count, capacity: 15), 3)
+        XCTAssertEqual(LauncherLayout.pageCount(forEntryCount: moved.orderedEntries.count, capacity: 80), 1)
+    }
+
 
 
     func testLayoutEditingStatusCopy() {
@@ -7890,11 +13861,69 @@ final class LaunchIconCoreTests: XCTestCase {
     func testCompactViewportKeepsIconAndCaptionInsideEachGridCell() {
         let viewport = CGSize(width: 800, height: 400)
         let item = LauncherLayout.itemSize(in: viewport)
-        let icon = LauncherLayout.iconPointSize(in: item)
+        let cell = CGRect(origin: .zero, size: item)
+        let icon = LauncherLayout.iconFrame(in: cell)
+        let caption = LauncherLayout.captionFrame(in: cell)
 
-        XCTAssertLessThanOrEqual(icon + 40, item.height)
-        XCTAssertLessThanOrEqual(icon, item.width)
+        XCTAssertTrue(cell.contains(icon))
+        XCTAssertTrue(cell.contains(caption))
+        XCTAssertGreaterThanOrEqual(caption.height, LauncherLayout.captionMinimumPointSize)
+        XCTAssertLessThanOrEqual(caption.maxY, icon.minY + 0.001)
+        XCTAssertLessThanOrEqual(icon.width, item.width)
         XCTAssertLessThanOrEqual(LauncherLayout.iconPointSize(in: CGSize(width: 44, height: 124)), 44)
+    }
+
+    /// A 13-inch-class fullscreen window at 10×8 used to clamp the icon to
+    /// `height - 40` (about 35 pt) under a 60 pt floor. The icon and one
+    /// caption line now both stay inside that cell, and the icon is larger
+    /// than that fixed reserve. The same window's default 7×5 cell stays
+    /// inside the 60–84 pt band.
+    func testDenseTenByEightCellGrowsIconAndKeepsCaptionInside() {
+        let window = CGSize(width: 1440, height: 900)
+        let chrome = LauncherLayout.searchChromeLayout(
+            windowSize: window,
+            topInset: LauncherLayout.searchChromeDefaultTopInset
+        )
+        let gutter = LauncherLayout.pagingGridViewportSideGutter(direction: .horizontal)
+        let grid = CGSize(
+            width: chrome.gridViewport.width - gutter * 2,
+            height: chrome.gridViewport.height
+        )
+        let dense = LauncherLayout.itemSize(in: grid, columns: 10, rows: 8)
+        let denseCell = CGRect(origin: .zero, size: dense)
+        let geometry = LauncherLayout.cellIconCaptionGeometry(in: dense)
+        let icon = LauncherLayout.iconFrame(in: denseCell)
+        let caption = LauncherLayout.captionFrame(in: denseCell)
+        let fixedReserve = floor(dense.height - 40)
+
+        XCTAssertGreaterThan(fixedReserve, 30)
+        XCTAssertLessThan(fixedReserve, 45)
+        XCTAssertGreaterThan(geometry.iconPointSize, fixedReserve)
+        XCTAssertEqual(icon.width, geometry.iconPointSize, accuracy: 0.001)
+        XCTAssertEqual(icon.height, icon.width, accuracy: 0.001)
+        XCTAssertTrue(denseCell.contains(icon))
+        XCTAssertTrue(denseCell.contains(caption))
+        XCTAssertGreaterThanOrEqual(caption.height, LauncherLayout.captionMinimumPointSize)
+        XCTAssertGreaterThanOrEqual(geometry.captionPointSize, LauncherLayout.captionMinimumPointSize)
+        XCTAssertLessThanOrEqual(caption.maxY, icon.minY + 0.001)
+        XCTAssertEqual(geometry.maximumLines, 1)
+
+        let roomy = LauncherLayout.itemSize(in: grid)
+        let roomyGeometry = LauncherLayout.cellIconCaptionGeometry(in: roomy)
+        let roomyCell = CGRect(origin: .zero, size: roomy)
+        let roomyIcon = LauncherLayout.iconFrame(in: roomyCell)
+        let roomyCaption = LauncherLayout.captionFrame(in: roomyCell)
+
+        XCTAssertGreaterThanOrEqual(roomyGeometry.iconPointSize, 60)
+        XCTAssertLessThanOrEqual(roomyGeometry.iconPointSize, 84)
+        XCTAssertTrue(roomyCell.contains(roomyIcon))
+        XCTAssertTrue(roomyCell.contains(roomyCaption))
+        XCTAssertGreaterThanOrEqual(roomyCaption.height, LauncherLayout.captionMinimumPointSize)
+        XCTAssertEqual(roomyGeometry.maximumLines, 2)
+        XCTAssertEqual(LauncherLayout.pageColumns, 7)
+        XCTAssertEqual(LauncherLayout.pageRows, 5)
+        XCTAssertEqual(LauncherLayout.folderColumns, 5)
+        XCTAssertEqual(LauncherLayout.folderRows, 5)
     }
 
     func testSearchMatchesDisplayNameAndBundleIdentifierIgnoringCaseAndDiacritics() {
@@ -8023,6 +14052,68 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertEqual(AppSearch.filter(all, query: "g").map(\.displayName), ["GarageBand"], "one letter never uses initials")
         XCTAssertTrue(AppSearch.filter(all, query: "nt").isEmpty, "single-word names have no initials")
         XCTAssertTrue(AppSearch.filter(all, query: "vcs").isEmpty, "initials must be a prefix, in order")
+    }
+
+    func testSearchTreatsHyphensDotsAndApostrophesLikeSpaces() {
+        // SEARCH-SEPARATOR-01 (P0-3). The same index the grid and the hidden-app
+        // hint already call. A typed hyphen, dot, or underscore is a space.
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        func app(_ name: String, _ package: String, bundle: String) -> AppCandidate {
+            AppCandidate(
+                canonicalURL: URL(fileURLWithPath: "/Applications/\(package).app"),
+                bundleIdentifier: bundle,
+                displayName: name,
+                sourcePriority: 1,
+                discoveredAt: now
+            )
+        }
+        let chrome = app("Google Chrome", "Google Chrome", bundle: "com.google.Chrome")
+        let grab = app("Grab", "Grab", bundle: "com.apple.Grab")
+        let shop = app("Photo Shop", "Photo Shop", bundle: "com.example.photoshop")
+        let helper = app("Photo Shop Helper", "Photo Shop Helper", bundle: "com.example.helper")
+        let hyphenated = app("Photo-Shop", "Photo-Shop", bundle: "com.example.photo-shop")
+        let players = app("Players", "Players", bundle: "com.example.players")
+        let owned = app("Player's", "Player's", bundle: "com.example.players-owned")
+        let vscode = app("Visual Studio Code", "Visual Studio Code", bundle: "com.microsoft.VSCode")
+        let vsx = app("VSX", "VSX", bundle: "com.example.vsx")
+        let calendar = app("日历", "Calendar", bundle: "com.apple.iCal")
+        let settings = app("系统设置", "System Settings", bundle: "com.apple.systempreferences")
+        let names = [grab, helper, shop, chrome]
+
+        XCTAssertEqual(AppSearch.filter(names, query: "google-chrome"), [chrome])
+        XCTAssertEqual(AppSearch.filter(names, query: "google_chrome"), [chrome])
+        XCTAssertEqual(AppSearch.filter(names, query: "google.chrome"), [chrome])
+        XCTAssertEqual(AppSearch.filter(names, query: "google–chrome"), [chrome], "an en dash is a space")
+        XCTAssertEqual(AppSearch.filter(names, query: "google－chrome"), [chrome], "a fullwidth hyphen folds before matching")
+        XCTAssertEqual(AppSearch.filter([helper, shop], query: "photo-shop"), [shop, helper],
+                       "the exact compacted name stays ahead of a longer prefix")
+        XCTAssertEqual(AppSearch.filter([helper, hyphenated], query: "photoshop"), [hyphenated, helper])
+        XCTAssertEqual(AppSearch.filter([helper, hyphenated], query: "photo shop"), [hyphenated, helper])
+        XCTAssertEqual(AppSearch.filter([players, owned], query: "players"), [players, owned])
+        XCTAssertEqual(AppSearch.filter([players, owned], query: "player's"), [players, owned])
+        XCTAssertEqual(
+            AppSearch.filter([vsx, vscode, grab], query: "v-s").map(\.displayName),
+            ["VSX", "Visual Studio Code"]
+        )
+        XCTAssertEqual(AppSearch.filter([vsx, vscode, grab], query: "v.s.c"), [vscode])
+        XCTAssertEqual(AppSearch.filter([vsx, vscode, grab], query: "v-s-c"), [vscode])
+        XCTAssertTrue(AppSearch.filter(names, query: "-").isEmpty)
+        XCTAssertTrue(AppSearch.filter(names, query: "g-").isEmpty, "one letter left after a separator does not compact")
+        XCTAssertEqual(AppSearch.filter([calendar, grab], query: "ri-li"), [calendar])
+        XCTAssertEqual(AppSearch.filter([calendar, grab], query: "r-l"), [calendar])
+        XCTAssertEqual(AppSearch.filter([calendar], query: "com apple ical"), [calendar])
+        XCTAssertEqual(AppSearch.filter([settings, grab], query: "system-settings"), [settings])
+
+        let folderID = UUID(uuidString: "00000000-0000-0000-0000-00000000005E")!
+        let otherFolder = UUID(uuidString: "00000000-0000-0000-0000-00000000005F")!
+        let index = AppSearchIndex(candidates: [shop, grab])
+        XCTAssertEqual(
+            index.filter(
+                [.folder(otherFolder, "Notes"), .app(grab), .folder(folderID, "Photo Shop"), .app(shop)],
+                query: "photo-shop"
+            ),
+            [.folder(folderID, "Photo Shop"), .app(shop)]
+        )
     }
 
     func testSearchTypoAndInitialsUsePackageNameUnderLocalizedDisplayName() {
@@ -8187,6 +14278,32 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertTrue(index.filter([moved], query: "LegacyBinary").isEmpty)
     }
 
+    func testSearchIndexFindsAliasOnFreshIndexBeforeCatalogTermsAreCached() {
+        let calculator = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/System/Applications/Calculator.app"),
+            bundleIdentifier: "com.apple.calculator",
+            displayName: "计算器",
+            sourcePriority: 0,
+            discoveredAt: .now
+        )
+        let clock = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/System/Applications/Clock.app"),
+            bundleIdentifier: "com.apple.clock",
+            displayName: "时钟",
+            sourcePriority: 0,
+            discoveredAt: .now
+        )
+        // Fresh empty index + aliases, as after a restart before async rebuild.
+        var index = AppSearchIndex(candidates: [])
+        index.setAliases([calculator.deduplicationKey: "我的计算器"])
+        XCTAssertEqual(index.filter([calculator, clock], query: "我的"), [calculator])
+        XCTAssertTrue(index.filter([calculator, clock], query: "时钟").contains(clock))
+        // Installing the same aliases again still hits (catalog already matches).
+        index.setAliases([calculator.deduplicationKey: "我的计算器"])
+        XCTAssertEqual(index.filter([calculator, clock], query: "我的"), [calculator])
+        XCTAssertFalse(index.filter([calculator, clock], query: "我的").contains(clock))
+    }
+
     func testPageSlottingUsesSevenByFiveCapacity() {
         XCTAssertEqual(LauncherLayout.pageColumns * LauncherLayout.pageRows, 35)
         XCTAssertEqual(LauncherLayout.pageCapacity, 35)
@@ -8212,6 +14329,40 @@ final class LaunchIconCoreTests: XCTestCase {
             LauncherLayout.pageIndicatorSlots(pageCount: 9, selectedPage: 8),
             [.ellipsis, .page(2), .page(3), .page(4), .page(5), .page(6), .page(7), .page(8)]
         )
+    }
+
+    /// PAGE-INDICATOR-ELLIPSIS-JUMP-01: the mark before the window goes to the
+    /// hidden page on that side, and the mark after goes to the next hidden
+    /// page. A full window and a single-sided window have no jump on the
+    /// closed side. The destination is never a page that does not exist.
+    func testPageIndicatorEllipsisJumpsToTheHiddenNeighbor() {
+        XCTAssertNil(LauncherLayout.pageIndicatorEllipsisDestination(pageCount: 7, selectedPage: 0, edge: .leading))
+        XCTAssertNil(LauncherLayout.pageIndicatorEllipsisDestination(pageCount: 7, selectedPage: 6, edge: .trailing))
+        XCTAssertNil(LauncherLayout.pageIndicatorEllipsisDestination(pageCount: 0, selectedPage: 0, edge: .trailing))
+        XCTAssertNil(LauncherLayout.pageIndicatorEllipsisDestination(pageCount: 9, selectedPage: 0, edge: .leading))
+        XCTAssertEqual(
+            LauncherLayout.pageIndicatorEllipsisDestination(pageCount: 9, selectedPage: 0, edge: .trailing),
+            7
+        )
+        XCTAssertEqual(
+            LauncherLayout.pageIndicatorEllipsisDestination(pageCount: 9, selectedPage: 4, edge: .leading),
+            0
+        )
+        XCTAssertEqual(
+            LauncherLayout.pageIndicatorEllipsisDestination(pageCount: 9, selectedPage: 4, edge: .trailing),
+            8
+        )
+        XCTAssertEqual(
+            LauncherLayout.pageIndicatorEllipsisDestination(pageCount: 9, selectedPage: 8, edge: .leading),
+            1
+        )
+        XCTAssertNil(LauncherLayout.pageIndicatorEllipsisDestination(pageCount: 9, selectedPage: 8, edge: .trailing))
+        let last = LauncherLayout.pageIndicatorEllipsisDestination(pageCount: 20, selectedPage: 0, edge: .trailing)
+        XCTAssertEqual(last, 7)
+        XCTAssertLessThan(last ?? 0, 20)
+        XCTAssertEqual(LauncherLayout.pageIndicatorEllipsisAccessibilityLabel(leading: true), "更早的页面")
+        XCTAssertEqual(LauncherLayout.pageIndicatorEllipsisAccessibilityLabel(leading: false), "更后的页面")
+        XCTAssertEqual(LauncherLayout.pageIndicatorEllipsisAccessibilityHelp(page: 7), "跳到第 8 页")
     }
 
     func testGridGeometryPreferenceClampsAndMatchesSevenByFive() throws {
@@ -8296,6 +14447,188 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertEqual(restored.shortcut, .optionSpace)
     }
 
+    func testPreferencesInvalidValuesAndOlderKeysFallBackToDefaults() async throws {
+        let suiteName = "com.sunzheng.LaunchIcon.Tests.PrefsMigrate.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = LauncherPreferencesStore(suiteName: suiteName)
+
+        // An older install only wrote the original shortcut key; newer fields
+        // must load as defaults (implicit migration, no schema version).
+        defaults.set("optionShiftSpace", forKey: "LaunchIcon.Preferences.shortcut")
+        let migrated = await store.load()
+        XCTAssertEqual(migrated.shortcut, .optionShiftSpace)
+        XCTAssertEqual(migrated, LauncherPreferences(shortcut: .optionShiftSpace))
+
+        // Unknown enums fall back per-field without wiping the rest.
+        defaults.set("unrecognized", forKey: "LaunchIcon.Preferences.backgroundDim")
+        defaults.set("unrecognized", forKey: "LaunchIcon.Preferences.reopenPageBehavior")
+        defaults.set("unrecognized", forKey: "LaunchIcon.Preferences.pageFlipDirection")
+        let unknown = await store.load()
+        XCTAssertEqual(unknown.backgroundDim, .standard)
+        XCTAssertEqual(unknown.reopenPageBehavior, .rememberLast)
+        XCTAssertEqual(unknown.pageFlipDirection, .horizontal)
+        XCTAssertEqual(unknown.shortcut, .optionShiftSpace)
+
+        // Junk types: booleans with default true stay true; false-default stay false.
+        defaults.set("nope", forKey: "LaunchIcon.Preferences.showsStatusItem")
+        defaults.set("nope", forKey: "LaunchIcon.Preferences.pinchToDismiss")
+        defaults.set("nope", forKey: "LaunchIcon.Preferences.reducesMotion")
+        defaults.set(0, forKey: "LaunchIcon.Preferences.blursBackground")
+        let junkBools = await store.load()
+        XCTAssertTrue(junkBools.showsStatusItem)
+        XCTAssertTrue(junkBools.pinchToDismiss)
+        XCTAssertFalse(junkBools.reducesMotion)
+        XCTAssertFalse(junkBools.blursBackground)
+
+        // Numeric strings still form a clamped geometry pair; a non-numeric
+        // column with a valid row is treated as a half write (7×5).
+        defaults.set("8", forKey: "LaunchIcon.Preferences.gridColumns")
+        defaults.set("4", forKey: "LaunchIcon.Preferences.gridRows")
+        let stringPair = await store.load()
+        XCTAssertEqual(stringPair.gridGeometry, GridGeometryPreference(columns: 8, rows: 4))
+
+        defaults.set(" 8 ", forKey: "LaunchIcon.Preferences.gridColumns")
+        defaults.set("\n4\n", forKey: "LaunchIcon.Preferences.gridRows")
+        let padded = await store.load()
+        XCTAssertEqual(padded.gridGeometry, GridGeometryPreference(columns: 8, rows: 4))
+
+        defaults.set("wide", forKey: "LaunchIcon.Preferences.gridColumns")
+        defaults.set(6, forKey: "LaunchIcon.Preferences.gridRows")
+        let half = await store.load()
+        XCTAssertEqual(half.gridGeometry, .standard)
+
+        defaults.set(99, forKey: "LaunchIcon.Preferences.gridColumns")
+        defaults.set(-2, forKey: "LaunchIcon.Preferences.gridRows")
+        let clamped = await store.load()
+        XCTAssertEqual(clamped.gridGeometry, GridGeometryPreference(columns: 10, rows: 3))
+
+        // A non-array directory list is ignored (sanitizer sees empty).
+        defaults.set("/tmp/apps", forKey: "LaunchIcon.Preferences.additionalAppDirectories")
+        let dirs = await store.load()
+        XCTAssertEqual(dirs.additionalAppDirectories, [])
+    }
+
+    func testIdleGridDoesNotMaterializeStagingOrSearchCopies() {
+        XCTAssertEqual(
+            LauncherLayout.gridItemSource(
+                role: .active, isSearching: false, currentPage: 2, stagingPage: nil
+            ),
+            .page(2)
+        )
+        XCTAssertEqual(
+            LauncherLayout.gridItemSource(
+                role: .staging, isSearching: false, currentPage: 2, stagingPage: nil
+            ),
+            .none
+        )
+        XCTAssertEqual(
+            LauncherLayout.gridItemSource(
+                role: .staging, isSearching: false, currentPage: 2, stagingPage: 3
+            ),
+            .page(3)
+        )
+        XCTAssertEqual(
+            LauncherLayout.gridItemSource(
+                role: .search, isSearching: false, currentPage: 0, stagingPage: nil
+            ),
+            .none
+        )
+        XCTAssertEqual(
+            LauncherLayout.gridItemSource(
+                role: .search, isSearching: true, currentPage: 0, stagingPage: nil
+            ),
+            .searchResults
+        )
+        XCTAssertFalse(LauncherLayout.shouldReleaseParkedStagingTiles(
+            isPaging: true, collectionHasRealizedTiles: true
+        ))
+        XCTAssertFalse(LauncherLayout.shouldReleaseParkedStagingTiles(
+            isPaging: false, collectionHasRealizedTiles: false
+        ))
+        XCTAssertTrue(LauncherLayout.shouldReleaseParkedStagingTiles(
+            isPaging: false, collectionHasRealizedTiles: true
+        ))
+        XCTAssertFalse(LauncherLayout.shouldReleaseIdleSearchGridTiles(
+            isPaging: false, isSearching: true, collectionHasRealizedTiles: true
+        ))
+        XCTAssertFalse(LauncherLayout.shouldReleaseIdleSearchGridTiles(
+            isPaging: true, isSearching: false, collectionHasRealizedTiles: true
+        ))
+        XCTAssertTrue(LauncherLayout.shouldReleaseIdleSearchGridTiles(
+            isPaging: false, isSearching: false, collectionHasRealizedTiles: true
+        ))
+    }
+
+    func testGridGeometryDerivationMatchesLayoutConstantsAtDefaultAndRemapsPages() {
+        XCTAssertEqual(GridGeometryPreference.standard.columns, LauncherLayout.pageColumns)
+        XCTAssertEqual(GridGeometryPreference.standard.rows, LauncherLayout.pageRows)
+        XCTAssertEqual(GridGeometryPreference.standard.capacity, LauncherLayout.pageCapacity)
+
+        let viewport = CGSize(width: 1024, height: 640)
+        XCTAssertEqual(
+            LauncherLayout.itemSize(in: viewport),
+            LauncherLayout.itemSize(
+                in: viewport,
+                columns: GridGeometryPreference.standard.columns,
+                rows: GridGeometryPreference.standard.rows
+            )
+        )
+
+        let defaultEntries = (0..<36).map { _ in LauncherEntry.app(UUID()) }
+        XCTAssertEqual(LauncherLayout.pageCount(forEntryCount: 36), 2)
+        XCTAssertEqual(LauncherLayout.pageCount(forEntryCount: 36, capacity: LauncherLayout.pageCapacity), 2)
+        XCTAssertEqual(LauncherLayout.entries(onPage: 0, from: defaultEntries).count, 35)
+        XCTAssertEqual(
+            LauncherLayout.entries(onPage: 0, from: defaultEntries, capacity: LauncherLayout.pageCapacity).count,
+            35
+        )
+        // Index 35 is the first slot of page 1 at 7×5, and stays on page 0
+        // when capacity is greater than 35.
+        XCTAssertEqual(LauncherLayout.pageIndex(containingEntryAt: 35), 1)
+        XCTAssertEqual(LauncherLayout.pageIndex(containingEntryAt: 35, capacity: 35), 1)
+        XCTAssertEqual(LauncherLayout.pageIndex(containingEntryAt: 35, capacity: 36), 0)
+        XCTAssertEqual(LauncherLayout.pageCount(forEntryCount: 36, capacity: 36), 1)
+        XCTAssertEqual(LauncherLayout.pageIndex(containingEntryAt: 35, capacity: 40), 0)
+        XCTAssertEqual(
+            LauncherLayout.entries(onPage: 0, from: defaultEntries, capacity: 36).count,
+            36
+        )
+    }
+
+    func testGridGeometrySettingsChoicesMatchClampedBoundsAndDefaultSevenByFive() {
+        XCTAssertEqual(GridGeometryPreference.columnChoices, Array(5...10))
+        XCTAssertEqual(GridGeometryPreference.rowChoices, Array(3...8))
+        XCTAssertEqual(GridGeometryPreference.columnChoices[GridGeometryPreference.choiceIndex(forColumns: 7)], 7)
+        XCTAssertEqual(GridGeometryPreference.rowChoices[GridGeometryPreference.choiceIndex(forRows: 5)], 5)
+        XCTAssertEqual(
+            GridGeometryPreference.choiceIndex(forColumns: 99),
+            GridGeometryPreference.choiceIndex(forColumns: 10)
+        )
+        XCTAssertEqual(
+            GridGeometryPreference.choiceIndex(forRows: 0),
+            GridGeometryPreference.choiceIndex(forRows: 3)
+        )
+        XCTAssertEqual(GridGeometryCopy.rowTitleKey, "网格大小")
+        XCTAssertEqual(GridGeometryCopy.columnsLabelKey, "列")
+        XCTAssertEqual(GridGeometryCopy.rowsLabelKey, "行")
+        XCTAssertEqual(GridGeometryCopy.columnsItemTitle(7), "7 列")
+        XCTAssertEqual(GridGeometryCopy.rowsItemTitle(5), "5 行")
+        XCTAssertTrue(GridGeometryCopy.accessibilityHelp().contains("7×5"))
+        XCTAssertTrue(GridGeometryCopy.accessibilityHelp().contains("不影响翻页动画"))
+        XCTAssertEqual(GridGeometryCopy.columnsPopupIdentifier, "settings-grid-columns")
+        XCTAssertEqual(GridGeometryCopy.rowsPopupIdentifier, "settings-grid-rows")
+        XCTAssertEqual(GridGeometryCopy.columnsLabel(), "列")
+        XCTAssertEqual(GridGeometryCopy.rowsLabel(), "行")
+        XCTAssertEqual(GridGeometryCopy.rowTitle(), "网格大小")
+    }
+
+    func testLauncherPanelDoesNotStealKeyFromApplicationModalAlert() {
+        XCTAssertFalse(LauncherLayout.launcherPanelWorksWhenModal())
+        XCTAssertTrue(LauncherLayout.launcherPanelCanBecomeKey(otherApplicationModalWindow: false))
+        XCTAssertFalse(LauncherLayout.launcherPanelCanBecomeKey(otherApplicationModalWindow: true))
+    }
+
     func testFocusSlotAfterPageTurnKeepsRelativeGridPosition() {
         let fullPage = LauncherLayout.pageCapacity
         XCTAssertEqual(LauncherLayout.focusSlot(previousSlot: 12, itemCount: fullPage), 12)
@@ -8308,6 +14641,27 @@ final class LaunchIconCoreTests: XCTestCase {
 
         XCTAssertNil(LauncherLayout.focusSlot(previousSlot: 4, itemCount: 0))
         XCTAssertNil(LauncherLayout.focusSlot(previousSlot: nil, itemCount: fullPage))
+    }
+
+    func testRootVerticalArrowFocusesFirstGridItemOnlyOnIdleHorizontalGrid() {
+        XCTAssertTrue(LauncherLayout.rootVerticalArrowFocusesFirstGridItem(
+            flipIsHorizontal: true, folderOpen: false, isSearching: false, isPaging: false
+        ))
+        XCTAssertFalse(LauncherLayout.rootVerticalArrowFocusesFirstGridItem(
+            flipIsHorizontal: false, folderOpen: false, isSearching: false, isPaging: false
+        ), "vertical flip keeps Up/Down as paging")
+        XCTAssertFalse(LauncherLayout.rootVerticalArrowFocusesFirstGridItem(
+            flipIsHorizontal: true, folderOpen: true, isSearching: false, isPaging: false
+        ))
+        XCTAssertFalse(LauncherLayout.rootVerticalArrowFocusesFirstGridItem(
+            flipIsHorizontal: true, folderOpen: false, isSearching: true, isPaging: false
+        ))
+        XCTAssertFalse(LauncherLayout.rootVerticalArrowFocusesFirstGridItem(
+            flipIsHorizontal: true, folderOpen: false, isSearching: false, isPaging: true
+        ), "never steals focus mid page transition")
+        // Up/Down still never count as typed search text.
+        XCTAssertFalse(LauncherLayout.hasPrintableSearchCharacter("\u{F700}"))
+        XCTAssertFalse(LauncherLayout.hasPrintableSearchCharacter("\u{F701}"))
     }
 
     func testGridKeyboardNeighborStaysInsideTheGrid() {
@@ -8619,6 +14973,63 @@ final class LaunchIconCoreTests: XCTestCase {
         )
     }
 
+    func testFolderTitleKeyboardFocusAllowsTestLayoutBegin() {
+        XCTAssertTrue(
+            LauncherLayout.folderTitleKeyboardFocusAvailable(
+                hasFieldEditor: false,
+                pointerEditingAvailable: false,
+                allowTestLayoutBegin: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.folderTitleKeyboardFocusAvailable(
+                hasFieldEditor: false,
+                pointerEditingAvailable: false,
+                allowTestLayoutBegin: false
+            )
+        )
+    }
+
+    func testLauncherTextFieldReportsAccessibilityFocusWhileEditing() {
+        XCTAssertTrue(
+            LauncherLayout.launcherTextFieldReportsAccessibilityFocus(hasFieldEditor: true)
+        )
+        XCTAssertFalse(
+            LauncherLayout.launcherTextFieldReportsAccessibilityFocus(hasFieldEditor: false)
+        )
+    }
+
+    func testSearchFieldReportsAccessibilityFocusForGridTypingUnderTestLayout() {
+        XCTAssertTrue(
+            LauncherLayout.searchFieldReportsAccessibilityFocus(
+                hasFieldEditor: true,
+                testLayoutActive: false,
+                rootViewIsFirstResponder: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.searchFieldReportsAccessibilityFocus(
+                hasFieldEditor: false,
+                testLayoutActive: true,
+                rootViewIsFirstResponder: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.searchFieldReportsAccessibilityFocus(
+                hasFieldEditor: false,
+                testLayoutActive: true,
+                rootViewIsFirstResponder: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.searchFieldReportsAccessibilityFocus(
+                hasFieldEditor: false,
+                testLayoutActive: false,
+                rootViewIsFirstResponder: true
+            )
+        )
+    }
+
 
     func testFolderMemberFocusFillWaitsForPanelChrome() {
         XCTAssertTrue(
@@ -8906,6 +15317,91 @@ final class LaunchIconCoreTests: XCTestCase {
         )
     }
 
+    func testSettingsMessageFadeLandingOnClose() {
+        // SETTINGS-MESSAGE-FADE-FINISH-ON-CLOSE-01
+        XCTAssertEqual(
+            LauncherLayout.settingsMessageFadeLandingOnClose(
+                animationStillAttached: false,
+                modelOpacity: 1,
+                hasReplacement: false,
+                labelHidden: false
+            ),
+            .leave
+        )
+        XCTAssertEqual(
+            LauncherLayout.settingsMessageFadeLandingOnClose(
+                animationStillAttached: false,
+                modelOpacity: 0,
+                hasReplacement: false,
+                labelHidden: false
+            ),
+            .leave
+        )
+        XCTAssertEqual(
+            LauncherLayout.settingsMessageFadeLandingOnClose(
+                animationStillAttached: false,
+                modelOpacity: 0,
+                hasReplacement: true,
+                labelHidden: false
+            ),
+            .showReplacement
+        )
+        XCTAssertEqual(
+            LauncherLayout.settingsMessageFadeLandingOnClose(
+                animationStillAttached: true,
+                modelOpacity: 0,
+                hasReplacement: true,
+                labelHidden: true
+            ),
+            .showReplacement
+        )
+        XCTAssertEqual(
+            LauncherLayout.settingsMessageFadeLandingOnClose(
+                animationStillAttached: true,
+                modelOpacity: 0,
+                hasReplacement: false,
+                labelHidden: false
+            ),
+            .parkHidden
+        )
+        XCTAssertEqual(
+            LauncherLayout.settingsMessageFadeLandingOnClose(
+                animationStillAttached: true,
+                modelOpacity: 0.01,
+                hasReplacement: false,
+                labelHidden: false
+            ),
+            .parkHidden
+        )
+        XCTAssertEqual(
+            LauncherLayout.settingsMessageFadeLandingOnClose(
+                animationStillAttached: true,
+                modelOpacity: 1,
+                hasReplacement: false,
+                labelHidden: true
+            ),
+            .parkHidden
+        )
+        XCTAssertEqual(
+            LauncherLayout.settingsMessageFadeLandingOnClose(
+                animationStillAttached: true,
+                modelOpacity: 1,
+                hasReplacement: false,
+                labelHidden: false
+            ),
+            .snapShown
+        )
+        XCTAssertEqual(
+            LauncherLayout.settingsMessageFadeLandingOnClose(
+                animationStillAttached: true,
+                modelOpacity: 0.5,
+                hasReplacement: false,
+                labelHidden: false
+            ),
+            .snapShown
+        )
+    }
+
 
     func testSearchAdjacentChromeQuietWhileFolderChrome() {
         XCTAssertTrue(
@@ -9110,6 +15606,31 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertTrue(LauncherLayout.settingsShouldMoveFocusAfterRestore(remainingHidden: 0))
         XCTAssertFalse(LauncherLayout.settingsShouldMoveFocusAfterRestore(remainingHidden: 2))
         XCTAssertTrue(LauncherLayout.settingsEscapeClosesWindow)
+        XCTAssertEqual(GridGeometryCopy.columnsPopupIdentifier, "settings-grid-columns")
+        XCTAssertEqual(GridGeometryCopy.rowsPopupIdentifier, "settings-grid-rows")
+        XCTAssertFalse(GridGeometryCopy.accessibilityHelp().isEmpty)
+        XCTAssertEqual(
+            LauncherLayout.searchHitAccessibilityLabel(displayName: "Notes", containingFolderName: "工具"),
+            "Notes，工具"
+        )
+        XCTAssertEqual(LauncherLayout.folderTileAccessibilityValue(memberCount: 1), "1 个项目")
+        XCTAssertEqual(LauncherLayout.folderTileAccessibilityValue(memberCount: 3), "3 个项目")
+        XCTAssertEqual(
+            LauncherLayout.pageArrowAccessibilityLabel(previous: true, horizontal: true),
+            "上一页"
+        )
+        XCTAssertEqual(
+            LauncherLayout.pageArrowAccessibilityLabel(previous: false, horizontal: false),
+            "向下翻页"
+        )
+        XCTAssertEqual(LauncherLayout.pageDotAccessibilityValue(isCurrent: true), "当前页")
+        XCTAssertNil(LauncherLayout.pageDotAccessibilityValue(isCurrent: false))
+        XCTAssertFalse(
+            LauncherLayout.tileAccessibilityHelp(isFolder: false, layoutEditingEnabled: true, layoutEditingExplanation: nil).isEmpty
+        )
+        XCTAssertFalse(
+            LauncherLayout.tileAccessibilityHelp(isFolder: true, layoutEditingEnabled: true, layoutEditingExplanation: nil).isEmpty
+        )
     }
 
     func testStatusChromeClearsOpacityBeforeUnhideAndRestoresWhenInterrupted() {
@@ -9395,6 +15916,132 @@ final class LaunchIconCoreTests: XCTestCase {
         )
     }
 
+    func testSearchRankingStaysStableForPinyinAliasesSpecialAndLongQueries() {
+        let wechatID = UUID()
+        let notesID = UUID()
+        let calcID = UUID()
+        let wechat = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/WeChat.app"),
+            bundleIdentifier: "com.tencent.xinWeChat",
+            displayName: "微信",
+            sourcePriority: 0,
+            discoveredAt: Date(timeIntervalSince1970: 0)
+        )
+        let notes = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Notes.app"),
+            bundleIdentifier: "com.apple.Notes",
+            displayName: "Notes",
+            sourcePriority: 0,
+            discoveredAt: Date(timeIntervalSince1970: 0)
+        )
+        let calc = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Calculator.app"),
+            bundleIdentifier: "com.apple.calculator",
+            displayName: "计算器",
+            sourcePriority: 0,
+            discoveredAt: Date(timeIntervalSince1970: 0)
+        )
+        let state = LayoutState(
+            orderedEntries: [.app(wechatID), .app(notesID), .app(calcID)],
+            appKeys: [
+                wechatID: wechat.deduplicationKey,
+                notesID: notes.deduplicationKey,
+                calcID: calc.deduplicationKey
+            ],
+            appAliases: [notes.deduplicationKey: "备忘录"],
+            updatedAt: Date(timeIntervalSince1970: 0)
+        )
+        let catalog = [wechat, notes, calc]
+        let hits = LauncherLayout.searchHits(in: state, catalog: catalog)
+        let index = AppSearchIndex(candidates: catalog, aliases: state.appAliases)
+
+        func keys(_ query: String) -> [String] {
+            index.filter(hits, query: query).compactMap { hit in
+                if case .app(let candidate) = hit { return candidate.deduplicationKey }
+                return nil
+            }
+        }
+
+        // Mixed case, pinyin, and initials of the same name stay identically ordered.
+        let wechatQueries = ["微信", "weixin", "WEIXIN", "WeiXin", "wx", "WX"]
+        let wechatOrder = keys("微信")
+        XCTAssertEqual(wechatOrder, [wechat.deduplicationKey])
+        for query in wechatQueries {
+            XCTAssertEqual(keys(query), wechatOrder, query)
+            XCTAssertEqual(keys(query), keys(query), "unstable \(query)")
+        }
+        // Alias and its pinyin / initials share that identity's rank.
+        for query in ["备忘录", "beiwanglu", "BWL", "bwl", "notes", "NOTES"] {
+            XCTAssertEqual(keys(query), [notes.deduplicationKey], query)
+        }
+        XCTAssertEqual(keys("jsq"), [calc.deduplicationKey])
+        XCTAssertEqual(keys("计算器"), keys("JISUANQI"))
+
+        // Control characters are dropped; punctuation and a very long query
+        // stay stable and clipped.
+        XCTAssertEqual(LauncherLayout.maximumSearchQueryLength, 256)
+        XCTAssertEqual(LauncherLayout.sanitizedSearchInput("wei\u{0001}xin"), "weixin")
+        XCTAssertEqual(keys("wei\u{0001}xin"), wechatOrder)
+        let special = "微信++@@()"
+        XCTAssertEqual(keys(special), keys(special))
+        let long = String(repeating: "微信", count: 200)
+        let sanitized = LauncherLayout.sanitizedSearchInput(long)
+        XCTAssertEqual(sanitized.count, LauncherLayout.maximumSearchQueryLength)
+        // A query longer than the name is not a prefix/contains hit; clipping
+        // must stay stable and must not throw or reorder.
+        XCTAssertEqual(keys(long), keys(sanitized))
+        XCTAssertEqual(keys(long), keys(String(repeating: "x", count: 400)))
+        XCTAssertEqual(keys("微信"), [wechat.deduplicationKey])
+
+        // Result order is independent of grid geometry. At 5×3 a 7-hit row
+        // uses the minimum inset; at 10×8 the same list is still centered,
+        // but the ranked identities stay identical.
+        var many: [AppCandidate] = []
+        var manyEntries: [LauncherEntry] = []
+        var manyKeys: [UUID: String] = [:]
+        for i in 1...7 {
+            let id = UUID()
+            let app = AppCandidate(
+                canonicalURL: URL(fileURLWithPath: "/Applications/App0\(i).app"),
+                bundleIdentifier: "com.example.app0\(i)",
+                displayName: "App 0\(i)",
+                sourcePriority: 0,
+                discoveredAt: Date(timeIntervalSince1970: 0)
+            )
+            many.append(app)
+            manyEntries.append(.app(id))
+            manyKeys[id] = app.deduplicationKey
+        }
+        let manyState = LayoutState(
+            orderedEntries: manyEntries,
+            appKeys: manyKeys,
+            updatedAt: Date(timeIntervalSince1970: 0)
+        )
+        let manyHits = LauncherLayout.searchHits(in: manyState, catalog: many)
+        let manyIndex = AppSearchIndex(candidates: many)
+        let ranked = manyIndex.filter(manyHits, query: "app")
+        XCTAssertEqual(ranked.count, 7)
+        XCTAssertEqual(ranked, manyIndex.filter(manyHits, query: "APP"))
+        XCTAssertEqual(ranked, manyIndex.filter(manyHits, query: "App"))
+        let compactInset = LauncherLayout.searchSectionHorizontalInset(
+            itemCount: ranked.count,
+            columns: 5,
+            itemWidth: 100,
+            interitemSpacing: 12,
+            viewportWidth: 800
+        )
+        let wideInset = LauncherLayout.searchSectionHorizontalInset(
+            itemCount: ranked.count,
+            columns: 10,
+            itemWidth: 100,
+            interitemSpacing: 12,
+            viewportWidth: 800
+        )
+        XCTAssertEqual(compactInset, 8, accuracy: 0.001)
+        XCTAssertGreaterThan(wideInset, compactInset)
+        XCTAssertEqual(manyIndex.filter(manyHits, query: "app"), ranked)
+    }
+
     func testClampedScrollOffsetStaysInsideAShorterDocument() {
         XCTAssertEqual(LauncherLayout.clampedScrollOffset(500, documentLength: 400, viewportLength: 100), 300)
         XCTAssertEqual(LauncherLayout.clampedScrollOffset(40, documentLength: 400, viewportLength: 100), 40)
@@ -9504,6 +16151,23 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertEqual(LauncherLayout.searchGridTypedCharacters(raw: "", ignoringModifiers: "C"), "C")
         XCTAssertEqual(LauncherLayout.searchGridTypedCharacters(raw: "", ignoringModifiers: "Clock"), "")
         XCTAssertEqual(LauncherLayout.searchGridTypedCharacters(raw: "", ignoringModifiers: "\u{F704}"), "")
+        // NS function keys (arrows U+F700–F703, F-keys) must never count as typed search.
+        for scalarValue in [0xF700, 0xF701, 0xF702, 0xF703, 0xF704, 0xF8FF] as [UInt32] {
+            let tofu = String(Unicode.Scalar(scalarValue)!)
+            XCTAssertEqual(
+                LauncherLayout.searchGridTypedCharacters(raw: tofu, ignoringModifiers: tofu),
+                "",
+                "function-key scalar U+\(String(scalarValue, radix: 16, uppercase: true)) must not open search"
+            )
+            XCTAssertFalse(
+                LauncherLayout.hasPrintableSearchCharacter(tofu),
+                "function-key scalar must not be printable search text"
+            )
+            XCTAssertTrue(LauncherLayout.isNSFunctionKeyScalar(Unicode.Scalar(scalarValue)!))
+        }
+        XCTAssertTrue(LauncherLayout.hasPrintableSearchCharacter("C"))
+        XCTAssertFalse(LauncherLayout.hasPrintableSearchCharacter(""))
+        XCTAssertFalse(LauncherLayout.hasPrintableSearchCharacter("\u{0007}"))
         XCTAssertEqual(
             LauncherLayout.searchGridKeyCommit(
                 before: "",
@@ -9735,6 +16399,19 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertEqual(LauncherLayout.topLevelDropIndex(page: 1, localIndex: 0), LauncherLayout.pageCapacity)
         XCTAssertEqual(LauncherLayout.topLevelDropIndex(page: 2, localIndex: 4), LauncherLayout.pageCapacity * 2 + 4)
         XCTAssertEqual(LauncherLayout.topLevelDropIndex(page: -1, localIndex: -2), 0)
+        // GRID-GEOMETRY-DROP-CAPACITY-01: a 5×3 page is 15 slots, not 35.
+        let compact = 15
+        XCTAssertEqual(LauncherLayout.topLevelDropIndex(page: 1, localIndex: 0, capacity: compact), compact)
+        XCTAssertEqual(
+            LauncherLayout.topLevelDropIndex(
+                page: 1,
+                localIndex: 0,
+                sourceIndex: 0,
+                countBeforeRemoval: 30,
+                capacity: compact
+            ),
+            compact + 1
+        )
         XCTAssertEqual(
             LauncherLayout.insertionIndexAfterRemovingSource(sourceIndex: 2, proposedIndex: 0, countBeforeRemoval: 3),
             0
@@ -10059,6 +16736,576 @@ final class LaunchIconCoreTests: XCTestCase {
             0.22,
             accuracy: 0.0001
         )
+    }
+
+    func testDissolvedGridFadeFinishesWhenHiddenWithoutWaitFlag() {
+        // DISSOLVED-GRID-FADE-FINISH-WHEN-HIDDEN-01
+        XCTAssertTrue(
+            LauncherLayout.shouldFinishUnpinnedDissolvedGridFade(
+                isVisible: false,
+                fadeStillAttached: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldFinishUnpinnedDissolvedGridFade(
+                isVisible: true,
+                fadeStillAttached: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldFinishUnpinnedDissolvedGridFade(
+                isVisible: false,
+                fadeStillAttached: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldFinishUnpinnedDissolvedGridFade(
+                isVisible: true,
+                fadeStillAttached: false
+            )
+        )
+    }
+
+    func testUnpinnedHiddenAnimationFinishesOnlyWhenStillAttached() {
+        // SEARCH-CHROME-FADE-FINISH-WHEN-HIDDEN-01
+        // TOAST-FADE-FINISH-WHEN-HIDDEN-01
+        // LAUNCH-FEEDBACK-FINISH-WHEN-HIDDEN-01
+        let cases: [(visible: Bool, attached: Bool, finish: Bool)] = [
+            (false, true, true),
+            (true, true, false),
+            (false, false, false),
+            (true, false, false)
+        ]
+        for sample in cases {
+            XCTAssertEqual(
+                LauncherLayout.shouldFinishUnpinnedHiddenAnimation(
+                    isVisible: sample.visible,
+                    animationStillAttached: sample.attached
+                ),
+                sample.finish
+            )
+            XCTAssertEqual(
+                LauncherLayout.shouldFinishUnpinnedDissolvedGridFade(
+                    isVisible: sample.visible,
+                    fadeStillAttached: sample.attached
+                ),
+                sample.finish
+            )
+        }
+    }
+
+    func testUnpinnedFolderChromeFinishWhenHidden() {
+        // FOLDER-CHROME-FINISH-WHEN-HIDDEN-01
+        // Opening panel lands open. Closing the folder here would change the page.
+        XCTAssertEqual(
+            LauncherLayout.unpinnedFolderChromeFinish(
+                isVisible: false,
+                panelOpening: true,
+                panelClosing: false,
+                backdropAnimating: true,
+                alreadyWaiting: false,
+                isAnimatingClose: false
+            ),
+            .commitOpen
+        )
+        // Close keys without the close flag: hide the panel, no landing callback.
+        XCTAssertEqual(
+            LauncherLayout.unpinnedFolderChromeFinish(
+                isVisible: false,
+                panelOpening: true,
+                panelClosing: true,
+                backdropAnimating: true,
+                alreadyWaiting: false,
+                isAnimatingClose: false
+            ),
+            .commitCloseVisual
+        )
+        XCTAssertEqual(
+            LauncherLayout.unpinnedFolderChromeFinish(
+                isVisible: false,
+                panelOpening: false,
+                panelClosing: false,
+                backdropAnimating: true,
+                alreadyWaiting: false,
+                isAnimatingClose: false
+            ),
+            .backdropOnly
+        )
+        // Settled open folder waits for the next appearance.
+        XCTAssertEqual(
+            LauncherLayout.unpinnedFolderChromeFinish(
+                isVisible: false,
+                panelOpening: false,
+                panelClosing: false,
+                backdropAnimating: false,
+                alreadyWaiting: false,
+                isAnimatingClose: false
+            ),
+            .none
+        )
+        // A pinned wait and a close already in progress have their own commit.
+        XCTAssertEqual(
+            LauncherLayout.unpinnedFolderChromeFinish(
+                isVisible: false,
+                panelOpening: true,
+                panelClosing: false,
+                backdropAnimating: false,
+                alreadyWaiting: true,
+                isAnimatingClose: false
+            ),
+            .none
+        )
+        XCTAssertEqual(
+            LauncherLayout.unpinnedFolderChromeFinish(
+                isVisible: false,
+                panelOpening: false,
+                panelClosing: true,
+                backdropAnimating: false,
+                alreadyWaiting: false,
+                isAnimatingClose: true
+            ),
+            .none
+        )
+        // A visible window keeps playing.
+        XCTAssertEqual(
+            LauncherLayout.unpinnedFolderChromeFinish(
+                isVisible: true,
+                panelOpening: true,
+                panelClosing: true,
+                backdropAnimating: true,
+                alreadyWaiting: false,
+                isAnimatingClose: false
+            ),
+            .none
+        )
+    }
+
+    func testUnpinnedOpacityFadeLandsWhenHidden() {
+        // CHROME-OPACITY-FADE-FINISH-WHEN-HIDDEN-01
+        // PAGE-INDICATOR-FADE-FINISH-WHEN-HIDDEN-01
+        let cases: [(
+            visible: Bool,
+            attached: Bool,
+            opacity: CGFloat,
+            park: Bool,
+            landing: LauncherLayout.UnpinnedOpacityFadeLanding
+        )] = [
+            (true, true, 0, true, .leave),
+            (false, false, 0, true, .leave),
+            (false, true, 0, true, .hiddenParked),
+            (false, true, 0.01, true, .hiddenParked),
+            (false, true, 0, false, .leave),
+            (false, true, 1, true, .shown),
+            (false, true, 1, false, .shown),
+            (false, true, 0.02, true, .shown)
+        ]
+        for sample in cases {
+            XCTAssertEqual(
+                LauncherLayout.unpinnedOpacityFadeLanding(
+                    isVisible: sample.visible,
+                    animationStillAttached: sample.attached,
+                    modelOpacity: sample.opacity,
+                    parkHiddenWhenClear: sample.park
+                ),
+                sample.landing
+            )
+        }
+    }
+
+    func testHiddenFinishStage1PolicyCoversOnlyOpacityFadeKeys() {
+        // HIDDEN-FINISH-REGISTRY-01 stage 1.
+        XCTAssertEqual(
+            LauncherLayout.hiddenFinishStage1AnimationKeys,
+            [
+                LauncherLayout.pageIndicatorFadeAnimationKey,
+                LauncherLayout.footerHintFadeAnimationKey,
+                LauncherLayout.statusChromeFadeAnimationKey,
+                LauncherLayout.searchAdjacentChromeFadeAnimationKey
+            ]
+        )
+        XCTAssertEqual(
+            LauncherLayout.hiddenFinishStage1Policy(
+                animationKey: LauncherLayout.footerHintFadeAnimationKey,
+                parkHiddenWhenClear: true
+            ),
+            .opacity(parkHiddenWhenClear: true)
+        )
+        XCTAssertEqual(
+            LauncherLayout.hiddenFinishStage1Policy(
+                animationKey: LauncherLayout.statusChromeFadeAnimationKey,
+                parkHiddenWhenClear: false
+            ),
+            .opacity(parkHiddenWhenClear: false)
+        )
+        XCTAssertEqual(
+            LauncherLayout.hiddenFinishStage1Policy(
+                animationKey: LauncherLayout.pageIndicatorFadeAnimationKey,
+                parkHiddenWhenClear: true
+            ),
+            .opacity(parkHiddenWhenClear: true)
+        )
+        XCTAssertEqual(
+            LauncherLayout.hiddenFinishStage1Policy(
+                animationKey: LauncherLayout.searchAdjacentChromeFadeAnimationKey,
+                parkHiddenWhenClear: false
+            ),
+            .opacity(parkHiddenWhenClear: false)
+        )
+        for other in [
+            LauncherLayout.toastFadeAnimationKey,
+            LauncherLayout.searchChromeFadeAnimationKey,
+            LauncherLayout.pageHostFadeAnimationKey,
+            LauncherLayout.tileChromeFillFadeAnimationKey,
+            LauncherLayout.pageArrowPresenceAnimationKey
+        ] {
+            XCTAssertNil(
+                LauncherLayout.hiddenFinishStage1Policy(
+                    animationKey: other,
+                    parkHiddenWhenClear: true
+                ),
+                other
+            )
+        }
+
+        let policy = LauncherLayout.HiddenFinishPolicy.opacity(parkHiddenWhenClear: true)
+        XCTAssertEqual(
+            LauncherLayout.hiddenFinishLanding(
+                policy: policy,
+                isVisible: false,
+                animationStillAttached: true,
+                modelOpacity: 0
+            ),
+            .hiddenParked
+        )
+        XCTAssertEqual(
+            LauncherLayout.hiddenFinishLanding(
+                policy: .opacity(parkHiddenWhenClear: false),
+                isVisible: false,
+                animationStillAttached: true,
+                modelOpacity: 0
+            ),
+            .leave
+        )
+        XCTAssertEqual(
+            LauncherLayout.hiddenFinishLanding(
+                policy: policy,
+                isVisible: true,
+                animationStillAttached: true,
+                modelOpacity: 1
+            ),
+            .leave
+        )
+        XCTAssertEqual(
+            LauncherLayout.hiddenFinishLanding(
+                policy: policy,
+                isVisible: false,
+                animationStillAttached: true,
+                modelOpacity: 1
+            ),
+            .shown
+        )
+        XCTAssertEqual(
+            LauncherLayout.hiddenFinishLanding(
+                policy: policy,
+                isVisible: false,
+                animationStillAttached: false,
+                modelOpacity: 0
+            ),
+            .leave
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldUnregisterHiddenFinishRecord(animationStillAttached: false)
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldUnregisterHiddenFinishRecord(animationStillAttached: true)
+        )
+    }
+
+    func testUnpinnedTileChromeFillLandsWhenHidden() {
+        // TILE-CHROME-FILL-FINISH-WHEN-HIDDEN-01
+        // A clear model must become nil. White at alpha 0 still paints a well.
+        let cases: [(
+            visible: Bool,
+            attached: Bool,
+            alpha: CGFloat,
+            landing: LauncherLayout.UnpinnedTileChromeFillLanding
+        )] = [
+            (true, true, 0, .leave),
+            (false, false, 0, .leave),
+            (false, true, 0, .clear),
+            (false, true, 0.01, .clear),
+            (false, true, 0.08, .keepModel),
+            (false, true, 0.10, .keepModel),
+            (true, false, 0.08, .leave)
+        ]
+        for sample in cases {
+            XCTAssertEqual(
+                LauncherLayout.unpinnedTileChromeFillLanding(
+                    isVisible: sample.visible,
+                    animationStillAttached: sample.attached,
+                    modelAlpha: sample.alpha
+                ),
+                sample.landing
+            )
+        }
+        // FOLDER-TITLE-UNDERLINE-FINISH-WHEN-HIDDEN-01 uses the shared gate.
+        // The model opacity is already 0 or 1, so removing the animation is enough.
+        XCTAssertTrue(
+            LauncherLayout.shouldFinishUnpinnedHiddenAnimation(
+                isVisible: false,
+                animationStillAttached: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldFinishUnpinnedHiddenAnimation(
+                isVisible: true,
+                animationStillAttached: true
+            )
+        )
+    }
+
+    func testUnpinnedReorderSlideFinishesWhenHidden() {
+        // REORDER-SLIDE-FINISH-WHEN-HIDDEN-01
+        XCTAssertTrue(LauncherLayout.shouldVisitReorderSlidesOutsideVisibleItems(isVisible: false))
+        XCTAssertFalse(LauncherLayout.shouldVisitReorderSlidesOutsideVisibleItems(isVisible: true))
+        XCTAssertTrue(
+            LauncherLayout.shouldFinishReorderSlideOnHiddenWindow(
+                isVisible: false,
+                clockRunning: true,
+                presentedMatchesTarget: false,
+                alreadyHeld: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldFinishReorderSlideOnHiddenWindow(
+                isVisible: false,
+                clockRunning: false,
+                presentedMatchesTarget: false,
+                alreadyHeld: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldFinishReorderSlideOnHiddenWindow(
+                isVisible: false,
+                clockRunning: false,
+                presentedMatchesTarget: true,
+                alreadyHeld: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldFinishReorderSlideOnHiddenWindow(
+                isVisible: false,
+                clockRunning: false,
+                presentedMatchesTarget: true,
+                alreadyHeld: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldFinishReorderSlideOnHiddenWindow(
+                isVisible: true,
+                clockRunning: true,
+                presentedMatchesTarget: false,
+                alreadyHeld: true
+            )
+        )
+    }
+
+    func testUnpinnedLauncherPresenceLandsRestingShownWhenHidden() {
+        // LAUNCHER-PRESENCE-FINISH-WHEN-HIDDEN-01
+        // Instant hide leaves a fully shown model. Either named animation is enough.
+        let cases: [(
+            visible: Bool,
+            fade: Bool,
+            rise: Bool,
+            landing: LauncherLayout.UnpinnedLauncherPresenceLanding
+        )] = [
+            (false, true, false, .restingShown),
+            (false, false, true, .restingShown),
+            (false, true, true, .restingShown),
+            (true, true, true, .leave),
+            (false, false, false, .leave),
+            (true, false, false, .leave)
+        ]
+        for sample in cases {
+            XCTAssertEqual(
+                LauncherLayout.unpinnedLauncherPresenceLanding(
+                    isVisible: sample.visible,
+                    fadeStillAttached: sample.fade,
+                    riseStillAttached: sample.rise
+                ),
+                sample.landing
+            )
+        }
+    }
+
+    func testUnpinnedPreviewPlateClockLandsWhenHidden() {
+        // PREVIEW-PLATE-CLOCK-FINISH-WHEN-HIDDEN-01
+        // A close already cleared the open folder. The clock still has to land.
+        XCTAssertEqual(
+            LauncherLayout.unpinnedPreviewPlateFinish(
+                isVisible: false,
+                clockRunning: true,
+                returning: true,
+                yielding: false
+            ),
+            .landReturning
+        )
+        XCTAssertEqual(
+            LauncherLayout.unpinnedPreviewPlateFinish(
+                isVisible: false,
+                clockRunning: true,
+                returning: false,
+                yielding: true
+            ),
+            .landYielding
+        )
+        // Yielding is the open end. It wins if both flags are reported.
+        XCTAssertEqual(
+            LauncherLayout.unpinnedPreviewPlateFinish(
+                isVisible: false,
+                clockRunning: true,
+                returning: true,
+                yielding: true
+            ),
+            .landYielding
+        )
+        XCTAssertEqual(
+            LauncherLayout.unpinnedPreviewPlateFinish(
+                isVisible: true,
+                clockRunning: true,
+                returning: true,
+                yielding: true
+            ),
+            .leave
+        )
+        XCTAssertEqual(
+            LauncherLayout.unpinnedPreviewPlateFinish(
+                isVisible: false,
+                clockRunning: false,
+                returning: true,
+                yielding: false
+            ),
+            .leave
+        )
+        XCTAssertEqual(
+            LauncherLayout.unpinnedPreviewPlateFinish(
+                isVisible: false,
+                clockRunning: true,
+                returning: false,
+                yielding: false
+            ),
+            .leave
+        )
+        // PREVIEW-PLATE-WRITE-RETAINED-TILES-01: order-out makes item(at:)
+        // return nothing. The folder tile is still in the hierarchy. Write
+        // it only when the lookup found none, so a recycled cell is not
+        // painted over a live one. A negative count is not a find. Glyph-hide
+        // flags and the incoming preview limit share this rule.
+        XCTAssertTrue(LauncherLayout.previewPlateShouldWriteRetainedTiles(
+            collectionLookupCount: 0
+        ))
+        XCTAssertTrue(LauncherLayout.previewPlateShouldWriteRetainedTiles(
+            collectionLookupCount: -1
+        ))
+        XCTAssertFalse(LauncherLayout.previewPlateShouldWriteRetainedTiles(
+            collectionLookupCount: 1
+        ))
+        XCTAssertFalse(LauncherLayout.previewPlateShouldWriteRetainedTiles(
+            collectionLookupCount: 3
+        ))
+    }
+
+    func testUnpinnedTileFlightFinishesWhenHidden() {
+        // FOLDER-LANDING-FINISH-WHEN-HIDDEN-01
+        // MERGE-PLATE-AND-OVERFLOW-FINISH-WHEN-HIDDEN-01
+        // Hidden and still attached: a folder landing or merge plate must
+        // show, because the landing model can still be opacity 0. Overflow
+        // only drops the named fade. A visible window keeps playing.
+        let cases: [(
+            kind: LauncherLayout.UnpinnedTileFlightKind,
+            visible: Bool,
+            attached: Bool,
+            finish: LauncherLayout.UnpinnedTileFlightFinish
+        )] = [
+            (.folderLanding, false, true, .commitShown),
+            (.mergePlate, false, true, .commitShown),
+            (.overflowOpenFade, false, true, .removeNamedFade),
+            (.folderLanding, true, true, .leave),
+            (.mergePlate, true, true, .leave),
+            (.overflowOpenFade, true, true, .leave),
+            (.folderLanding, false, false, .leave),
+            (.mergePlate, false, false, .leave),
+            (.overflowOpenFade, false, false, .leave),
+            (.folderLanding, true, false, .leave)
+        ]
+        for sample in cases {
+            XCTAssertEqual(
+                LauncherLayout.unpinnedTileFlightFinish(
+                    kind: sample.kind,
+                    isVisible: sample.visible,
+                    animationStillAttached: sample.attached
+                ),
+                sample.finish,
+                "\(sample.kind) visible=\(sample.visible) attached=\(sample.attached)"
+            )
+        }
+        // FOLDER-GLYPH-REVEAL-WHEN-HIDDEN-01: a return still shrinking on
+        // screen keeps member icons hidden. Once that panel is off screen,
+        // the same return must reveal them. An opening flight always does.
+        XCTAssertFalse(LauncherLayout.folderGlyphFlightShouldRevealCells(
+            returningHome: true,
+            panelStillClosingOnScreen: true
+        ))
+        XCTAssertTrue(LauncherLayout.folderGlyphFlightShouldRevealCells(
+            returningHome: true,
+            panelStillClosingOnScreen: false
+        ))
+        XCTAssertTrue(LauncherLayout.folderGlyphFlightShouldRevealCells(
+            returningHome: false,
+            panelStillClosingOnScreen: true
+        ))
+        XCTAssertTrue(LauncherLayout.folderGlyphFlightShouldRevealCells(
+            returningHome: false,
+            panelStillClosingOnScreen: false
+        ))
+        XCTAssertEqual(LauncherLayout.folderCreatedAnimationKey, "folder-created")
+        XCTAssertEqual(LauncherLayout.folderCreatedOpacityAnimationKey, "folder-created-opacity")
+        XCTAssertEqual(LauncherLayout.folderMergePlateAnimationKey, "folder-merge-plate")
+        XCTAssertEqual(LauncherLayout.folderMergePlateScaleAnimationKey, "folder-merge-plate-scale")
+    }
+
+    func testUnpinnedPageArrowPresenceLandsWhenHidden() {
+        // PAGE-ARROW-PRESENCE-FINISH-WHEN-HIDDEN-01
+        // Hidden and still attached: a clear model was becoming unavailable,
+        // so the arrow hides now instead of waiting for a completion that
+        // can fire after the next show. A shown model only drops the fade.
+        // A visible window keeps playing. Does not page.
+        let cases: [(
+            visible: Bool,
+            attached: Bool,
+            opacity: CGFloat,
+            landing: LauncherLayout.UnpinnedPageArrowPresenceLanding
+        )] = [
+            (false, true, 0, .hideUnavailable),
+            (false, true, 0.01, .hideUnavailable),
+            (false, true, 0.02, .dropOpacity),
+            (false, true, 0.9, .dropOpacity),
+            (true, true, 0, .leave),
+            (false, false, 0, .leave),
+            (true, false, 0.9, .leave)
+        ]
+        for sample in cases {
+            XCTAssertEqual(
+                LauncherLayout.unpinnedPageArrowPresenceLanding(
+                    isVisible: sample.visible,
+                    presenceStillAttached: sample.attached,
+                    modelOpacity: sample.opacity
+                ),
+                sample.landing,
+                "visible=\(sample.visible) attached=\(sample.attached) opacity=\(sample.opacity)"
+            )
+        }
+        XCTAssertEqual(LauncherLayout.pageArrowPresenceAnimationKey, "page-arrow-presence")
     }
 
     func testFolderBackdropSnapsUnderReducedMotion() {
@@ -10616,6 +17863,53 @@ final class LaunchIconCoreTests: XCTestCase {
                                               isPromptingForAlias: false))
         XCTAssertTrue(LauncherMarquee.suppressesDismissOnRelease(didActivate: true))
         XCTAssertFalse(LauncherMarquee.suppressesDismissOnRelease(didActivate: false))
+        // PRESENCE-GESTURE-SUPPRESS-UNINSTALL-PROMPT-01: uninstall modal blocks arm.
+        XCTAssertFalse(LauncherMarquee.canArm(
+            buttonNumber: 0, clickCount: 1, startsOnBlankArea: true, isSearching: false,
+            folderOpen: false, isDragging: false, isPaging: false, isDismissing: false,
+            isPromptingForAlias: false, isPromptingForUninstall: true
+        ))
+        XCTAssertTrue(LauncherMarquee.canArm(
+            buttonNumber: 0, clickCount: 1, startsOnBlankArea: true, isSearching: false,
+            folderOpen: false, isDragging: false, isPaging: false, isDismissing: false,
+            isPromptingForAlias: false, isPromptingForUninstall: false
+        ))
+    }
+
+    func testPresenceGestureTreatsUninstallPromptAsEditing() {
+        // PRESENCE-GESTURE-SUPPRESS-UNINSTALL-PROMPT-01
+        XCTAssertFalse(
+            LauncherLayout.shouldTreatAsPresenceGestureEditing(
+                folderTitleEditing: false,
+                searchFieldEditing: false,
+                isPromptingForAlias: false,
+                isPromptingForUninstall: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldTreatAsPresenceGestureEditing(
+                folderTitleEditing: false,
+                searchFieldEditing: false,
+                isPromptingForAlias: false,
+                isPromptingForUninstall: true
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldTreatAsPresenceGestureEditing(
+                folderTitleEditing: true,
+                searchFieldEditing: false,
+                isPromptingForAlias: false,
+                isPromptingForUninstall: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldTreatAsPresenceGestureEditing(
+                folderTitleEditing: false,
+                searchFieldEditing: true,
+                isPromptingForAlias: true,
+                isPromptingForUninstall: false
+            )
+        )
     }
 
 
@@ -11628,6 +18922,7 @@ final class LaunchIconCoreTests: XCTestCase {
     }
 
     func testLayoutDragFileURLWaitsUntilPointerLeavesWindow() {
+        let screen = CGRect(x: 0, y: 0, width: 1920, height: 1080)
         let window = CGRect(x: 448, y: 156, width: 1024, height: 768)
         let app = AppCandidate(
             canonicalURL: URL(fileURLWithPath: "/System/Applications/Calculator.app"),
@@ -11641,29 +18936,639 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertFalse(LauncherLayout.layoutDragPasteboardIncludesFileURL(
             offer: offer,
             pointerInScreen: CGPoint(x: 620, y: 760),
-            launcherWindowFrame: window))
+            launcherWindowFrame: window,
+            screenFrame: screen))
         XCTAssertFalse(LauncherLayout.layoutDragPasteboardIncludesFileURL(
             offer: offer,
             pointerInScreen: CGPoint(x: 960, y: 540),
-            launcherWindowFrame: window))
+            launcherWindowFrame: window,
+            screenFrame: screen))
         // Just outside the window, still far from the screen edge: the Dock
         // can link the app, and the in-window hotspot is already gone.
         XCTAssertTrue(LauncherLayout.layoutDragPasteboardIncludesFileURL(
             offer: offer,
             pointerInScreen: CGPoint(x: 960, y: 140),
-            launcherWindowFrame: window))
+            launcherWindowFrame: window,
+            screenFrame: screen))
         XCTAssertTrue(LauncherLayout.layoutDragPasteboardIncludesFileURL(
             offer: offer,
             pointerInScreen: CGPoint(x: 1500, y: 540),
-            launcherWindowFrame: window))
+            launcherWindowFrame: window,
+            screenFrame: screen))
         XCTAssertFalse(LauncherLayout.layoutDragPasteboardIncludesFileURL(
             offer: .none,
             pointerInScreen: CGPoint(x: 960, y: 40),
-            launcherWindowFrame: window))
+            launcherWindowFrame: window,
+            screenFrame: screen))
         XCTAssertFalse(LauncherLayout.layoutDragPasteboardIncludesFileURL(
             offer: offer,
             pointerInScreen: CGPoint(x: 960, y: 40),
-            launcherWindowFrame: .zero))
+            launcherWindowFrame: .zero,
+            screenFrame: .zero))
+    }
+
+    /// DOCK-FILE-URL-EDGE-01: production window == screen.frame, so leaving
+    /// the window never fires. The bottom 12 pt Dock edge must arm the file
+    /// URL when the Dock edge is unknown. Side rails stay a layout drag
+    /// unless the Dock is actually on that side. The icon center must stay
+    /// a layout drag.
+    func testLayoutDragFileURLArmsOnFullscreenDockEdge() {
+        let screen = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let window = screen
+        let app = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/System/Applications/Calculator.app"),
+            bundleIdentifier: "com.apple.calculator",
+            displayName: "Calculator",
+            sourcePriority: 0,
+            discoveredAt: .distantPast
+        )
+        let offer = LauncherLayout.layoutDragOutsideOffer(for: app, isFolder: false)
+        XCTAssertFalse(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: CGPoint(x: 720, y: 450),
+            launcherWindowFrame: window,
+            screenFrame: screen))
+        // Footer band / last icon row still inside the grid — not the edge.
+        XCTAssertFalse(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: CGPoint(x: 720, y: 56),
+            launcherWindowFrame: window,
+            screenFrame: screen))
+        XCTAssertTrue(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: CGPoint(x: 720, y: 4),
+            launcherWindowFrame: window,
+            screenFrame: screen))
+        // Unknown / default Dock opens only the bottom band, so the 96 pt
+        // page-turn rails at the sides stay a layout drag.
+        XCTAssertFalse(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: CGPoint(x: 2, y: 400),
+            launcherWindowFrame: window,
+            screenFrame: screen))
+        XCTAssertFalse(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: CGPoint(x: 1438, y: 400),
+            launcherWindowFrame: window,
+            screenFrame: screen))
+        XCTAssertTrue(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: CGPoint(x: 2, y: 400),
+            launcherWindowFrame: window,
+            screenFrame: screen,
+            iconLayout: .init(lastIconRowMinY: 200, firstIconColumnMinX: 120, lastIconColumnMaxX: 1320, dockEdge: .left)))
+        XCTAssertTrue(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: CGPoint(x: 1438, y: 400),
+            launcherWindowFrame: window,
+            screenFrame: screen,
+            iconLayout: .init(lastIconRowMinY: 200, firstIconColumnMinX: 120, lastIconColumnMaxX: 1320, dockEdge: .right)))
+        XCTAssertFalse(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: .none,
+            pointerInScreen: CGPoint(x: 720, y: 4),
+            launcherWindowFrame: window,
+            screenFrame: screen))
+    }
+
+    /// DOCK-FILE-URL-OUTSIDE-APP-01: the Dock is taller than the 12 pt edge.
+    /// Once AppKit reports the drag is outside the app, the file URL is
+    /// attached even though a fullscreen window still contains the point.
+    /// The same point stays a layout drag while the pointer is still inside.
+    func testLayoutDragFileURLArmsWhenDragIsAlreadyOutsideTheApp() {
+        let screen = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let window = screen
+        let app = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/System/Applications/Calculator.app"),
+            bundleIdentifier: "com.apple.calculator",
+            displayName: "Calculator",
+            sourcePriority: 0,
+            discoveredAt: .distantPast
+        )
+        let offer = LauncherLayout.layoutDragOutsideOffer(for: app, isFolder: false)
+        let overDock = CGPoint(x: 720, y: 40)
+        let fixture = LauncherLayout.ExternalDragIconLayout(lastIconRowMinY: 56)
+        // Without a last-row layout, both asks stay on the 12 pt edge, so
+        // y = 40 does not attach. The derived fixture band (48 pt) does.
+        XCTAssertFalse(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: overDock,
+            launcherWindowFrame: window,
+            screenFrame: screen,
+            draggingOutsideApplication: false))
+        XCTAssertFalse(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: overDock,
+            launcherWindowFrame: window,
+            screenFrame: screen,
+            draggingOutsideApplication: true))
+        XCTAssertTrue(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: overDock,
+            launcherWindowFrame: window,
+            screenFrame: screen,
+            draggingOutsideApplication: true,
+            iconLayout: fixture))
+        // Drag start asks for the outside mask while the pointer is still
+        // on an icon. Attaching there replaces the drag image.
+        XCTAssertFalse(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: CGPoint(x: 720, y: 450),
+            launcherWindowFrame: window,
+            screenFrame: screen,
+            draggingOutsideApplication: true,
+            iconLayout: fixture))
+        XCTAssertFalse(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: CGPoint(x: 720, y: 450),
+            launcherWindowFrame: window,
+            screenFrame: .zero,
+            draggingOutsideApplication: true,
+            iconLayout: fixture))
+        // The last icon row stays a layout drag even if that ask arrives.
+        XCTAssertFalse(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: CGPoint(x: 720, y: 56),
+            launcherWindowFrame: window,
+            screenFrame: screen,
+            draggingOutsideApplication: true,
+            iconLayout: fixture))
+        XCTAssertFalse(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: .none,
+            pointerInScreen: overDock,
+            launcherWindowFrame: window,
+            screenFrame: screen,
+            draggingOutsideApplication: true,
+            iconLayout: fixture))
+    }
+
+    /// Dissolved-grid fade and folder chrome are residual layers, same as a
+    /// merge flyer. A clean handoff is zero layers and zero placeholders.
+    func testExternalDragDockLinkInsetsCapBelowLastIconRow() {
+        let screen = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        // Fixture last row at y = 56, minus 8 pt spacing, caps at the old 48 pt band.
+        let fixture = LauncherLayout.externalDragDockLinkInsets(
+            screenFrame: screen,
+            iconLayout: .init(lastIconRowMinY: 56)
+        )
+        XCTAssertEqual(fixture.bottom, 48)
+        XCTAssertEqual(fixture.left, 0)
+        XCTAssertEqual(fixture.right, 0)
+
+        // Production last row is far above a typical 80 pt Dock. Unknown /
+        // default opens only the bottom band so the side rails stay free.
+        let roomy = LauncherLayout.externalDragDockLinkInsets(
+            screenFrame: screen,
+            iconLayout: .init(lastIconRowMinY: 200, firstIconColumnMinX: 120, lastIconColumnMaxX: 1320)
+        )
+        XCTAssertEqual(roomy.bottom, 80)
+        XCTAssertEqual(roomy.left, 0)
+        XCTAssertEqual(roomy.right, 0)
+        let roomyLeft = LauncherLayout.externalDragDockLinkInsets(
+            screenFrame: screen,
+            iconLayout: .init(
+                lastIconRowMinY: 200,
+                firstIconColumnMinX: 120,
+                lastIconColumnMaxX: 1320,
+                dockEdge: .left
+            )
+        )
+        XCTAssertEqual(roomyLeft.bottom, 0)
+        XCTAssertEqual(roomyLeft.left, 80)
+        XCTAssertEqual(roomyLeft.right, 0)
+
+        // A last row close to the Dock must not expand the band into the icons.
+        let tight = LauncherLayout.externalDragDockLinkInsets(
+            screenFrame: screen,
+            iconLayout: .init(lastIconRowMinY: 20)
+        )
+        XCTAssertEqual(tight.bottom, 12)
+        let flush = LauncherLayout.externalDragDockLinkInsets(
+            screenFrame: screen,
+            iconLayout: .init(lastIconRowMinY: 8)
+        )
+        XCTAssertEqual(flush.bottom, 0)
+
+        // Unknown layout stays on the 12 pt reveal edge so a merge is not armed.
+        let unknown = LauncherLayout.externalDragDockLinkInsets(screenFrame: screen, iconLayout: nil)
+        XCTAssertEqual(unknown.bottom, 12)
+        XCTAssertEqual(unknown.left, 0)
+        XCTAssertEqual(unknown.right, 0)
+        let emptyScreen = LauncherLayout.externalDragDockLinkInsets(
+            screenFrame: .zero,
+            iconLayout: .init(lastIconRowMinY: 200)
+        )
+        XCTAssertEqual(emptyScreen.bottom, 0)
+    }
+
+    func testExternalDragDockEdgeOpensOnlyTheActualDockSide() {
+        // DOCK-FILE-URL-DOCK-EDGE-01. A bottom Dock does not arm the 96 pt
+        // page-turn rails, so x = 40 stays a layout drag. A left Dock does
+        // arm x = 40, capped by the visible inset. Unknown opens only the
+        // bottom band.
+        let screen = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let window = screen
+        let app = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/System/Applications/Calculator.app"),
+            bundleIdentifier: "com.apple.calculator",
+            displayName: "Calculator",
+            sourcePriority: 0,
+            discoveredAt: .distantPast
+        )
+        let offer = LauncherLayout.layoutDragOutsideOffer(for: app, isFolder: false)
+        let bottom = LauncherLayout.ExternalDragIconLayout(
+            lastIconRowMinY: 200,
+            firstIconColumnMinX: 120,
+            lastIconColumnMaxX: 1320,
+            dockEdge: .bottom
+        )
+        let bottomInsets = LauncherLayout.externalDragDockLinkInsets(
+            screenFrame: screen, iconLayout: bottom)
+        XCTAssertEqual(bottomInsets.bottom, 80)
+        XCTAssertEqual(bottomInsets.left, 0)
+        XCTAssertEqual(bottomInsets.right, 0)
+        XCTAssertFalse(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: CGPoint(x: 40, y: 400),
+            launcherWindowFrame: window,
+            screenFrame: screen,
+            iconLayout: bottom))
+        XCTAssertTrue(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: CGPoint(x: 720, y: 40),
+            launcherWindowFrame: window,
+            screenFrame: screen,
+            iconLayout: bottom))
+
+        let left = LauncherLayout.ExternalDragIconLayout(
+            lastIconRowMinY: 200,
+            firstIconColumnMinX: 120,
+            lastIconColumnMaxX: 1320,
+            dockEdge: .left,
+            dockInset: 70
+        )
+        let leftInsets = LauncherLayout.externalDragDockLinkInsets(
+            screenFrame: screen, iconLayout: left)
+        XCTAssertEqual(leftInsets.left, 70)
+        XCTAssertEqual(leftInsets.right, 0)
+        XCTAssertEqual(leftInsets.bottom, 0)
+        XCTAssertTrue(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: CGPoint(x: 40, y: 400),
+            launcherWindowFrame: window,
+            screenFrame: screen,
+            iconLayout: left))
+        XCTAssertFalse(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: CGPoint(x: 1400, y: 400),
+            launcherWindowFrame: window,
+            screenFrame: screen,
+            iconLayout: left))
+
+        let unknown = LauncherLayout.ExternalDragIconLayout(
+            lastIconRowMinY: 200,
+            firstIconColumnMinX: 120,
+            lastIconColumnMaxX: 1320,
+            dockEdge: .unknown
+        )
+        let unknownInsets = LauncherLayout.externalDragDockLinkInsets(
+            screenFrame: screen, iconLayout: unknown)
+        XCTAssertEqual(unknownInsets.bottom, 80)
+        XCTAssertEqual(unknownInsets.left, 0)
+        XCTAssertEqual(unknownInsets.right, 0)
+        XCTAssertFalse(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: CGPoint(x: 40, y: 400),
+            launcherWindowFrame: window,
+            screenFrame: screen,
+            iconLayout: unknown))
+        XCTAssertTrue(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: CGPoint(x: 720, y: 40),
+            launcherWindowFrame: window,
+            screenFrame: screen,
+            iconLayout: unknown))
+    }
+
+    func testExternalDragDockEdgeIsInferredFromVisibleFrame() {
+        let screen = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let bottomVisible = CGRect(x: 0, y: 70, width: 1440, height: 800)
+        XCTAssertEqual(
+            LauncherLayout.externalDragDockEdge(screenFrame: screen, visibleFrame: bottomVisible),
+            .bottom)
+        let leftVisible = CGRect(x: 70, y: 0, width: 1370, height: 870)
+        XCTAssertEqual(
+            LauncherLayout.externalDragDockEdge(screenFrame: screen, visibleFrame: leftVisible),
+            .left)
+        let rightVisible = CGRect(x: 0, y: 0, width: 1370, height: 870)
+        XCTAssertEqual(
+            LauncherLayout.externalDragDockEdge(screenFrame: screen, visibleFrame: rightVisible),
+            .right)
+        let menuBarOnly = CGRect(x: 0, y: 0, width: 1440, height: 870)
+        XCTAssertEqual(
+            LauncherLayout.externalDragDockEdge(screenFrame: screen, visibleFrame: menuBarOnly),
+            .unknown)
+        XCTAssertEqual(
+            LauncherLayout.externalDragDockEdge(
+                screenFrame: screen, visibleFrame: menuBarOnly, orientationFallback: .left),
+            .left)
+        XCTAssertEqual(
+            LauncherLayout.externalDragDockEdge(
+                screenFrame: screen, visibleFrame: bottomVisible, orientationFallback: .left),
+            .bottom)
+    }
+
+    func testLayoutDragFileURLYieldsToThePageTurnPlateUntilThePointerLeavesTheApp() {
+        // DOCK-FILE-URL-DOCK-EDGE-01. A left Dock band overlaps the 96 pt
+        // page-arrow plate. In-window hover on that plate stays a layout
+        // drag so a cross-page move can start. The same point attaches once
+        // AppKit reports the drag is outside the app. The footer below the
+        // plate still attaches in-window.
+        let screen = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let window = screen
+        let app = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/System/Applications/Calculator.app"),
+            bundleIdentifier: "com.apple.calculator",
+            displayName: "Calculator",
+            sourcePriority: 0,
+            discoveredAt: .distantPast
+        )
+        let offer = LauncherLayout.layoutDragOutsideOffer(for: app, isFolder: false)
+        let left = LauncherLayout.ExternalDragIconLayout(
+            lastIconRowMinY: 200,
+            firstIconColumnMinX: 120,
+            lastIconColumnMaxX: 1320,
+            dockEdge: .left,
+            dockInset: 80
+        )
+        let plate = CGRect(x: 0, y: 100, width: 96, height: 700)
+        let onPlate = CGPoint(x: 40, y: 400)
+        let belowPlate = CGPoint(x: 40, y: 40)
+        XCTAssertFalse(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: onPlate,
+            launcherWindowFrame: window,
+            screenFrame: screen,
+            draggingOutsideApplication: false,
+            iconLayout: left,
+            pageTurnPlates: [plate]))
+        XCTAssertTrue(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: onPlate,
+            launcherWindowFrame: window,
+            screenFrame: screen,
+            draggingOutsideApplication: true,
+            iconLayout: left,
+            pageTurnPlates: [plate]))
+        XCTAssertTrue(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: belowPlate,
+            launcherWindowFrame: window,
+            screenFrame: screen,
+            draggingOutsideApplication: false,
+            iconLayout: left,
+            pageTurnPlates: [plate]))
+    }
+
+    func testExternalDragFileURLPasteboardActionWithdrawsWhenLeavingTheBand() {
+        // DOCK-FILE-URL-WITHDRAW-01. Entering a left Dock band attaches.
+        // Moving back to the icon grid withdraws. Leaving the window keeps
+        // the file URL. The historical latch must not stay attached.
+        let screen = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let window = screen
+        let app = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/System/Applications/Calculator.app"),
+            bundleIdentifier: "com.apple.calculator",
+            displayName: "Calculator",
+            sourcePriority: 0,
+            discoveredAt: .distantPast
+        )
+        let offer = LauncherLayout.layoutDragOutsideOffer(for: app, isFolder: false)
+        let left = LauncherLayout.ExternalDragIconLayout(
+            lastIconRowMinY: 200,
+            firstIconColumnMinX: 120,
+            lastIconColumnMaxX: 1320,
+            dockEdge: .left,
+            dockInset: 80
+        )
+        let inBand = LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: CGPoint(x: 40, y: 400),
+            launcherWindowFrame: window,
+            screenFrame: screen,
+            iconLayout: left)
+        let inGrid = LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: CGPoint(x: 400, y: 400),
+            launcherWindowFrame: window,
+            screenFrame: screen,
+            iconLayout: left)
+        XCTAssertTrue(inBand)
+        XCTAssertFalse(inGrid)
+        XCTAssertEqual(
+            LauncherLayout.externalDragFileURLPasteboardAction(
+                currentlyAttached: false, shouldIncludeFileURL: inBand),
+            .attach)
+        XCTAssertEqual(
+            LauncherLayout.externalDragFileURLPasteboardAction(
+                currentlyAttached: true, shouldIncludeFileURL: inBand),
+            .none)
+        XCTAssertEqual(
+            LauncherLayout.externalDragFileURLPasteboardAction(
+                currentlyAttached: true, shouldIncludeFileURL: inGrid),
+            .withdraw)
+        XCTAssertEqual(
+            LauncherLayout.externalDragFileURLPasteboardAction(
+                currentlyAttached: false, shouldIncludeFileURL: inGrid),
+            .none)
+
+        let windowed = CGRect(x: 200, y: 100, width: 1024, height: 700)
+        let outsideWindow = LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: CGPoint(x: 960, y: 40),
+            launcherWindowFrame: windowed,
+            screenFrame: screen,
+            iconLayout: left)
+        XCTAssertTrue(outsideWindow)
+        XCTAssertEqual(
+            LauncherLayout.externalDragFileURLPasteboardAction(
+                currentlyAttached: true, shouldIncludeFileURL: outsideWindow),
+            .none)
+        XCTAssertEqual(
+            LauncherLayout.externalDragFileURLPasteboardAction(
+                currentlyAttached: false, shouldIncludeFileURL: outsideWindow),
+            .attach)
+    }
+
+    /// DOCK-FILE-URL-LAYOUT-BAND-01: a typical 60–80 pt Dock sits above the
+    /// old 48 pt magic inset. With a last row at y = 200 the derived band is
+    /// 80 pt, and both the outside-app mask and `movedTo` attach there. The
+    /// last icon row itself stays a layout drag. A fixture last row at y = 56
+    /// still caps the band at 48 pt.
+    func testLayoutDragFileURLArmsInDerivedDockBandIncludingMovedTo() {
+        let screen = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let window = screen
+        let app = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/System/Applications/Calculator.app"),
+            bundleIdentifier: "com.apple.calculator",
+            displayName: "Calculator",
+            sourcePriority: 0,
+            discoveredAt: .distantPast
+        )
+        let offer = LauncherLayout.layoutDragOutsideOffer(for: app, isFolder: false)
+        let production = LauncherLayout.ExternalDragIconLayout(
+            lastIconRowMinY: 200,
+            firstIconColumnMinX: 120,
+            lastIconColumnMaxX: 1320
+        )
+        let overUpperDock = CGPoint(x: 720, y: 70)
+        XCTAssertTrue(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: overUpperDock,
+            launcherWindowFrame: window,
+            screenFrame: screen,
+            draggingOutsideApplication: true,
+            iconLayout: production))
+        // movedTo uses the same derived band, not the 12 pt edge only.
+        XCTAssertTrue(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: overUpperDock,
+            launcherWindowFrame: window,
+            screenFrame: screen,
+            draggingOutsideApplication: false,
+            iconLayout: production))
+        // On the last icon row itself: still a layout drag.
+        XCTAssertFalse(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: CGPoint(x: 720, y: 200),
+            launcherWindowFrame: window,
+            screenFrame: screen,
+            draggingOutsideApplication: true,
+            iconLayout: production))
+        // Tight fixture last row: y = 70 would overlap the icons, so no attach.
+        let fixture = LauncherLayout.ExternalDragIconLayout(lastIconRowMinY: 56)
+        XCTAssertFalse(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: overUpperDock,
+            launcherWindowFrame: window,
+            screenFrame: screen,
+            draggingOutsideApplication: true,
+            iconLayout: fixture))
+        XCTAssertTrue(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: CGPoint(x: 720, y: 40),
+            launcherWindowFrame: window,
+            screenFrame: screen,
+            draggingOutsideApplication: true,
+            iconLayout: fixture))
+        XCTAssertFalse(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: CGPoint(x: 720, y: 56),
+            launcherWindowFrame: window,
+            screenFrame: screen,
+            draggingOutsideApplication: true,
+            iconLayout: fixture))
+        // Side Dock only opens on the actual Dock edge.
+        var leftDock = production
+        leftDock.dockEdge = .left
+        var rightDock = production
+        rightDock.dockEdge = .right
+        XCTAssertTrue(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: CGPoint(x: 20, y: 400),
+            launcherWindowFrame: window,
+            screenFrame: screen,
+            draggingOutsideApplication: false,
+            iconLayout: leftDock))
+        XCTAssertFalse(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: CGPoint(x: 20, y: 400),
+            launcherWindowFrame: window,
+            screenFrame: screen,
+            draggingOutsideApplication: false,
+            iconLayout: production))
+        XCTAssertFalse(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: CGPoint(x: 120, y: 400),
+            launcherWindowFrame: window,
+            screenFrame: screen,
+            draggingOutsideApplication: true,
+            iconLayout: leftDock))
+        XCTAssertTrue(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: CGPoint(x: 1430, y: 400),
+            launcherWindowFrame: window,
+            screenFrame: screen,
+            draggingOutsideApplication: false,
+            iconLayout: rightDock))
+        XCTAssertFalse(LauncherLayout.layoutDragPasteboardIncludesFileURL(
+            offer: offer,
+            pointerInScreen: overUpperDock,
+            launcherWindowFrame: window,
+            screenFrame: screen,
+            draggingOutsideApplication: false,
+            iconLayout: nil))
+    }
+
+
+    func testDismissalVisualResidueCountsDissolvedGridAndFolderChrome() {
+        let clean = LauncherLayout.dismissalVisualResidue(
+            mergeFlyerAttached: false,
+            dropLandingAttached: false,
+            mergePreviewFlyerCount: 0,
+            previewGlyphFlyerCount: 0,
+            folderAnimatingClose: false,
+            dissolveScatterFlyerCount: 0,
+            dissolvedGridFadeStillHeld: false,
+            folderChromeStillHeld: false,
+            folderOverlayVisible: false,
+            placeholderIconCount: 0
+        )
+        XCTAssertEqual(clean.layers, 0)
+        XCTAssertEqual(clean.placeholders, 0)
+
+        let fade = LauncherLayout.dismissalVisualResidue(
+            mergeFlyerAttached: false,
+            dropLandingAttached: false,
+            mergePreviewFlyerCount: 0,
+            previewGlyphFlyerCount: 0,
+            folderAnimatingClose: false,
+            dissolveScatterFlyerCount: 1,
+            dissolvedGridFadeStillHeld: true,
+            folderChromeStillHeld: false,
+            folderOverlayVisible: false,
+            placeholderIconCount: 0
+        )
+        XCTAssertEqual(fade.layers, 2)
+
+        let chrome = LauncherLayout.dismissalVisualResidue(
+            mergeFlyerAttached: false,
+            dropLandingAttached: false,
+            mergePreviewFlyerCount: 0,
+            previewGlyphFlyerCount: 0,
+            folderAnimatingClose: true,
+            dissolveScatterFlyerCount: 0,
+            dissolvedGridFadeStillHeld: false,
+            folderChromeStillHeld: true,
+            folderOverlayVisible: true,
+            placeholderIconCount: 2
+        )
+        XCTAssertEqual(chrome.layers, 3)
+        XCTAssertEqual(chrome.placeholders, 2)
+
+        let clamped = LauncherLayout.dismissalVisualResidue(
+            mergeFlyerAttached: true,
+            dropLandingAttached: true,
+            mergePreviewFlyerCount: -3,
+            previewGlyphFlyerCount: 1,
+            folderAnimatingClose: false,
+            dissolveScatterFlyerCount: 0,
+            dissolvedGridFadeStillHeld: false,
+            folderChromeStillHeld: false,
+            folderOverlayVisible: false,
+            placeholderIconCount: -1
+        )
+        XCTAssertEqual(clamped.layers, 3)
+        XCTAssertEqual(clamped.placeholders, 0)
     }
 
     func testAccessibilityFramePrefersTheViewScreenFrame() {
@@ -11795,6 +19700,56 @@ final class LaunchIconCoreTests: XCTestCase {
             keyCode: 36, commandOnly: true, isSearching: true, folderOpen: false, hasMarkedText: true))
         XCTAssertFalse(LauncherLayout.searchRevealShortcutMatches(
             keyCode: 49, commandOnly: true, isSearching: true, folderOpen: false, hasMarkedText: false))
+    }
+
+    func testGridTileCommandReturnRevealsTheFocusedApp() {
+        // GRID-CMD-RETURN-REVEAL-01. Search keeps its own shortcut. A focused
+        // app tile uses the same ⌘↩; a folder tile still opens.
+        XCTAssertTrue(LauncherLayout.gridTileCommandReturnReveals(
+            keyCode: 36, commandOnly: true, canRevealInFinder: true))
+        XCTAssertTrue(LauncherLayout.gridTileCommandReturnReveals(
+            keyCode: 76, commandOnly: true, canRevealInFinder: true))
+        XCTAssertFalse(LauncherLayout.gridTileCommandReturnReveals(
+            keyCode: 36, commandOnly: true, canRevealInFinder: false))
+        XCTAssertFalse(LauncherLayout.gridTileCommandReturnReveals(
+            keyCode: 36, commandOnly: false, canRevealInFinder: true))
+        XCTAssertFalse(LauncherLayout.gridTileCommandReturnReveals(
+            keyCode: 49, commandOnly: true, canRevealInFinder: true))
+        XCTAssertFalse(LauncherLayout.searchRevealShortcutMatches(
+            keyCode: 36, commandOnly: true, isSearching: false, folderOpen: false, hasMarkedText: false),
+            "an idle grid still does not take the search shortcut")
+    }
+
+    func testCommandShiftReturnRevealsTheSelection() {
+        // GRID-COMMAND-SHIFT-RETURN-REVEAL-01. Two or more selected items
+        // reveal together. One item, and ⌘↩ without Shift, stay on the old path.
+        XCTAssertTrue(LauncherLayout.commandShiftReturnRevealsSelection(
+            keyCode: 36, command: true, shift: true, option: false, control: false,
+            isEditingText: false, acceptsAction: true, isPaging: false, selectedCount: 2))
+        XCTAssertTrue(LauncherLayout.commandShiftReturnRevealsSelection(
+            keyCode: 76, command: true, shift: true, option: false, control: false,
+            isEditingText: false, acceptsAction: true, isPaging: false, selectedCount: 3))
+        XCTAssertFalse(LauncherLayout.commandShiftReturnRevealsSelection(
+            keyCode: 36, command: true, shift: true, option: false, control: false,
+            isEditingText: false, acceptsAction: true, isPaging: false, selectedCount: 1))
+        XCTAssertFalse(LauncherLayout.commandShiftReturnRevealsSelection(
+            keyCode: 36, command: true, shift: false, option: false, control: false,
+            isEditingText: false, acceptsAction: true, isPaging: false, selectedCount: 2))
+        XCTAssertFalse(LauncherLayout.commandShiftReturnRevealsSelection(
+            keyCode: 36, command: true, shift: true, option: true, control: false,
+            isEditingText: false, acceptsAction: true, isPaging: false, selectedCount: 2))
+        XCTAssertFalse(LauncherLayout.commandShiftReturnRevealsSelection(
+            keyCode: 36, command: true, shift: true, option: false, control: false,
+            isEditingText: true, acceptsAction: true, isPaging: false, selectedCount: 2))
+        XCTAssertFalse(LauncherLayout.commandShiftReturnRevealsSelection(
+            keyCode: 36, command: true, shift: true, option: false, control: false,
+            isEditingText: false, acceptsAction: false, isPaging: false, selectedCount: 2))
+        XCTAssertFalse(LauncherLayout.commandShiftReturnRevealsSelection(
+            keyCode: 36, command: true, shift: true, option: false, control: false,
+            isEditingText: false, acceptsAction: true, isPaging: true, selectedCount: 2))
+        XCTAssertFalse(LauncherLayout.commandShiftReturnRevealsSelection(
+            keyCode: 49, command: true, shift: true, option: false, control: false,
+            isEditingText: false, acceptsAction: true, isPaging: false, selectedCount: 2))
     }
 
     func testBatchRevealMenuTitleFormatKeyIncludesCount() {
@@ -13758,6 +21713,33 @@ final class LaunchIconCoreTests: XCTestCase {
             LauncherLayout.shouldSnapInFlightDropLanding(isDismissing: false, isVisible: true),
             LauncherLayout.shouldSnapInFlightMergeFlight(isDismissing: false, isVisible: true)
         )
+        // DROP-LANDING-REVEAL-RETAINED-TILES-01: order-out makes item(at:)
+        // return nothing. The cells remembered when they were hidden are
+        // still shown. A lookup is not added, and it cannot invent a hide.
+        XCTAssertTrue(LauncherLayout.dropLandingShouldRevealRetainedTiles(
+            retainedHiddenTileCount: 1,
+            collectionLookupCount: 0
+        ))
+        XCTAssertTrue(LauncherLayout.dropLandingShouldRevealRetainedTiles(
+            retainedHiddenTileCount: 2,
+            collectionLookupCount: 2
+        ))
+        XCTAssertTrue(LauncherLayout.dropLandingShouldRevealRetainedTiles(
+            retainedHiddenTileCount: 1,
+            collectionLookupCount: -2
+        ))
+        XCTAssertFalse(LauncherLayout.dropLandingShouldRevealRetainedTiles(
+            retainedHiddenTileCount: 0,
+            collectionLookupCount: 0
+        ))
+        XCTAssertFalse(LauncherLayout.dropLandingShouldRevealRetainedTiles(
+            retainedHiddenTileCount: 0,
+            collectionLookupCount: 4
+        ))
+        XCTAssertFalse(LauncherLayout.dropLandingShouldRevealRetainedTiles(
+            retainedHiddenTileCount: -1,
+            collectionLookupCount: 3
+        ))
     }
 
     /// The lift shadow lives in the drag image. The flyer is the cell, so the
@@ -13823,11 +21805,13 @@ final class LaunchIconCoreTests: XCTestCase {
     }
 
     func testSearchFieldUsesTheSpecifiedChromeSize() {
-        XCTAssertGreaterThanOrEqual(LauncherLayout.searchFieldWidth, 360)
+        // SEARCH-FIELD-CHROME-02
+        XCTAssertGreaterThanOrEqual(LauncherLayout.searchFieldWidth, 320)
         XCTAssertLessThanOrEqual(LauncherLayout.searchFieldWidth, 520)
-        XCTAssertEqual(LauncherLayout.searchFieldWidth, 400)
-        XCTAssertEqual(LauncherLayout.searchFieldHeight, 42)
-        XCTAssertEqual(LauncherLayout.searchFieldCornerRadius, 21)
+        XCTAssertEqual(LauncherLayout.searchFieldWidth, 360)
+        XCTAssertEqual(LauncherLayout.searchFieldHeight, 36)
+        XCTAssertEqual(LauncherLayout.searchFieldCornerRadius, 18)
+        XCTAssertEqual(LauncherLayout.searchSettingsButtonSize, 32)
     }
 
     func testDragReorderPreviewSlidesOtherItemsAroundTheGap() {
@@ -14114,6 +22098,342 @@ final class LaunchIconCoreTests: XCTestCase {
             LauncherLayout.resolvedFolderName(draft: " 新名 ", previous: "工具"),
             "新名"
         )
+        // AX-FOLDER-COUNT-01 / AX-PAGE-DOT-CURRENT-01
+        XCTAssertNil(LauncherLayout.folderTileAccessibilityValue(memberCount: 0))
+        XCTAssertEqual(LauncherLayout.folderTileAccessibilityValue(memberCount: 1), "1 个项目")
+        XCTAssertEqual(LauncherLayout.folderTileAccessibilityValue(memberCount: 25), "25 个项目")
+        XCTAssertEqual(
+            LauncherLayout.folderTileAccessibilityValue(
+                memberCount: 3,
+                localize: { $0 == "%d 个项目" ? "%d items" : $0 }
+            ),
+            "3 items"
+        )
+        XCTAssertEqual(LauncherLayout.pageDotAccessibilityValue(isCurrent: true), "当前页")
+        XCTAssertNil(LauncherLayout.pageDotAccessibilityValue(isCurrent: false))
+        // PAGE-ARROW-AX-AXIS-01
+        XCTAssertEqual(
+            LauncherLayout.pageArrowAccessibilityLabel(previous: true, horizontal: true),
+            "上一页"
+        )
+        XCTAssertEqual(
+            LauncherLayout.pageArrowAccessibilityLabel(previous: false, horizontal: false),
+            "向下翻页"
+        )
+        XCTAssertEqual(
+            LauncherLayout.pageArrowAccessibilityLabel(previous: true, horizontal: false),
+            "向上翻页"
+        )
+        // STATUS-ITEM-BUTTON-AX-01: show/hide titles exist for button label
+        XCTAssertEqual(LauncherLayout.statusItemToggleTitle(isVisible: false, isDismissing: false), "显示 LaunchIcon")
+        XCTAssertEqual(LauncherLayout.statusItemToggleTitle(isVisible: true, isDismissing: false), "隐藏 LaunchIcon")
+        // TOAST-ESC-DISMISS-01
+        XCTAssertTrue(LauncherLayout.shouldDismissToastOnEscape(isToastVisible: true))
+        XCTAssertFalse(LauncherLayout.shouldDismissToastOnEscape(isToastVisible: false))
+        // BLANK-CLICK-TOAST-01
+        XCTAssertTrue(LauncherLayout.shouldDismissToastOnBlankClick(isToastVisible: true))
+        XCTAssertFalse(LauncherLayout.shouldDismissToastOnBlankClick(isToastVisible: false))
+        // PINCH-DISMISS-LAYERED-01
+        XCTAssertEqual(
+            LauncherLayout.pinchDismissLayer(isToastVisible: true, folderOpen: true, selectionCount: 2),
+            .dismissToast
+        )
+        XCTAssertEqual(
+            LauncherLayout.pinchDismissLayer(isToastVisible: false, folderOpen: true, selectionCount: 2),
+            .closeFolder
+        )
+        XCTAssertEqual(
+            LauncherLayout.pinchDismissLayer(isToastVisible: false, folderOpen: false, selectionCount: 2),
+            .clearSelection
+        )
+        XCTAssertEqual(
+            LauncherLayout.pinchDismissLayer(isToastVisible: false, folderOpen: false, selectionCount: 0),
+            .hideLauncher
+        )
+        // SETTINGS-OPEN-DISMISS-TOAST-01 / SETTINGS-OPEN-CLOSE-FOLDER-01
+        XCTAssertTrue(LauncherLayout.shouldDismissToastWhenOpeningSettings(isToastVisible: true))
+        XCTAssertFalse(LauncherLayout.shouldDismissToastWhenOpeningSettings(isToastVisible: false))
+        XCTAssertTrue(LauncherLayout.shouldCloseFolderWhenOpeningSettings(folderOpen: true))
+        XCTAssertFalse(LauncherLayout.shouldCloseFolderWhenOpeningSettings(folderOpen: false))
+        // SEARCH-BEGIN-DISMISS-TOAST-01 / ICON-MENU-DISMISS-TOAST-01
+        XCTAssertTrue(LauncherLayout.shouldDismissToastWhenBeginningSearch(isToastVisible: true))
+        XCTAssertFalse(LauncherLayout.shouldDismissToastWhenBeginningSearch(isToastVisible: false))
+        XCTAssertTrue(LauncherLayout.shouldDismissToastWhenOpeningIconMenu(isToastVisible: true))
+        XCTAssertFalse(LauncherLayout.shouldDismissToastWhenOpeningIconMenu(isToastVisible: false))
+        // APP-MENU-READONLY-REVEAL-01
+        XCTAssertTrue(LauncherLayout.shouldOfferRevealInFinderInAppMenu(layoutEditingEnabled: true))
+        XCTAssertFalse(LauncherLayout.shouldOfferRevealInFinderInAppMenu(layoutEditingEnabled: false))
+        // FOLDER-MENU-SEP-AFTER-RENAME-01
+        XCTAssertTrue(LauncherLayout.shouldSeparateFolderRenameFromSorts(hasRename: true, hasSort: true))
+        XCTAssertFalse(LauncherLayout.shouldSeparateFolderRenameFromSorts(hasRename: true, hasSort: false))
+        XCTAssertFalse(LauncherLayout.shouldSeparateFolderRenameFromSorts(hasRename: false, hasSort: true))
+        // SEARCH-FOCUS / DRAG-BEGIN / MARQUEE-ACTIVATE toast dismiss
+        XCTAssertTrue(LauncherLayout.shouldDismissToastWhenFocusingSearch(isToastVisible: true))
+        XCTAssertFalse(LauncherLayout.shouldDismissToastWhenFocusingSearch(isToastVisible: false))
+        XCTAssertTrue(LauncherLayout.shouldDismissToastWhenBeginningDrag(isToastVisible: true))
+        XCTAssertFalse(LauncherLayout.shouldDismissToastWhenBeginningDrag(isToastVisible: false))
+        XCTAssertTrue(LauncherLayout.shouldDismissToastWhenActivatingMarquee(isToastVisible: true))
+        XCTAssertFalse(LauncherLayout.shouldDismissToastWhenActivatingMarquee(isToastVisible: false))
+        // SETTINGS-TAB-SCROLL-TO-TOP-01
+        XCTAssertEqual(SettingsScrollDocument.scrollOriginForTabSelectReset(), .zero)
+        XCTAssertEqual(
+            LauncherLayout.FooterChromeCopy.pageIndicatorAccessibilityLabel(),
+            "页码"
+        )
+        // DOCK-REVEAL-RESET-ON-HIDE-01: while dismissing, do not re-hide Dock
+        XCTAssertFalse(
+            LauncherLayout.shouldRestoreDockHideAfterExternalDrag(
+                launcherVisible: true,
+                launcherDismissing: true
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldRestoreDockHideAfterExternalDrag(
+                launcherVisible: true,
+                launcherDismissing: false
+            )
+        )
+        // SEARCH-CANCEL-BUTTON-ABORTS-IME-01
+        XCTAssertTrue(
+            LauncherLayout.searchCancelButtonRequiresForcedEmpty(
+                committed: "",
+                editing: nil,
+                editingHasMarkedText: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.searchCancelRequiresForcedEmpty(
+                committed: "",
+                editing: nil,
+                editingHasMarkedText: true
+            )
+        )
+        // SEARCH-CANCEL-VISIBLE-DURING-IME-01 / SEARCH-CANCEL-BUTTON-EXITS-SEARCH-01
+        XCTAssertTrue(
+            LauncherLayout.searchFieldShowsCancelButton(
+                committed: "",
+                editing: "ni",
+                editingHasMarkedText: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.searchFieldShowsCancelButton(
+                committed: "",
+                editing: nil,
+                editingHasMarkedText: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.searchFieldShowsCancelButton(
+                committed: "a",
+                editing: nil,
+                editingHasMarkedText: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.searchCancelButtonShouldExitSearch(
+                isSearching: true,
+                committed: "",
+                editing: nil,
+                editingHasMarkedText: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.searchCancelButtonShouldExitSearch(
+                isSearching: false,
+                committed: "",
+                editing: nil,
+                editingHasMarkedText: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.searchCancelButtonShouldExitSearch(
+                isSearching: false,
+                committed: "",
+                editing: nil,
+                editingHasMarkedText: true
+            )
+        )
+        // SEARCH-CANCEL-BUTTON-CLEARS-MARKED-AND-COMMITTED-01: one × exit
+        // covers marked pinyin sitting on top of a committed query. The Esc
+        // path still protects marked-only pinyin, but also force-empties when
+        // a committed string is already present.
+        XCTAssertTrue(
+            LauncherLayout.searchCancelButtonRequiresForcedEmpty(
+                committed: "钟",
+                editing: "钟ni",
+                editingHasMarkedText: true
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.searchCancelButtonShouldExitSearch(
+                isSearching: true,
+                committed: "钟",
+                editing: "钟ni",
+                editingHasMarkedText: true
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.searchCancelButtonShouldExitSearch(
+                isSearching: false,
+                committed: "钟",
+                editing: "钟ni",
+                editingHasMarkedText: true
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.searchCancelRequiresForcedEmpty(
+                committed: "钟",
+                editing: "钟ni",
+                editingHasMarkedText: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.searchCancelRequiresForcedEmpty(
+                committed: "",
+                editing: "ni",
+                editingHasMarkedText: true
+            )
+        )
+        // SEARCH-CANCEL-AX-DURING-IME-01 / SEARCH-CANCEL-AX-WHEN-COMMITTED-01:
+        // append whenever the × is visible and AppKit left it out, including
+        // a committed query. An idle empty field still stays unchanged.
+        XCTAssertTrue(
+            LauncherLayout.searchCancelAccessibilityShouldAppendSynthetic(
+                committed: "",
+                editing: "ni",
+                editingHasMarkedText: true,
+                systemAlreadyIncludesCancel: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.searchCancelAccessibilityShouldAppendSynthetic(
+                committed: "",
+                editing: "ni",
+                editingHasMarkedText: false,
+                systemAlreadyIncludesCancel: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.searchCancelAccessibilityShouldAppendSynthetic(
+                committed: "",
+                editing: "ni",
+                editingHasMarkedText: true,
+                systemAlreadyIncludesCancel: true
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.searchCancelAccessibilityShouldAppendSynthetic(
+                committed: "",
+                editing: nil,
+                editingHasMarkedText: false,
+                systemAlreadyIncludesCancel: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.searchCancelAccessibilityShouldAppendSynthetic(
+                committed: "mail",
+                editing: nil,
+                editingHasMarkedText: false,
+                systemAlreadyIncludesCancel: false
+            )
+        )
+        XCTAssertTrue(
+            LauncherLayout.searchCancelAccessibilityShouldAppendSynthetic(
+                committed: "mail",
+                editing: "hao",
+                editingHasMarkedText: true,
+                systemAlreadyIncludesCancel: false
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.searchCancelAccessibilityShouldAppendSynthetic(
+                committed: "mail",
+                editing: nil,
+                editingHasMarkedText: false,
+                systemAlreadyIncludesCancel: true
+            )
+        )
+        // SEARCH-CANCEL-AX-CHILDREN-CHANGED-DURING-IME-01: notify only when
+        // the synthetic × enters or leaves. The next marked keystroke does not.
+        let appear = LauncherLayout.searchCancelAccessibilityTreeUpdate(
+            previouslyShown: false,
+            committed: "",
+            editing: "ni",
+            editingHasMarkedText: true
+        )
+        XCTAssertTrue(appear.syntheticShown)
+        XCTAssertTrue(appear.notifyLayoutChanged)
+        let stillComposing = LauncherLayout.searchCancelAccessibilityTreeUpdate(
+            previouslyShown: true,
+            committed: "",
+            editing: "hao",
+            editingHasMarkedText: true
+        )
+        XCTAssertTrue(stillComposing.syntheticShown)
+        XCTAssertFalse(stillComposing.notifyLayoutChanged)
+        let committedOverMark = LauncherLayout.searchCancelAccessibilityTreeUpdate(
+            previouslyShown: true,
+            committed: "mail",
+            editing: "hao",
+            editingHasMarkedText: true
+        )
+        XCTAssertTrue(committedOverMark.syntheticShown)
+        XCTAssertFalse(committedOverMark.notifyLayoutChanged)
+        let committedAppear = LauncherLayout.searchCancelAccessibilityTreeUpdate(
+            previouslyShown: false,
+            committed: "mail",
+            editing: nil,
+            editingHasMarkedText: false
+        )
+        XCTAssertTrue(committedAppear.syntheticShown)
+        XCTAssertTrue(committedAppear.notifyLayoutChanged)
+        let idle = LauncherLayout.searchCancelAccessibilityTreeUpdate(
+            previouslyShown: false,
+            committed: "",
+            editing: nil,
+            editingHasMarkedText: false
+        )
+        XCTAssertFalse(idle.syntheticShown)
+        XCTAssertFalse(idle.notifyLayoutChanged)
+        let cleared = LauncherLayout.searchCancelAccessibilityTreeUpdate(
+            previouslyShown: true,
+            committed: "",
+            editing: nil,
+            editingHasMarkedText: false
+        )
+        XCTAssertFalse(cleared.syntheticShown)
+        XCTAssertTrue(cleared.notifyLayoutChanged)
+        // SEARCH-QUERY-SANITIZE-01
+        XCTAssertEqual(LauncherLayout.sanitizedSearchInput("hello\nworld\t!"), "hello world !")
+        XCTAssertEqual(LauncherLayout.sanitizedSearchInput("a  b"), "a  b")
+        XCTAssertEqual(LauncherLayout.sanitizedSearchInput("\u{F700}up"), "up")
+        XCTAssertEqual(
+            LauncherLayout.searchQuery(committed: "foo\n", editing: nil),
+            "foo "
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchQueryAppending("hi", "\nthere"),
+            "hi there"
+        )
+        // NAME-SINGLE-LINE-01
+        XCTAssertEqual(
+            LauncherLayout.resolvedFolderName(draft: "开发\n工具\t箱\r\n", previous: "工具"),
+            "开发 工具 箱"
+        )
+        XCTAssertEqual(
+            LauncherLayout.resolvedFolderName(draft: "\n\t\u{0007}", previous: "工具"),
+            "工具"
+        )
+        XCTAssertEqual(LauncherLayout.singleLineDisplayName("A\u{2028}B\u{0000}C  D"), "A BC D")
+        XCTAssertEqual(LauncherLayout.singleLineDisplayName("👨\u{200D}💻 dev"), "👨\u{200D}💻 dev")
+        XCTAssertEqual(LauncherLayout.singleLineDisplayName("\u{F8FF} Apple"), "\u{F8FF} Apple")
+        XCTAssertEqual(
+            LauncherLayout.resolvedFolderName(
+                draft: String(repeating: "长", count: 39) + "\n" + "尾", previous: "x"
+            ),
+            String(repeating: "长", count: 39)
+        )
         XCTAssertTrue(LauncherLayout.folderTitleSelectsAllOnBeginEditing)
         XCTAssertTrue(LauncherLayout.aliasSelectsAllOnBeginEditing)
         XCTAssertFalse(
@@ -14165,6 +22485,10 @@ final class LaunchIconCoreTests: XCTestCase {
             )
         )
         XCTAssertTrue(LauncherLayout.folderTitleFocusesFirstMemberAfterEndingEdit)
+        // FOLDER-TITLE-RETURN-CONFIRMS-IME-01: marked pinyin keeps the field.
+        // A plain Return still ends the rename.
+        XCTAssertFalse(LauncherLayout.folderTitleReturnEndsEditing(hasMarkedText: true))
+        XCTAssertTrue(LauncherLayout.folderTitleReturnEndsEditing(hasMarkedText: false))
     }
 
     func testDropUsesLocalizedFolderNameProvidedByUI() throws {
@@ -14214,6 +22538,155 @@ final class LaunchIconCoreTests: XCTestCase {
         ).get()
         XCTAssertEqual(keptTogether.orderedEntries, [.app(kept), .app(dragged), .app(neighbor)])
         XCTAssertEqual(LauncherLayout.topLevelIndexAfterFolder(UUID(), in: state), state.orderedEntries.count)
+    }
+
+    func testFolderExtractOntoTheNextPageSnapsWhenTheOverlayCloses() throws {
+        let capacity = LauncherLayout.pageCapacity
+        let folderID = UUID()
+        let first = UUID()
+        let second = UUID()
+        let third = UUID()
+        var entries = (0..<(capacity - 1)).map { _ in LauncherEntry.app(UUID()) }
+        entries.append(.folder(folderID))
+        let state = LayoutState(
+            orderedEntries: entries,
+            folders: [
+                folderID: LauncherFolder(
+                    id: folderID,
+                    name: "Utils",
+                    itemIDs: [first, second, third],
+                    createdAt: Date(timeIntervalSince1970: 0)
+                )
+            ],
+            updatedAt: Date(timeIntervalSince1970: 0)
+        )
+        XCTAssertEqual(LauncherLayout.topLevelIndexAfterFolder(folderID, in: state), capacity)
+        let drop = LayoutDrop(
+            source: .folderMember(folderID: folderID, itemID: first),
+            destination: .topLevelIndex(LauncherLayout.topLevelIndexAfterFolder(folderID, in: state))
+        )
+        let next = try LauncherLayout.applyDrop(drop, to: state).get()
+        XCTAssertNotNil(next.folders[folderID])
+        XCTAssertEqual(next.orderedEntries.firstIndex(of: .app(first)), capacity)
+        XCTAssertEqual(LauncherLayout.pageContainingDrop(drop, in: next, capacity: capacity), 1)
+
+        XCTAssertEqual(
+            LauncherLayout.rememberedFolderExtractLandingPage(
+                landingPage: 1, currentPage: 0, folderStillOpen: true
+            ),
+            1
+        )
+        XCTAssertNil(
+            LauncherLayout.rememberedFolderExtractLandingPage(
+                landingPage: 1, currentPage: 0, folderStillOpen: false
+            )
+        )
+        XCTAssertNil(
+            LauncherLayout.rememberedFolderExtractLandingPage(
+                landingPage: 0, currentPage: 0, folderStillOpen: true
+            )
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderExtractPageToSnapOnClose(
+                pendingPage: 1, currentPage: 0, isSearching: false, pageCount: 2
+            ),
+            1
+        )
+        XCTAssertNil(
+            LauncherLayout.folderExtractPageToSnapOnClose(
+                pendingPage: 1, currentPage: 1, isSearching: false, pageCount: 2
+            )
+        )
+        XCTAssertNil(
+            LauncherLayout.folderExtractPageToSnapOnClose(
+                pendingPage: 1, currentPage: 0, isSearching: true, pageCount: 2
+            )
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderCloseFocusIDAfterExtract(
+                extractedItemID: first,
+                followExtractedItem: true,
+                folderID: folderID,
+                previousEntries: state.orderedEntries,
+                currentEntries: next.orderedEntries
+            ),
+            first
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderCloseFocusIDAfterExtract(
+                extractedItemID: first,
+                followExtractedItem: false,
+                folderID: folderID,
+                previousEntries: state.orderedEntries,
+                currentEntries: next.orderedEntries
+            ),
+            folderID
+        )
+    }
+
+    /// The page remembered at drop time is stale once the item moves. Closing
+    /// recomputes from the item's current top-level index. Back inside a
+    /// folder, or already on the page that is showing, does not remap. A
+    /// hidden launcher does not remap either.
+    func testFolderExtractCloseIgnoresAStalePageWhenTheItemMoved() {
+        let capacity = LauncherLayout.pageCapacity
+        let onThisPage = 4
+        let onNextPage = capacity
+        XCTAssertEqual(
+            LauncherLayout.pageIndex(containingEntryAt: onThisPage, capacity: capacity),
+            0
+        )
+        XCTAssertEqual(
+            LauncherLayout.pageIndex(containingEntryAt: onNextPage, capacity: capacity),
+            1
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderExtractPageToSnapOnClose(
+                pendingPage: 1, currentPage: 0, isSearching: false, pageCount: 2
+            ),
+            1
+        )
+        XCTAssertNil(
+            LauncherLayout.folderExtractSnapPageOnClose(
+                itemIndex: nil,
+                capacity: capacity,
+                currentPage: 0,
+                isSearching: false,
+                pageCount: 2,
+                launcherVisible: true
+            )
+        )
+        XCTAssertNil(
+            LauncherLayout.folderExtractSnapPageOnClose(
+                itemIndex: onThisPage,
+                capacity: capacity,
+                currentPage: 0,
+                isSearching: false,
+                pageCount: 2,
+                launcherVisible: true
+            )
+        )
+        XCTAssertEqual(
+            LauncherLayout.folderExtractSnapPageOnClose(
+                itemIndex: onNextPage,
+                capacity: capacity,
+                currentPage: 0,
+                isSearching: false,
+                pageCount: 2,
+                launcherVisible: true
+            ),
+            1
+        )
+        XCTAssertNil(
+            LauncherLayout.folderExtractSnapPageOnClose(
+                itemIndex: onNextPage,
+                capacity: capacity,
+                currentPage: 0,
+                isSearching: false,
+                pageCount: 2,
+                launcherVisible: false
+            )
+        )
     }
 
     func testEveryAcceptedDropKeepsAppsPlacedExactlyOnce() {
@@ -14776,6 +23249,125 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertEqual(restored.orderedEntries.count, 2)
         XCTAssertTrue(restored.appKeys.values.contains(first.deduplicationKey))
         XCTAssertTrue(restored.appKeys.values.contains(second.deduplicationKey))
+    }
+
+    func testContextMenuActionsNoOpWhenItemLeavesTheLayout() throws {
+        let firstID = UUID()
+        let secondID = UUID()
+        let first = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/First.app"),
+            bundleIdentifier: "com.example.first",
+            displayName: "First",
+            sourcePriority: 0,
+            discoveredAt: Date(timeIntervalSince1970: 0)
+        )
+        let second = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Second.app"),
+            bundleIdentifier: "com.example.second",
+            displayName: "Second",
+            sourcePriority: 0,
+            discoveredAt: Date(timeIntervalSince1970: 0)
+        )
+        let initial = LayoutState(
+            orderedEntries: [.app(firstID), .app(secondID)],
+            appKeys: [
+                firstID: first.deduplicationKey,
+                secondID: second.deduplicationKey
+            ],
+            updatedAt: Date(timeIntervalSince1970: 0)
+        )
+        XCTAssertTrue(LauncherLayout.shouldApplyContextMenuAction(itemID: firstID, in: initial))
+        XCTAssertTrue(LauncherLayout.shouldApplyContextMenuAction(itemID: secondID, in: initial))
+
+        let afterRemoval = LayoutState(
+            orderedEntries: [.app(secondID)],
+            appKeys: [secondID: second.deduplicationKey],
+            updatedAt: Date(timeIntervalSince1970: 0)
+        )
+        XCTAssertFalse(LauncherLayout.shouldApplyContextMenuAction(itemID: firstID, in: afterRemoval))
+        XCTAssertTrue(LauncherLayout.shouldApplyContextMenuAction(itemID: secondID, in: afterRemoval))
+
+        // Hide of a vanished key must not dirty the layout or add a hidden mark.
+        let hidden = LauncherLayout.hideApplication(withKey: first.deduplicationKey, in: afterRemoval)
+        XCTAssertEqual(hidden.updatedAt, afterRemoval.updatedAt)
+        XCTAssertFalse(hidden.hiddenAppKeys.contains(first.deduplicationKey))
+        XCTAssertEqual(hidden.orderedEntries, afterRemoval.orderedEntries)
+        XCTAssertEqual(hidden, afterRemoval)
+
+        // Alias writes stay allowed on a bare key (Settings / tests can set one
+        // before the app is in the grid). The context-menu path no-ops via
+        // shouldApplyContextMenuAction before it calls setAlias.
+
+        // A still-present item can still be hidden.
+        let hidePresent = LauncherLayout.hideApplication(withKey: second.deduplicationKey, in: afterRemoval)
+        XCTAssertTrue(hidePresent.hiddenAppKeys.contains(second.deduplicationKey))
+        XCTAssertTrue(hidePresent.orderedEntries.isEmpty)
+    }
+
+    func testContextMenuActionsRemainAllowedAfterRenameAndMove() throws {
+        let firstID = UUID()
+        let secondID = UUID()
+        let thirdID = UUID()
+        let folderID = UUID()
+        let first = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/First.app"),
+            bundleIdentifier: "com.example.first",
+            displayName: "First",
+            sourcePriority: 0,
+            discoveredAt: Date(timeIntervalSince1970: 0)
+        )
+        let second = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Second.app"),
+            bundleIdentifier: "com.example.second",
+            displayName: "Second",
+            sourcePriority: 0,
+            discoveredAt: Date(timeIntervalSince1970: 0)
+        )
+        let third = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Third.app"),
+            bundleIdentifier: "com.example.third",
+            displayName: "Third",
+            sourcePriority: 0,
+            discoveredAt: Date(timeIntervalSince1970: 0)
+        )
+        let initial = LayoutState(
+            orderedEntries: [.folder(folderID), .app(thirdID)],
+            folders: [
+                folderID: LauncherFolder(
+                    id: folderID,
+                    name: "Utils",
+                    itemIDs: [firstID, secondID],
+                    createdAt: Date(timeIntervalSince1970: 0)
+                )
+            ],
+            appKeys: [
+                firstID: first.deduplicationKey,
+                secondID: second.deduplicationKey,
+                thirdID: third.deduplicationKey
+            ],
+            updatedAt: Date(timeIntervalSince1970: 0)
+        )
+        XCTAssertTrue(LauncherLayout.shouldApplyContextMenuAction(itemID: folderID, in: initial))
+        XCTAssertTrue(LauncherLayout.shouldApplyContextMenuAction(itemID: firstID, in: initial))
+        XCTAssertTrue(LauncherLayout.shouldApplyContextMenuAction(itemID: thirdID, in: initial))
+
+        let renamed = LauncherLayout.renameFolder(folderID, to: "Tools", in: initial)
+        XCTAssertEqual(renamed.folders[folderID]?.name, "Tools")
+        XCTAssertTrue(LauncherLayout.shouldApplyContextMenuAction(itemID: folderID, in: renamed))
+        XCTAssertTrue(LauncherLayout.shouldApplyContextMenuAction(itemID: firstID, in: renamed))
+
+        let moved = try LauncherLayout.moveTopLevelApp(thirdID, toFolder: folderID, in: renamed).get()
+        XCTAssertFalse(moved.orderedEntries.contains(.app(thirdID)))
+        XCTAssertTrue(moved.folders[folderID]?.itemIDs.contains(thirdID) == true)
+        XCTAssertTrue(LauncherLayout.shouldApplyContextMenuAction(itemID: thirdID, in: moved))
+        XCTAssertTrue(LauncherLayout.shouldApplyContextMenuAction(itemID: folderID, in: moved))
+
+        let movedOut = try XCTUnwrap(
+            LauncherLayout.removingAppFromFolder(firstID, folderID: folderID, in: moved)
+        )
+        XCTAssertTrue(movedOut.orderedEntries.contains(.app(firstID)))
+        XCTAssertTrue(LauncherLayout.shouldApplyContextMenuAction(itemID: firstID, in: movedOut))
+        XCTAssertTrue(LauncherLayout.shouldApplyContextMenuAction(itemID: thirdID, in: movedOut))
     }
 
     func testLayoutStoreRoundTripsFoldersAndLeavesUnknownSchemaFileUnchanged() async throws {
@@ -15444,6 +24036,85 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertEqual(LauncherLayout.searchHiddenMatchHint(query: "x", hiddenNames: []), .none)
     }
 
+    /// SEARCH-HIDDEN-HINT-MATCH-01: the empty-state hint uses the same index
+    /// as visible search. A hidden 日历 is findable by pinyin, initials, and
+    /// bundle id; a hidden 计算器 is findable by its English package name and
+    /// one typo. An alias is the name the hint speaks. A visible app in the
+    /// same catalog, and a second copy of a hidden key, do not inflate the count.
+    func testSearchHiddenMatchHintUsesTheSameRulesAsSearch() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let calendar = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Calendar.app"),
+            bundleIdentifier: "com.apple.iCal",
+            displayName: "日历",
+            sourcePriority: 0,
+            discoveredAt: now
+        )
+        let calendarCopy = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Users/me/Applications/Calendar.app"),
+            bundleIdentifier: "com.apple.iCal",
+            displayName: "日历",
+            sourcePriority: 1,
+            discoveredAt: now
+        )
+        let calculator = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Calculator.app"),
+            bundleIdentifier: "com.apple.calculator",
+            displayName: "计算器",
+            sourcePriority: 0,
+            discoveredAt: now
+        )
+        let notes = AppCandidate(
+            canonicalURL: URL(fileURLWithPath: "/Applications/Notes.app"),
+            bundleIdentifier: "com.apple.Notes",
+            displayName: "Notes",
+            sourcePriority: 0,
+            discoveredAt: now
+        )
+        let catalog = [calendar, calendarCopy, calculator, notes]
+        let hidden: Set<String> = [calendar.deduplicationKey, calculator.deduplicationKey]
+        let aliases = [calendar.deduplicationKey: "我的日历"]
+
+        XCTAssertEqual(
+            LauncherLayout.searchHiddenMatchHint(query: "  ", catalog: catalog, hiddenKeys: hidden, aliases: aliases),
+            .none
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchHiddenMatchHint(query: "rili", catalog: catalog, hiddenKeys: [], aliases: aliases),
+            .none
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchHiddenMatchHint(query: "rili", catalog: catalog, hiddenKeys: hidden, aliases: aliases),
+            .one(name: "我的日历")
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchHiddenMatchHint(query: "rl", catalog: catalog, hiddenKeys: hidden, aliases: aliases),
+            .one(name: "我的日历")
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchHiddenMatchHint(query: "ical", catalog: catalog, hiddenKeys: hidden),
+            .one(name: "日历")
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchHiddenMatchHint(query: "calculator", catalog: catalog, hiddenKeys: hidden),
+            .one(name: "计算器")
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchHiddenMatchHint(query: "calculater", catalog: catalog, hiddenKeys: hidden),
+            .one(name: "计算器")
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchHiddenMatchHint(query: "notes", catalog: catalog, hiddenKeys: hidden),
+            .none,
+            "a visible app is not a hidden-match hint"
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchHiddenMatchHint(query: " ", catalog: catalog, hiddenKeys: hidden),
+            .none,
+            "an empty query must not list every hidden app"
+        )
+    }
+
     func testBlankAreaHiddenAppsMenuEntriesCapsAndFlagsOverflow() {
         XCTAssertEqual(LauncherLayout.blankAreaHiddenAppsMenuEntries([Int]()).shown, [])
         XCTAssertFalse(LauncherLayout.blankAreaHiddenAppsMenuEntries([Int]()).hasMore)
@@ -15609,6 +24280,16 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertEqual(
             LauncherLayout.SettingsLayoutIOChromeCopy.restoreBackupToolTip(available: true),
             "恢复最近一次自动保存前的布局"
+        )
+        XCTAssertFalse(
+            LauncherLayout.SettingsLayoutIOChromeCopy.shouldEnableRestoreBackupControl(hasBackupFile: false)
+        )
+        XCTAssertTrue(
+            LauncherLayout.SettingsLayoutIOChromeCopy.shouldEnableRestoreBackupControl(hasBackupFile: true)
+        )
+        XCTAssertEqual(
+            LauncherLayout.LayoutIOOutcomeCopy.restoreNoBackup(localize: { $0 }),
+            "没有可用备份"
         )
     }
 
@@ -15794,6 +24475,14 @@ final class LaunchIconCoreTests: XCTestCase {
         XCTAssertEqual(selected.orderedIDs, page0)
         XCTAssertEqual(selected.rangeAnchorID, page0.first)
         XCTAssertEqual(LauncherItemSelection.selectingAll(ids: []).orderedIDs, [])
+    }
+
+    func testSelectAllShortcutConsumesOnlyWhenItemsPresent() {
+        // SELECT-ALL-EMPTY-NO-CONSUME-01
+        XCTAssertTrue(LauncherLayout.shouldConsumeSelectAllShortcut(itemCount: 1))
+        XCTAssertTrue(LauncherLayout.shouldConsumeSelectAllShortcut(itemCount: 12))
+        XCTAssertFalse(LauncherLayout.shouldConsumeSelectAllShortcut(itemCount: 0))
+        XCTAssertFalse(LauncherLayout.shouldConsumeSelectAllShortcut(itemCount: -1))
     }
 
     func testShiftClickRangeSelectionPreservesAnchorWithoutPaging() {
@@ -16229,6 +24918,304 @@ final class LaunchIconCoreTests: XCTestCase {
         )
     }
 
+    /// GRID-GEOMETRY-DROP-CAPACITY-01: same-page batch and drop paging must
+    /// use the live grid capacity. Changing geometry does not rewrite the
+    /// persisted entry order; it only changes which slice is a "page".
+    func testBatchSamePageAndDropPagingHonorNonDefaultCapacity() {
+        let ids = (0..<50).map { _ in UUID() }
+        var state = LayoutState()
+        state.orderedEntries = ids.map { .app($0) }
+        state.appKeys = Dictionary(uniqueKeysWithValues: ids.enumerated().map { ($1, "bundle:\($0)") })
+        let previous = state.orderedEntries
+        let large = 80 // 10×8: every item is on page 0
+        let compact = 15 // 5×3
+        let farSelection = LauncherItemSelection(orderedIDs: [ids[40], ids[41]])
+
+        XCTAssertEqual(
+            LauncherLayout.topLevelIDsForBatchReorder(
+                selection: farSelection, draggedID: ids[40], insertAt: 20, in: state, capacity: large
+            ),
+            [ids[40], ids[41]]
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldBatchReorderSelection(
+                selection: farSelection, draggedID: ids[40], insertAt: 20, in: state, capacity: large
+            )
+        )
+        // Default 7×5 treats index 40 as page 1, so a gap at 20 is "off page".
+        XCTAssertTrue(
+            LauncherLayout.topLevelIDsForBatchReorder(
+                selection: farSelection, draggedID: ids[40], insertAt: 20, in: state
+            ).isEmpty
+        )
+
+        let compactSelection = LauncherItemSelection(orderedIDs: [ids[16], ids[17]])
+        // Page 1 of a 15-slot grid is 15..<30; 30 is the trailing gap of that
+        // page. 31 is already on page 2.
+        XCTAssertTrue(
+            LauncherLayout.topLevelIDsForBatchReorder(
+                selection: compactSelection, draggedID: ids[16], insertAt: 31, in: state, capacity: compact
+            ).isEmpty
+        )
+        XCTAssertEqual(
+            LauncherLayout.topLevelIDsForBatchReorder(
+                selection: compactSelection, draggedID: ids[16], insertAt: 31, in: state
+            ),
+            [ids[16], ids[17]]
+        )
+
+        XCTAssertTrue(
+            LauncherLayout.shouldBatchCreateFolderFromSelection(
+                selection: farSelection, draggedID: ids[40], targetAppID: ids[10], in: state, capacity: large
+            )
+        )
+        XCTAssertFalse(
+            LauncherLayout.shouldBatchCreateFolderFromSelection(
+                selection: farSelection, draggedID: ids[40], targetAppID: ids[10], in: state
+            )
+        )
+
+        let parked = LayoutDrop(source: .topLevel(ids[16]), destination: .topLevelIndex(16))
+        XCTAssertEqual(LauncherLayout.pageContainingDrop(parked, in: state, capacity: compact), 1)
+        XCTAssertEqual(LauncherLayout.pageContainingDrop(parked, in: state), 0)
+        XCTAssertEqual(state.orderedEntries, previous)
+    }
+
+    func testChangingGeometryThenDroppingAndRestoringKeepsOrderedEntries() throws {
+        let ids = (0..<36).map { _ in UUID() }
+        var state = LayoutState()
+        state.orderedEntries = ids.map { .app($0) }
+        state.appKeys = Dictionary(uniqueKeysWithValues: ids.enumerated().map { ($1, "bundle:\($0)") })
+        let original = state.orderedEntries
+        let compact = GridGeometryPreference(columns: 5, rows: 3)
+        let wide = GridGeometryPreference(columns: 10, rows: 8)
+        let standard = GridGeometryPreference.standard
+
+        XCTAssertEqual(compact.capacity, 15)
+        XCTAssertEqual(wide.capacity, 80)
+        XCTAssertEqual(standard.capacity, 35)
+        XCTAssertEqual(LauncherLayout.pageCount(forEntryCount: 36, capacity: standard.capacity), 2)
+        XCTAssertEqual(LauncherLayout.pageCount(forEntryCount: 36, capacity: compact.capacity), 3)
+        XCTAssertEqual(LauncherLayout.pageCount(forEntryCount: 36, capacity: wide.capacity), 1)
+        // Changing geometry does not rewrite the linear list.
+        XCTAssertEqual(state.orderedEntries, original)
+        XCTAssertEqual(state.orderedEntries.map(\.id), ids)
+
+        // Compact page 1 is 15..<30. Move the item at 20 to the first slot
+        // of that page. Default capacity 35 would treat 20 as still on page 0.
+        let insertAt = LauncherLayout.topLevelDropIndex(page: 1, localIndex: 0, capacity: compact.capacity)
+        XCTAssertEqual(insertAt, 15)
+        XCTAssertEqual(LauncherLayout.topLevelDropIndex(page: 1, localIndex: 0), 35)
+        let reordered = try LauncherLayout.applyDrop(
+            LayoutDrop(source: .topLevel(ids[20]), destination: .topLevelIndex(insertAt)),
+            to: state
+        ).get()
+        var expectedReorder = original
+        let moved = expectedReorder.remove(at: 20)
+        expectedReorder.insert(moved, at: 15)
+        XCTAssertEqual(reordered.orderedEntries, expectedReorder)
+        XCTAssertEqual(reordered.orderedEntries.map(\.id), expectedReorder.map(\.id))
+        XCTAssertEqual(Set(reordered.orderedEntries.map(\.id)), Set(ids))
+        XCTAssertEqual(reordered.appKeys.count, 36)
+        // Restoring 7×5 keeps the post-drop order; nothing is lost or invented.
+        XCTAssertEqual(LauncherLayout.pageCount(forEntryCount: reordered.orderedEntries.count, capacity: standard.capacity), 2)
+        XCTAssertEqual(reordered.orderedEntries, expectedReorder)
+
+        // Merge on compact page 1: drop ids[16] onto ids[17]. Folder replaces
+        // the target's slot; changing back to 7×5 keeps that list (35 entries).
+        let merged = try LauncherLayout.applyDrop(
+            LayoutDrop(source: .topLevel(ids[16]), destination: .merge(.topLevel(ids[17]))),
+            to: state
+        ).get()
+        XCTAssertEqual(merged.orderedEntries.count, 35)
+        XCTAssertEqual(merged.folders.count, 1)
+        let folderID = try XCTUnwrap(merged.folders.keys.first)
+        XCTAssertEqual(merged.folders[folderID]?.itemIDs, [ids[17], ids[16]])
+        XCTAssertEqual(merged.orderedEntries[16], .folder(folderID))
+        let kept = Array(ids[0..<16]) + Array(ids[18..<36])
+        XCTAssertEqual(merged.orderedEntries.map(\.id).filter { $0 != folderID }, kept)
+        XCTAssertEqual(Set(merged.appKeys.keys), Set(ids))
+        XCTAssertEqual(LauncherLayout.pageCount(forEntryCount: 35, capacity: standard.capacity), 1)
+        XCTAssertEqual(LauncherLayout.pageCount(forEntryCount: 35, capacity: compact.capacity), 3)
+        XCTAssertEqual(merged.orderedEntries[16], .folder(folderID))
+        XCTAssertEqual(merged.folders[folderID]?.itemIDs, [ids[17], ids[16]])
+        XCTAssertEqual(state.orderedEntries, original, "applyDrop must not mutate the source state")
+    }
+
+    func testPageCountKeyboardNeighborAndSearchPlacementAtCompactAndWideGeometry() {
+        let compact = GridGeometryPreference(columns: 5, rows: 3)
+        let wide = GridGeometryPreference(columns: 10, rows: 8)
+        let entries = (0..<36).map { _ in LauncherEntry.app(UUID()) }
+
+        XCTAssertEqual(LauncherLayout.pageCount(forEntryCount: 36, capacity: compact.capacity), 3)
+        XCTAssertEqual(LauncherLayout.pageIndex(containingEntryAt: 14, capacity: compact.capacity), 0)
+        XCTAssertEqual(LauncherLayout.pageIndex(containingEntryAt: 15, capacity: compact.capacity), 1)
+        XCTAssertEqual(LauncherLayout.pageIndex(containingEntryAt: 29, capacity: compact.capacity), 1)
+        XCTAssertEqual(LauncherLayout.pageIndex(containingEntryAt: 30, capacity: compact.capacity), 2)
+        XCTAssertEqual(LauncherLayout.entries(onPage: 0, from: entries, capacity: compact.capacity).count, 15)
+        XCTAssertEqual(LauncherLayout.entries(onPage: 1, from: entries, capacity: compact.capacity).count, 15)
+        XCTAssertEqual(LauncherLayout.entries(onPage: 2, from: entries, capacity: compact.capacity).count, 6)
+
+        XCTAssertEqual(LauncherLayout.pageCount(forEntryCount: 36, capacity: wide.capacity), 1)
+        XCTAssertEqual(LauncherLayout.pageIndex(containingEntryAt: 35, capacity: wide.capacity), 0)
+        XCTAssertEqual(LauncherLayout.entries(onPage: 0, from: entries, capacity: wide.capacity).count, 36)
+        XCTAssertEqual(LauncherLayout.entries(onPage: 1, from: entries, capacity: wide.capacity).count, 0)
+
+        // 5-column neighbors: slot 4 is the end of row 0 (would be mid-row at 7).
+        XCTAssertEqual(
+            LauncherLayout.gridKeyboardNeighborSlot(from: 0, count: 15, columns: compact.columns, direction: .right),
+            1
+        )
+        XCTAssertNil(
+            LauncherLayout.gridKeyboardNeighborSlot(from: 0, count: 15, columns: compact.columns, direction: .left)
+        )
+        XCTAssertNil(
+            LauncherLayout.gridKeyboardNeighborSlot(from: 4, count: 15, columns: compact.columns, direction: .right),
+            "end of a 5-column row must not wrap"
+        )
+        XCTAssertEqual(
+            LauncherLayout.gridKeyboardNeighborSlot(from: 4, count: 15, columns: compact.columns, direction: .down),
+            9
+        )
+        XCTAssertEqual(
+            LauncherLayout.gridKeyboardNeighborSlot(from: 6, count: 15, columns: compact.columns, direction: .right),
+            7
+        )
+        // At default 7 columns, slot 4 still walks right and slot 6 ends the row.
+        XCTAssertEqual(
+            LauncherLayout.gridKeyboardNeighborSlot(from: 4, count: 35, columns: LauncherLayout.pageColumns, direction: .right),
+            5
+        )
+        XCTAssertNil(
+            LauncherLayout.gridKeyboardNeighborSlot(from: 6, count: 35, columns: LauncherLayout.pageColumns, direction: .right)
+        )
+
+        // 10-column neighbors: slot 9 ends the first row; down from 0 is 10.
+        XCTAssertNil(
+            LauncherLayout.gridKeyboardNeighborSlot(from: 9, count: 36, columns: wide.columns, direction: .right)
+        )
+        XCTAssertEqual(
+            LauncherLayout.gridKeyboardNeighborSlot(from: 0, count: 36, columns: wide.columns, direction: .down),
+            10
+        )
+        XCTAssertEqual(
+            LauncherLayout.gridKeyboardNeighborSlot(from: 4, count: 36, columns: wide.columns, direction: .right),
+            5
+        )
+        XCTAssertEqual(
+            LauncherLayout.gridKeyboardNeighborSlot(from: 8, count: 36, columns: wide.columns, direction: .right),
+            9
+        )
+
+        let itemWidth: CGFloat = 100
+        let spacing: CGFloat = 12
+        let viewport: CGFloat = 800
+        // 4 hits on a 5-column search row still center; 5 and 7 use the minimum inset.
+        let fourWidth = 4 * itemWidth + 3 * spacing
+        XCTAssertEqual(
+            LauncherLayout.searchSectionHorizontalInset(
+                itemCount: 4, columns: compact.columns, itemWidth: itemWidth, interitemSpacing: spacing, viewportWidth: viewport
+            ),
+            floor((viewport - fourWidth) / 2),
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchSectionHorizontalInset(
+                itemCount: 5, columns: compact.columns, itemWidth: itemWidth, interitemSpacing: spacing, viewportWidth: viewport
+            ),
+            8,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchSectionHorizontalInset(
+                itemCount: 7, columns: compact.columns, itemWidth: itemWidth, interitemSpacing: spacing, viewportWidth: viewport
+            ),
+            8,
+            accuracy: 0.001,
+            "a second search row at 5 columns must not re-center as a short 7-wide row"
+        )
+        // 7 hits are a full row at 7×5 (minimum inset) but a short row at 10×8.
+        let sevenWidth = 7 * itemWidth + 6 * spacing
+        XCTAssertEqual(
+            LauncherLayout.searchSectionHorizontalInset(
+                itemCount: 7, columns: LauncherLayout.pageColumns, itemWidth: itemWidth, interitemSpacing: spacing, viewportWidth: viewport
+            ),
+            8,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchSectionHorizontalInset(
+                itemCount: 7, columns: wide.columns, itemWidth: itemWidth, interitemSpacing: spacing, viewportWidth: viewport
+            ),
+            floor((viewport - sevenWidth) / 2),
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchSectionHorizontalInset(
+                itemCount: 10, columns: wide.columns, itemWidth: itemWidth, interitemSpacing: spacing, viewportWidth: viewport
+            ),
+            8,
+            accuracy: 0.001
+        )
+
+        // 36 items at 10×8 fill three full rows plus a 6-icon last row.
+        // Down from a column that the last row does not cover must not wrap.
+        XCTAssertNil(
+            LauncherLayout.gridKeyboardNeighborSlot(from: 26, count: 36, columns: wide.columns, direction: .down)
+        )
+        XCTAssertEqual(
+            LauncherLayout.gridKeyboardNeighborSlot(from: 25, count: 36, columns: wide.columns, direction: .down),
+            35
+        )
+        XCTAssertEqual(
+            LauncherLayout.gridKeyboardNeighborSlot(from: 32, count: 36, columns: wide.columns, direction: .up),
+            22
+        )
+        XCTAssertNil(
+            LauncherLayout.gridKeyboardNeighborSlot(from: 30, count: 36, columns: wide.columns, direction: .left)
+        )
+        // Last page at 5×3 with 6 items: only column 0 has a cell below row 0.
+        XCTAssertEqual(
+            LauncherLayout.gridKeyboardNeighborSlot(from: 0, count: 6, columns: compact.columns, direction: .down),
+            5
+        )
+        XCTAssertNil(
+            LauncherLayout.gridKeyboardNeighborSlot(from: 1, count: 6, columns: compact.columns, direction: .down)
+        )
+
+        // The one-hit helper still steps along the list. The search field
+        // uses the row step, locked in testSearchFieldArrowMovesHighlightByGridRow.
+        let searchIDs = (0..<7).map { _ in UUID() }
+        XCTAssertEqual(
+            LauncherLayout.searchKeyboardHighlightIDMoving(from: searchIDs[0], in: searchIDs, by: 1),
+            searchIDs[1]
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchKeyboardHighlightIDMoving(from: searchIDs[0], in: searchIDs, by: -1),
+            searchIDs[0]
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchKeyboardHighlightIDMoving(from: nil, in: searchIDs, by: 1),
+            searchIDs.first
+        )
+        XCTAssertEqual(
+            LauncherLayout.searchFieldTabHandoffTargetID(highlightID: searchIDs[3], presentedIDs: searchIDs),
+            searchIDs[3]
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldHandOffSearchFieldTabToHit(isSearching: true, hasHits: true, hasMarkedText: false)
+        )
+        XCTAssertTrue(
+            LauncherLayout.shouldReturnSearchHitBacktabToField(isSearchCollection: true, tabDirection: -1)
+        )
+        XCTAssertTrue(
+            LauncherLayout.folderCloseShouldRestoreGridFocusOnChromeLand(restoreFocusRequested: true)
+        )
+        XCTAssertFalse(
+            LauncherLayout.folderCloseShouldRestoreGridFocusOnChromeLand(restoreFocusRequested: false)
+        )
+    }
+
     func testMultiDragBadgeCountRequiresMultiTopLevelSelection() {
         let a = UUID(), b = UUID(), c = UUID()
         var state = LayoutState()
@@ -16256,6 +25243,1111 @@ final class LaunchIconCoreTests: XCTestCase {
                 in: state
             )
         )
+    }
+
+
+    func testRegisteredKeyboardCommandsAreUniqueForTheSameChordAndContext() {
+        // KEYBOARD-COMMAND-REGISTRY-01. The first-wave table lists each
+        // command once, in performKeyEquivalent order. The same chord in
+        // the same context hits at most one registered command.
+        XCTAssertEqual(
+            Set(LauncherLayout.registeredKeyboardCommands).count,
+            LauncherLayout.registeredKeyboardCommands.count
+        )
+        XCTAssertEqual(
+            Set(LauncherLayout.registeredKeyboardCommands),
+            Set(LauncherLayout.KeyboardCommand.allCases)
+        )
+        XCTAssertEqual(
+            LauncherLayout.registeredKeyboardCommands,
+            [
+                .openSettings,
+                .focusSearch,
+                .dismissLauncher,
+                .copyFocusedApp,
+                .selectAllOnPage,
+                .undoLayout,
+                .selectEveryTopLevelEntry,
+                .shiftMMovesSelectionIntoFolder,
+                .shiftNCreatesFolder,
+                .optionNSortsFocusedFolder,
+                .optionNSortsOpenFolder,
+                .optionCSortsFocusedFolder,
+                .optionCSortsOpenFolder,
+                .optionRRearrangesGridByName,
+                .optionKRearrangesGridByKind,
+                .optionKSortsOpenFolderByKind,
+                .optionGRearrangesGridByCategory,
+                .optionGSortsOpenFolderByCategory,
+                .shiftCRearrangesGridByColor,
+                .optionBTogglesBrowseAxis,
+                .optionUUngroupsAllFolders,
+                .shiftURestoresAllHidden,
+                .reloadCatalog,
+                .shiftHHidesFocusedApp,
+                .removeFromOpenFolder,
+                .dissolveClosedFolder,
+                .uninstallApp,
+                .shiftReturnRevealsSelection,
+                .revealSearchHit,
+                .revealFocusedTile,
+                .shiftVerticalMovesFocusedFolderMember,
+                .shiftVerticalSelectionEdge,
+                .optionVerticalNudgesFocusedFolderMember,
+                .optionVerticalMovesFoldersToEdge,
+                .commandUpClosesOpenFolder,
+                .commandDownOpensFocusedFolder,
+                .optionShiftHorizontalMovesFocusedEntryToAdjacentPage,
+                .optionHorizontalNudgesFocusedFolderMember,
+                .shiftHorizontalMovesFocusedFolderMember,
+                .optionHorizontalNudgesFocusedEntry,
+                .shiftHorizontalMovesFocusedEntry,
+                .commandArrowPaging,
+                .escapeCancels,
+                .spaceActivatesFocusedItem,
+                .arrowExtendsSelection,
+                .arrowWalksGrid,
+                .shiftHomeEndExtendsSelection,
+                .homeEndJumpsInGrid,
+                .f2RenamesFocusedClosedFolder,
+                .f2RenamesFocusedAppAlias,
+                .pageUpDownScrollsOpenList,
+                .pageUpDownPagesGrid,
+            ]
+        )
+
+        let contexts: [(String, (inout LauncherLayout.KeyboardProbe) -> Void)] = [
+            ("idle grid", { _ in }),
+            ("multi-page vertical", { probe in
+                probe.pageCount = 2
+                probe.pageFlipHorizontal = false
+            }),
+            ("focused folder", { probe in
+                probe.focusedIsFolder = true
+                probe.selectedFolderCount = 1
+                probe.pageCount = 2
+                probe.pageFlipHorizontal = false
+            }),
+            ("focused app", { probe in
+                probe.focusedIsApp = true
+                probe.focusedIsInSelection = true
+                probe.selectedAppCount = 1
+                probe.canRevealInFinder = true
+            }),
+            ("two folders selected", { probe in
+                probe.focusedIsFolder = true
+                probe.selectedFolderCount = 2
+                probe.batchDissolveAllowed = true
+            }),
+            ("two top-level entries", { probe in
+                probe.selectedTopLevelCount = 2
+                probe.selectedTopLevelAppCount = 2
+                probe.focusedIsApp = true
+                probe.selectedAppCount = 2
+            }),
+            ("folder open + removable member", { probe in
+                probe.folderOpen = true
+                probe.focusedIsRemovableMember = true
+                probe.selectedMemberCount = 1
+            }),
+            ("folder open + two members", { probe in
+                probe.folderOpen = true
+                probe.focusedIsRemovableMember = true
+                probe.selectedMemberCount = 2
+                probe.batchRemovalAllowed = true
+            }),
+            ("folder open, no member", { probe in
+                probe.folderOpen = true
+            }),
+            ("editing text + focused folder", { probe in
+                probe.isEditingText = true
+                probe.focusedIsFolder = true
+                probe.selectedFolderCount = 1
+            }),
+            ("searching + focused folder", { probe in
+                probe.isSearching = true
+                probe.focusedIsFolder = true
+                probe.selectedFolderCount = 1
+                probe.canRevealInFinder = true
+            }),
+            ("searching + folder open", { probe in
+                probe.isSearching = true
+                probe.folderOpen = true
+                probe.focusedIsRemovableMember = true
+                probe.selectedMemberCount = 1
+                probe.focusedIsApp = true
+                probe.focusedIsInSelection = true
+                probe.selectedAppCount = 1
+            }),
+            ("editing text + folder open", { probe in
+                probe.isEditingText = true
+                probe.folderOpen = true
+                probe.focusedIsRemovableMember = true
+                probe.selectedMemberCount = 1
+            }),
+            ("paging", { probe in
+                probe.isPaging = true
+                probe.focusedIsFolder = true
+                probe.selectedFolderCount = 1
+            }),
+            ("layout editing off", { probe in
+                probe.layoutEditingEnabled = false
+                probe.focusedIsFolder = true
+                probe.selectedFolderCount = 1
+            }),
+            ("rejects action", { probe in
+                probe.acceptsAction = false
+                probe.focusedIsFolder = true
+                probe.selectedFolderCount = 1
+            }),
+            ("color sampling", { probe in
+                probe.samplingInFlight = true
+                probe.focusedIsFolder = true
+                probe.selectedFolderCount = 1
+            }),
+        ]
+        let chords: [(String, (inout LauncherLayout.KeyboardProbe) -> Void)] = [
+            ("⌘Z", { probe in
+                probe.character = "z"
+                probe.command = true
+            }),
+            ("⌘⇧Z", { probe in
+                probe.character = "z"
+                probe.command = true
+                probe.shift = true
+            }),
+            ("⌘F", { probe in
+                probe.character = "f"
+                probe.command = true
+            }),
+            ("⌘W", { probe in
+                probe.character = "w"
+                probe.command = true
+            }),
+            ("⌘C", { probe in
+                probe.character = "c"
+                probe.command = true
+            }),
+            ("⌘A", { probe in
+                probe.character = "a"
+                probe.command = true
+            }),
+            ("⌘⇧A", { probe in
+                probe.character = "a"
+                probe.command = true
+                probe.shift = true
+            }),
+            ("⌘⇧C", { probe in
+                probe.character = "c"
+                probe.command = true
+                probe.shift = true
+            }),
+            ("⌘⇧N", { probe in
+                probe.character = "n"
+                probe.command = true
+                probe.shift = true
+            }),
+            ("⌘⇧M", { probe in
+                probe.character = "m"
+                probe.command = true
+                probe.shift = true
+            }),
+            ("⌘⇧↑", { probe in
+                probe.keyCode = 126
+                probe.command = true
+                probe.shift = true
+            }),
+            ("⌘⇧↓", { probe in
+                probe.keyCode = 125
+                probe.command = true
+                probe.shift = true
+            }),
+            ("⌘⇧←", { probe in
+                probe.keyCode = 123
+                probe.command = true
+                probe.shift = true
+            }),
+            ("⌘⇧→", { probe in
+                probe.keyCode = 124
+                probe.command = true
+                probe.shift = true
+            }),
+            ("⌘N", { probe in
+                probe.character = "n"
+                probe.command = true
+            }),
+            ("⌘⌥N", { probe in
+                probe.character = "n"
+                probe.command = true
+                probe.option = true
+            }),
+            ("⌘⌥C", { probe in
+                probe.character = "c"
+                probe.command = true
+                probe.option = true
+            }),
+            ("⌘⌥R", { probe in
+                probe.character = "r"
+                probe.command = true
+                probe.option = true
+            }),
+            ("⌘⌥K", { probe in
+                probe.character = "k"
+                probe.command = true
+                probe.option = true
+            }),
+            ("⌘⌥G", { probe in
+                probe.character = "g"
+                probe.command = true
+                probe.option = true
+            }),
+            ("⌘⌥B", { probe in
+                probe.character = "b"
+                probe.command = true
+                probe.option = true
+            }),
+            ("⌘⌥U", { probe in
+                probe.character = "u"
+                probe.command = true
+                probe.option = true
+            }),
+            ("⌘⇧U", { probe in
+                probe.character = "u"
+                probe.command = true
+                probe.shift = true
+            }),
+            ("⌘R", { probe in
+                probe.character = "r"
+                probe.command = true
+            }),
+            ("⌘⇧H", { probe in
+                probe.character = "h"
+                probe.command = true
+                probe.shift = true
+            }),
+            ("⌘,", { probe in
+                probe.character = ","
+                probe.command = true
+            }),
+            ("⌘⇧↩", { probe in
+                probe.keyCode = 36
+                probe.command = true
+                probe.shift = true
+            }),
+            ("⌘↩", { probe in
+                probe.keyCode = 36
+                probe.command = true
+            }),
+            ("⌘↑", { probe in
+                probe.keyCode = 126
+                probe.command = true
+            }),
+            ("⌘↓", { probe in
+                probe.keyCode = 125
+                probe.command = true
+            }),
+            ("⌘←", { probe in
+                probe.keyCode = 123
+                probe.command = true
+            }),
+            ("⌘→", { probe in
+                probe.keyCode = 124
+                probe.command = true
+            }),
+            ("Esc", { probe in
+                probe.keyCode = 53
+            }),
+            ("Space", { probe in
+                probe.character = " "
+                probe.keyCode = 49
+            }),
+            ("←", { probe in
+                probe.keyCode = 123
+            }),
+            ("→", { probe in
+                probe.keyCode = 124
+            }),
+            ("↑", { probe in
+                probe.keyCode = 126
+            }),
+            ("↓", { probe in
+                probe.keyCode = 125
+            }),
+            ("⇧←", { probe in
+                probe.keyCode = 123
+                probe.shift = true
+            }),
+            ("⇧→", { probe in
+                probe.keyCode = 124
+                probe.shift = true
+            }),
+            ("⇧↑", { probe in
+                probe.keyCode = 126
+                probe.shift = true
+            }),
+            ("⇧↓", { probe in
+                probe.keyCode = 125
+                probe.shift = true
+            }),
+            ("Home", { probe in
+                probe.keyCode = 115
+            }),
+            ("End", { probe in
+                probe.keyCode = 119
+            }),
+            ("⇧Home", { probe in
+                probe.keyCode = 115
+                probe.shift = true
+            }),
+            ("⇧End", { probe in
+                probe.keyCode = 119
+                probe.shift = true
+            }),
+            ("F2", { probe in
+                probe.keyCode = 120
+            }),
+            ("Page Up", { probe in
+                probe.keyCode = 116
+            }),
+            ("Page Down", { probe in
+                probe.keyCode = 121
+            }),
+            ("⌘⌫", { probe in
+                probe.keyCode = 51
+                probe.command = true
+            }),
+            ("⌘⇧⌫", { probe in
+                probe.keyCode = 51
+                probe.command = true
+                probe.shift = true
+            }),
+            ("⌘⌥↑", { probe in
+                probe.keyCode = 126
+                probe.command = true
+                probe.option = true
+            }),
+            ("⌘⌥↓", { probe in
+                probe.keyCode = 125
+                probe.command = true
+                probe.option = true
+            }),
+            ("⌘⌥←", { probe in
+                probe.keyCode = 123
+                probe.command = true
+                probe.option = true
+            }),
+            ("⌘⌥→", { probe in
+                probe.keyCode = 124
+                probe.command = true
+                probe.option = true
+            }),
+            ("⌘⌥⇧←", { probe in
+                probe.keyCode = 123
+                probe.command = true
+                probe.option = true
+                probe.shift = true
+            }),
+            ("⌘⌥⇧→", { probe in
+                probe.keyCode = 124
+                probe.command = true
+                probe.option = true
+                probe.shift = true
+            }),
+        ]
+
+        var checked = 0
+        for (contextName, applyContext) in contexts {
+            for (chordName, applyChord) in chords {
+                var probe = LauncherLayout.KeyboardProbe()
+                applyContext(&probe)
+                applyChord(&probe)
+                let matches = LauncherLayout.matchingKeyboardCommands(probe)
+                XCTAssertLessThanOrEqual(
+                    matches.count,
+                    1,
+                    "\(chordName) in \(contextName) bound \(matches)"
+                )
+                checked += 1
+            }
+        }
+        XCTAssertEqual(checked, contexts.count * chords.count)
+    }
+
+    func testKeyboardCommandRegistryAllowMatrixForSearchRenameAndOpenFolder() {
+        // KEYBOARD-COMMAND-REGISTRY-01. Search, a field editor, and an
+        // open folder keep the existing first-wave allow / deny rules.
+        // Keys and conflict order stay the same.
+        func resolve(
+            _ apply: (inout LauncherLayout.KeyboardProbe) -> Void
+        ) -> LauncherLayout.KeyboardCommand? {
+            var probe = LauncherLayout.KeyboardProbe()
+            apply(&probe)
+            return LauncherLayout.resolveKeyboardCommand(probe)
+        }
+
+        XCTAssertEqual(resolve {
+            $0.character = "z"
+            $0.command = true
+        }, .undoLayout)
+        XCTAssertEqual(resolve {
+            $0.character = "Z"
+            $0.command = true
+        }, .undoLayout)
+        XCTAssertNil(resolve {
+            $0.character = "z"
+            $0.command = true
+            $0.shift = true
+        })
+        XCTAssertNil(resolve {
+            $0.character = "z"
+            $0.command = true
+            $0.isEditingText = true
+        })
+        XCTAssertNil(resolve {
+            $0.character = "z"
+            $0.command = true
+            $0.isSearching = true
+        })
+
+        XCTAssertEqual(resolve {
+            $0.keyCode = 51
+            $0.command = true
+            $0.focusedIsFolder = true
+            $0.selectedFolderCount = 1
+        }, .dissolveClosedFolder)
+        XCTAssertNil(resolve {
+            $0.keyCode = 51
+            $0.command = true
+            $0.focusedIsFolder = true
+            $0.selectedFolderCount = 1
+            $0.isSearching = true
+        })
+        XCTAssertNil(resolve {
+            $0.keyCode = 51
+            $0.command = true
+            $0.focusedIsFolder = true
+            $0.selectedFolderCount = 1
+            $0.isEditingText = true
+        })
+        XCTAssertEqual(resolve {
+            $0.keyCode = 51
+            $0.command = true
+            $0.folderOpen = true
+            $0.focusedIsRemovableMember = true
+            $0.selectedMemberCount = 1
+        }, .removeFromOpenFolder)
+        // Removal from an open folder does not take isSearching, so ⌘⌫
+        // still removes a member during search.
+        XCTAssertEqual(resolve {
+            $0.keyCode = 51
+            $0.command = true
+            $0.folderOpen = true
+            $0.focusedIsRemovableMember = true
+            $0.selectedMemberCount = 1
+            $0.isSearching = true
+        }, .removeFromOpenFolder)
+        XCTAssertNil(resolve {
+            $0.keyCode = 51
+            $0.command = true
+            $0.folderOpen = true
+            $0.focusedIsRemovableMember = true
+            $0.selectedMemberCount = 1
+            $0.isEditingText = true
+        })
+        XCTAssertEqual(resolve {
+            $0.keyCode = 51
+            $0.command = true
+            $0.shift = true
+            $0.focusedIsApp = true
+            $0.selectedAppCount = 1
+        }, .uninstallApp)
+        // Uninstall also does not take isSearching.
+        XCTAssertEqual(resolve {
+            $0.keyCode = 51
+            $0.command = true
+            $0.shift = true
+            $0.focusedIsApp = true
+            $0.selectedAppCount = 1
+            $0.isSearching = true
+        }, .uninstallApp)
+        XCTAssertNil(resolve {
+            $0.keyCode = 51
+            $0.command = true
+            $0.shift = true
+            $0.focusedIsApp = true
+            $0.selectedAppCount = 1
+            $0.isEditingText = true
+        })
+
+        XCTAssertEqual(resolve {
+            $0.character = "n"
+            $0.command = true
+            $0.option = true
+            $0.focusedIsFolder = true
+        }, .optionNSortsFocusedFolder)
+        XCTAssertEqual(resolve {
+            $0.character = "n"
+            $0.command = true
+            $0.option = true
+            $0.folderOpen = true
+        }, .optionNSortsOpenFolder)
+        XCTAssertNil(resolve {
+            $0.character = "n"
+            $0.command = true
+            $0.option = true
+            $0.focusedIsFolder = true
+            $0.isSearching = true
+        })
+        XCTAssertNil(resolve {
+            $0.character = "n"
+            $0.command = true
+            $0.option = true
+            $0.folderOpen = true
+            $0.isEditingText = true
+        })
+        XCTAssertEqual(resolve {
+            $0.character = "c"
+            $0.command = true
+            $0.option = true
+            $0.focusedIsFolder = true
+        }, .optionCSortsFocusedFolder)
+        XCTAssertNil(resolve {
+            $0.character = "c"
+            $0.command = true
+            $0.option = true
+            $0.focusedIsFolder = true
+            $0.samplingInFlight = true
+        })
+        XCTAssertEqual(resolve {
+            $0.character = "r"
+            $0.command = true
+            $0.option = true
+        }, .optionRRearrangesGridByName)
+        XCTAssertNil(resolve {
+            $0.character = "r"
+            $0.command = true
+            $0.option = true
+            $0.folderOpen = true
+        })
+        XCTAssertEqual(resolve {
+            $0.character = "b"
+            $0.command = true
+            $0.option = true
+        }, .optionBTogglesBrowseAxis)
+        // Browse-axis is allowed when layout editing is off.
+        XCTAssertEqual(resolve {
+            $0.character = "b"
+            $0.command = true
+            $0.option = true
+            $0.layoutEditingEnabled = false
+        }, .optionBTogglesBrowseAxis)
+        XCTAssertNil(resolve {
+            $0.character = "u"
+            $0.command = true
+            $0.option = true
+            $0.layoutEditingEnabled = false
+        })
+        XCTAssertEqual(resolve {
+            $0.keyCode = 126
+            $0.command = true
+            $0.option = true
+        }, .optionVerticalMovesFoldersToEdge)
+        XCTAssertEqual(resolve {
+            $0.keyCode = 126
+            $0.command = true
+            $0.option = true
+            $0.folderOpen = true
+        }, .optionVerticalNudgesFocusedFolderMember)
+        XCTAssertEqual(resolve {
+            $0.keyCode = 123
+            $0.command = true
+            $0.option = true
+        }, .optionHorizontalNudgesFocusedEntry)
+        XCTAssertEqual(resolve {
+            $0.keyCode = 123
+            $0.command = true
+            $0.option = true
+            $0.folderOpen = true
+        }, .optionHorizontalNudgesFocusedFolderMember)
+        XCTAssertEqual(resolve {
+            $0.keyCode = 124
+            $0.command = true
+            $0.option = true
+            $0.shift = true
+        }, .optionShiftHorizontalMovesFocusedEntryToAdjacentPage)
+        XCTAssertNil(resolve {
+            $0.keyCode = 124
+            $0.command = true
+            $0.option = true
+            $0.shift = true
+            $0.folderOpen = true
+        })
+        XCTAssertEqual(resolve {
+            $0.character = "f"
+            $0.command = true
+        }, .focusSearch)
+        XCTAssertEqual(resolve {
+            $0.character = "F"
+            $0.command = true
+            $0.isEditingText = true
+            $0.folderOpen = true
+        }, .focusSearch)
+        XCTAssertNil(resolve {
+            $0.character = "f"
+            $0.command = true
+            $0.shift = true
+        })
+        XCTAssertEqual(resolve {
+            $0.character = "w"
+            $0.command = true
+        }, .dismissLauncher)
+        XCTAssertNil(resolve {
+            $0.character = "w"
+            $0.command = true
+            $0.isEditingText = true
+        })
+        XCTAssertEqual(resolve {
+            $0.character = "c"
+            $0.command = true
+        }, .copyFocusedApp)
+        XCTAssertNil(resolve {
+            $0.character = "c"
+            $0.command = true
+            $0.isEditingText = true
+        })
+        XCTAssertEqual(resolve {
+            $0.character = "a"
+            $0.command = true
+        }, .selectAllOnPage)
+        XCTAssertEqual(resolve {
+            $0.character = "a"
+            $0.command = true
+            $0.isSearching = true
+            $0.folderOpen = true
+        }, .selectAllOnPage)
+        XCTAssertNil(resolve {
+            $0.character = "a"
+            $0.command = true
+            $0.isEditingText = true
+        })
+        XCTAssertEqual(resolve {
+            $0.character = "a"
+            $0.command = true
+            $0.shift = true
+        }, .selectEveryTopLevelEntry)
+        XCTAssertNil(resolve {
+            $0.character = "a"
+            $0.command = true
+            $0.shift = true
+            $0.isSearching = true
+        })
+        XCTAssertNil(resolve {
+            $0.character = "a"
+            $0.command = true
+            $0.shift = true
+            $0.folderOpen = true
+        })
+        XCTAssertEqual(resolve {
+            $0.character = "c"
+            $0.command = true
+            $0.shift = true
+        }, .shiftCRearrangesGridByColor)
+        XCTAssertNil(resolve {
+            $0.character = "c"
+            $0.command = true
+            $0.shift = true
+            $0.folderOpen = true
+        })
+        XCTAssertEqual(resolve {
+            $0.character = "n"
+            $0.command = true
+            $0.shift = true
+            $0.selectedTopLevelAppCount = 2
+        }, .shiftNCreatesFolder)
+        XCTAssertNil(resolve {
+            $0.character = "n"
+            $0.command = true
+            $0.shift = true
+            $0.selectedTopLevelAppCount = 1
+        })
+        XCTAssertEqual(resolve {
+            $0.character = "m"
+            $0.command = true
+            $0.shift = true
+        }, .shiftMMovesSelectionIntoFolder)
+        XCTAssertNil(resolve {
+            $0.character = "m"
+            $0.command = true
+            $0.shift = true
+            $0.isSearching = true
+        })
+        XCTAssertEqual(resolve {
+            $0.keyCode = 126
+            $0.command = true
+            $0.shift = true
+            $0.selectedTopLevelCount = 2
+        }, .shiftVerticalSelectionEdge)
+        XCTAssertEqual(resolve {
+            $0.keyCode = 126
+            $0.command = true
+            $0.shift = true
+            $0.folderOpen = true
+        }, .shiftVerticalMovesFocusedFolderMember)
+        XCTAssertEqual(resolve {
+            $0.keyCode = 123
+            $0.command = true
+            $0.shift = true
+        }, .shiftHorizontalMovesFocusedEntry)
+        XCTAssertEqual(resolve {
+            $0.keyCode = 123
+            $0.command = true
+            $0.shift = true
+            $0.folderOpen = true
+        }, .shiftHorizontalMovesFocusedFolderMember)
+        XCTAssertNil(resolve {
+            $0.character = "n"
+            $0.command = true
+        })
+        XCTAssertEqual(resolve {
+            $0.character = "u"
+            $0.command = true
+            $0.shift = true
+        }, .shiftURestoresAllHidden)
+        XCTAssertNil(resolve {
+            $0.character = "u"
+            $0.command = true
+            $0.shift = true
+            $0.isSearching = true
+        })
+        XCTAssertNil(resolve {
+            $0.character = "u"
+            $0.command = true
+            $0.shift = true
+            $0.folderOpen = true
+        })
+        XCTAssertEqual(resolve {
+            $0.character = "r"
+            $0.command = true
+        }, .reloadCatalog)
+        XCTAssertEqual(resolve {
+            $0.character = "R"
+            $0.command = true
+            $0.isSearching = true
+            $0.folderOpen = true
+        }, .reloadCatalog)
+        XCTAssertNil(resolve {
+            $0.character = "r"
+            $0.command = true
+            $0.isEditingText = true
+        })
+        XCTAssertEqual(resolve {
+            $0.character = "h"
+            $0.command = true
+            $0.shift = true
+            $0.focusedIsApp = true
+        }, .shiftHHidesFocusedApp)
+        XCTAssertEqual(resolve {
+            $0.character = "h"
+            $0.command = true
+            $0.shift = true
+            $0.focusedIsInSelection = true
+            $0.selectedAppCount = 2
+        }, .shiftHHidesFocusedApp)
+        XCTAssertNil(resolve {
+            $0.character = "h"
+            $0.command = true
+            $0.shift = true
+            $0.selectedAppCount = 2
+        })
+        XCTAssertNil(resolve {
+            $0.character = "h"
+            $0.command = true
+            $0.shift = true
+            $0.focusedIsApp = true
+            $0.isEditingText = true
+        })
+        XCTAssertEqual(resolve {
+            $0.character = ","
+            $0.command = true
+        }, .openSettings)
+        XCTAssertEqual(resolve {
+            $0.character = ","
+            $0.command = true
+            $0.isEditingText = true
+            $0.folderOpen = true
+            $0.isSearching = true
+        }, .openSettings)
+        XCTAssertNil(resolve {
+            $0.character = ","
+            $0.command = true
+            $0.shift = true
+        })
+        XCTAssertEqual(resolve {
+            $0.keyCode = 36
+            $0.command = true
+            $0.shift = true
+            $0.selectedCount = 2
+        }, .shiftReturnRevealsSelection)
+        XCTAssertNil(resolve {
+            $0.keyCode = 36
+            $0.command = true
+            $0.shift = true
+            $0.selectedCount = 1
+        })
+        XCTAssertNil(resolve {
+            $0.keyCode = 36
+            $0.command = true
+            $0.shift = true
+            $0.selectedCount = 2
+            $0.isEditingText = true
+        })
+        XCTAssertEqual(resolve {
+            $0.keyCode = 36
+            $0.command = true
+            $0.isSearching = true
+        }, .revealSearchHit)
+        XCTAssertEqual(resolve {
+            $0.keyCode = 76
+            $0.command = true
+            $0.isSearching = true
+            $0.canRevealInFinder = true
+        }, .revealSearchHit)
+        XCTAssertNil(resolve {
+            $0.keyCode = 36
+            $0.command = true
+            $0.isSearching = true
+            $0.folderOpen = true
+        })
+        XCTAssertNil(resolve {
+            $0.keyCode = 36
+            $0.command = true
+            $0.isSearching = true
+            $0.hasMarkedText = true
+        })
+        XCTAssertEqual(resolve {
+            $0.keyCode = 36
+            $0.command = true
+            $0.canRevealInFinder = true
+        }, .revealFocusedTile)
+        XCTAssertNil(resolve {
+            $0.keyCode = 36
+            $0.command = true
+        })
+        XCTAssertEqual(resolve {
+            $0.keyCode = 126
+            $0.command = true
+            $0.folderOpen = true
+        }, .commandUpClosesOpenFolder)
+        XCTAssertNil(resolve {
+            $0.keyCode = 126
+            $0.command = true
+            $0.folderOpen = true
+            $0.isEditingFolderTitle = true
+        })
+        XCTAssertNil(resolve {
+            $0.keyCode = 126
+            $0.command = true
+        })
+        XCTAssertEqual(resolve {
+            $0.keyCode = 125
+            $0.command = true
+            $0.focusedIsFolder = true
+        }, .commandDownOpensFocusedFolder)
+        XCTAssertNil(resolve {
+            $0.keyCode = 125
+            $0.command = true
+            $0.focusedIsFolder = true
+            $0.folderOpen = true
+        })
+        XCTAssertNil(resolve {
+            $0.keyCode = 125
+            $0.command = true
+            $0.focusedIsFolder = true
+            $0.isSearching = true
+        })
+        XCTAssertEqual(resolve {
+            $0.keyCode = 123
+            $0.command = true
+            $0.pageCount = 2
+        }, .commandArrowPaging)
+        XCTAssertEqual(resolve {
+            $0.keyCode = 124
+            $0.command = true
+            $0.pageCount = 2
+        }, .commandArrowPaging)
+        XCTAssertNil(resolve {
+            $0.keyCode = 123
+            $0.command = true
+            $0.pageCount = 1
+        })
+        XCTAssertNil(resolve {
+            $0.keyCode = 123
+            $0.command = true
+            $0.pageCount = 2
+            $0.isSearching = true
+        })
+        XCTAssertNil(resolve {
+            $0.keyCode = 123
+            $0.command = true
+            $0.pageCount = 2
+            $0.folderOpen = true
+        })
+        XCTAssertNil(resolve {
+            $0.keyCode = 126
+            $0.command = true
+            $0.pageCount = 2
+        })
+        XCTAssertEqual(resolve {
+            $0.keyCode = 126
+            $0.command = true
+            $0.pageCount = 2
+            $0.pageFlipHorizontal = false
+        }, .commandArrowPaging)
+        XCTAssertEqual(resolve {
+            $0.keyCode = 125
+            $0.command = true
+            $0.pageCount = 2
+            $0.pageFlipHorizontal = false
+        }, .commandArrowPaging)
+        XCTAssertEqual(resolve {
+            $0.keyCode = 125
+            $0.command = true
+            $0.pageCount = 2
+            $0.pageFlipHorizontal = false
+            $0.focusedIsFolder = true
+        }, .commandDownOpensFocusedFolder)
+        XCTAssertEqual(resolve {
+            $0.keyCode = 126
+            $0.command = true
+            $0.pageCount = 2
+            $0.pageFlipHorizontal = false
+            $0.folderOpen = true
+        }, .commandUpClosesOpenFolder)
+        XCTAssertEqual(resolve {
+            $0.keyCode = 53
+        }, .escapeCancels)
+        XCTAssertEqual(resolve {
+            $0.keyCode = 53
+            $0.command = true
+            $0.isSearching = true
+            $0.folderOpen = true
+        }, .escapeCancels)
+        XCTAssertEqual(resolve {
+            $0.character = " "
+        }, .spaceActivatesFocusedItem)
+        XCTAssertEqual(resolve {
+            $0.character = " "
+            $0.isSearching = true
+            $0.folderOpen = true
+        }, .spaceActivatesFocusedItem)
+        XCTAssertNil(resolve {
+            $0.character = "a"
+            $0.keyCode = 49
+        })
+        XCTAssertEqual(resolve {
+            $0.keyCode = 123
+        }, .arrowWalksGrid)
+        XCTAssertEqual(resolve {
+            $0.keyCode = 126
+        }, .arrowWalksGrid)
+        XCTAssertEqual(resolve {
+            $0.keyCode = 123
+            $0.shift = true
+        }, .arrowExtendsSelection)
+        XCTAssertEqual(resolve {
+            $0.keyCode = 116
+        }, .pageUpDownPagesGrid)
+        XCTAssertEqual(resolve {
+            $0.keyCode = 123
+            $0.command = true
+            $0.pageCount = 2
+        }, .commandArrowPaging)
+        XCTAssertEqual(resolve {
+            $0.keyCode = 115
+        }, .homeEndJumpsInGrid)
+        XCTAssertEqual(resolve {
+            $0.keyCode = 119
+        }, .homeEndJumpsInGrid)
+        XCTAssertEqual(resolve {
+            $0.keyCode = 115
+            $0.shift = true
+        }, .shiftHomeEndExtendsSelection)
+        XCTAssertNil(resolve {
+            $0.keyCode = 115
+            $0.command = true
+        })
+        XCTAssertEqual(resolve {
+            $0.keyCode = 116
+            $0.shift = true
+        }, .pageUpDownPagesGrid)
+        XCTAssertEqual(resolve {
+            $0.keyCode = 120
+            $0.focusedIsFolder = true
+        }, .f2RenamesFocusedClosedFolder)
+        XCTAssertEqual(resolve {
+            $0.keyCode = 120
+            $0.focusedIsApp = true
+        }, .f2RenamesFocusedAppAlias)
+        XCTAssertNil(resolve {
+            $0.keyCode = 120
+            $0.focusedIsFolder = true
+            $0.isSearching = true
+        })
+        XCTAssertEqual(resolve {
+            $0.keyCode = 120
+            $0.focusedIsApp = true
+            $0.isSearching = true
+        }, .f2RenamesFocusedAppAlias)
+        XCTAssertEqual(resolve {
+            $0.keyCode = 120
+            $0.focusedIsApp = true
+            $0.folderOpen = true
+        }, .f2RenamesFocusedAppAlias)
+        XCTAssertNil(resolve {
+            $0.keyCode = 120
+            $0.focusedIsFolder = true
+            $0.folderOpen = true
+        })
+        XCTAssertNil(resolve {
+            $0.keyCode = 120
+            $0.focusedIsFolder = true
+            $0.isEditingText = true
+        })
+        XCTAssertNil(resolve {
+            $0.keyCode = 120
+            $0.focusedIsApp = true
+            $0.isEditingText = true
+        })
+        XCTAssertNil(resolve {
+            $0.keyCode = 120
+        })
+        XCTAssertNil(resolve {
+            $0.keyCode = 120
+            $0.focusedIsFolder = true
+            $0.shift = true
+        })
+        XCTAssertEqual(resolve {
+            $0.keyCode = 116
+        }, .pageUpDownPagesGrid)
+        XCTAssertEqual(resolve {
+            $0.keyCode = 121
+        }, .pageUpDownPagesGrid)
+        XCTAssertEqual(resolve {
+            $0.keyCode = 116
+            $0.isSearching = true
+        }, .pageUpDownScrollsOpenList)
+        XCTAssertEqual(resolve {
+            $0.keyCode = 121
+            $0.folderOpen = true
+        }, .pageUpDownScrollsOpenList)
+        XCTAssertEqual(resolve {
+            $0.keyCode = 116
+            $0.isSearching = true
+            $0.folderOpen = true
+        }, .pageUpDownScrollsOpenList)
+        XCTAssertEqual(resolve {
+            $0.keyCode = 123
+        }, .arrowWalksGrid)
     }
 
 }

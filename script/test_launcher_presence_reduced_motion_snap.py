@@ -5,7 +5,7 @@ import sys
 
 root = Path(__file__).resolve().parents[1]
 core = (root / "Sources/Core/LauncherLayout.swift").read_text()
-direct = (root / "Sources/Direct/LauncherWindowController.swift").read_text()
+direct = "".join(p.read_text() for p in [root / "Sources/Direct/LauncherWindowController.swift", *sorted((root / "Sources/Direct").glob("LauncherWindowController+*.swift"))])
 tests = (root / "Tests/CoreTests/LaunchIconCoreTests.swift").read_text()
 failures = []
 
@@ -37,10 +37,10 @@ need("CATransform3DIdentity" in snap_branch, "snap must rest card transform")
 need("return duration" in snap_branch, "snap must return duration 0")
 
 # Entry points
-need("func respondToHotCornerTrigger()" in direct, "hot-corner must use show/hide → presence")
-need("func toggleVisibility()" in direct, "hotkey toggle must use show/hide → presence")
+need("func respondToHotCornerTrigger" in direct, "hot-corner must use show/hide → presence")
+need("func toggleVisibility" in direct, "hotkey toggle must use show/hide → presence")
 show = direct[direct.index("func show(animated:"):direct.index("func hide(animated:")]
-hide = direct[direct.index("func hide(animated:"):direct.index("func toggleVisibility()")]
+hide = direct[direct.index("func hide(animated:"):direct.index("func toggleVisibility")]
 need("animateLauncherPresence" in show, "show must call animateLauncherPresence")
 need("animateLauncherPresence" in hide, "hide must call animateLauncherPresence")
 

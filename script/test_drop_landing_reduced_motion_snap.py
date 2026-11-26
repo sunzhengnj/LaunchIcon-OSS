@@ -5,7 +5,7 @@ import sys
 
 root = Path(__file__).resolve().parents[1]
 core = (root / "Sources/Core/LauncherLayout.swift").read_text()
-direct = (root / "Sources/Direct/LauncherWindowController.swift").read_text()
+direct = "".join(p.read_text() for p in [root / "Sources/Direct/LauncherWindowController.swift", *sorted((root / "Sources/Direct").glob("LauncherWindowController+*.swift"))])
 tests = (root / "Tests/CoreTests/LaunchIconCoreTests.swift").read_text()
 failures = []
 
@@ -34,8 +34,8 @@ play = core[
 need("shouldSnapDropLandingForReducedMotion" in play, "shouldPlay must consult snap")
 
 queue = direct[
-    direct.index("private func queueDropLanding(") : direct.index(
-        "private func queueCancelledDropLanding("
+    direct.index("func queueDropLanding(") : direct.index(
+        "func queueCancelledDropLanding("
     )
 ]
 need("shouldSnapDropLandingForReducedMotion" in queue, "queueDropLanding must consult snap")
@@ -44,8 +44,8 @@ need("dropLandingStartFrame" in queue and "reducesMotion: reduced" in queue,
      "start frame must pass reduced")
 
 start = direct[
-    direct.index("private func startDropLandingFlight()") : direct.index(
-        "private func dropLandingDestinationFrame("
+    direct.index("func startDropLandingFlight()") : direct.index(
+        "func dropLandingDestinationFrame("
     )
 ]
 need("shouldSnapDropLandingForReducedMotion" in start, "startDropLandingFlight must consult snap")

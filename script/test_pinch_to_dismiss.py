@@ -40,10 +40,14 @@ for needle in (
     if needle not in settings:
         fail(f"Settings missing {needle!r}")
 
-hm = re.search(r"height:\s*(\d+)", settings)
-# SETTINGS-FORM-DENSITY-01: shorter window after collapsing button walls; still fits pinch row.
-if not hm or int(hm.group(1)) < 860:
-    fail("Settings window height must be >= 860 for pinch row")
+# SETTINGS-COMPACT-SCROLL-02: scrolled viewport; pinch row retained.
+if "NSScrollView" not in settings:
+    fail("Settings must use NSScrollView after compact pass")
+hm = re.search(r"defaultContentHeight:\s*CGFloat\s*=\s*(\d+)", settings)
+if not hm or int(hm.group(1)) < 520 or int(hm.group(1)) > 760:
+    fail("Settings defaultContentHeight should be compact (~520-760)")
+if "settings-pinch-dismiss" not in settings:
+    fail("pinch AX id must remain")
 
 if "showPage(" in settings or "pageTransition" in settings or "pageAnimation" in settings:
     fail("settings must not touch paging")
@@ -68,12 +72,23 @@ body = "\n".join(direct[start:].splitlines()[:80])
 for bad in ("showPage(", "transitionToPage(", "animatePage", "movePage("):
     if bad in body:
         fail(f"handlePinchMagnify must not call {bad} (paging red line)")
-edit_at = body.find("folderOverlay.isEditingTitle")
+# PRESENCE-GESTURE-SUPPRESS-UNINSTALL-PROMPT-01: Core helper gates editing/modals.
+if "shouldTreatAsPresenceGestureEditing" not in body:
+    fail("pinch must use shouldTreatAsPresenceGestureEditing")
+if "isPromptingForUninstall" not in body:
+    fail("pinch must suppress while uninstall prompt is up")
+edit_at = body.find("shouldTreatAsPresenceGestureEditing")
 policy_at = body.find("PinchDismissPolicy.shouldDismiss")
 phase_at = body.find("let phase = event.phase")
 editing_prefix = body[:phase_at] if phase_at > 0 else ""
-if edit_at < 0 or "searchField.currentEditor()" not in editing_prefix or "isPromptingForAlias" not in editing_prefix:
-    fail("pinch must ignore folder title, search, and alias editing")
+if (
+    edit_at < 0
+    or "folderOverlay.isEditingTitle" not in editing_prefix
+    or "searchField.currentEditor()" not in editing_prefix
+    or "isPromptingForAlias" not in editing_prefix
+    or "isPromptingForUninstall" not in editing_prefix
+):
+    fail("pinch must ignore folder title, search, alias, and uninstall editing")
 if "pinchDismissAccumulated = 0" not in editing_prefix or "return true" not in editing_prefix:
     fail("editing pinch must reset and stay consumed")
 if policy_at < 0 or edit_at > policy_at or "isEditingText:" not in body:
@@ -88,4 +103,23 @@ for key in (
     if key not in strings:
         fail(f"xcstrings missing {key!r}")
 
+# PINCH-DISMISS-LAYERED-01
+if "PINCH-DISMISS-LAYERED-01" not in direct:
+    fail("Direct missing PINCH-DISMISS-LAYERED-01")
+if "performPinchDismissLayer" not in direct:
+    fail("Direct missing performPinchDismissLayer")
+if "pinchDismissLayer" not in prefs and "pinchDismissLayer" not in Path(ROOT / "Sources/Core/LauncherLayout.swift").read_text(encoding="utf-8"):
+    fail("Core missing pinchDismissLayer")
+core = Path(ROOT / "Sources/Core/LauncherLayout.swift").read_text(encoding="utf-8")
+if "pinchDismissLayer" not in core:
+    fail("Core missing pinchDismissLayer")
+# Layered path must still reach hide via onPinchDismissRequested
+layer_at = direct.find("func performPinchDismissLayer")
+layer_body = direct[layer_at:layer_at+800]
+if "onPinchDismissRequested?()" not in layer_body:
+    fail("performPinchDismissLayer must still call onPinchDismissRequested for hide")
+if "hideToast" not in layer_body or "closeFolder" not in layer_body:
+    fail("performPinchDismissLayer must peel toast and folder")
+if "showPage(" in layer_body or "transitionToPage(" in layer_body:
+    fail("performPinchDismissLayer must not touch paging")
 print("PASS: pinch-to-dismiss wired")

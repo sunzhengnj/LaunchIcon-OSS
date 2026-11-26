@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """SEARCH-FIELD-CHROME-01: search/count/settings chrome owned by Core."""
 from pathlib import Path
+import re
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -13,7 +14,7 @@ def fail(msg: str) -> None:
     sys.exit(1)
 
 
-if "SEARCH-FIELD-CHROME-01" not in layout:
+if "SEARCH-FIELD-CHROME-01" not in layout and "SEARCH-FIELD-CHROME-02" not in layout:
     fail("Core missing slice tag")
 if "enum SearchFieldChromeCopy" not in layout:
     fail("missing SearchFieldChromeCopy")
@@ -78,5 +79,48 @@ if 'accessibilityDescription: L("设置")' in direct:
     fail("settings gear still uses L(设置)")
 if 'toolTip = L("设置")' in direct:
     fail("settings toolTip still L")
+
+# SEARCH-FIELD-CHROME-02 sizes
+w = re.search(r"searchFieldWidth:\s*CGFloat\s*=\s*(\d+)", layout)
+h = re.search(r"searchFieldHeight:\s*CGFloat\s*=\s*(\d+)", layout)
+r = re.search(r"searchFieldCornerRadius:\s*CGFloat\s*=\s*(\d+)", layout)
+if not w or int(w.group(1)) != 360:
+    fail(f"searchFieldWidth expected 360, got {w.group(1) if w else None}")
+if not h or int(h.group(1)) != 36:
+    fail(f"searchFieldHeight expected 36, got {h.group(1) if h else None}")
+if not r or int(r.group(1)) != 18:
+    fail(f"searchFieldCornerRadius expected 18, got {r.group(1) if r else None}")
+if "searchSettingsButtonSize" not in layout:
+    fail("missing searchSettingsButtonSize")
+if "LauncherLayout.searchSettingsButtonSize" not in direct:
+    fail("Direct must use searchSettingsButtonSize")
+
+
+# SEARCH-FIELD-CHROME-03: vertical center cell
+for needle in (
+    "SEARCH-FIELD-CHROME-03",
+    "private final class LauncherSearchFieldCell: NSSearchFieldCell",
+    'searchField.cell = LauncherSearchFieldCell(textCell: "")',
+    "override func drawingRect(forBounds rect: NSRect) -> NSRect",
+    "override func titleRect(forBounds rect: NSRect) -> NSRect",
+    "override func searchButtonRect(forBounds rect: NSRect) -> NSRect",
+    "override func cancelButtonRect(forBounds rect: NSRect) -> NSRect",
+):
+    if needle not in direct:
+        fail(f"Direct missing {needle!r}")
+
+# SEARCH-FIELD-CELL-EDITABLE-01: the replacement cell must stay an editable text cell.
+install = direct.index('searchField.cell = LauncherSearchFieldCell(textCell: "")')
+after = direct[install:install + 900]
+for needle in ("SEARCH-FIELD-CELL-EDITABLE-01", "cell.isEditable = true", "cell.isSelectable = true", "cell.isScrollable = true"):
+    if needle not in after:
+        fail(f"replacement search cell missing {needle!r}")
+
+# SEARCH-FIELD-TEXT-CENTER-01: drawing rect and field editor clip share one centered line.
+cell_s = direct.index("private final class LauncherSearchFieldCell")
+cell = direct[cell_s:direct.index("private final class LauncherSearchField: NSSearchField", cell_s)]
+for needle in ("SEARCH-FIELD-TEXT-CENTER-01", "singleLineHeight", "centerFieldEditorClip", "override func select(", "override func edit("):
+    if needle not in cell:
+        fail(f"search cell missing {needle!r}")
 
 print("PASS: search-field chrome owned by Core")

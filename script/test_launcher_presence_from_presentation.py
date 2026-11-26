@@ -4,7 +4,7 @@ from pathlib import Path
 import sys
 
 root = Path(__file__).resolve().parents[1]
-direct = (root / "Sources/Direct/LauncherWindowController.swift").read_text()
+direct = "".join(p.read_text() for p in [root / "Sources/Direct/LauncherWindowController.swift", *sorted((root / "Sources/Direct").glob("LauncherWindowController+*.swift"))])
 core = (root / "Sources/Core/LauncherLayout.swift").read_text()
 failures = []
 
@@ -70,7 +70,7 @@ need("return duration" in snap_branch or "return duration" in anim[:anim.index("
      "snap branch must return duration (0)")
 # Hot corner / hotkey still enter via show/hide → animateLauncherPresence
 need("respondToHotCornerTrigger" in direct, "hot corner path must remain")
-need("func toggleVisibility()" in direct, "hotkey toggle path must remain")
+need("func toggleVisibility" in direct, "hotkey toggle path must remain")
 need("showPage(" not in anim and "pageTransition" not in anim and "pageAnimationDuration" not in anim,
      "presence animate must not retune paging")
 

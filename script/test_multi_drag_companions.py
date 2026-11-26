@@ -3,7 +3,7 @@
 from pathlib import Path
 import sys
 root = Path(__file__).resolve().parents[1]
-direct = (root / "Sources/Direct/LauncherWindowController.swift").read_text()
+direct = "".join(p.read_text() for p in [root / "Sources/Direct/LauncherWindowController.swift", *sorted((root / "Sources/Direct").glob("LauncherWindowController+*.swift"))])
 failures=[]
 def need(c,m):
     if not c: failures.append(m)
@@ -12,7 +12,7 @@ need("restoreMultiDragCompanionTiles(" in direct, "Direct missing restoreMultiDr
 need("MULTI-DRAG-COMPANIONS-01" in direct, "Direct must tag COMPANIONS-01")
 need("multiDragHiddenCompanionTiles" in direct, "Direct must track hidden companion tiles")
 # restore path must call companions restore
-idx = direct.index("private func restoreDragSourceTile()")
+idx = direct.index("func restoreDragSourceTile()")
 chunk = direct[idx:idx+350]
 need("restoreMultiDragCompanionTiles()" in chunk, "restoreDragSourceTile must restore companions")
 # hide call near beginDraggingSession for multi

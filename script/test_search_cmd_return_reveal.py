@@ -14,6 +14,12 @@ need("SEARCH-CMD-RETURN-REVEAL-01" in core and "SEARCH-CMD-RETURN-REVEAL-01" in 
 need("panel.searchRevealHandler" in direct, "panel handler not wired")
 need("func revealSearchKeyboardHighlightOrFirst(" in direct, "root reveal missing")
 need("testSearchRevealShortcutMatchesOnlyCommandReturnWhileSearching" in tests, "Core test missing")
+need("func gridTileCommandReturnReveals(" in core, "Core missing gridTileCommandReturnReveals")
+need("GRID-CMD-RETURN-REVEAL-01" in core and "GRID-CMD-RETURN-REVEAL-01" in direct, "grid slice tag missing")
+need("func revealFocusedTileInFinder(" in direct, "focused-tile reveal missing")
+need("revealFocusedTileInFinder(keyCode:" in direct, "panel does not ask the focused tile")
+need("gridTileCommandReturnReveals(" in direct, "tile does not call Core")
+need("testGridTileCommandReturnRevealsTheFocusedApp" in tests, "grid Core test missing")
 fn = direct.split("func revealSearchKeyboardHighlightOrFirst(")[1].split("private func activateSearchKeyboardHighlightOrFirst")[0] if "func revealSearchKeyboardHighlightOrFirst(" in direct else ""
 need("onRevealInFinderRequested" in fn, "must reuse onRevealInFinderRequested (dismiss + Finder)")
 need("onCandidateSelected" not in fn, "⌘↩ must not launch")

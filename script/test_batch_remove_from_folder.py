@@ -17,6 +17,21 @@ need("BATCH-REMOVE-FROM-FOLDER-01" in direct, "Direct must tag BATCH-REMOVE-FROM
 need("onBatchRemoveFromFolder" in direct, "Direct missing onBatchRemoveFromFolder")
 need("removeSelectedApplicationsFromOpenFolder" in direct, "Direct missing batch action")
 need("testBatchRemovingAppsFromFolderKeepsFolderAlive" in tests, "Core test missing")
+need("func commandDeleteFolderRemoval(" in core, "Core command-delete gate missing")
+need("func removeFromOpenFolderWithCommandDelete(" in direct, "Direct command-delete missing")
+need("removeFromOpenFolderWithCommandDelete(" in direct, "panel must ask to remove")
+need("testCommandDeleteRemovesMembersFromTheOpenFolder" in tests, "Core command-delete test missing")
+delete_at = direct.index("func removeFromOpenFolderWithCommandDelete(")
+delete_body = direct[delete_at:direct.index("private func removeApplicationFromOpenFolder(", delete_at)]
+need("commandDeleteFolderRemoval(" in delete_body, "command-delete must ask Core")
+need("removeSelectedApplicationsFromOpenFolder(" in delete_body, "batch path missing")
+need("removeApplicationFromOpenFolder(" in delete_body, "single path missing")
+for banned in ("showPage", "transitionToPage", "completePageTransition", "movePage"):
+    need(banned not in delete_body, f"command-delete must not page ({banned})")
+need("recordingKeyboardLayoutUndo(" in delete_body, "command-delete remove must keep one undo")
+menu_remove_at = direct.index("private func removeApplicationFromOpenFolder(")
+menu_remove = direct[menu_remove_at:direct.index("private func moveSelectedApplications(", menu_remove_at)]
+need("recordingKeyboardLayoutUndo(" not in menu_remove, "menu remove must not record undo")
 # Must not touch paging hosts
 for bad in ("pageAnimationDuration", "transitionToPage", "movePage("):
     # allow existing uses; only fail if NEW near our tag

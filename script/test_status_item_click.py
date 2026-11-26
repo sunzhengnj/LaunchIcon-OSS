@@ -42,6 +42,25 @@ need(".nonPointer" in core, "Core must treat non-pointer activation as its own k
 need("case .secondary, .nonPointer" in core, "non-pointer activation must show the menu")
 need("return .nonPointer" in delegate, "Direct must map a missing or non-mouse event to nonPointer")
 need("statusItemButtonAction(for: .nonPointer" in tests, "Core test must cover non-pointer menu")
+need("STATUS-ITEM-AX-SHOW-MENU-01" in core, "Core missing AX show-menu marker")
+need("statusItemActionForAccessibilityShowMenu" in core, "Core missing AX show-menu action")
+need("statusItemActionForAccessibilityShowMenu()" in tests, "Core test must cover AX show-menu")
+need("LaunchIconStatusButton" in delegate, "Direct must subclass the status button")
+need("accessibilityPerformShowMenu" in delegate, "status button must implement Show Menu")
+need("object_setClass(button, LaunchIconStatusButton.self)" in delegate,
+     "existing status button must receive the Show Menu subclass")
+need("presentStatusItemMenuForAccessibility" in delegate, "Direct must present the menu for AX")
+need("statusItemActionForAccessibilityShowMenu()" in delegate, "AX path must ask Core")
+need("STATUS-ITEM-AX-SHOW-MENU-SUPPRESSED-01" in core, "Core missing suppressed Show Menu marker")
+need("statusItemAccessibilityShowMenuPerformed" in core, "Core missing suppressed Show Menu gate")
+need("statusItemAccessibilityShowMenuPerformed" in delegate, "AX path must ask the suppressed gate")
+need("testStatusItemAccessibilityShowMenuFailsWhenSuppressed" in tests, "Core test must cover a suppressed Show Menu")
+need("presentationAllowed: false" in tests, "Core test must reject a suppressed Show Menu")
+ax = delegate[delegate.index("func presentStatusItemMenuForAccessibility"):
+              delegate.index("private func menuKeyEquivalent")]
+need(ax.index("statusItemAccessibilityShowMenuPerformed") < ax.index("presentStatusMenu"),
+     "AX show menu must consult the suppressed gate before popping")
+need("return false" in ax, "a suppressed Show Menu must return false")
 
 # No paging retune in the click path
 chunk = delegate[delegate.index("statusItemButtonActivated"):

@@ -59,12 +59,17 @@ for bad in (
     if bad in settings:
         fail(f"Settings still has dense control {bad!r}")
 
-hm = re.search(r"height:\s*(\d+)", settings)
-wm = re.search(r"width:\s*(\d+)", settings)
-if not hm or int(hm.group(1)) > 950:
-    fail("Settings height should shrink after density pass (<= 950)")
+# SETTINGS-COMPACT-SCROLL-02: default viewport ~680 with NSScrollView
+if "NSScrollView" not in settings:
+    fail("Settings must scroll after compact pass")
+if "SettingsWindowChrome" not in settings:
+    fail("compact chrome metrics missing")
+hm = re.search(r"defaultContentHeight:\s*CGFloat\s*=\s*(\d+)", settings)
+wm = re.search(r"contentWidth:\s*CGFloat\s*=\s*(\d+)", settings)
+if not hm or int(hm.group(1)) > 760 or int(hm.group(1)) < 520:
+    fail("Settings defaultContentHeight should shrink after compact pass (520-760)")
 if not wm or int(wm.group(1)) < 520:
-    fail("Settings width should be >= 520 for form labels")
+    fail("Settings contentWidth should be >= 520 for form labels")
 
 if "showPage(" in settings or "pageTransition" in settings:
     fail("settings must not touch paging")
