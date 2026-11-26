@@ -34,4 +34,20 @@ if "return false" not in window:
 for bad in ("pageAnimationDuration", "transitionToPage", "movePage("):
     if bad in window:
         fail(f"paging symbol {bad} near blank-click clear — refuse")
-print("PASS: blank click clear selection")
+# BLANK-CLICK-TOAST-01: toast peel before dismiss; toast chrome ignored.
+if "BLANK-CLICK-TOAST-01" not in direct:
+    fail("Direct missing BLANK-CLICK-TOAST-01 tag")
+if "shouldDismissToastOnBlankClick" not in core:
+    fail("Core missing shouldDismissToastOnBlankClick")
+if "shouldDismissToastOnBlankClick" not in direct:
+    fail("Direct shouldDismiss must call shouldDismissToastOnBlankClick")
+sd = direct.find("func shouldDismiss(at point:")
+sd_body = direct[sd:sd + 2200] if sd >= 0 else ""
+if "view === toastView" not in sd_body:
+    fail("shouldDismiss must ignore toastView hits")
+if "shouldDismissToastOnBlankClick" not in sd_body or "hideToast(animated: true)" not in sd_body:
+    fail("blank click must hideToast when toast visible")
+# toast peel must precede selection clear inside shouldDismiss
+if sd_body.find("shouldDismissToastOnBlankClick") > sd_body.find("BLANK-CLICK-CLEAR-SELECTION-01"):
+    fail("BLANK-CLICK-TOAST peel must precede CLEAR-SELECTION")
+print("PASS: blank click clear selection + toast")

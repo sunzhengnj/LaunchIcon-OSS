@@ -60,4 +60,54 @@ if '"解散选中的文件夹？"' not in xc:
 if "BATCH-DISSOLVE-FOLDERS" not in docs and "Batch dissolve" not in docs:
     fail("MULTI_SELECT_DESIGN.md must mention batch dissolve folders")
 
+if "func commandDeleteDissolvesClosedFolder(" not in core:
+    fail("Core command-delete dissolve gate missing")
+if "func dissolveFocusedFolderWithCommandDelete(" not in direct:
+    fail("Direct command-delete dissolve missing")
+if "dissolveFocusedFolderWithCommandDelete(" not in direct:
+    fail("panel must ask to dissolve")
+if "testCommandDeleteDissolvesTheFocusedFolderWhenNoneIsOpen" not in tests:
+    fail("Core command-delete dissolve test missing")
+dissolve_at = direct.index("func dissolveFocusedFolderWithCommandDelete(")
+dissolve_body = direct[dissolve_at:direct.index("private func dissolveFolderFromMenu(", dissolve_at)]
+if "commandDeleteDissolvesClosedFolder(" not in dissolve_body:
+    fail("command-delete dissolve must ask Core")
+if "dissolveSelectedFolders(" not in dissolve_body:
+    fail("batch dissolve path missing")
+if "dissolveFolderFromMenu(" not in dissolve_body:
+    fail("single dissolve path missing")
+for bad in ("showPage", "transitionToPage", "completePageTransition", "movePage"):
+    if bad in dissolve_body:
+        fail(f"command-delete dissolve must not page ({bad})")
+if "recordingKeyboardLayoutUndo(" not in dissolve_body:
+    fail("command-delete dissolve must keep one undo")
+selected_at = direct.index("private func dissolveSelectedFolders(anchorID:")
+selected_body = direct[selected_at:direct.index("func dissolveFocusedFolderWithCommandDelete(", selected_at)]
+if "recordingKeyboardLayoutUndo(" in selected_body:
+    fail("batch dissolve confirm must not record undo")
+menu_dissolve_at = direct.index("private func dissolveFolderFromMenu(")
+menu_dissolve = direct[menu_dissolve_at:direct.index("func sortFocusedFolderByNameFromCommandOption(", menu_dissolve_at)]
+if "recordingKeyboardLayoutUndo(" in menu_dissolve:
+    fail("menu dissolve must not record undo")
+
+if "func commandShiftDeleteUninstallsFocusedApp(" not in core:
+    fail("Core command-shift-delete uninstall gate missing")
+if "func uninstallFocusedAppFromCommandShiftDelete(" not in direct:
+    fail("Direct command-shift-delete uninstall missing")
+if "uninstallFocusedAppFromCommandShiftDelete(" not in direct:
+    fail("panel must ask to uninstall")
+if "testCommandShiftDeleteUninstallsTheFocusedApp" not in tests:
+    fail("Core command-shift-delete test missing")
+uninstall_at = direct.index("func uninstallFocusedAppFromCommandShiftDelete(")
+uninstall_body = direct[uninstall_at:direct.index("private func dissolveFolderFromMenu(", uninstall_at)]
+if "commandShiftDeleteUninstallsFocusedApp(" not in uninstall_body:
+    fail("uninstall shortcut must ask Core")
+if "uninstallSelectedApplications(" not in uninstall_body or "promptToUninstall(" not in uninstall_body:
+    fail("uninstall shortcut must use the existing confirms")
+for bad in ("showPage", "transitionToPage", "completePageTransition", "movePage"):
+    if bad in uninstall_body:
+        fail(f"command-shift-delete uninstall must not page ({bad})")
+if "recordingKeyboardLayoutUndo(" in uninstall_body:
+    fail("uninstall must not record layout undo")
+
 print("PASS: batch dissolve folders")

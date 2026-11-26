@@ -50,4 +50,7 @@ if failures:
     for f in failures:
         print("FAIL:", f)
     sys.exit(1)
+# APP-MENU-READONLY-REVEAL-01: read-only menus suppress Reveal in Finder
+need("shouldOfferRevealInFinderInAppMenu" in core, "Core must gate reveal for read-only menus")
+need("shouldOfferRevealInFinderInAppMenu" in direct, "Direct must gate reveal for read-only menus")
 print("PASS: incomplete-scan readonly AX")

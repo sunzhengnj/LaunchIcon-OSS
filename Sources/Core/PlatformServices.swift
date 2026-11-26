@@ -209,6 +209,82 @@ public final class WorkspaceIconCache: @unchecked Sendable {
         storage.object(forKey: Self.key(for: candidate))
     }
 
+    /// Drop the path-only entry and this candidate's versioned entry so a
+    /// later load can decode a replacement icon. NSCache cannot enumerate
+    /// other versions; the catalog pass evicts the previous stamp.
+    public func invalidateIcons(for candidate: AppCandidate) {
+        invalidateIcons(for: candidate.canonicalURL)
+        storage.removeObject(forKey: Self.key(for: candidate))
+    }
+
+    public func invalidateIcons(for applicationURL: URL) {
+        storage.removeObject(forKey: applicationURL.path as NSString)
+    }
+
+    /// Newest of the provided dates. Nil when every value is missing.
+    public static func iconCacheStamp(dates: [Date?]) -> Date? {
+        dates.compactMap { $0 }.max()
+    }
+
+    /// Icon-only replacements often touch Info.plist, Resources, or the icns
+    /// / Assets.car without updating the .app wrapper's own modification date.
+    /// `CFBundleIconName` is checked as well as `CFBundleIconFile`, because
+    /// modern bundles often only declare the asset catalog name.
+    public static func iconCacheModificationDate(
+        ofBundleAt url: URL,
+        bundleModificationDate: Date?,
+        info: [String: Any]? = nil,
+        fileManager: FileManager = .default
+    ) -> Date? {
+        var dates: [Date?] = [bundleModificationDate]
+        var relatives = [
+            "Contents/Info.plist",
+            "Contents/Resources",
+            "Contents/Resources/Assets.car",
+            "Info.plist"
+        ]
+        func appendIconResource(_ raw: Any?) {
+            guard let iconName = raw as? String else { return }
+            let trimmed = iconName.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+            let file = (trimmed as NSString).pathExtension.isEmpty ? "\(trimmed).icns" : trimmed
+            relatives.append("Contents/Resources/\(file)")
+            relatives.append(file)
+        }
+        appendIconResource(info?["CFBundleIconFile"])
+        appendIconResource(info?["CFBundleIconName"])
+        for relative in relatives {
+            let item = url.appendingPathComponent(relative)
+            guard fileManager.fileExists(atPath: item.path) else { continue }
+            let date = try? item.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+            dates.append(date)
+        }
+        return iconCacheStamp(dates: dates)
+    }
+
+    /// Previous candidates whose path is still present with a new stamp.
+    /// Invalidate these old keys before the catalog swap.
+    public static func candidatesNeedingIconInvalidation(
+        previous: [AppCandidate],
+        current: [AppCandidate]
+    ) -> [AppCandidate] {
+        var previousByPath: [String: AppCandidate] = [:]
+        previousByPath.reserveCapacity(previous.count)
+        for candidate in previous where previousByPath[candidate.canonicalURL.path] == nil {
+            previousByPath[candidate.canonicalURL.path] = candidate
+        }
+        var seen = Set<String>()
+        var stale: [AppCandidate] = []
+        for candidate in current {
+            let path = candidate.canonicalURL.path
+            guard seen.insert(path).inserted, let old = previousByPath[path] else { continue }
+            if old.modificationDate != candidate.modificationDate {
+                stale.append(old)
+            }
+        }
+        return stale
+    }
+
     public func prefetchIcons(for candidates: [AppCandidate]) async throws {
         let batchSize = 20
         var batchStart = 0

@@ -6,7 +6,10 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 prefs = (ROOT / "Sources/Core/LauncherPreferences.swift").read_text(encoding="utf-8")
-direct = (ROOT / "Sources/Direct/LauncherWindowController.swift").read_text(encoding="utf-8")
+_direct_dir = ROOT / "Sources/Direct"
+direct = (_direct_dir / "LauncherWindowController.swift").read_text(encoding="utf-8") + "".join(
+    p.read_text(encoding="utf-8") for p in sorted(_direct_dir.glob("LauncherWindowController+*.swift"))
+)
 settings = (ROOT / "Sources/Direct/SettingsWindowController.swift").read_text(encoding="utf-8")
 delegate = (ROOT / "Sources/Direct/DirectAppDelegate.swift").read_text(encoding="utf-8")
 tests = (ROOT / "Tests/CoreTests/LaunchIconCoreTests.swift").read_text(encoding="utf-8")
@@ -51,10 +54,14 @@ for needle in (
         fail(f"Settings missing {needle!r}")
 
 import re
-hm = re.search(r"height:\s*(\d+)", settings)
-# SETTINGS-FORM-DENSITY-01: window shortened after collapsing button walls.
-if not hm or int(hm.group(1)) < 860:
-    fail("Settings window height must stay >= 860 (reopen row)")
+# SETTINGS-COMPACT-SCROLL-02: scrolled viewport; reopen row retained.
+if "NSScrollView" not in settings:
+    fail("Settings must use NSScrollView after compact pass")
+hm = re.search(r"defaultContentHeight:\s*CGFloat\s*=\s*(\d+)", settings)
+if not hm or int(hm.group(1)) < 520 or int(hm.group(1)) > 760:
+    fail("Settings defaultContentHeight should be compact (~520-760)")
+if "settings-reopen-page" not in settings:
+    fail("reopen AX id must remain")
 
 if "showPage(" in settings or "pageTransition" in settings or "pageAnimation" in settings:
     fail("settings must not touch paging")

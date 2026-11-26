@@ -308,12 +308,1362 @@ public enum LauncherLayout {
         return (follow, CGFloat(direction) * travel + follow)
     }
 
+    // MARK: - Page flip direction (PAGE-FLIP-DIRECTION-01)
+
+    /// Travel extent along the active page axis (width for horizontal, height for vertical).
+    public static func pageFlipExtent(
+        boundsSize: CGSize,
+        direction: LauncherPageFlipDirection
+    ) -> CGFloat {
+        let size = direction.isHorizontal ? boundsSize.width : boundsSize.height
+        return size.isFinite ? max(size, 1) : 1
+    }
+
+    /// Model offset for a signed distance along the page axis.
+    /// Horizontal keeps dy == 0 (default path). Vertical keeps dx == 0.
+    public static func pageFlipFrameOffset(
+        distance: CGFloat,
+        direction: LauncherPageFlipDirection
+    ) -> CGPoint {
+        let d = distance.isFinite ? distance : 0
+        return direction.isHorizontal ? CGPoint(x: d, y: 0) : CGPoint(x: 0, y: d)
+    }
+
+    /// First-move axis lock for precise trackpad scrolls.
+    /// Horizontal preference preserves the historical `abs(dx) >= abs(dy)` rule.
+    /// Vertical preference prefers the vertical axis on a tie.
+    public static func pageFlipLocksHorizontalAxis(
+        preferredHorizontal: Bool,
+        dx: CGFloat,
+        dy: CGFloat
+    ) -> Bool {
+        if preferredHorizontal {
+            return abs(dx) >= abs(dy)
+        }
+        return abs(dx) > abs(dy)
+    }
+
+
+    // MARK: - Mouse side-button paging (MOUSE-SIDE-BUTTON-PAGING-01)
+
+    /// AppKit `buttonNumber` for mouse Back / Forward side buttons.
+    /// Independent input path — does not alter trackpad/wheel gesture lock or
+    /// the horizontal page-flip default (PAGE-FLIP-DIRECTION-01 red line).
+    public enum MouseSideButtonPaging {
+        public static let backButtonNumber = 3
+        public static let forwardButtonNumber = 4
+
+        /// `-1` previous page, `+1` next page, or `nil` when the click is not a
+        /// side button or the main grid cannot page right now.
+        public static func pageTurnDirection(
+            buttonNumber: Int,
+            hasMultiplePages: Bool,
+            isSearching: Bool,
+            folderOpen: Bool,
+            isDragging: Bool,
+            isPaging: Bool,
+            isDismissing: Bool
+        ) -> Int? {
+            guard hasMultiplePages,
+                  !isSearching,
+                  !folderOpen,
+                  !isDragging,
+                  !isPaging,
+                  !isDismissing else { return nil }
+            switch buttonNumber {
+            case backButtonNumber: return -1
+            case forwardButtonNumber: return 1
+            default: return nil
+            }
+        }
+    }
+
+    /// Where the previous/next page-arrow hit zones sit for drag-to-edge
+    /// auto-page (DRAG-EDGE-AUTO-PAGE-AXIS-01). Horizontal keeps leading/trailing
+    /// (historical default). Vertical moves them to top/bottom so edge hover
+    /// matches the page-flip axis. Does not change turn timing or gesture lock.
+    public enum PagingArrowEdgeLayout: Equatable, Sendable {
+        case leadingTrailing
+        case topBottom
+    }
+
+    public static func pagingArrowEdgeLayout(
+        direction: LauncherPageFlipDirection
+    ) -> PagingArrowEdgeLayout {
+        direction.isHorizontal ? .leadingTrailing : .topBottom
+    }
+
+    /// NATURAL-SCROLLING-PASS-THROUGH-01: Paging deltas must keep AppKit's Natural Scrolling adjustment.
+    /// `scrollingDelta*` (precise) already incorporate the System Setting;
+    /// legacy `deltaX`/`deltaY` likewise. Negating by
+    /// `isDirectionInvertedFromDevice` would double-invert and fight the OS.
+    public static func pagingScrollDeltaPreservingNaturalScrolling(
+        deviceDelta: CGFloat,
+        isDirectionInvertedFromDevice: Bool
+    ) -> CGFloat {
+        _ = isDirectionInvertedFromDevice
+        return deviceDelta.isFinite ? deviceDelta : 0
+    }
+
+
     /// Where a page dot is along the same ease-out as the page slide.
     /// `elapsed` is measured to the frame about to draw, not to a timer that
     /// waits a full interval first. That wait lands on the steep part of
     /// this curve, so the dot jumps. 0 is the old page. 1 is the new page.
     /// A bad clock stays on the old page. A duration that is not positive
     /// has already finished once any time has passed.
+    /// Side gutter reserved for L/R paging-arrow hit zones when the flip
+    /// axis is horizontal (DRAG-EDGE-VIEWPORT-INSET-01). Vertical flip moves
+    /// arrows to T/B overlays — side gutter collapses to 0 so the grid is
+    /// not left with empty 96pt rails. Horizontal default path keeps 96.
+    public static func pagingGridViewportSideGutter(
+        direction: LauncherPageFlipDirection
+    ) -> CGFloat {
+        direction.isHorizontal ? 96 : 0
+    }
+
+    /// DRAG-EDGE-VIEWPORT-END-INSET-01: base top/bottom inset of `gridViewport`
+    /// under search chrome / above footer. Horizontal keeps the historical
+    /// 28 / 18. Vertical adds a light 48pt so T/B paging-arrow hit zones
+    /// (96pt tall) do not sit on the first/last icon row. Not a full 96 —
+    /// chevron sits mid-band; half-band clearance is enough without
+    /// shrinking the grid more than needed. Horizontal default unchanged.
+    public static func pagingGridViewportEndInset(
+        direction: LauncherPageFlipDirection
+    ) -> (top: CGFloat, bottom: CGFloat) {
+        if direction.isHorizontal {
+            return (top: 28, bottom: 18)
+        }
+        return (top: 28 + 48, bottom: 18 + 48)
+    }
+
+    /// KEYBOARD-COMMAND-ARROW-PAGING-01: Launchpad-parity ⌘←/→ (and ⌘↑/↓
+    /// when the page-flip axis is vertical). Returns -1 / +1 / nil.
+    /// Does not change the plain-arrow paging path or the horizontal default.
+    /// WHEEL-PAGE-WHILE-ITEM-DRAG-01: while an icon drag is airborne, the
+    /// wheel must turn pages discretely (movePage) instead of driving the
+    /// finger-follow page gesture — that gesture would fight the drag image.
+    /// Threshold matches discrete wheel paging; Natural Scrolling already
+    /// baked into `dominantDelta`. Axis-agnostic: sign of delta only.
+    public enum WheelPageWhileItemDragging {
+        public static let deltaThreshold: CGFloat = 2
+
+        public static func pageTurnDirection(
+            isItemDragging: Bool,
+            dominantDelta: CGFloat
+        ) -> Int? {
+            guard isItemDragging else { return nil }
+            guard dominantDelta.isFinite, abs(dominantDelta) >= deltaThreshold else { return nil }
+            return dominantDelta < 0 ? 1 : -1
+        }
+    }
+
+    public enum CommandArrowPaging {
+        public static func pageTurnDirection(
+            keyCode: UInt16,
+            commandOnly: Bool,
+            pageFlipHorizontal: Bool
+        ) -> Int? {
+            guard commandOnly else { return nil }
+            switch keyCode {
+            case 123: return -1 // left — always previous
+            case 124: return 1  // right — always next
+            case 126: return pageFlipHorizontal ? nil : -1 // up
+            case 125: return pageFlipHorizontal ? nil : 1  // down
+            default: return nil
+            }
+        }
+    }
+
+    /// FOLDER-COMMAND-UP-CLOSE-01. ⌘↑ leaves an open folder, the way Finder
+    /// leaves a folder for its parent. A title being typed, or marked text,
+    /// keeps the key. Horizontal ⌘↑ was already not a page turn. Does not
+    /// turn a page.
+    public static func commandUpClosesOpenFolder(
+        keyCode: UInt16,
+        commandOnly: Bool,
+        folderOpen: Bool,
+        isEditingFolderTitle: Bool,
+        hasMarkedText: Bool
+    ) -> Bool {
+        keyCode == 126 && commandOnly && folderOpen && !isEditingFolderTitle && !hasMarkedText
+    }
+
+    /// FOLDER-COMMAND-DOWN-OPEN-01. ⌘↓ opens the focused folder tile.
+    /// An app tile does not take it, so vertical paging still moves when the
+    /// focus is not a folder. Search and an already-open folder stay out.
+    /// Does not turn a page.
+    public static func commandDownOpensFocusedFolder(
+        keyCode: UInt16,
+        commandOnly: Bool,
+        focusedIsFolder: Bool,
+        folderAlreadyOpen: Bool,
+        isSearching: Bool
+    ) -> Bool {
+        keyCode == 125 && commandOnly && focusedIsFolder && !folderAlreadyOpen && !isSearching
+    }
+
+    /// FOLDER-COMMAND-SHIFT-N-01. ⌘⇧N gathers two or more selected top-level
+    /// apps into a new folder, the same action as the selection menu. Search,
+    /// an open folder, a text field, and editing turned off stay out. Does not
+    /// turn a page.
+    public static func commandShiftNCreatesFolder(
+        character: String?,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isSearching: Bool,
+        folderOpen: Bool,
+        isEditingText: Bool,
+        layoutEditingEnabled: Bool,
+        selectedTopLevelAppCount: Int
+    ) -> Bool {
+        guard layoutEditingEnabled, !isSearching, !folderOpen, !isEditingText else { return false }
+        guard command, shift, !option, !control else { return false }
+        guard selectedTopLevelAppCount >= 2 else { return false }
+        return character?.lowercased() == "n"
+    }
+
+    /// FOLDER-COMMAND-SHIFT-M-MOVE-01. ⌘⇧M moves the selected top-level apps
+    /// into the one folder in that selection. Search, an open folder, a text
+    /// field, and a page turn in flight stay out. Does not turn a page.
+    public static func commandShiftMMovesSelectionIntoFolder(
+        character: String?,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isSearching: Bool,
+        folderOpen: Bool,
+        isEditingText: Bool,
+        layoutEditingEnabled: Bool,
+        acceptsAction: Bool,
+        isPaging: Bool
+    ) -> Bool {
+        guard command, shift, !option, !control, !isEditingText else { return false }
+        guard !isSearching, !folderOpen, layoutEditingEnabled, acceptsAction, !isPaging else { return false }
+        return character?.lowercased() == "m"
+    }
+
+    /// The folder and apps ⌘⇧M should hand to the existing move-into-folder
+    /// path. Focus on a folder uses that folder. Focus on an app uses the
+    /// only folder in the selection. Two folders and no focused folder, a
+    /// selection with no app, and a focus outside the selection stay put.
+    public struct MoveIntoFolderRequest: Equatable, Sendable {
+        public var folderID: UUID
+        public var appIDs: [UUID]
+
+        public init(folderID: UUID, appIDs: [UUID]) {
+            self.folderID = folderID
+            self.appIDs = appIDs
+        }
+    }
+
+    public static func moveIntoFolderRequest(
+        focusedID: UUID,
+        selection: LauncherItemSelection,
+        in state: LayoutState
+    ) -> MoveIntoFolderRequest? {
+        guard selection.count >= 2, selection.contains(focusedID) else { return nil }
+        func isTopLevelFolder(_ id: UUID) -> Bool {
+            state.folders[id] != nil && state.orderedEntries.contains(.folder(id))
+        }
+        let folderIDs = selection.orderedIDs.filter(isTopLevelFolder)
+        let target: UUID
+        if isTopLevelFolder(focusedID) {
+            target = focusedID
+        } else if folderIDs.count == 1, let only = folderIDs.first {
+            target = only
+        } else {
+            return nil
+        }
+        let apps = topLevelAppIDsForBatchFolder(selection: selection, in: state)
+            .filter { $0 != target }
+        guard !apps.isEmpty else { return nil }
+        return MoveIntoFolderRequest(folderID: target, appIDs: apps)
+    }
+
+    /// GRID-COMMAND-Z-UNDO-01. One previous layout from an arrow reorder.
+    /// A second undo has no slot. Equal layouts are not recorded.
+    /// `expected` is the layout committed with that change. A later hide,
+    /// drop, uninstall, or other layout commit makes the slot stale.
+    public struct LayoutUndoSlot: Equatable, Sendable {
+        public var previous: LayoutState
+        public var expected: LayoutState
+
+        public init(previous: LayoutState, expected: LayoutState) {
+            self.previous = previous
+            self.expected = expected
+        }
+    }
+
+    public struct KeyboardLayoutUndoResult: Equatable, Sendable {
+        public var layout: LayoutState
+        public var slot: LayoutUndoSlot?
+
+        public init(layout: LayoutState, slot: LayoutUndoSlot?) {
+            self.layout = layout
+            self.slot = slot
+        }
+    }
+
+    public static func recordingKeyboardLayoutUndo(
+        previous: LayoutState,
+        next: LayoutState
+    ) -> LayoutUndoSlot? {
+        guard previous != next else { return nil }
+        return LayoutUndoSlot(previous: previous, expected: next)
+    }
+
+    /// Ignores `updatedAt` so a later write of the same layout still undoes.
+    public static func layoutMatchesKeyboardUndoExpected(
+        _ current: LayoutState,
+        expected: LayoutState
+    ) -> Bool {
+        var lhs = current
+        let rhs = expected
+        lhs.updatedAt = rhs.updatedAt
+        return lhs == rhs
+    }
+
+    public static func applyingKeyboardLayoutUndo(
+        slot: LayoutUndoSlot?,
+        current: LayoutState
+    ) -> KeyboardLayoutUndoResult? {
+        guard let slot, slot.previous != current else { return nil }
+        guard layoutMatchesKeyboardUndoExpected(current, expected: slot.expected) else { return nil }
+        var restored = slot.previous
+        restored.updatedAt = .now
+        return KeyboardLayoutUndoResult(layout: restored, slot: nil)
+    }
+
+    public static func commandZUndoesKeyboardLayout(
+        character: String?,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isSearching: Bool,
+        isEditingText: Bool,
+        layoutEditingEnabled: Bool,
+        isPaging: Bool
+    ) -> Bool {
+        guard command, !shift, !option, !control else { return false }
+        guard !isSearching, !isEditingText, layoutEditingEnabled, !isPaging else { return false }
+        return character?.lowercased() == "z"
+    }
+
+    /// FOLDER-COMMAND-DELETE-REMOVE-01. ⌘⌫ moves members out of the open
+    /// folder, the same action as「移出文件夹」. A multi-select that cannot
+    /// leave two members behind does not drop down to removing only the
+    /// focused app. A text field keeps the key. Does not turn a page.
+    public enum CommandDeleteFolderRemoval: Equatable, Sendable {
+        case single
+        case batch
+    }
+
+    public static func commandDeleteFolderRemoval(
+        keyCode: UInt16,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        folderOpen: Bool,
+        isEditingText: Bool,
+        layoutEditingEnabled: Bool,
+        acceptsAction: Bool,
+        focusedIsRemovableMember: Bool,
+        selectedMemberCount: Int,
+        batchRemovalAllowed: Bool
+    ) -> CommandDeleteFolderRemoval? {
+        guard keyCode == 51, command, !shift, !option, !control else { return nil }
+        guard folderOpen, !isEditingText, layoutEditingEnabled, acceptsAction else { return nil }
+        if batchRemovalAllowed { return .batch }
+        if selectedMemberCount >= 2 { return nil }
+        if focusedIsRemovableMember { return .single }
+        return nil
+    }
+
+    /// FOLDER-COMMAND-DELETE-DISSOLVE-01. With the folder closed, ⌘⌫ dissolves
+    /// the focused folder, or asks before dissolving a multi-select. A
+    /// multi-select that does not include the focused folder stays put.
+    /// Does not turn a page.
+    public enum CommandDeleteDissolve: Equatable, Sendable {
+        case one
+        case batch
+    }
+
+    public static func commandDeleteDissolvesClosedFolder(
+        keyCode: UInt16,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        folderOpen: Bool,
+        isSearching: Bool,
+        isEditingText: Bool,
+        layoutEditingEnabled: Bool,
+        acceptsAction: Bool,
+        isPaging: Bool,
+        focusedIsFolder: Bool,
+        selectedFolderCount: Int,
+        batchDissolveAllowed: Bool
+    ) -> CommandDeleteDissolve? {
+        guard keyCode == 51, command, !shift, !option, !control else { return nil }
+        guard !folderOpen, !isSearching, !isEditingText,
+              layoutEditingEnabled, acceptsAction, !isPaging else { return nil }
+        if batchDissolveAllowed { return .batch }
+        if selectedFolderCount >= 2 { return nil }
+        if focusedIsFolder { return .one }
+        return nil
+    }
+
+    /// APP-COMMAND-SHIFT-DELETE-UNINSTALL-01. ⌘⇧⌫ asks to uninstall the focused
+    /// app, the same confirm as「卸载」. Two or more selected apps uninstall
+    /// together when the focus is one of them. Command-Delete without Shift
+    /// stays remove / dissolve. A text field stays out. Does not turn a page.
+    public enum CommandShiftUninstall: Equatable, Sendable {
+        case one
+        case batch
+    }
+
+    public static func commandShiftDeleteUninstallsFocusedApp(
+        keyCode: UInt16,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isEditingText: Bool,
+        layoutEditingEnabled: Bool,
+        acceptsAction: Bool,
+        isPaging: Bool,
+        focusedIsApp: Bool,
+        focusedIsInSelection: Bool,
+        selectedAppCount: Int
+    ) -> CommandShiftUninstall? {
+        guard keyCode == 51, command, shift, !option, !control else { return nil }
+        guard !isEditingText, layoutEditingEnabled, acceptsAction, !isPaging else { return nil }
+        if selectedAppCount >= 2 {
+            return focusedIsInSelection ? .batch : nil
+        }
+        return focusedIsApp ? .one : nil
+    }
+
+    /// FOLDER-COMMAND-OPTION-N-SORT-01. ⌘⌥N sorts the focused folder by name,
+    /// the same action as「按名称排列文件夹内应用」. Search, an open folder,
+    /// and a text field stay out. Does not turn a page.
+    public static func commandOptionNSortsFocusedFolder(
+        character: String?,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isSearching: Bool,
+        folderOpen: Bool,
+        isEditingText: Bool,
+        layoutEditingEnabled: Bool,
+        acceptsAction: Bool,
+        isPaging: Bool,
+        focusedIsFolder: Bool
+    ) -> Bool {
+        guard command, option, !shift, !control else { return false }
+        guard !isSearching, !folderOpen, !isEditingText,
+              layoutEditingEnabled, acceptsAction, !isPaging,
+              focusedIsFolder else { return false }
+        return character?.lowercased() == "n"
+    }
+
+    /// FOLDER-COMMAND-OPTION-N-OPEN-SORT-01. ⌘⌥N sorts the open folder by name,
+    /// the same member order as「按名称排列文件夹内应用」. The closed grid keeps
+    /// the focused-folder shortcut. Shift stays the new-folder shortcut.
+    /// Search and a text field stay out. Does not turn a page.
+    public static func commandOptionNSortsOpenFolder(
+        character: String?,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isSearching: Bool,
+        folderOpen: Bool,
+        isEditingText: Bool,
+        layoutEditingEnabled: Bool,
+        acceptsAction: Bool,
+        isPaging: Bool
+    ) -> Bool {
+        guard command, option, !shift, !control else { return false }
+        guard folderOpen, !isSearching, !isEditingText,
+              layoutEditingEnabled, acceptsAction, !isPaging else { return false }
+        return character?.lowercased() == "n"
+    }
+
+    /// FOLDER-COMMAND-OPTION-C-SORT-01. ⌘⌥C sorts the focused folder by icon
+    /// color, the same action as「按颜色排列文件夹内应用」. A sample already
+    /// running stays out. Does not turn a page.
+    public static func commandOptionCSortsFocusedFolderByColor(
+        character: String?,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isSearching: Bool,
+        folderOpen: Bool,
+        isEditingText: Bool,
+        layoutEditingEnabled: Bool,
+        acceptsAction: Bool,
+        isPaging: Bool,
+        samplingInFlight: Bool,
+        focusedIsFolder: Bool
+    ) -> Bool {
+        guard command, option, !shift, !control else { return false }
+        guard !isSearching, !folderOpen, !isEditingText,
+              layoutEditingEnabled, acceptsAction, !isPaging,
+              !samplingInFlight, focusedIsFolder else { return false }
+        return character?.lowercased() == "c"
+    }
+
+    /// FOLDER-COMMAND-OPTION-C-OPEN-SORT-01. ⌘⌥C sorts the open folder by icon
+    /// color, the same member order as「按颜色排列文件夹内应用」. The closed
+    /// grid keeps the focused-folder shortcut. A sample already running stays
+    /// out. Search and a text field stay out. Does not turn a page.
+    public static func commandOptionCSortsOpenFolderByColor(
+        character: String?,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isSearching: Bool,
+        folderOpen: Bool,
+        isEditingText: Bool,
+        layoutEditingEnabled: Bool,
+        acceptsAction: Bool,
+        isPaging: Bool,
+        samplingInFlight: Bool
+    ) -> Bool {
+        guard command, option, !shift, !control else { return false }
+        guard folderOpen, !isSearching, !isEditingText,
+              layoutEditingEnabled, acceptsAction, !isPaging,
+              !samplingInFlight else { return false }
+        return character?.lowercased() == "c"
+    }
+
+    /// GRID-COMMAND-OPTION-R-NAME-01. ⌘⌥R asks to arrange the top-level grid
+    /// by name, the same confirm as「按名称排列…」. Search, an open folder,
+    /// and a text field stay out. Does not turn a page.
+    public static func commandOptionRRearrangesGridByName(
+        character: String?,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isSearching: Bool,
+        folderOpen: Bool,
+        isEditingText: Bool,
+        layoutEditingEnabled: Bool,
+        acceptsAction: Bool,
+        isPaging: Bool
+    ) -> Bool {
+        guard command, option, !shift, !control else { return false }
+        guard !isSearching, !folderOpen, !isEditingText,
+              layoutEditingEnabled, acceptsAction, !isPaging else { return false }
+        return character?.lowercased() == "r"
+    }
+
+    /// GRID-COMMAND-OPTION-K-KIND-01. ⌘⌥K asks to arrange the top-level grid
+    /// by kind, the same confirm as「按类型排列…」. Search, an open folder,
+    /// and a text field stay out. Does not turn a page.
+    public static func commandOptionKRearrangesGridByKind(
+        character: String?,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isSearching: Bool,
+        folderOpen: Bool,
+        isEditingText: Bool,
+        layoutEditingEnabled: Bool,
+        acceptsAction: Bool,
+        isPaging: Bool
+    ) -> Bool {
+        guard command, option, !shift, !control else { return false }
+        guard !isSearching, !folderOpen, !isEditingText,
+              layoutEditingEnabled, acceptsAction, !isPaging else { return false }
+        return character?.lowercased() == "k"
+    }
+
+    /// FOLDER-COMMAND-OPTION-K-OPEN-SORT-01. ⌘⌥K sorts the open folder by kind:
+    /// system apps first, then display name. The closed grid keeps the
+    /// confirm-to-arrange shortcut. Search and a text field stay out.
+    /// Does not turn a page.
+    public static func commandOptionKSortsOpenFolderByKind(
+        character: String?,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isSearching: Bool,
+        folderOpen: Bool,
+        isEditingText: Bool,
+        layoutEditingEnabled: Bool,
+        acceptsAction: Bool,
+        isPaging: Bool
+    ) -> Bool {
+        guard command, option, !shift, !control else { return false }
+        guard folderOpen, !isSearching, !isEditingText,
+              layoutEditingEnabled, acceptsAction, !isPaging else { return false }
+        return character?.lowercased() == "k"
+    }
+
+    /// GRID-COMMAND-OPTION-G-CATEGORY-01. ⌘⌥G asks to arrange the top-level
+    /// grid by category, the same confirm as「按分类排列…」. Search, an open
+    /// folder, and a text field stay out. Does not turn a page.
+    public static func commandOptionGRearrangesGridByCategory(
+        character: String?,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isSearching: Bool,
+        folderOpen: Bool,
+        isEditingText: Bool,
+        layoutEditingEnabled: Bool,
+        acceptsAction: Bool,
+        isPaging: Bool
+    ) -> Bool {
+        guard command, option, !shift, !control else { return false }
+        guard !isSearching, !folderOpen, !isEditingText,
+              layoutEditingEnabled, acceptsAction, !isPaging else { return false }
+        return character?.lowercased() == "g"
+    }
+
+    /// FOLDER-COMMAND-OPTION-G-OPEN-SORT-01. ⌘⌥G sorts the open folder by
+    /// category group, then display name. The closed grid keeps the
+    /// confirm-to-arrange shortcut. Search and a text field stay out.
+    /// Does not turn a page.
+    public static func commandOptionGSortsOpenFolderByCategory(
+        character: String?,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isSearching: Bool,
+        folderOpen: Bool,
+        isEditingText: Bool,
+        layoutEditingEnabled: Bool,
+        acceptsAction: Bool,
+        isPaging: Bool
+    ) -> Bool {
+        guard command, option, !shift, !control else { return false }
+        guard folderOpen, !isSearching, !isEditingText,
+              layoutEditingEnabled, acceptsAction, !isPaging else { return false }
+        return character?.lowercased() == "g"
+    }
+
+    /// GRID-COMMAND-SHIFT-C-COLOR-01. ⌘⇧C asks to arrange the top-level grid
+    /// by icon color, the same confirm as「按颜色排列…」. Search, an open
+    /// folder, and a text field stay out. ⌘⌥C still sorts one folder.
+    /// Does not turn a page.
+    public static func commandShiftCRearrangesGridByColor(
+        character: String?,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isSearching: Bool,
+        folderOpen: Bool,
+        isEditingText: Bool,
+        layoutEditingEnabled: Bool,
+        acceptsAction: Bool,
+        isPaging: Bool
+    ) -> Bool {
+        guard command, shift, !option, !control else { return false }
+        guard !isSearching, !folderOpen, !isEditingText,
+              layoutEditingEnabled, acceptsAction, !isPaging else { return false }
+        return character?.lowercased() == "c"
+    }
+
+    /// APP-COMMAND-SHIFT-U-UNHIDE-01. ⌘⇧U puts every hidden app back, the
+    /// same action as「全部恢复」. Search, an open folder, and a text field
+    /// stay out. Nothing hidden still keeps the key. Does not turn a page.
+    public static func commandShiftURestoresAllHiddenApplications(
+        character: String?,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isSearching: Bool,
+        folderOpen: Bool,
+        isEditingText: Bool,
+        layoutEditingEnabled: Bool,
+        acceptsAction: Bool,
+        isPaging: Bool
+    ) -> Bool {
+        guard command, shift, !option, !control else { return false }
+        guard !isSearching, !folderOpen, !isEditingText,
+              layoutEditingEnabled, acceptsAction, !isPaging else { return false }
+        return character?.lowercased() == "u"
+    }
+
+    /// FOLDER-COMMAND-OPTION-U-UNGROUP-01. ⌘⌥U asks to ungroup every folder,
+    /// the same confirm as「解散所有文件夹…」. Search, an open folder, and a
+    /// text field stay out. ⌘⇧U still restores hidden apps. Nothing to
+    /// ungroup still keeps the key. Does not turn a page.
+    public static func commandOptionUUngroupsAllFolders(
+        character: String?,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isSearching: Bool,
+        folderOpen: Bool,
+        isEditingText: Bool,
+        layoutEditingEnabled: Bool,
+        acceptsAction: Bool,
+        isPaging: Bool
+    ) -> Bool {
+        guard command, option, !shift, !control else { return false }
+        guard !isSearching, !folderOpen, !isEditingText,
+              layoutEditingEnabled, acceptsAction, !isPaging else { return false }
+        return character?.lowercased() == "u"
+    }
+
+    /// BROWSE-COMMAND-OPTION-B-AXIS-01. ⌘⌥B toggles the main-grid page axis,
+    /// the same choice as「浏览模式」. Search, an open folder, and a text
+    /// field stay out. Layout editing can be off. Does not turn a page.
+    public static func commandOptionBTogglesBrowseAxis(
+        character: String?,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isSearching: Bool,
+        folderOpen: Bool,
+        isEditingText: Bool,
+        acceptsAction: Bool,
+        isPaging: Bool
+    ) -> Bool {
+        guard command, option, !shift, !control else { return false }
+        guard !isSearching, !folderOpen, !isEditingText, acceptsAction, !isPaging else { return false }
+        return character?.lowercased() == "b"
+    }
+
+    /// CATALOG-COMMAND-R-RELOAD-01. ⌘R starts a catalog rescan, the same
+    /// request as the empty-grid and settings rescan buttons. A text field
+    /// stays out. ⌘⌥R still arranges by name. Does not turn a page.
+    public static func commandRReloadsCatalog(
+        character: String?,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isEditingText: Bool,
+        acceptsAction: Bool,
+        isPaging: Bool
+    ) -> Bool {
+        guard command, !shift, !option, !control else { return false }
+        guard !isEditingText, acceptsAction, !isPaging else { return false }
+        return character?.lowercased() == "r"
+    }
+
+    /// GRID-COMMAND-SHIFT-A-SELECT-ALL-01. ⌘⇧A selects every top-level icon,
+    /// including icons on other pages. ⌘A still selects only the current page.
+    /// Search, an open folder, and a text field stay out. Does not turn a page.
+    public static func commandShiftASelectsEveryTopLevelEntry(
+        character: String?,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isSearching: Bool,
+        folderOpen: Bool,
+        isEditingText: Bool,
+        acceptsAction: Bool,
+        isPaging: Bool
+    ) -> Bool {
+        guard command, shift, !option, !control else { return false }
+        guard !isSearching, !folderOpen, !isEditingText, acceptsAction, !isPaging else { return false }
+        return character?.lowercased() == "a"
+    }
+
+    /// Top-level ids in grid order, apps and folders, for ⌘⇧A.
+    public static func topLevelEntryIDsForSelectAll(in state: LayoutState) -> [UUID] {
+        state.orderedEntries.map(\.id)
+    }
+
+    /// FOLDER-F2-RENAME-01. F2 renames the focused closed folder, the same
+    /// action as「重命名文件夹…」. Modifiers, search, an open folder, and a
+    /// text field stay out. Does not turn a page.
+    public static func f2RenamesFocusedClosedFolder(
+        keyCode: UInt16,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isSearching: Bool,
+        folderOpen: Bool,
+        isEditingText: Bool,
+        layoutEditingEnabled: Bool,
+        acceptsAction: Bool,
+        isPaging: Bool,
+        focusedIsFolder: Bool
+    ) -> Bool {
+        guard keyCode == 120 else { return false }
+        guard !command, !shift, !option, !control else { return false }
+        guard !isSearching, !folderOpen, !isEditingText,
+              layoutEditingEnabled, acceptsAction, !isPaging,
+              focusedIsFolder else { return false }
+        return true
+    }
+
+    /// APP-F2-ALIAS-01. Plain F2 renames the focused app, the same sheet as
+    ///「重命名」. A folder stays on the folder rename. Modifiers and a text
+    /// field stay out. Search and an open folder stay in, matching the icon
+    /// menu. Does not turn a page.
+    public static func f2RenamesFocusedAppAlias(
+        keyCode: UInt16,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isEditingText: Bool,
+        layoutEditingEnabled: Bool,
+        acceptsAction: Bool,
+        isPaging: Bool,
+        focusedIsApp: Bool
+    ) -> Bool {
+        guard keyCode == 120 else { return false }
+        guard !command, !shift, !option, !control else { return false }
+        guard !isEditingText, layoutEditingEnabled, acceptsAction, !isPaging,
+              focusedIsApp else { return false }
+        return true
+    }
+
+    /// KEYBOARD-COMMAND-REGISTRY-01. ⌘, opens settings, matching the
+    /// existing performKeyEquivalent path. A text field still consumes
+    /// the chord. Shift stays free.
+    public static func commandCommaOpensSettings(
+        character: String?,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool
+    ) -> Bool {
+        guard command, !shift, !option, !control else { return false }
+        return character == ","
+    }
+
+    /// KEYBOARD-COMMAND-REGISTRY-01. Escape cancels or dismisses, matching
+    /// the existing sendEvent path. Marked text is still delivered first
+    /// in Direct. Does not turn a page.
+    public static func commandEscapeCancelsOrDismisses(
+        keyCode: UInt16
+    ) -> Bool {
+        keyCode == 53
+    }
+
+    /// KEYBOARD-COMMAND-REGISTRY-01. Space activates the focused tile,
+    /// matching the existing tile keyDown path. Plain Return stays on
+    /// its own open path. Does not turn a page.
+    public static func spaceActivatesFocusedItem(
+        character: String?
+    ) -> Bool {
+        character == " "
+    }
+
+    /// KEYBOARD-COMMAND-REGISTRY-01. Shift+arrow extends the selection,
+    /// matching the existing tile keyDown path. A declined left/right on
+    /// the main grid still falls through to paging. Does not turn a page.
+    public static func arrowExtendsSelection(
+        keyCode: UInt16,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool
+    ) -> Bool {
+        guard gridKeyboardExtendsSelection(
+            shift: shift, command: command, option: option, control: control
+        ) else { return false }
+        return gridKeyboardDirection(forKeyCode: keyCode) != nil
+    }
+
+    /// KEYBOARD-COMMAND-REGISTRY-01. A plain arrow walks the current grid,
+    /// matching the existing tile keyDown path. Command, Shift, Option, and
+    /// Control keep their own paths. A declined walk still falls through
+    /// to paging. Page Up/Down stay out. Does not turn a page.
+    public static func arrowWalksGrid(
+        keyCode: UInt16,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool
+    ) -> Bool {
+        guard !command, !shift, !option, !control else { return false }
+        return gridKeyboardDirection(forKeyCode: keyCode) != nil
+    }
+
+    /// KEYBOARD-COMMAND-REGISTRY-01. Shift-Home / Shift-End extend the
+    /// selection, matching the existing tile keyDown path. The original
+    /// handler still applies the range. Does not turn a page.
+    public static func commandShiftHomeEndExtendsSelection(
+        keyCode: UInt16,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool
+    ) -> Bool {
+        guard shift, !command, !option, !control else { return false }
+        return keyCode == 115 || keyCode == 119
+    }
+
+    /// KEYBOARD-COMMAND-REGISTRY-01. Home / End jump inside the current
+    /// grid, matching the existing tile keyDown path. The original handler
+    /// still asks gridKeyboardHomeEndSlot. Page Up/Down stay out.
+    /// Does not turn a page.
+    public static func commandHomeEndJumpsInGrid(
+        keyCode: UInt16,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool
+    ) -> Bool {
+        return gridKeyboardHomeEndSlot(
+            keyCode: keyCode,
+            itemCount: 1,
+            command: command,
+            shift: shift,
+            option: option,
+            control: control
+        ) != nil
+    }
+
+    /// KEYBOARD-COMMAND-REGISTRY-01. Page Up / Page Down scroll an open
+    /// folder or the search list, matching the existing tile keyDown path.
+    /// The original handler still asks verticalPageKeyTarget. Does not
+    /// turn a page by itself.
+    public static func commandPageUpDownScrollsOpenList(
+        keyCode: UInt16,
+        isSearching: Bool,
+        folderOpen: Bool
+    ) -> Bool {
+        guard keyCode == 116 || keyCode == 121 else { return false }
+        return verticalPageKeyTarget(
+            folderOpen: folderOpen,
+            searching: isSearching
+        ) != nil
+    }
+
+    /// KEYBOARD-COMMAND-REGISTRY-01. Page Up / Page Down page the main
+    /// grid when no open list should scroll, matching the existing tile
+    /// keyDown path. The original handler still turns the page. Left/Right
+    /// stay out.
+    public static func commandPageUpDownPagesGrid(
+        keyCode: UInt16,
+        isSearching: Bool,
+        folderOpen: Bool
+    ) -> Bool {
+        guard keyCode == 116 || keyCode == 121 else { return false }
+        return verticalPageKeyTarget(
+            folderOpen: folderOpen,
+            searching: isSearching
+        ) == nil
+    }
+
+    /// LAUNCHER-COMMAND-F-SEARCH-01. ⌘F focuses search. Shift stays free.
+    /// A text field does not keep the key. An open folder still consumes
+    /// the chord; focusSearch() itself refuses to leave the folder.
+    /// Does not turn a page.
+    public static func commandFFocusesSearch(
+        character: String?,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool
+    ) -> Bool {
+        guard command, !shift, !option, !control else { return false }
+        return character?.lowercased() == "f"
+    }
+
+    /// LAUNCHER-COMMAND-W-DISMISS-01. ⌘W closes the launcher, the same dismiss
+    /// as Escape once nothing else is cancelling. Shift stays free. A text
+    /// field stays out. Does not turn a page.
+    public static func commandWDismissesLauncher(
+        character: String?,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isEditingText: Bool
+    ) -> Bool {
+        guard command, !shift, !option, !control, !isEditingText else { return false }
+        return character?.lowercased() == "w"
+    }
+
+    /// LAUNCHER-COMMAND-C-COPY-01. ⌘C copies the focused app's file URL, the
+    /// same bundle「在访达中显示」would open. A folder has no file URL. Shift
+    /// and Option stay on their own shortcuts. A text field keeps Copy.
+    /// Does not turn a page.
+    public static func commandCCopiesFocusedApp(
+        character: String?,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isEditingText: Bool
+    ) -> Bool {
+        guard command, !shift, !option, !control, !isEditingText else { return false }
+        return character?.lowercased() == "c"
+    }
+
+    /// GRID-COMMAND-A-SELECT-PAGE-01. ⌘A selects the current page, or the
+    /// open folder, or the search results. A text field keeps Select All.
+    /// Command-Shift-A stays on every top-level icon. Does not turn a page.
+    public static func commandASelectsCurrentPageIcons(
+        character: String?,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isEditingText: Bool
+    ) -> Bool {
+        guard command, !shift, !option, !control, !isEditingText else { return false }
+        return character?.lowercased() == "a"
+    }
+
+    /// LAUNCHER-COMMAND-C-COPY-01. The focused app's file URL, looked up by
+    /// its catalog key. A folder, a missing key, and a non-file bundle are
+    /// nil, so the caller leaves the pasteboard alone. Does not touch layout.
+    public static func copyingFocusedAppFileURL(
+        focusedID: UUID,
+        in state: LayoutState,
+        candidatesByKey: [String: AppCandidate]
+    ) -> URL? {
+        guard state.folders[focusedID] == nil,
+              let key = state.appKeys[focusedID],
+              let candidate = candidatesByKey[key] else { return nil }
+        return revealInFinderURL(for: candidate, isFolder: false)
+    }
+
+    /// LAUNCHER-COMMAND-C-SELECTION-COPY-01. ⌘C with two or more selected
+    /// items copies each selected app's file URL, in selection order. The
+    /// focus must be one of them. Folders and missing bundles are skipped.
+    /// One selected item stays on the single-app copy. Does not touch layout.
+    public static func copyingSelectedAppFileURLs(
+        focusedID: UUID,
+        selection: LauncherItemSelection,
+        in state: LayoutState,
+        candidatesByKey: [String: AppCandidate]
+    ) -> [URL]? {
+        guard selection.count >= 2, selection.contains(focusedID) else { return nil }
+        return revealInFinderURLs(
+            selection: selection,
+            anchorID: focusedID,
+            in: state,
+            candidatesByKey: candidatesByKey
+        )
+    }
+
+    /// SELECTION-COMMAND-SHIFT-VERTICAL-EDGE-01. ⌘⇧↑ moves the multi-select
+    /// to the front and ⌘⇧↓ moves it to the back, the same action as the
+    /// blank-area menu. One item, search, an open folder, a text field, and
+    /// a page turn in flight stay out. Does not turn a page.
+    public enum CommandShiftSelectionEdge: Equatable, Sendable {
+        case start
+        case end
+    }
+
+    public static func commandShiftVerticalSelectionEdge(
+        keyCode: UInt16,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isSearching: Bool,
+        folderOpen: Bool,
+        isEditingText: Bool,
+        layoutEditingEnabled: Bool,
+        acceptsAction: Bool,
+        isPaging: Bool,
+        selectedTopLevelCount: Int
+    ) -> CommandShiftSelectionEdge? {
+        guard command, shift, !option, !control else { return nil }
+        guard !isSearching, !folderOpen, !isEditingText,
+              layoutEditingEnabled, acceptsAction, !isPaging else { return nil }
+        guard selectedTopLevelCount >= 2 else { return nil }
+        switch keyCode {
+        case 126: return .start
+        case 125: return .end
+        default: return nil
+        }
+    }
+
+    /// FOLDER-COMMAND-SHIFT-VERTICAL-EDGE-01. ⌘⇧↑ moves the focused member of
+    /// an open folder to the front and ⌘⇧↓ moves it to the back. Two or more
+    /// selected members move together and keep their order. The closed grid
+    /// keeps the top-level multi-select. Command without Shift still closes
+    /// or pages. The key stays taken even when nothing moves.
+    public static func commandShiftVerticalMovesFocusedFolderMemberToEdge(
+        keyCode: UInt16,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isSearching: Bool,
+        folderOpen: Bool,
+        isEditingText: Bool,
+        layoutEditingEnabled: Bool,
+        acceptsAction: Bool,
+        isPaging: Bool
+    ) -> CommandShiftSelectionEdge? {
+        guard command, shift, !option, !control else { return nil }
+        guard folderOpen, !isSearching, !isEditingText,
+              layoutEditingEnabled, acceptsAction, !isPaging else { return nil }
+        switch keyCode {
+        case 126: return .start
+        case 125: return .end
+        default: return nil
+        }
+    }
+
+    /// FOLDER-COMMAND-OPTION-VERTICAL-EDGE-01. ⌘⌥↑ moves every folder to the
+    /// front and ⌘⌥↓ moves every folder to the back, the same action as
+    /// 「文件夹移到最前 / 最后」. Search, an open folder, and a text field stay
+    /// out. Command without Option still closes, opens, or pages. The key
+    /// stays taken even when nothing moves, so the tile does not page.
+    public enum CommandOptionFolderEdge: Equatable, Sendable {
+        case start
+        case end
+    }
+
+    public static func commandOptionVerticalMovesFoldersToEdge(
+        keyCode: UInt16,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isSearching: Bool,
+        folderOpen: Bool,
+        isEditingText: Bool,
+        layoutEditingEnabled: Bool,
+        acceptsAction: Bool,
+        isPaging: Bool
+    ) -> CommandOptionFolderEdge? {
+        guard command, option, !shift, !control else { return nil }
+        guard !isSearching, !folderOpen, !isEditingText,
+              layoutEditingEnabled, acceptsAction, !isPaging else { return nil }
+        switch keyCode {
+        case 126: return .start
+        case 125: return .end
+        default: return nil
+        }
+    }
+
+    /// GRID-COMMAND-OPTION-HORIZONTAL-NUDGE-01. ⌘⌥← / ⌘⌥→ swap the focused
+    /// top-level entry with its neighbor. Command without Option still pages.
+    /// Search, an open folder, and a text field stay out. The key stays taken
+    /// even when the step would leave the page.
+    public enum CommandOptionHorizontalNudge: Equatable, Sendable {
+        case previous
+        case next
+    }
+
+    public static func commandOptionHorizontalNudgesFocusedEntry(
+        keyCode: UInt16,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isSearching: Bool,
+        folderOpen: Bool,
+        isEditingText: Bool,
+        layoutEditingEnabled: Bool,
+        acceptsAction: Bool,
+        isPaging: Bool
+    ) -> CommandOptionHorizontalNudge? {
+        guard command, option, !shift, !control else { return nil }
+        guard !isSearching, !folderOpen, !isEditingText,
+              layoutEditingEnabled, acceptsAction, !isPaging else { return nil }
+        switch keyCode {
+        case 123: return .previous
+        case 124: return .next
+        default: return nil
+        }
+    }
+
+    /// GRID-COMMAND-OPTION-SHIFT-PAGE-MOVE-01. ⌘⌥⇧← / ⌘⌥⇧→ move the focused
+    /// top-level entry to the first slot of the previous or next page. A page
+    /// that does not already exist stays put, so this never adds an empty
+    /// page. Command without Shift still nudges one step. Search, an open
+    /// folder, and a text field stay out.
+    public static func commandOptionShiftHorizontalMovesFocusedEntryToAdjacentPage(
+        keyCode: UInt16,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isSearching: Bool,
+        folderOpen: Bool,
+        isEditingText: Bool,
+        layoutEditingEnabled: Bool,
+        acceptsAction: Bool,
+        isPaging: Bool
+    ) -> CommandOptionHorizontalNudge? {
+        guard command, option, shift, !control else { return nil }
+        guard !isSearching, !folderOpen, !isEditingText,
+              layoutEditingEnabled, acceptsAction, !isPaging else { return nil }
+        switch keyCode {
+        case 123: return .previous
+        case 124: return .next
+        default: return nil
+        }
+    }
+
+    /// FOLDER-COMMAND-OPTION-HORIZONTAL-NUDGE-01. ⌘⌥← / ⌘⌥→ swap the focused
+    /// member inside an open folder. The closed grid keeps the top-level
+    /// nudge. Command without Option still pages. Search and a text field
+    /// stay out. The key stays taken even when the step would leave the list.
+    public static func commandOptionHorizontalNudgesFocusedFolderMember(
+        keyCode: UInt16,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isSearching: Bool,
+        folderOpen: Bool,
+        isEditingText: Bool,
+        layoutEditingEnabled: Bool,
+        acceptsAction: Bool,
+        isPaging: Bool
+    ) -> CommandOptionHorizontalNudge? {
+        guard command, option, !shift, !control else { return nil }
+        guard folderOpen, !isSearching, !isEditingText,
+              layoutEditingEnabled, acceptsAction, !isPaging else { return nil }
+        switch keyCode {
+        case 123: return .previous
+        case 124: return .next
+        default: return nil
+        }
+    }
+
+    /// FOLDER-COMMAND-OPTION-VERTICAL-NUDGE-01. ⌘⌥↑ / ⌘⌥↓ swap the focused
+    /// member with the one a row away. The closed grid keeps moving every
+    /// folder. Command without Option still closes or pages. Search and a
+    /// text field stay out. The key stays taken even when the row does not exist.
+    public static func commandOptionVerticalNudgesFocusedFolderMember(
+        keyCode: UInt16,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isSearching: Bool,
+        folderOpen: Bool,
+        isEditingText: Bool,
+        layoutEditingEnabled: Bool,
+        acceptsAction: Bool,
+        isPaging: Bool
+    ) -> CommandOptionHorizontalNudge? {
+        guard command, option, !shift, !control else { return nil }
+        guard folderOpen, !isSearching, !isEditingText,
+              layoutEditingEnabled, acceptsAction, !isPaging else { return nil }
+        switch keyCode {
+        case 126: return .previous
+        case 125: return .next
+        default: return nil
+        }
+    }
+
+    /// GRID-COMMAND-SHIFT-HORIZONTAL-EDGE-01. ⌘⇧← moves the focused top-level
+    /// entry to the front and ⌘⇧→ moves it to the back. Command without Shift
+    /// still pages. Option stays the one-step nudge. A multi-select stays on
+    /// ⌘⇧↑ / ⌘⇧↓. Search, an open folder, and a text field stay out. The key
+    /// stays taken even when the entry is already at that end.
+    public enum CommandShiftHorizontalEdge: Equatable, Sendable {
+        case start
+        case end
+    }
+
+    public static func commandShiftHorizontalMovesFocusedEntryToEdge(
+        keyCode: UInt16,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isSearching: Bool,
+        folderOpen: Bool,
+        isEditingText: Bool,
+        layoutEditingEnabled: Bool,
+        acceptsAction: Bool,
+        isPaging: Bool
+    ) -> CommandShiftHorizontalEdge? {
+        guard command, shift, !option, !control else { return nil }
+        guard !isSearching, !folderOpen, !isEditingText,
+              layoutEditingEnabled, acceptsAction, !isPaging else { return nil }
+        switch keyCode {
+        case 123: return .start
+        case 124: return .end
+        default: return nil
+        }
+    }
+
+    /// FOLDER-COMMAND-SHIFT-HORIZONTAL-EDGE-01. ⌘⇧← moves the focused member
+    /// to the front of the open folder and ⌘⇧→ moves it to the back. The
+    /// closed grid keeps the top-level edge move. Command without Shift still
+    /// pages. Option stays the one-step member nudge. Search and a text field
+    /// stay out. The key stays taken even when the member is already there.
+    public static func commandShiftHorizontalMovesFocusedFolderMemberToEdge(
+        keyCode: UInt16,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isSearching: Bool,
+        folderOpen: Bool,
+        isEditingText: Bool,
+        layoutEditingEnabled: Bool,
+        acceptsAction: Bool,
+        isPaging: Bool
+    ) -> CommandShiftHorizontalEdge? {
+        guard command, shift, !option, !control else { return nil }
+        guard folderOpen, !isSearching, !isEditingText,
+              layoutEditingEnabled, acceptsAction, !isPaging else { return nil }
+        switch keyCode {
+        case 123: return .start
+        case 124: return .end
+        default: return nil
+        }
+    }
+
+    /// APP-COMMAND-SHIFT-H-HIDE-01. ⌘⇧H hides the focused app, the same action
+    /// as「隐藏应用」. Two or more selected apps hide together when the focus
+    /// is one of them. Command without Shift stays the system Hide. A text
+    /// field stays out. Does not turn a page.
+    public enum CommandShiftHide: Equatable, Sendable {
+        case one
+        case batch
+    }
+
+    public static func commandShiftHHidesFocusedApp(
+        character: String?,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isEditingText: Bool,
+        layoutEditingEnabled: Bool,
+        acceptsAction: Bool,
+        isPaging: Bool,
+        focusedIsApp: Bool,
+        focusedIsInSelection: Bool,
+        batchHideCount: Int
+    ) -> CommandShiftHide? {
+        guard command, shift, !option, !control else { return nil }
+        guard character?.lowercased() == "h" else { return nil }
+        guard !isEditingText, layoutEditingEnabled, acceptsAction, !isPaging else { return nil }
+        if batchHideCount >= 2 {
+            return focusedIsInSelection ? .batch : nil
+        }
+        return focusedIsApp ? .one : nil
+    }
+
     public static func pageDotWeightProgress(elapsed: TimeInterval, duration: TimeInterval) -> CGFloat {
         guard elapsed.isFinite, duration.isFinite else { return 0 }
         guard duration > 0 else { return elapsed > 0 ? 1 : 0 }
@@ -601,6 +1951,39 @@ public enum LauncherLayout {
         return commandOnly && isSearching && !folderOpen && !hasMarkedText
     }
 
+    /// GRID-CMD-RETURN-REVEAL-01. The same ⌘↩ once a tile itself has the key.
+    /// Search still uses `searchRevealShortcutMatches` and wins while a query
+    /// is showing. An app tile reveals; a folder tile does not, so ⌘↩ still
+    /// opens the folder. Space and plain Return stay on open. Does not page.
+    public static func gridTileCommandReturnReveals(
+        keyCode: UInt16,
+        commandOnly: Bool,
+        canRevealInFinder: Bool
+    ) -> Bool {
+        guard keyCode == 36 || keyCode == 76 else { return false }
+        return commandOnly && canRevealInFinder
+    }
+
+    /// GRID-COMMAND-SHIFT-RETURN-REVEAL-01. ⌘⇧↩ reveals the live multi-select
+    /// in Finder, the same action as the blank-area menu. One selected item
+    /// stays on open / ⌘↩. A text field stays out. Does not turn a page.
+    public static func commandShiftReturnRevealsSelection(
+        keyCode: UInt16,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool,
+        isEditingText: Bool,
+        acceptsAction: Bool,
+        isPaging: Bool,
+        selectedCount: Int
+    ) -> Bool {
+        guard keyCode == 36 || keyCode == 76 else { return false }
+        guard command, shift, !option, !control else { return false }
+        guard !isEditingText, acceptsAction, !isPaging else { return false }
+        return selectedCount >= 2
+    }
+
     /// Reveal hands focus to Finder; the full-screen launcher would cover the
     /// new Finder window, so it dismisses first (same as a launch).
     public static let revealInFinderDismissesLauncher = true
@@ -637,6 +2020,51 @@ public enum LauncherLayout {
     /// couple of pixels so the pointer can hit it, narrower than the footer
     /// (56 pt above the bottom) so page dots and the last icon row do not.
     public static let externalDragDockRevealEdgeInset: CGFloat = 12
+
+    /// Typical Dock thickness (icons, padding, and a little magnification).
+    /// A real Dock is often 60–80 pt; 80 covers the upper half that a 12 pt
+    /// edge misses. The actual link band is derived in
+    /// `externalDragDockLinkInsets`, which caps this below the last icon row.
+    public static let externalDragTypicalDockThickness: CGFloat = 80
+
+    /// Gap between the Dock link band and the last icon row or side column,
+    /// so a merge on that row is not armed as a file drop.
+    public static let externalDragDockLinkRowSpacing: CGFloat = 8
+
+    /// Visible grid bounds in screen coordinates, used to cap the Dock link
+    /// band so it never overlaps the last icon row or the side columns.
+    /// Which screen edge currently holds the Dock. `unknown` is an auto-hidden
+    /// Dock or a screen with no measurable inset; only the bottom band opens.
+    public enum ExternalDragDockEdge: Equatable, Sendable {
+        case bottom
+        case left
+        case right
+        case unknown
+    }
+
+    public struct ExternalDragIconLayout: Equatable, Sendable {
+        public var lastIconRowMinY: CGFloat
+        public var firstIconColumnMinX: CGFloat?
+        public var lastIconColumnMaxX: CGFloat?
+        public var dockEdge: ExternalDragDockEdge
+        /// Visible-frame inset on `dockEdge`. Zero or nil means cap only
+        /// against the icon gap and the typical Dock thickness.
+        public var dockInset: CGFloat?
+
+        public init(
+            lastIconRowMinY: CGFloat,
+            firstIconColumnMinX: CGFloat? = nil,
+            lastIconColumnMaxX: CGFloat? = nil,
+            dockEdge: ExternalDragDockEdge = .unknown,
+            dockInset: CGFloat? = nil
+        ) {
+            self.lastIconRowMinY = lastIconRowMinY
+            self.firstIconColumnMinX = firstIconColumnMinX
+            self.lastIconColumnMaxX = lastIconColumnMaxX
+            self.dockEdge = dockEdge
+            self.dockInset = dockInset
+        }
+    }
     /// Once the Dock is out, keep it while the pointer is still over a typical
     /// Dock. Pulling back into the grid past this inset hides it again.
     public static let externalDragDockKeepVisibleInset: CGFloat = 96
@@ -670,20 +2098,172 @@ public enum LauncherLayout {
         pasteboardHasFileURL
     }
 
-    /// A file URL on the pasteboard at session start lets AppKit replace the
-    /// custom drag image and its hotspot. An in-window drop then misses the
-    /// icon center (merge) even though the pointer started on it. Attach the
-    /// Dock link only after the pointer has left the launcher window. Does
-    /// not page, and does not reveal the Dock by itself.
+    /// Bottom / left / right insets of the Dock link band, in points.
+    /// Only the actual Dock edge opens. A bottom or unknown Dock never
+    /// opens the left or right 96 pt page-turn rails. Preferred thickness
+    /// is a typical Dock (~80 pt), also capped by a visible Dock inset and
+    /// stopped `externalDragDockLinkRowSpacing` short of the icons. With no
+    /// layout yet, fall back to the 12 pt reveal edge on the open edge so
+    /// an in-window merge is not armed. Does not page, and does not reveal
+    /// the Dock by itself.
+    /// Infer the Dock edge from `visibleFrame`. The menu-bar inset at the
+    /// top is ignored. When no Dock inset is visible (auto-hide), use
+    /// `orientationFallback` from the Dock preference. A visible inset wins.
+    public static func externalDragDockEdge(
+        screenFrame: CGRect,
+        visibleFrame: CGRect,
+        orientationFallback: ExternalDragDockEdge = .unknown
+    ) -> ExternalDragDockEdge {
+        guard screenFrame.width > 0, screenFrame.height > 0 else {
+            return orientationFallback
+        }
+        let left = max(0, visibleFrame.minX - screenFrame.minX)
+        let right = max(0, screenFrame.maxX - visibleFrame.maxX)
+        let bottom = max(0, visibleFrame.minY - screenFrame.minY)
+        let sides: [(ExternalDragDockEdge, CGFloat)] = [
+            (.left, left), (.right, right), (.bottom, bottom)
+        ]
+        if let best = sides.max(by: { $0.1 < $1.1 }), best.1 > 1 {
+            return best.0
+        }
+        return orientationFallback
+    }
+
+    public static func externalDragDockLinkInsets(
+        screenFrame: CGRect,
+        iconLayout: ExternalDragIconLayout?,
+        typicalDockThickness: CGFloat = externalDragTypicalDockThickness,
+        rowSpacing: CGFloat = externalDragDockLinkRowSpacing,
+        revealInset: CGFloat = externalDragDockRevealEdgeInset,
+        dockEdge: ExternalDragDockEdge? = nil
+    ) -> (bottom: CGFloat, left: CGFloat, right: CGFloat) {
+        guard screenFrame.width > 0, screenFrame.height > 0 else { return (0, 0, 0) }
+        let edge = dockEdge ?? iconLayout?.dockEdge ?? .unknown
+        let preferred = max(0, typicalDockThickness)
+        let gap = max(0, rowSpacing)
+        let fallback = max(0, revealInset)
+        func cap(_ available: CGFloat) -> CGFloat {
+            var value = max(0, min(preferred, available))
+            if let inset = iconLayout?.dockInset, inset > 0 {
+                value = min(value, inset)
+            }
+            return value
+        }
+        let rawBottom: CGFloat
+        let rawLeft: CGFloat
+        let rawRight: CGFloat
+        if let layout = iconLayout {
+            rawBottom = cap(layout.lastIconRowMinY - screenFrame.minY - gap)
+            if let minX = layout.firstIconColumnMinX {
+                rawLeft = cap(minX - screenFrame.minX - gap)
+            } else {
+                rawLeft = cap(fallback)
+            }
+            if let maxX = layout.lastIconColumnMaxX {
+                rawRight = cap(screenFrame.maxX - maxX - gap)
+            } else {
+                rawRight = cap(fallback)
+            }
+        } else {
+            rawBottom = cap(fallback)
+            rawLeft = cap(fallback)
+            rawRight = cap(fallback)
+        }
+        switch edge {
+        case .bottom, .unknown:
+            return (rawBottom, 0, 0)
+        case .left:
+            return (0, rawLeft, 0)
+        case .right:
+            return (0, 0, rawRight)
+        }
+    }
+
+    /// True when the pointer sits in the derived bottom or side Dock band.
+    /// The top edge is the menu bar, not a drop target. Does not page.
+    public static func pointerIsInExternalDragDockLinkZone(
+        pointerInScreen: CGPoint,
+        screenFrame: CGRect,
+        insets: (bottom: CGFloat, left: CGFloat, right: CGFloat)
+    ) -> Bool {
+        guard screenFrame.width > 0, screenFrame.height > 0,
+              pointerInScreen.x.isFinite,
+              pointerInScreen.y.isFinite,
+              screenFrame.contains(pointerInScreen)
+        else { return false }
+        if insets.bottom > 0, pointerInScreen.y <= screenFrame.minY + insets.bottom { return true }
+        if insets.left > 0, pointerInScreen.x <= screenFrame.minX + insets.left { return true }
+        if insets.right > 0, pointerInScreen.x >= screenFrame.maxX - insets.right { return true }
+        return false
+    }
+
+    /// Attach the file URL once the pointer has left the launcher window, or
+    /// once it is sitting in the layout-derived Dock band of a fullscreen
+    /// window (the window then equals `screen.frame`, so "outside the window"
+    /// never fires). The same band is used for the outside-app mask and for
+    /// `movedTo`, so a 60–80 pt Dock is covered without a magic 48 pt inset.
+    /// Folders still return false. Does not page, and does not reveal the
+    /// Dock by itself.
+    ///
+    /// DOCK-FILE-URL-OUTSIDE-APP-01: AppKit asks for the outside mask when the
+    /// pointer enters the Dock, and also at drag start while the pointer is
+    /// still on an icon. Attaching on that first ask replaces the drag image,
+    /// so an in-window drop misses the merge center. Attach only once the
+    /// pointer has left the window or sits in the derived Dock band.
+    /// DOCK-FILE-URL-WITHDRAW-01. Once a Dock file URL is attached, leaving
+    /// the link band must withdraw it so a later in-window merge is not a
+    /// file drag. Re-entering the band attaches again. Does not page.
+    public enum ExternalDragFileURLPasteboardAction: Equatable, Sendable {
+        case none
+        case attach
+        case withdraw
+    }
+
+    public static func externalDragFileURLPasteboardAction(
+        currentlyAttached: Bool,
+        shouldIncludeFileURL: Bool
+    ) -> ExternalDragFileURLPasteboardAction {
+        switch (currentlyAttached, shouldIncludeFileURL) {
+        case (false, true): return .attach
+        case (true, false): return .withdraw
+        default: return .none
+        }
+    }
+
     public static func layoutDragPasteboardIncludesFileURL(
         offer: LayoutDragOutsideOffer,
         pointerInScreen: CGPoint,
-        launcherWindowFrame: CGRect
+        launcherWindowFrame: CGRect,
+        screenFrame: CGRect,
+        revealInset: CGFloat = externalDragDockRevealEdgeInset,
+        draggingOutsideApplication: Bool = false,
+        iconLayout: ExternalDragIconLayout? = nil,
+        pageTurnPlates: [CGRect] = []
     ) -> Bool {
         guard case .linkToApp = offer else { return false }
-        guard launcherWindowFrame.width > 0, launcherWindowFrame.height > 0 else { return false }
-        return !launcherWindowFrame.contains(pointerInScreen)
+        if launcherWindowFrame.width > 0, launcherWindowFrame.height > 0,
+           !launcherWindowFrame.contains(pointerInScreen) {
+            return true
+        }
+        // Yield the visible page-arrow plate while the pointer is still in
+        // the app, so a cross-page drag is not armed as a Dock file link.
+        // The same point may attach once AppKit reports it is outside.
+        if !draggingOutsideApplication,
+           pageTurnPlates.contains(where: { $0.contains(pointerInScreen) }) {
+            return false
+        }
+        let insets = externalDragDockLinkInsets(
+            screenFrame: screenFrame,
+            iconLayout: iconLayout,
+            revealInset: revealInset
+        )
+        return pointerIsInExternalDragDockLinkZone(
+            pointerInScreen: pointerInScreen,
+            screenFrame: screenFrame,
+            insets: insets
+        )
     }
+
 
     private static func pointerIsInExternalDragDockZone(
         pointerInScreen: CGPoint,
@@ -832,11 +2412,39 @@ public enum LauncherLayout {
     ) -> Bool {
         generation == expected
     }
+
+    /// SETTINGS-MESSAGE-FADE-FINISH-ON-CLOSE-01: closing can drop
+    /// `settings-message-fade` before its completion. The model opacity is
+    /// already the destination. A crossfade's next string lives only in that
+    /// completion, and the next `show()` skips `setMessage` while a rescan
+    /// or shortcut error is still latched. Does not page.
+    public enum SettingsMessageFadeCloseLanding: Equatable, Sendable {
+        /// Nothing in flight. Leave the row alone.
+        case leave
+        /// Apply the pending crossfade string, unhide, and stop at opacity 1.
+        case showReplacement
+        /// A fade-to-1 already wrote model opacity 1. Remove the animation.
+        case snapShown
+        /// A fade-to-0 must not stay at opacity 0 for the next open.
+        case parkHidden
+    }
+
+    public static func settingsMessageFadeLandingOnClose(
+        animationStillAttached: Bool,
+        modelOpacity: Float,
+        hasReplacement: Bool,
+        labelHidden: Bool
+    ) -> SettingsMessageFadeCloseLanding {
+        if hasReplacement { return .showReplacement }
+        if !animationStillAttached { return .leave }
+        if labelHidden || modelOpacity <= 0.01 { return .parkHidden }
+        return .snapShown
+    }
     public static let pageHostFadeAnimationKey = "page-host-fade"
     public static let pageHostSlideAnimationKey = "page-host-slide"
     public static let flyerSlideAnimationKey = "flyer-slide"
     public static let dissolvedGridFadeAnimationKey = "dissolved-grid-fade"
-    public static let searchFieldWidth: CGFloat = 400
+    public static let searchFieldWidth: CGFloat = 360
 
     /// Search top chrome (field pill + count + settings) stays quiet while
     /// folder chrome is open or still dissolving closed.
@@ -923,8 +2531,14 @@ public enum LauncherLayout {
         return .selected(next)
     }
 
-    public static let searchFieldHeight: CGFloat = 42
-    public static let searchFieldCornerRadius: CGFloat = 21
+    public static let searchFieldHeight: CGFloat = 36
+    public static let searchFieldCornerRadius: CGFloat = 18
+    /// Settings gear beside the search pill (SEARCH-FIELD-CHROME-02).
+    public static let searchSettingsButtonSize: CGFloat = 32
+    /// Gap between search pill and settings gear.
+    public static let searchSettingsGap: CGFloat = 8
+    /// Gap between count label and search pill.
+    public static let searchCountGap: CGFloat = 10
 
     public struct DragLiftPresentation: Equatable, Sendable {
         public var scale: CGFloat
@@ -1068,10 +2682,10 @@ public enum LauncherLayout {
 
     /// Page that holds the item a drop just placed on the grid. Nil when the
     /// drop only moved something inside a folder, so the grid page stays put.
-    public static func pageContainingDrop(_ drop: LayoutDrop, in state: LayoutState) -> Int? {
+    public static func pageContainingDrop(_ drop: LayoutDrop, in state: LayoutState, capacity: Int = pageCapacity) -> Int? {
         guard let id = topLevelLandingID(drop, in: state),
               let index = state.orderedEntries.firstIndex(where: { $0.id == id }) else { return nil }
-        return pageIndex(containingEntryAt: index)
+        return pageIndex(containingEntryAt: index, capacity: capacity)
     }
 
     /// The grid entry to focus after `folderID` is gone. A remaining member
@@ -1109,6 +2723,78 @@ public enum LauncherLayout {
             return id
         }
         return currentEntries.first?.id
+    }
+
+    /// FOLDER-EXTRACT-SNAP-PAGE-01. A member dragged onto the dimmer lands
+    /// beside the folder. If that slot is the first cell of the next page and
+    /// the folder stays open, `showPage` is intentionally not used. Remember
+    /// the landing page so the close path can remap with the non-animated snap.
+    public static func rememberedFolderExtractLandingPage(
+        landingPage: Int?,
+        currentPage: Int,
+        folderStillOpen: Bool
+    ) -> Int? {
+        guard folderStillOpen, let landingPage, landingPage != currentPage, landingPage >= 0 else {
+            return nil
+        }
+        return landingPage
+    }
+
+    /// Page to show with the non-animated remap once the overlay has closed.
+    /// Nil when the grid is already on that page, a search is up, or there is
+    /// no pending extract landing.
+    public static func folderExtractPageToSnapOnClose(
+        pendingPage: Int?,
+        currentPage: Int,
+        isSearching: Bool,
+        pageCount: Int
+    ) -> Int? {
+        guard !isSearching, pageCount > 0, let pendingPage else { return nil }
+        let bounded = min(max(pendingPage, 0), pageCount - 1)
+        return bounded == currentPage ? nil : bounded
+    }
+
+    /// Page to remap to when the folder overlay closes, from where the
+    /// extracted item sits now. A remembered page goes stale if the item was
+    /// moved back into a folder or onto the page already showing. Nil also
+    /// when a search is up, or the launcher is hidden: a hidden remap would
+    /// not reload, and the next show keeps the page it already has.
+    public static func folderExtractSnapPageOnClose(
+        itemIndex: Int?,
+        capacity: Int,
+        currentPage: Int,
+        isSearching: Bool,
+        pageCount: Int,
+        launcherVisible: Bool
+    ) -> Int? {
+        guard launcherVisible, !isSearching, pageCount > 0, let itemIndex, itemIndex >= 0 else {
+            return nil
+        }
+        let page = pageIndex(containingEntryAt: itemIndex, capacity: capacity)
+        let bounded = min(max(page, 0), pageCount - 1)
+        return bounded == currentPage ? nil : bounded
+    }
+
+    /// Close-folder focus after an off-page extract follows the moved item
+    /// (already on the remapped page). Same-page extracts and ordinary closes
+    /// still restore the folder tile.
+    public static func folderCloseFocusIDAfterExtract(
+        extractedItemID: UUID?,
+        followExtractedItem: Bool,
+        folderID: UUID,
+        previousEntries: [LauncherEntry],
+        currentEntries: [LauncherEntry]
+    ) -> UUID? {
+        if followExtractedItem,
+           let extractedItemID,
+           currentEntries.contains(where: { $0.id == extractedItemID }) {
+            return extractedItemID
+        }
+        return folderCloseGridFocusID(
+            pendingFolderID: folderID,
+            previousEntries: previousEntries,
+            currentEntries: currentEntries
+        )
     }
 
     /// Apps that should fly out of an open folder when it breaks apart.
@@ -1197,11 +2883,106 @@ public enum LauncherLayout {
         return CGSize(width: width, height: height)
     }
 
+    /// Preferred caption size on a cell that can still reserve 40 pt under the icon.
+    public static let captionPreferredPointSize: CGFloat = 12
+    /// Smallest caption that still counts as one readable line.
+    public static let captionMinimumPointSize: CGFloat = 11
+    /// Gap between the icon's bottom and the caption, matching the tile constraint.
+    public static let captionGap: CGFloat = 5
+    /// Padding under the caption, matching the tile's bottom inequality.
+    public static let captionBottomInset: CGFloat = 2
+    /// Horizontal inset of the caption, matching the tile's side constraints.
+    public static let captionSideInset: CGFloat = 6
+
+    /// Icon and caption chosen for one grid cell. Roomy cells keep the
+    /// historical 60–84 pt icon. A short cell, such as one slot of a 10×8
+    /// grid on a 13-inch window, used to clamp the icon to `height - 40`
+    /// (about 35 pt) and still spend 40 pt on the caption. The icon is lifted
+    /// above center, so that caption can sit in the band under the icon and
+    /// the icon can grow until it meets the top of the cell.
+    public struct CellIconCaptionGeometry: Equatable, Sendable {
+        public var iconPointSize: CGFloat
+        public var captionPointSize: CGFloat
+        /// One caption line, in points. Core has no font metrics; the line
+        /// box is the point size, which stays at least `captionMinimumPointSize`.
+        public var captionHeight: CGFloat
+        public var maximumLines: Int
+    }
+
     public static func iconPointSize(in itemSize: CGSize) -> CGFloat {
-        let widthLimited = itemSize.width * 0.58
-        let heightLimited = itemSize.height - 40
+        cellIconCaptionGeometry(in: itemSize).iconPointSize
+    }
+
+    public static func cellIconCaptionGeometry(in itemSize: CGSize) -> CellIconCaptionGeometry {
+        let width = itemSize.width.isFinite ? itemSize.width : 0
+        let height = itemSize.height.isFinite ? itemSize.height : 0
+        let classic = classicIconPointSize(width: width, height: height)
+        let caption = captionPreferredPointSize
+        let icon = fittedIconPointSize(
+            width: width,
+            height: height,
+            classic: classic,
+            captionPointSize: caption
+        )
+        return CellIconCaptionGeometry(
+            iconPointSize: icon,
+            captionPointSize: caption,
+            captionHeight: caption,
+            maximumLines: captionLineLimit(
+                width: width,
+                height: height,
+                icon: icon,
+                caption: caption,
+                usesClassicReserve: icon == classic && classic >= 60
+            )
+        )
+    }
+
+    /// Historical size: 60 pt floor, 84 pt cap, and a fixed 40 pt caption reserve.
+    /// A short cell then clamps the floor back down to `height - 40`.
+    private static func classicIconPointSize(width: CGFloat, height: CGFloat) -> CGFloat {
+        let widthLimited = width * 0.58
+        let heightLimited = height - 40
         let preferred = min(84, max(60, floor(min(widthLimited, heightLimited))))
-        return max(1, min(preferred, floor(heightLimited), floor(itemSize.width)))
+        return max(1, min(preferred, floor(heightLimited), floor(width)))
+    }
+
+    /// Keep the classic size when the 60 pt floor still clears a 40 pt caption
+    /// reserve, or when the cell is already no wider than that size. Otherwise
+    /// grow the icon up to the top of the cell, leaving one caption line beneath
+    /// the lifted icon. Never shrink the classic result, and never pass 84 pt.
+    private static func fittedIconPointSize(
+        width: CGFloat,
+        height: CGFloat,
+        classic: CGFloat,
+        captionPointSize: CGFloat
+    ) -> CGFloat {
+        if classic >= 60, height + 0.001 >= classic + 40 {
+            return classic
+        }
+        if width >= 1, classic + 0.001 >= floor(width) {
+            return classic
+        }
+        let topLimited = height - 2 * iconCenterLift
+        guard topLimited >= 1, width >= 1 else { return classic }
+        let captionBlock = captionGap + captionPointSize + captionBottomInset
+        let captionLimited = height + 2 * iconCenterLift - 2 * captionBlock
+        let fitted = floor(min(width, 84, topLimited, captionLimited))
+        return max(classic, max(1, fitted))
+    }
+
+    private static func captionLineLimit(
+        width: CGFloat,
+        height: CGFloat,
+        icon: CGFloat,
+        caption: CGFloat,
+        usesClassicReserve: Bool
+    ) -> Int {
+        if usesClassicReserve { return 2 }
+        guard width >= 1, height >= 1, icon >= 1 else { return 1 }
+        let iconMinY = height / 2 + iconCenterLift - icon / 2
+        let available = iconMinY - captionGap - captionBottomInset
+        return available + 0.001 >= caption * 2 + 2 ? 2 : 1
     }
 
     /// How far the icon sits above the cell's center, in y-up points. The
@@ -1223,6 +3004,23 @@ public enum LauncherLayout {
             y: cell.midY + iconCenterLift - iconSize / 2,
             width: iconSize,
             height: iconSize
+        )
+    }
+
+    /// One caption line under the lifted icon. Same gap and side inset as the tile.
+    public static func captionFrame(in cell: CGRect) -> CGRect {
+        let icon = iconFrame(in: cell)
+        guard icon.width >= 1, icon.height >= 1 else { return .zero }
+        let geometry = cellIconCaptionGeometry(in: cell.size)
+        let height = geometry.captionHeight
+        guard height >= 1 else { return .zero }
+        let width = max(1, cell.width - captionSideInset * 2)
+        let maxY = icon.minY - captionGap
+        return CGRect(
+            x: cell.midX - width / 2,
+            y: maxY - height,
+            width: width,
+            height: height
         )
     }
 
@@ -1699,6 +3497,45 @@ public enum LauncherLayout {
         return delta > 0 ? presentedIDs.first : presentedIDs.last
     }
 
+    /// SEARCH-FIELD-ARROW-ROW-01. Up or Down while the search field keeps the
+    /// caret moves one visual row. Same neighbor rule as a focused search tile:
+    /// a short last row stays put instead of sliding sideways. Left and Right
+    /// stay in the text. Does not turn a page.
+    public static func searchKeyboardHighlightIDMovingByRow(
+        from current: UUID?,
+        in presentedIDs: [UUID],
+        columns: Int,
+        downward: Bool
+    ) -> UUID? {
+        guard !presentedIDs.isEmpty else { return nil }
+        guard let current, let index = presentedIDs.firstIndex(of: current) else {
+            return downward ? presentedIDs.first : presentedIDs.last
+        }
+        guard let next = gridKeyboardNeighborSlot(
+            from: index,
+            count: presentedIDs.count,
+            columns: columns,
+            direction: downward ? .down : .up
+        ) else {
+            return current
+        }
+        return presentedIDs[next]
+    }
+
+    /// SEARCH-FIELD-ARROW-ANNOUNCE-01. The caret stays in the field, so
+    /// VoiceOver does not hear a row step unless it is spoken. The same hit,
+    /// or a blank name, says nothing. Does not turn a page.
+    public static func searchKeyboardHighlightAnnouncement(
+        previousID: UUID?,
+        nextID: UUID?,
+        name: String?
+    ) -> String? {
+        guard let nextID, nextID != previousID else { return nil }
+        let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !trimmed.isEmpty else { return nil }
+        return trimmed
+    }
+
     /// Focus-fill chrome when the tile is first responder or the search
     /// keyboard-open highlight (field still holds the caret).
     public static func tileShowsKeyboardFocusChrome(
@@ -1835,6 +3672,395 @@ public enum LauncherLayout {
         return previousHit != configured
     }
 
+    /// HOT-CORNER-SUPPRESS-WHEN-SETTINGS-OR-MODAL-01 /
+    /// PRESENCE-TOGGLE-SUPPRESS-WHEN-EDITING-TEXT-01: do not toggle presence
+    /// under an alias/uninstall sheet, while Settings is key, or while a
+    /// folder title / search field editor is live (avoid abandoning drafts).
+    public static func shouldAcceptHotCornerPresenceToggle(
+        isPromptingForAlias: Bool,
+        isPromptingForUninstall: Bool,
+        settingsIsKey: Bool,
+        folderTitleEditing: Bool = false,
+        searchFieldEditing: Bool = false
+    ) -> Bool {
+        !isPromptingForAlias && !isPromptingForUninstall && !settingsIsKey
+            && !folderTitleEditing && !searchFieldEditing
+    }
+
+    /// SELECT-ALL-EMPTY-NO-CONSUME-01: ⌘A with nothing to select must not
+    /// consume the key equivalent (leave it for the system / field editor).
+    public static func shouldConsumeSelectAllShortcut(itemCount: Int) -> Bool {
+        itemCount > 0
+    }
+
+    /// SEARCH-KEYBOARD-HIGHLIGHT-SCROLL-ON-SYNC-01: after pinning/preserving
+    /// the keyboard-open highlight, scroll it into view (arrow moves already do).
+    public static func shouldScrollSearchKeyboardHighlightOnSync(hasHighlight: Bool) -> Bool {
+        hasHighlight
+    }
+
+    /// PRESENCE-GESTURE-SUPPRESS-UNINSTALL-PROMPT-01: pinch treats uninstall
+    /// modal like alias / field editing — consume but do not dismiss.
+    public static func shouldTreatAsPresenceGestureEditing(
+        folderTitleEditing: Bool,
+        searchFieldEditing: Bool,
+        isPromptingForAlias: Bool,
+        isPromptingForUninstall: Bool
+    ) -> Bool {
+        folderTitleEditing || searchFieldEditing || isPromptingForAlias || isPromptingForUninstall
+    }
+
+
+    /// HOTKEY-STATUS-SUPPRESS-WHEN-SETTINGS-OR-MODAL-01 /
+    /// PRESENCE-TOGGLE-SUPPRESS-WHEN-EDITING-TEXT-01: same gate as hot corner.
+    public static func shouldAcceptHotkeyPresenceToggle(
+        isPromptingForAlias: Bool,
+        isPromptingForUninstall: Bool,
+        settingsIsKey: Bool,
+        folderTitleEditing: Bool = false,
+        searchFieldEditing: Bool = false
+    ) -> Bool {
+        shouldAcceptHotCornerPresenceToggle(
+            isPromptingForAlias: isPromptingForAlias,
+            isPromptingForUninstall: isPromptingForUninstall,
+            settingsIsKey: settingsIsKey,
+            folderTitleEditing: folderTitleEditing,
+            searchFieldEditing: searchFieldEditing
+        )
+    }
+
+    /// SETTINGS-OPEN-CHROME-POLICY-01: chrome that Settings must clear before
+    /// `hide()` arms dismiss. In-flight fades (reorder, merge, landings, search
+    /// crossfade, dissolved-grid fade, folder chrome, launch press, page-arrow
+    /// hover, toast fade) are not on this list — `hide()` settles those after
+    /// dismiss is armed. Icon prefetch and per-tile decodes are also absent:
+    /// a visible launcher cancels them inside `hide()`, and a hidden launcher
+    /// cancels them once on its own path.
+    public enum SettingsOpenChromeAction: String, CaseIterable, Equatable, Sendable {
+        case dismissToast
+        case closeFolder
+        case cancelMarquee
+        case cancelItemDrag
+        case cancelIconContextMenu
+        case resetPinchDismiss
+        case clearDropHighlight
+        case clearSearchKeyboardHighlight
+        case abortSearchField
+        case invalidateDeferredGridRearrange
+        case clearIconSampling
+        case resetExternalDragDockReveal
+        case cancelPendingPageInput
+    }
+
+    /// Live chrome when Settings is about to open. Defaults are idle so a
+    /// single flag can be tested without inventing the rest of the window.
+    public struct SettingsOpenChromeSnapshot: Equatable, Sendable {
+        public var toastVisible: Bool
+        public var folderOpen: Bool
+        public var marqueeArmed: Bool
+        public var itemDragInFlight: Bool
+        public var iconMenuTracking: Bool
+        public var pinchAccumulated: Bool
+        public var pinchTriggered: Bool
+        public var dropHighlightNeedsClear: Bool
+        public var searchKeyboardHighlight: Bool
+        public var searchFieldEditing: Bool
+        public var dockRevealActive: Bool
+
+        public init(
+            toastVisible: Bool = false,
+            folderOpen: Bool = false,
+            marqueeArmed: Bool = false,
+            itemDragInFlight: Bool = false,
+            iconMenuTracking: Bool = false,
+            pinchAccumulated: Bool = false,
+            pinchTriggered: Bool = false,
+            dropHighlightNeedsClear: Bool = false,
+            searchKeyboardHighlight: Bool = false,
+            searchFieldEditing: Bool = false,
+            dockRevealActive: Bool = false
+        ) {
+            self.toastVisible = toastVisible
+            self.folderOpen = folderOpen
+            self.marqueeArmed = marqueeArmed
+            self.itemDragInFlight = itemDragInFlight
+            self.iconMenuTracking = iconMenuTracking
+            self.pinchAccumulated = pinchAccumulated
+            self.pinchTriggered = pinchTriggered
+            self.dropHighlightNeedsClear = dropHighlightNeedsClear
+            self.searchKeyboardHighlight = searchKeyboardHighlight
+            self.searchFieldEditing = searchFieldEditing
+            self.dockRevealActive = dockRevealActive
+        }
+    }
+
+    /// Ordered cleanup for one Settings open. Unconditional entries always
+    /// run: a deferred rearrange token, sampling progress toast, and a waiting
+    /// page-input arm must not survive even when the matching flag is already
+    /// clear. Does not page.
+    public static func settingsOpenChromeActions(
+        for snapshot: SettingsOpenChromeSnapshot
+    ) -> [SettingsOpenChromeAction] {
+        var actions: [SettingsOpenChromeAction] = []
+        if snapshot.toastVisible { actions.append(.dismissToast) }
+        if snapshot.folderOpen { actions.append(.closeFolder) }
+        if snapshot.marqueeArmed { actions.append(.cancelMarquee) }
+        if snapshot.itemDragInFlight { actions.append(.cancelItemDrag) }
+        if snapshot.iconMenuTracking { actions.append(.cancelIconContextMenu) }
+        if snapshot.pinchAccumulated || snapshot.pinchTriggered {
+            actions.append(.resetPinchDismiss)
+        }
+        if snapshot.dropHighlightNeedsClear { actions.append(.clearDropHighlight) }
+        if snapshot.searchKeyboardHighlight { actions.append(.clearSearchKeyboardHighlight) }
+        if snapshot.searchFieldEditing { actions.append(.abortSearchField) }
+        actions.append(.invalidateDeferredGridRearrange)
+        actions.append(.clearIconSampling)
+        if snapshot.dockRevealActive { actions.append(.resetExternalDragDockReveal) }
+        actions.append(.cancelPendingPageInput)
+        return actions
+    }
+
+    /// MARQUEE-CANCEL-ON-SETTINGS-OPEN-01: drop an armed/active band before
+    /// Settings covers the grid (hide also cancels; cancel here avoids a
+    /// one-frame overlay under the handoff fade).
+    public static func shouldCancelMarqueeWhenOpeningSettings(isArmed: Bool) -> Bool {
+        settingsOpenChromeActions(for: SettingsOpenChromeSnapshot(marqueeArmed: isArmed))
+            .contains(.cancelMarquee)
+    }
+
+    /// DRAG-CANCEL-ON-SETTINGS-OPEN-01: synthetic mouse-up before Settings
+    /// handoff so companions are not stuck at opacity 0 under the fade.
+    public static func shouldCancelItemDragWhenOpeningSettings(isDragging: Bool) -> Bool {
+        settingsOpenChromeActions(for: SettingsOpenChromeSnapshot(itemDragInFlight: isDragging))
+            .contains(.cancelItemDrag)
+    }
+
+    /// SEARCH-KEYBOARD-HIGHLIGHT-CLEAR-ON-OPEN-FOLDER-01: opening a folder
+    /// (incl. from a search hit) must drop the keyboard-open ring so it does
+    /// not flash under the overlay / after close.
+    public static func shouldClearSearchKeyboardHighlightWhenOpeningFolder(
+        hasHighlight: Bool
+    ) -> Bool {
+        hasHighlight
+    }
+
+
+    /// DOCK-REOPEN-SUPPRESS-WHEN-SETTINGS-OR-MODAL-01 /
+    /// PRESENCE-TOGGLE-SUPPRESS-WHEN-EDITING-TEXT-01.
+    public static func shouldAcceptDockReopenShow(
+        isPromptingForAlias: Bool,
+        isPromptingForUninstall: Bool,
+        settingsIsKey: Bool,
+        folderTitleEditing: Bool = false,
+        searchFieldEditing: Bool = false
+    ) -> Bool {
+        shouldAcceptHotkeyPresenceToggle(
+            isPromptingForAlias: isPromptingForAlias,
+            isPromptingForUninstall: isPromptingForUninstall,
+            settingsIsKey: settingsIsKey,
+            folderTitleEditing: folderTitleEditing,
+            searchFieldEditing: searchFieldEditing
+        )
+    }
+
+    /// ICON-MENU-CANCEL-ON-SETTINGS-OPEN-01: cancel a tracking icon menu
+    /// before Settings covers the grid (same cancel as dismiss).
+    public static func shouldCancelIconContextMenuWhenOpeningSettings(
+        isTracking: Bool
+    ) -> Bool {
+        settingsOpenChromeActions(for: SettingsOpenChromeSnapshot(iconMenuTracking: isTracking))
+            .contains(.cancelIconContextMenu)
+    }
+
+    /// RELOAD-CATALOG-SUPPRESS-WHEN-MODAL-01: do not start a rescan while an
+    /// alias / uninstall modal owns the event loop.
+    public static func shouldAcceptCatalogReload(
+        isPromptingForAlias: Bool,
+        isPromptingForUninstall: Bool
+    ) -> Bool {
+        !isPromptingForAlias && !isPromptingForUninstall
+    }
+
+    /// SEARCH-KEYBOARD-HIGHLIGHT-RESYNC-ON-CLOSE-FOLDER-01: after closing a
+    /// folder opened from search, re-pin/preserve the keyboard-open ring on
+    /// the still-active results.
+    public static func shouldResyncSearchKeyboardHighlightWhenClosingFolder(
+        isSearching: Bool
+    ) -> Bool {
+        isSearching
+    }
+
+
+    /// PINCH-RESET-ON-SETTINGS-OPEN-01: clear mid-pinch before Settings handoff
+    /// so a restored launcher does not dismiss on the first continued magnify.
+    public static func shouldResetPinchDismissWhenOpeningSettings(
+        hasAccumulated: Bool,
+        wasTriggered: Bool
+    ) -> Bool {
+        settingsOpenChromeActions(
+            for: SettingsOpenChromeSnapshot(
+                pinchAccumulated: hasAccumulated,
+                pinchTriggered: wasTriggered
+            )
+        ).contains(.resetPinchDismiss)
+    }
+
+    /// DROP-HIGHLIGHT-CLEAR-ON-SETTINGS-OPEN-01: drop merge ring / reorder gap
+    /// before Settings covers the grid.
+    public static func shouldClearDropHighlightWhenOpeningSettings(
+        needsClear: Bool
+    ) -> Bool {
+        settingsOpenChromeActions(
+            for: SettingsOpenChromeSnapshot(dropHighlightNeedsClear: needsClear)
+        ).contains(.clearDropHighlight)
+    }
+
+    /// SEARCH-KEYBOARD-HIGHLIGHT-CLEAR-ON-SETTINGS-OPEN-01: drop keyboard-open
+    /// ring so handoff restore does not flash it under Settings.
+    public static func shouldClearSearchKeyboardHighlightWhenOpeningSettings(
+        hasHighlight: Bool
+    ) -> Bool {
+        settingsOpenChromeActions(
+            for: SettingsOpenChromeSnapshot(searchKeyboardHighlight: hasHighlight)
+        ).contains(.clearSearchKeyboardHighlight)
+    }
+
+    /// LAUNCH-HIGHLIGHT-CLEAR-ON-SETTINGS-OPEN-01: drop stale「正在启动…」when
+    /// no open is still in flight (same rule as hide).
+    public static func shouldClearLaunchHighlightWhenOpeningSettings(
+        hasHighlight: Bool,
+        launchesInFlightEmpty: Bool
+    ) -> Bool {
+        hasHighlight && launchesInFlightEmpty
+    }
+
+
+    /// SELECT-ALL-SCROLL-INTO-VIEW-01: after ⌘A, bring the first selected
+    /// tile into view (search / folder grids can be scrolled).
+    public static func shouldScrollSelectionIntoViewAfterSelectAll(
+        itemCount: Int
+    ) -> Bool {
+        itemCount > 0
+    }
+
+    /// STATUS-ITEM-MENU-SUPPRESS-WHEN-MODAL-01: do not pop the status menu
+    /// over an alias / uninstall sheet.
+    public static func shouldPresentStatusItemMenu(
+        isPromptingForAlias: Bool,
+        isPromptingForUninstall: Bool
+    ) -> Bool {
+        !isPromptingForAlias && !isPromptingForUninstall
+    }
+
+    /// SEARCH-FIELD-ABORT-ON-SETTINGS-OPEN-01: abort the search field editor
+    /// (incl. IME marked text) before Settings handoff.
+    public static func shouldAbortSearchFieldWhenOpeningSettings(
+        hasFieldEditor: Bool
+    ) -> Bool {
+        settingsOpenChromeActions(
+            for: SettingsOpenChromeSnapshot(searchFieldEditing: hasFieldEditor)
+        ).contains(.abortSearchField)
+    }
+
+
+    /// SHIFT-SELECT-SCROLL-INTO-VIEW-01: after Shift-click range select, reveal
+    /// the clicked endpoint (folder/search grids may be scrolled).
+    public static func shouldScrollSelectionIntoViewAfterShiftSelect(
+        hasSelection: Bool
+    ) -> Bool {
+        hasSelection
+    }
+
+    /// CMD-TOGGLE-SCROLL-INTO-VIEW-01: after ⌘-click adds an item, reveal it.
+    public static func shouldScrollSelectionIntoViewAfterCommandToggle(
+        itemIsSelected: Bool
+    ) -> Bool {
+        itemIsSelected
+    }
+
+    /// MARQUEE-END-SCROLL-INTO-VIEW-01: after an activated marquee, reveal the
+    /// first selected id (band may cover off-screen rows in search/folder).
+    public static func shouldScrollSelectionIntoViewAfterMarquee(
+        activated: Bool,
+        selectionCount: Int
+    ) -> Bool {
+        activated && selectionCount > 0
+    }
+
+    /// LAYOUT-FLUSH-ON-SETTINGS-OPEN-01: flush debounced layout before Settings
+    /// handoff so a quit during settings does not drop the last rearrange.
+    public static func shouldFlushLayoutWhenOpeningSettings(
+        hasPendingSave: Bool
+    ) -> Bool {
+        hasPendingSave
+    }
+
+    /// DEFERRED-GRID-REARRANGE-INVALIDATE-ON-SETTINGS-OPEN-01: bump the
+    /// deferred rearrange token so a color/date sort armed before Settings
+    /// cannot land under the sheet (same as hide).
+    public static func shouldInvalidateDeferredGridRearrangeWhenOpeningSettings() -> Bool {
+        settingsOpenChromeActions(for: SettingsOpenChromeSnapshot())
+            .contains(.invalidateDeferredGridRearrange)
+    }
+
+    /// ICON-SAMPLING-CLEAR-ON-SETTINGS-OPEN-01 /
+    /// REARRANGE-PROGRESS-TOAST-CLEAR-ON-SETTINGS-OPEN-01: abandon in-flight
+    /// color/date samples and peel their progress toasts when Settings opens
+    /// (same helper path as hide; idempotent when idle).
+    public static func shouldClearIconSamplingWhenOpeningSettings(
+        isSamplingIconColors: Bool,
+        isSamplingAppDates: Bool
+    ) -> Bool {
+        // Always enter the hide helper so progress toasts peel even after the
+        // sample flags already cleared; flags themselves still gate inside.
+        _ = (isSamplingIconColors, isSamplingAppDates)
+        return settingsOpenChromeActions(for: SettingsOpenChromeSnapshot())
+            .contains(.clearIconSampling)
+    }
+
+    /// DOCK-REVEAL-RESET-ON-SETTINGS-OPEN-01: clear external-drag Dock reveal
+    /// so Settings handoff does not leave Dock auto-hide suspended.
+    public static func shouldResetExternalDragDockRevealWhenOpeningSettings(
+        dockRevealActive: Bool
+    ) -> Bool {
+        settingsOpenChromeActions(
+            for: SettingsOpenChromeSnapshot(dockRevealActive: dockRevealActive)
+        ).contains(.resetExternalDragDockReveal)
+    }
+
+    /// PENDING-PAGE-INPUT-CANCEL-ON-SETTINGS-OPEN-01: drop a waiting wheel /
+    /// quiet-period page arm so it cannot fire after Settings covers the grid.
+    /// Cancels input only — does not call showPage / transitionToPage /
+    /// completePageTransition.
+    public static func shouldCancelPendingPageInputWhenOpeningSettings() -> Bool {
+        settingsOpenChromeActions(for: SettingsOpenChromeSnapshot())
+            .contains(.cancelPendingPageInput)
+    }
+
+    // SETTINGS-HANDOFF-SETTLE-VIA-HIDE-01: in-flight reorder slides, merge
+    // flyers, drop landings, folder landings, search↔grid crossfades, page-arrow
+    // hover fades, launch-press scale, and toast fades settle inside `hide()`
+    // after dismiss is armed. Opening Settings calls `hide(animated: false)`
+    // on the next turn. Settling earlier runs while the launcher is still up,
+    // so the hold branches do not pin. Dissolved-grid fade and folder chrome
+    // stay on that same hide checklist.
+
+    /// ICON-PREFETCH-CANCEL-ON-SETTINGS-OPEN-01 / SETTINGS-OPEN-DEDUPE-CALLS-01:
+    /// stop background icon prefetch when Settings opens over a launcher that
+    /// is already hidden. A visible launcher cancels inside `hide()` instead,
+    /// so this gate must not run again on that path.
+    public static func shouldCancelIconPrefetchWhenOpeningSettings(
+        hasPrefetchTask: Bool
+    ) -> Bool {
+        hasPrefetchTask
+    }
+
+    /// TILE-ICON-CANCEL-ON-SETTINGS-OPEN-01 / SETTINGS-OPEN-DEDUPE-CALLS-01:
+    /// stop per-tile icon decodes when Settings opens over a hidden launcher.
+    /// A visible launcher cancels inside `hide()` instead.
+    public static func shouldCancelTileIconLoadsWhenOpeningSettings() -> Bool {
+        true
+    }
 
     /// Hot-corner show/hide must use the same animated launcher presence fade
     /// as the hotkey (`park` + `animateLauncherPresence` from presentation).
@@ -1924,6 +4150,26 @@ public enum LauncherLayout {
         case .primary:
             return .toggle
         }
+    }
+
+    /// STATUS-ITEM-AX-SHOW-MENU-01: VoiceOver's Show Menu action is not a
+    /// click. It opens the status menu even when the current event is a
+    /// synthesized left mouse. Assigning `item.menu` would steal that left
+    /// click, so this action stays separate from the pointer policy above.
+    public static func statusItemActionForAccessibilityShowMenu() -> StatusItemButtonAction {
+        .showMenu
+    }
+
+    /// STATUS-ITEM-AX-SHOW-MENU-SUPPRESSED-01: Show Menu reports success only
+    /// when a button and a menu exist and the alias / uninstall sheet is not
+    /// covering the launcher. Returning success while the menu stays down
+    /// makes VoiceOver announce a menu that did not open. Does not page.
+    public static func statusItemAccessibilityShowMenuPerformed(
+        hasButton: Bool,
+        hasMenu: Bool,
+        presentationAllowed: Bool
+    ) -> Bool {
+        hasButton && hasMenu && presentationAllowed
     }
 
     public static func statusItemToggleTitle(isVisible: Bool, isDismissing: Bool) -> String {
@@ -2097,11 +4343,36 @@ public enum LauncherLayout {
         )
     }
 
+    /// The tile that opened a context menu must still be in the layout when
+    /// the action fires. A catalog reload, hide, or uninstall can remove it
+    /// between menu-open and click; callers then no-op instead of mutating
+    /// a vanished id. Does not page.
+    public static func shouldApplyContextMenuAction(itemID: UUID, in state: LayoutState) -> Bool {
+        if state.orderedEntries.contains(where: {
+            switch $0 {
+            case .app(let id), .folder(let id):
+                return id == itemID
+            }
+        }) {
+            return true
+        }
+        return state.folders.values.contains { $0.itemIDs.contains(itemID) }
+    }
+
     /// A drag can still be on the cursor while the launcher fades. Releasing
     /// then must not reorder or merge. The drag image may stay until the
     /// pointer comes up; the layout does not change.
     public static func shouldAcceptLayoutDrop(isDismissing: Bool) -> Bool {
         !isDismissing
+    }
+
+    /// ESC-CANCEL-DRAG-RELEASE-01: Escape posts a left mouse-up only because
+    /// AppKit has no public `NSDraggingSession` cancel. That release exists
+    /// to end the session and fly the icon home. It must not also land a
+    /// drop, dismiss the launcher, clear a multi-select, or close a folder.
+    /// A real mouse-up leaves this false and keeps those behaviors.
+    public static func suppressesPointerReleaseSideEffects(escapeCancelInFlight: Bool) -> Bool {
+        escapeCancelInFlight
     }
 
     /// A session that already exists still receives moves so its image can
@@ -2293,6 +4564,30 @@ public enum LauncherLayout {
         !shouldHoldInFlightLauncherPresence(isDismissing: isDismissing, isVisible: isVisible)
     }
 
+    /// Where the launcher fade and card rise should sit once the window is
+    /// already hidden. Instant hide promises a fully shown model: the next
+    /// `orderFront` must not flash a mid-fade, or a hide that already wrote
+    /// opacity 0 and dropped the card. Either named animation still attached
+    /// is enough. A visible window keeps playing. Does not page.
+    public enum UnpinnedLauncherPresenceLanding: Equatable, Sendable {
+        case leave
+        case restingShown
+    }
+
+    /// LAUNCHER-PRESENCE-FINISH-WHEN-HIDDEN-01.
+    public static func unpinnedLauncherPresenceLanding(
+        isVisible: Bool,
+        fadeStillAttached: Bool,
+        riseStillAttached: Bool
+    ) -> UnpinnedLauncherPresenceLanding {
+        let attached = fadeStillAttached || riseStillAttached
+        guard shouldFinishUnpinnedHiddenAnimation(
+            isVisible: isVisible,
+            animationStillAttached: attached
+        ) else { return .leave }
+        return .restingShown
+    }
+
     /// The drag image is drawn once, when the pointer crosses the drag
     /// threshold. Reduced motion keeps the original cell image. A lift that
     /// is already showing used to stay scaled, with its shadow, after the
@@ -2368,14 +4663,22 @@ public enum LauncherLayout {
         return motionDuration ?? folderChromeFallbackDuration
     }
 
-    public static func folderBackdropStyle(open: Bool, reducesMotion: Bool) -> FolderBackdropStyle {
+    /// Open-folder veil. Reduced motion drops scale and blur. System reduce
+    /// transparency drops only the blur: the grid still recedes, and the
+    /// preference is not what this flag reads. Default transparency keeps
+    /// older call sites on the previous picture. Does not page.
+    public static func folderBackdropStyle(
+        open: Bool,
+        reducesMotion: Bool,
+        reducesTransparency: Bool = false
+    ) -> FolderBackdropStyle {
         guard open else {
             return FolderBackdropStyle(opacity: 1, scale: 1, blurs: false)
         }
         return FolderBackdropStyle(
             opacity: folderBackdropOpenOpacity,
             scale: reducesMotion ? 1 : folderBackdropOpenScale,
-            blurs: !reducesMotion
+            blurs: !reducesMotion && !reducesTransparency
         )
     }
 
@@ -2600,6 +4903,44 @@ public enum LauncherLayout {
         phase: FolderPreviewPlatePhase
     ) -> Bool {
         tracksIcon && phase == .borrowed
+    }
+
+    /// What to do with the preview-plate display link once the window is
+    /// already hidden. The hold path never stops a clock that started after
+    /// the window left the screen. A close has already cleared the open
+    /// folder, so the panel commit does not see this clock. Returning lands
+    /// on a solid plate. Yielding hides it, the same end as an open panel.
+    /// A visible window keeps the clock. Does not page, and does not close
+    /// the folder.
+    public enum UnpinnedPreviewPlateFinish: Equatable, Sendable {
+        case leave
+        case landReturning
+        case landYielding
+    }
+
+    /// PREVIEW-PLATE-CLOCK-FINISH-WHEN-HIDDEN-01.
+    public static func unpinnedPreviewPlateFinish(
+        isVisible: Bool,
+        clockRunning: Bool,
+        returning: Bool,
+        yielding: Bool
+    ) -> UnpinnedPreviewPlateFinish {
+        guard !isVisible, clockRunning else { return .leave }
+        if yielding { return .landYielding }
+        if returning { return .landReturning }
+        return .leave
+    }
+
+    /// PREVIEW-PLATE-WRITE-RETAINED-TILES-01. The plate writers ask
+    /// `item(at:)`. After the window orders out that lookup is empty, and the
+    /// folder tile is still in the hierarchy with the id from configure.
+    /// Write those tiles only when the lookup found none. A live lookup is
+    /// the cells the collection view still owns; walking the hierarchy as
+    /// well can paint a cell that was already reused. A negative count is
+    /// not a find. Glyph-hide flags and the incoming preview limit use this
+    /// same empty-lookup rule. Does not page, and does not close the folder.
+    public static func previewPlateShouldWriteRetainedTiles(collectionLookupCount: Int) -> Bool {
+        max(collectionLookupCount, 0) == 0
     }
 
     /// Clock time 0...1 along a tracked open, mapped through
@@ -2893,6 +5234,20 @@ public enum LauncherLayout {
         return folderPreviewGlyphFlightDuration
     }
 
+    /// FOLDER-GLYPH-REVEAL-WHEN-HIDDEN-01: an on-screen return keeps member
+    /// icons hidden so they do not pop into the shrinking panel. Hide orders
+    /// the window out and then commits that return. The panel is no longer
+    /// on screen, so those icons must come back. Leaving them at alpha 0
+    /// counts as placeholder residue and can stay blank until a later
+    /// configure. An opening flight always reveals. Does not page.
+    public static func folderGlyphFlightShouldRevealCells(
+        returningHome: Bool,
+        panelStillClosingOnScreen: Bool
+    ) -> Bool {
+        if !returningHome { return true }
+        return !panelStillClosingOnScreen
+    }
+
     /// Fly the preview glyphs into the open folder. Reduced motion does not
     /// travel. An unusable frame, a repeated id, or a hop shorter than a
     /// point stays put. Icons start together; a stagger would break the one gesture.
@@ -2990,6 +5345,15 @@ public enum LauncherLayout {
 
     /// CAAnimation key for Direct's overflow open fade (icon + title).
     public static let folderOverflowOpenFadeAnimationKey = "overflow-open-fade"
+    /// New-folder spring / dissolve scale. Not removed on completion.
+    public static let folderCreatedAnimationKey = "folder-created"
+    /// New-folder opacity reveal. Not removed on completion. Model opacity
+    /// can still be 0 while this animation is attached.
+    public static let folderCreatedOpacityAnimationKey = "folder-created-opacity"
+    /// Merge-preview plate fade. The model opacity is already 1.
+    public static let folderMergePlateAnimationKey = "folder-merge-plate"
+    /// Merge-preview plate grow. The model transform is already identity.
+    public static let folderMergePlateScaleAnimationKey = "folder-merge-plate-scale"
 
     /// Two app icons becoming a folder. The icon that was already on the grid
     /// lands in `destinations[0]`, the one that was dropped in `destinations[1]`.
@@ -3476,6 +5840,24 @@ public enum LauncherLayout {
         shouldAdvanceMergeFlight(isDismissing: isDismissing, isVisible: isVisible)
     }
 
+    /// DROP-LANDING-REVEAL-RETAINED-TILES-01: the cell under a reorder flight
+    /// is hidden so it does not stack on the picture. After the window orders
+    /// out, `NSCollectionView.item(at:)` is nil, so that lookup cannot uncover
+    /// the cell. Tiles remembered when they were hidden still can. A lookup
+    /// finds those same cells while the window is up, and finds none once it
+    /// is hidden. The overlap is not a second set, and a lookup with nothing
+    /// remembered is not a cell this flight parked. Does not page.
+    public static func dropLandingShouldRevealRetainedTiles(
+        retainedHiddenTileCount: Int,
+        collectionLookupCount: Int
+    ) -> Bool {
+        let retained = max(retainedHiddenTileCount, 0)
+        let lookup = max(collectionLookupCount, 0)
+        let rememberedBeyondLookup = retained > lookup ? retained - lookup : 0
+        let rememberedAlsoLookedUp = min(retained, lookup)
+        return rememberedBeyondLookup + rememberedAlsoLookedUp > 0
+    }
+
     public static func shouldSnapInFlightDropLanding(isDismissing: Bool, isVisible: Bool) -> Bool {
         shouldSnapInFlightMergeFlight(isDismissing: isDismissing, isVisible: isVisible)
     }
@@ -3499,6 +5881,47 @@ public enum LauncherLayout {
         isVisible: Bool
     ) -> Bool {
         !shouldHoldFolderChromeAnimation(isDismissing: isDismissing, isVisible: isVisible)
+    }
+
+    /// What to do with folder chrome that is still moving after the window
+    /// has already been ordered out. The hold path never pinned it, so the
+    /// wait flag is false. A close that is already flagged has its own
+    /// commit. An opening panel lands fully open and stays open — closing
+    /// it here can change the remembered page. A close animation whose flag
+    /// already dropped is only hidden; its landing callback can move the
+    /// page, so that callback does not run. A backdrop that is still moving
+    /// under a settled panel is restyled alone. A settled open folder is
+    /// left for the next appearance. A visible window keeps playing.
+    /// Does not page.
+    public enum UnpinnedFolderChromeFinish: Equatable, Sendable {
+        case none
+        case commitOpen
+        case commitCloseVisual
+        case backdropOnly
+    }
+
+    /// FOLDER-CHROME-FINISH-WHEN-HIDDEN-01.
+    public static func unpinnedFolderChromeFinish(
+        isVisible: Bool,
+        panelOpening: Bool,
+        panelClosing: Bool,
+        backdropAnimating: Bool,
+        alreadyWaiting: Bool,
+        isAnimatingClose: Bool
+    ) -> UnpinnedFolderChromeFinish {
+        if isVisible || alreadyWaiting || isAnimatingClose {
+            return .none
+        }
+        if panelClosing {
+            return .commitCloseVisual
+        }
+        if panelOpening {
+            return .commitOpen
+        }
+        if backdropAnimating {
+            return .backdropOnly
+        }
+        return .none
     }
 
     /// Search and the grid crossfade when a query starts or clears. That fade
@@ -3554,6 +5977,162 @@ public enum LauncherLayout {
         !shouldHoldDissolvedGridFade(isDismissing: isDismissing, isVisible: isVisible)
     }
 
+    /// Hide can run after the window is already ordered out, so the hold
+    /// path never pins the animation and the wait flag stays false. The
+    /// named animation is still attached. Finish it. A visible window keeps
+    /// playing. Search crossfade, toast fade, launch press, the dissolved-grid
+    /// fade, the chrome opacity fades, the tile focus fill, the folder title
+    /// underline, and the page-arrow presence fade share this gate. Does not
+    /// page.
+    public static func shouldFinishUnpinnedHiddenAnimation(
+        isVisible: Bool,
+        animationStillAttached: Bool
+    ) -> Bool {
+        !isVisible && animationStillAttached
+    }
+
+    /// Where a presentation-backed opacity fade should sit once the window
+    /// is already hidden. The model opacity is the destination written
+    /// before the animation attached. Near zero is a hide: park the view
+    /// hidden at full opacity, matching the hide completion. Anything else
+    /// is already shown. A text swap dips through clear opacity and still
+    /// owns its completion, so a clear model is left alone when
+    /// `parkHiddenWhenClear` is false. A visible window keeps playing.
+    /// Does not page, and does not move page-dot weight.
+    public enum UnpinnedOpacityFadeLanding: Equatable, Sendable {
+        case leave
+        case shown
+        case hiddenParked
+    }
+
+    /// CHROME-OPACITY-FADE-FINISH-WHEN-HIDDEN-01.
+    public static func unpinnedOpacityFadeLanding(
+        isVisible: Bool,
+        animationStillAttached: Bool,
+        modelOpacity: CGFloat,
+        parkHiddenWhenClear: Bool
+    ) -> UnpinnedOpacityFadeLanding {
+        guard shouldFinishUnpinnedHiddenAnimation(
+            isVisible: isVisible,
+            animationStillAttached: animationStillAttached
+        ) else { return .leave }
+        if modelOpacity <= 0.01 {
+            if parkHiddenWhenClear {
+                return .hiddenParked
+            }
+            return .leave
+        }
+        return .shown
+    }
+
+    /// Where a tile focus fill should sit once the window is already hidden.
+    /// The model color is the destination written before the animation
+    /// attached. Near zero is a resting tile: white at alpha 0 still paints
+    /// a well, so the fade-out completion clears it to nil. A visible fill
+    /// keeps that model color. A visible window keeps playing. Does not page,
+    /// and does not move page-dot weight.
+    public enum UnpinnedTileChromeFillLanding: Equatable, Sendable {
+        case leave
+        case clear
+        case keepModel
+    }
+
+    /// TILE-CHROME-FILL-FINISH-WHEN-HIDDEN-01.
+    public static func unpinnedTileChromeFillLanding(
+        isVisible: Bool,
+        animationStillAttached: Bool,
+        modelAlpha: CGFloat
+    ) -> UnpinnedTileChromeFillLanding {
+        guard shouldFinishUnpinnedHiddenAnimation(
+            isVisible: isVisible,
+            animationStillAttached: animationStillAttached
+        ) else { return .leave }
+        if modelAlpha <= 0.01 { return .clear }
+        return .keepModel
+    }
+
+    /// Which leftover tile flight is still attached after the window is hidden.
+    public enum UnpinnedTileFlightKind: Equatable, Sendable {
+        case folderLanding
+        case mergePlate
+        case overflowOpenFade
+    }
+
+    /// Where that flight should sit. A folder landing and a merge plate
+    /// land fully shown: the landing's model opacity can still be 0, and
+    /// the plate's presentation can still be mid-grow. An overflow fade
+    /// already wrote opacity 1, so only the named animation comes off.
+    /// Forcing that alpha would also rewrite a pin that had already removed
+    /// the fade. A visible window keeps playing.
+    public enum UnpinnedTileFlightFinish: Equatable, Sendable {
+        case leave
+        case commitShown
+        case removeNamedFade
+    }
+
+    /// FOLDER-LANDING-FINISH-WHEN-HIDDEN-01
+    /// MERGE-PLATE-AND-OVERFLOW-FINISH-WHEN-HIDDEN-01.
+    /// Hide that starts after the window is ordered out never pins these,
+    /// and a dropped token or a nil plate pointer never reaches the
+    /// deferred commit. Finish only while hidden and still attached.
+    /// Does not page, and does not close the folder.
+    public static func unpinnedTileFlightFinish(
+        kind: UnpinnedTileFlightKind,
+        isVisible: Bool,
+        animationStillAttached: Bool
+    ) -> UnpinnedTileFlightFinish {
+        guard shouldFinishUnpinnedHiddenAnimation(
+            isVisible: isVisible,
+            animationStillAttached: animationStillAttached
+        ) else { return .leave }
+        switch kind {
+        case .folderLanding, .mergePlate:
+            return .commitShown
+        case .overflowOpenFade:
+            return .removeNamedFade
+        }
+    }
+
+    /// Where a page-arrow presence fade should sit once the window is hidden.
+    /// The model opacity is the destination written before the animation
+    /// attached. Near zero means the arrow was becoming unavailable: hide it
+    /// now, because the fade's completion would do that later and can still
+    /// hide a button the next show already revealed. A shown model only drops
+    /// the named fade. The hidden window still parks opacity at 0 afterwards
+    /// so the next appearance does not flash a half-faded arrow. A visible
+    /// window keeps playing. Does not page, and does not move page-dot weight.
+    public enum UnpinnedPageArrowPresenceLanding: Equatable, Sendable {
+        case leave
+        case hideUnavailable
+        case dropOpacity
+    }
+
+    /// PAGE-ARROW-PRESENCE-FINISH-WHEN-HIDDEN-01.
+    public static func unpinnedPageArrowPresenceLanding(
+        isVisible: Bool,
+        presenceStillAttached: Bool,
+        modelOpacity: CGFloat
+    ) -> UnpinnedPageArrowPresenceLanding {
+        guard shouldFinishUnpinnedHiddenAnimation(
+            isVisible: isVisible,
+            animationStillAttached: presenceStillAttached
+        ) else { return .leave }
+        if modelOpacity <= 0.01 { return .hideUnavailable }
+        return .dropOpacity
+    }
+
+    /// DISSOLVED-GRID-FADE-FINISH-WHEN-HIDDEN-01. Same rule as
+    /// `shouldFinishUnpinnedHiddenAnimation`.
+    public static func shouldFinishUnpinnedDissolvedGridFade(
+        isVisible: Bool,
+        fadeStillAttached: Bool
+    ) -> Bool {
+        shouldFinishUnpinnedHiddenAnimation(
+            isVisible: isVisible,
+            animationStillAttached: fadeStillAttached
+        )
+    }
+
     /// A page turn slides the two hosts until the animation ends. Ignoring the
     /// completion still lets those hosts travel to the destination under the
     /// fade. Hold only while the fade is up. A hidden window, or a cancelled
@@ -3593,6 +6172,45 @@ public enum LauncherLayout {
         case pageButtonHover
         case toastFade
         case dropLanding
+    }
+
+    /// Flyers and chrome that must already be gone when the grid is prepared
+    /// to appear again. `placeholders` is the caller's stuck-icon count.
+    /// Dissolved-grid fade and folder chrome are part of this count: a held
+    /// fade, a scatter flyer, or a folder panel still on screen is a layer.
+    public struct DismissalVisualResidue: Equatable, Sendable {
+        public var layers: Int
+        public var placeholders: Int
+
+        public init(layers: Int, placeholders: Int) {
+            self.layers = layers
+            self.placeholders = placeholders
+        }
+    }
+
+    public static func dismissalVisualResidue(
+        mergeFlyerAttached: Bool,
+        dropLandingAttached: Bool,
+        mergePreviewFlyerCount: Int,
+        previewGlyphFlyerCount: Int,
+        folderAnimatingClose: Bool,
+        dissolveScatterFlyerCount: Int,
+        dissolvedGridFadeStillHeld: Bool,
+        folderChromeStillHeld: Bool,
+        folderOverlayVisible: Bool,
+        placeholderIconCount: Int
+    ) -> DismissalVisualResidue {
+        var layers = 0
+        if mergeFlyerAttached { layers += 1 }
+        if dropLandingAttached { layers += 1 }
+        layers += max(mergePreviewFlyerCount, 0)
+        layers += max(previewGlyphFlyerCount, 0)
+        if folderAnimatingClose { layers += 1 }
+        layers += max(dissolveScatterFlyerCount, 0)
+        if dissolvedGridFadeStillHeld { layers += 1 }
+        if folderChromeStillHeld { layers += 1 }
+        if folderOverlayVisible { layers += 1 }
+        return DismissalVisualResidue(layers: layers, placeholders: max(placeholderIconCount, 0))
     }
 
     /// Historical order of `applyDeferredVisualState()` — do not reorder.
@@ -3655,6 +6273,113 @@ public enum LauncherLayout {
         .reorderSlideLand,
         .dropLanding
     ]
+
+    /// Historical order of `settleInFlightVisualsForDismissal()` — do not
+    /// reorder. Direct walks this list; a new in-flight settle is a new
+    /// case, not another call site in `hide()`. Does not page.
+    public enum DismissalSettleSlot: String, CaseIterable, Equatable, Sendable {
+        case reorderSlide
+        case folderLanding
+        case mergeFlight
+        case dropLanding
+        case folderChrome
+        case searchChrome
+        case dissolvedGridFade
+        case launchFeedback
+        case pageButtonHover
+        case toastFade
+    }
+
+    public static let dismissalSettleOrder: [DismissalSettleSlot] = [
+        .reorderSlide,
+        .folderLanding,
+        .mergeFlight,
+        .dropLanding,
+        .folderChrome,
+        .searchChrome,
+        .dissolvedGridFade,
+        .launchFeedback,
+        .pageButtonHover,
+        .toastFade
+    ]
+
+    /// Historical order of `finishUnpinnedHiddenChromeFades()` — do not
+    /// reorder. These are not deferred visual slots: a hide that starts
+    /// after the window is already ordered out never pins them. Does not page.
+    public enum HiddenChromeFinishSlot: String, CaseIterable, Equatable, Sendable {
+        case pageIndicator
+        case footerFades
+        case statusFades
+        case tileChromeFills
+        case folderTitleUnderline
+        case launcherPresence
+        case previewPlateClock
+        case folderTileFlights
+    }
+
+    public static let hiddenChromeFinishOrder: [HiddenChromeFinishSlot] = [
+        .pageIndicator,
+        .footerFades,
+        .statusFades,
+        .tileChromeFills,
+        .folderTitleUnderline,
+        .launcherPresence,
+        .previewPlateClock,
+        .folderTileFlights
+    ]
+
+    /// HIDDEN-FINISH-REGISTRY-01 stage 1: opacity fades only. A key that is
+    /// not in this list (toast, search crossfade, page-host, tile fill) must
+    /// not register. `parkHiddenWhenClear` is per view — the footer and
+    /// status text swaps share a key with single-purpose fades.
+    public enum HiddenFinishPolicy: Equatable, Sendable {
+        case opacity(parkHiddenWhenClear: Bool)
+    }
+
+    public static let hiddenFinishStage1AnimationKeys: Set<String> = [
+        pageIndicatorFadeAnimationKey,
+        footerHintFadeAnimationKey,
+        statusChromeFadeAnimationKey,
+        searchAdjacentChromeFadeAnimationKey
+    ]
+
+    public static func hiddenFinishStage1Policy(
+        animationKey: String,
+        parkHiddenWhenClear: Bool
+    ) -> HiddenFinishPolicy? {
+        guard hiddenFinishStage1AnimationKeys.contains(animationKey) else { return nil }
+        return .opacity(parkHiddenWhenClear: parkHiddenWhenClear)
+    }
+
+    /// Same landing as `unpinnedOpacityFadeLanding`. Nil means the policy is
+    /// not a stage-1 opacity fade (no later stages yet).
+    public static func hiddenFinishLanding(
+        policy: HiddenFinishPolicy,
+        isVisible: Bool,
+        animationStillAttached: Bool,
+        modelOpacity: CGFloat
+    ) -> UnpinnedOpacityFadeLanding? {
+        switch policy {
+        case .opacity(let parkHiddenWhenClear):
+            return unpinnedOpacityFadeLanding(
+                isVisible: isVisible,
+                animationStillAttached: animationStillAttached,
+                modelOpacity: modelOpacity,
+                parkHiddenWhenClear: parkHiddenWhenClear
+            )
+        }
+    }
+
+    /// A stage-1 record whose animation has already detached will never land
+    /// later. Drop it so hide cycles cannot accumulate finished leftovers,
+    /// including when the view has already been released and only the layer
+    /// pointer is still alive. A still-attached fade stays registered so a
+    /// later hide can finish it, or so a visible window can keep playing.
+    public static func shouldUnregisterHiddenFinishRecord(
+        animationStillAttached: Bool
+    ) -> Bool {
+        !animationStillAttached
+    }
 
     /// App and system preferences can change independently. Only a change in
     /// their effective result should interrupt an animation already in flight.
@@ -3786,6 +6511,31 @@ public enum LauncherLayout {
     /// the launch pulse.
     public static func shouldHoldReorderSlide(isDismissing: Bool, isVisible: Bool) -> Bool {
         shouldHoldLaunchFeedback(isDismissing: isDismissing, isVisible: isVisible)
+    }
+
+    /// Ordered-out collection views report no visible items. The cells are
+    /// still in the hierarchy and their reorder springs keep running. Walk
+    /// those cells only while the window is hidden. A visible window keeps
+    /// using the collection view's visible items. Does not page.
+    public static func shouldVisitReorderSlidesOutsideVisibleItems(isVisible: Bool) -> Bool {
+        !isVisible
+    }
+
+    /// REORDER-SLIDE-FINISH-WHEN-HIDDEN-01. A hidden window never pinned
+    /// this slide, or pinned it and then the collection view stopped
+    /// calling the cell visible. Stop the clock. The caller jumps to the
+    /// gap only while the drag is still down. A drag that ended stays on
+    /// the frame already drawn. An idle cell is left alone. A visible
+    /// window is not this path. Does not page.
+    public static func shouldFinishReorderSlideOnHiddenWindow(
+        isVisible: Bool,
+        clockRunning: Bool,
+        presentedMatchesTarget: Bool,
+        alreadyHeld: Bool
+    ) -> Bool {
+        guard !isVisible else { return false }
+        if alreadyHeld { return true }
+        return clockRunning || !presentedMatchesTarget
     }
 
     /// Reduced motion: neighbor reorder slide snaps to the gap (no 0.18s spring).
@@ -4126,6 +6876,39 @@ public enum LauncherLayout {
         hasFieldEditor || pointerEditingAvailable
     }
 
+    /// XCTest `typeText` on a SearchField/TextField requires AX focus on that
+    /// element. The field editor is often a window child, so report the client
+    /// field as focused while its editor owns first responder.
+    public static func launcherTextFieldReportsAccessibilityFocus(
+        hasFieldEditor: Bool
+    ) -> Bool {
+        hasFieldEditor
+    }
+
+    /// Under UI fixtures the panel remaps RootView AX focus to the search
+    /// field so `app.typeText` has a framed target. Report the search field
+    /// as focused in that case even before the field editor is up, so
+    /// synthesized keys reach the key window (RootView.beginSearch).
+    public static func searchFieldReportsAccessibilityFocus(
+        hasFieldEditor: Bool,
+        testLayoutActive: Bool,
+        rootViewIsFirstResponder: Bool
+    ) -> Bool {
+        if hasFieldEditor { return true }
+        return testLayoutActive && rootViewIsFirstResponder
+    }
+
+    /// Test fixtures may begin folder rename while chrome is still landing.
+    /// Keyboard focus must use the same bypass as pointer begin, or
+    /// `makeFirstResponder` fails and AM never gets a field editor.
+    public static func folderTitleKeyboardFocusAvailable(
+        hasFieldEditor: Bool,
+        pointerEditingAvailable: Bool,
+        allowTestLayoutBegin: Bool
+    ) -> Bool {
+        hasFieldEditor || pointerEditingAvailable || allowTestLayoutBegin
+    }
+
     /// Losing key ends the search field editor. Unfinished pinyin is dropped
     /// without a text-change callback, so the result list would keep matching
     /// a query the field no longer shows. Confirmed characters stay. A field
@@ -4223,12 +7006,708 @@ public enum LauncherLayout {
         !isDismissing
     }
 
+    /// TILE-ICON-RESTART-AFTER-CANCEL-ON-SHOW-01: hide cancelled an in-flight
+    /// tile decode; the next appearance must start it again unless a deferred
+    /// image already waited out the fade (applyDeferredLoadedIcon covers that).
+    public static func shouldRestartCancelledTileIconLoad(
+        cancelledForDismissal: Bool,
+        hasInFlightLoad: Bool,
+        holdsDeferredIcon: Bool
+    ) -> Bool {
+        cancelledForDismissal && !hasInFlightLoad && !holdsDeferredIcon
+    }
+
+    /// ICON-PREFETCH-RESTART-ON-SHOW-01: hide cancelled background prefetch;
+    /// the next appearance must warm icons again when the catalog is non-empty.
+    public static func shouldRestartIconPrefetchAfterAppearance(
+        cancelledForDismissal: Bool,
+        catalogIsEmpty: Bool
+    ) -> Bool {
+        cancelledForDismissal && !catalogIsEmpty
+    }
+
+    /// SEARCH-KEYBOARD-HIGHLIGHT-CLEAR-ON-HIDE-01: drop search keyboard-open
+    /// chrome under the fade so the next show does not flash a stale ring.
+    public static func shouldClearSearchKeyboardHighlightOnHide(hasHighlight: Bool) -> Bool {
+        hasHighlight
+    }
+
+    /// UNAVAILABLE-ROOT-TOAST-DEDUP-01: re-announce only when the unavailable
+    /// root set changes. Clearing the set resets the remembered announcement.
+    public static func shouldAnnounceUnavailableRootsToast(
+        previouslyAnnouncedPaths: Set<String>,
+        currentUnavailablePaths: [URL]
+    ) -> Bool {
+        let current = Set(currentUnavailablePaths.map(\.path))
+        guard !current.isEmpty else { return false }
+        return current != previouslyAnnouncedPaths
+    }
+
+    /// Paths to remember after observing a scan's unavailable roots (empty → clear).
+    public static func announcedUnavailableRootPaths(
+        afterObserving currentUnavailablePaths: [URL]
+    ) -> Set<String> {
+        Set(currentUnavailablePaths.map(\.path))
+    }
+
+    /// TRUNCATED-ROOT-TOAST-DEDUP-01: re-announce only when the truncated
+    /// root set changes. Clearing the set resets the remembered announcement.
+    public static func shouldAnnounceTruncatedRootsToast(
+        previouslyAnnouncedPaths: Set<String>,
+        currentTruncatedPaths: [URL]
+    ) -> Bool {
+        let current = Set(currentTruncatedPaths.map(\.path))
+        guard !current.isEmpty else { return false }
+        return current != previouslyAnnouncedPaths
+    }
+
+    /// Paths to remember after observing a scan's truncated roots (empty → clear).
+    public static func announcedTruncatedRootPaths(
+        afterObserving currentTruncatedPaths: [URL]
+    ) -> Set<String> {
+        Set(currentTruncatedPaths.map(\.path))
+    }
+
+    /// SAMPLING-FLAG-CLEAR-ON-HIDE-01: hide invalidates the rearrange token;
+    /// clear the sampling busy flags so the next show can start a new sort
+    /// without waiting for the abandoned sample Task to finish.
+    public static func shouldClearIconSamplingFlagsOnHide(
+        isSamplingIconColors: Bool,
+        isSamplingAppDates: Bool
+    ) -> Bool {
+        isSamplingIconColors || isSamplingAppDates
+    }
+
+    /// REARRANGE-PROGRESS-TOAST-CLEAR-ON-HIDE-01 /
+    /// REARRANGE-PROGRESS-TOAST-CLEAR-ON-SKIP-01: peel color/date progress
+    /// toasts when hide invalidates a sample, or when the sample finishes
+    /// but the rearrange is not applied.
+    public static func shouldClearRearrangeProgressToast(
+        progressToastVisible: Bool
+    ) -> Bool {
+        progressToastVisible
+    }
+
     /// The desktop thumbnail is decoded off the main thread. It can finish
     /// during the fade and replace the wallpaper under it. Wait out the fade,
     /// and let a hidden window take the image immediately. Same rule as a
     /// decoded app icon.
     public static func shouldApplyDesktopBackground(isDismissing: Bool) -> Bool {
         shouldApplyLoadedIcon(isDismissing: isDismissing)
+    }
+
+    /// A thumbnail decoded during the dismiss fade is held, and the request
+    /// already recorded its URL, point size, and scale. The next appearance
+    /// therefore skips a new decode. Install the held image, or the previous
+    /// thumbnail stays on screen. A fade that is still running keeps holding.
+    public static func shouldInstallHeldDesktopBackgroundOnAppearance(
+        holdsDecodedImage: Bool,
+        isDismissing: Bool
+    ) -> Bool {
+        holdsDecodedImage && shouldApplyDesktopBackground(isDismissing: isDismissing)
+    }
+
+    /// The request records its URL, point size, and scale before a thumbnail
+    /// exists. A failed decode must not count as that load. Installing nil
+    /// would clear the picture already on screen, and the next update would
+    /// skip because the identity still matches. Forget the request and keep
+    /// the previous thumbnail.
+    public static func shouldForgetFailedDesktopBackgroundRequest(producedImage: Bool) -> Bool {
+        !producedImage
+    }
+
+    /// One automatic retry after a failed thumbnail. A second failure waits
+    /// for the next appearance or display change, so an unreadable file does
+    /// not decode forever.
+    public static func shouldRetryDesktopBackgroundAfterFailedDecode(alreadyRetried: Bool) -> Bool {
+        !alreadyRetried
+    }
+
+    /// The single retry counts only when it can actually start. No screen, or
+    /// no desktop image URL, used to set the retry flag and then return, so
+    /// that one attempt was gone until the next appearance. Leave the flag
+    /// alone and let the next show or display change try. Does not page.
+    public static func shouldStartDesktopBackgroundDecodeRetry(
+        alreadyRetried: Bool,
+        hasScreen: Bool,
+        hasDesktopImageURL: Bool
+    ) -> Bool {
+        shouldRetryDesktopBackgroundAfterFailedDecode(alreadyRetried: alreadyRetried)
+            && hasScreen
+            && hasDesktopImageURL
+    }
+
+    /// Wallpaper blur is a user preference. System "reduce transparency"
+    /// hides that blur without writing the preference, so turning the system
+    /// setting off brings it back. The dim overlay stays. Does not page.
+    public static func shouldBlurDesktopBackground(
+        preferenceEnabled: Bool,
+        systemReducesTransparency: Bool
+    ) -> Bool {
+        preferenceEnabled && !systemReducesTransparency
+    }
+
+    // MARK: - DISPLAY-SECONDARY-LAYOUT-01
+
+    /// Fullscreen (or centered test) frame for the launcher panel on a screen.
+    /// `show()` must use the *target* screen's frame, not a cached primary size.
+    public static func launcherWindowFrame(
+        for screenFrame: CGRect,
+        testSize: CGSize?
+    ) -> CGRect {
+        guard let testSize else { return screenFrame }
+        return CGRect(
+            x: screenFrame.midX - testSize.width / 2,
+            y: screenFrame.midY - testSize.height / 2,
+            width: testSize.width,
+            height: testSize.height
+        )
+    }
+
+    /// Historical search-chrome offset from the top of a full-screen frame.
+    /// Kept as the floor so a 24 pt menu bar still yields this exact inset.
+    public static let searchChromeDefaultTopInset: CGFloat = 34
+    /// Gap between the bottom of the menu bar / notch and the search field.
+    public static let searchChromeTopGapBelowMenuBar: CGFloat = 10
+
+    /// Height of the page-indicator / hint footer stack.
+    public static let footerControlsHeight: CGFloat = 24
+    /// Distance from the card bottom to the footer stack bottom.
+    public static let footerControlsBottomInset: CGFloat = 56
+
+    /// Top inset for the search field. Only the menu bar / notch the *window*
+    /// itself covers is counted: a fullscreen launcher on a notched bar rises
+    /// so the field clears the menu, but a centered test window already inside
+    /// `visibleFrame` keeps the historical 34 pt inset. A classic 24 pt bar
+    /// plus the 10 pt gap still equals 34, so default geometry is unchanged.
+    /// `safeAreaTop` is `NSScreen.safeAreaInsets.top`. Auto-hiding the menu bar
+    /// makes `visibleFrame` reach the screen top, so the menu-bar estimate
+    /// drops out and the notch would be ignored. The safe-area band is counted
+    /// only when the window actually enters it. `windowFrame` defaults to the
+    /// screen frame (fullscreen). Does not page.
+    public static func searchChromeTopInset(
+        screenFrame: CGRect,
+        visibleFrame: CGRect,
+        windowFrame: CGRect? = nil,
+        safeAreaTop: CGFloat = 0
+    ) -> CGFloat {
+        let windowTop = windowFrame?.maxY ?? screenFrame.maxY
+        let coveredObstruction = max(0, min(windowTop, screenFrame.maxY) - visibleFrame.maxY)
+        let safe = safeAreaTop.isFinite ? max(0, safeAreaTop) : 0
+        let coversNotch = safe > 0 && windowTop > screenFrame.maxY - safe
+        let obstruction = max(coveredObstruction, coversNotch ? safe : 0)
+        return max(searchChromeDefaultTopInset, obstruction + searchChromeTopGapBelowMenuBar)
+    }
+
+    /// Top-down frames of the search chrome, paging grid, and footer inside a
+    /// launcher window. Y grows downward from the window top. The grid starts
+    /// `pagingGridViewportEndInset.top` (28) below the 36 pt search chrome and
+    /// ends `pagingGridViewportEndInset.bottom` (18) above the footer, so a
+    /// taller notch inset cannot overlap the page area.
+    public struct SearchChromeLayout: Equatable, Sendable {
+        public var topInset: CGFloat
+        public var searchChrome: CGRect
+        public var gridViewport: CGRect
+        public var footerControls: CGRect
+    }
+
+    public static func searchChromeLayout(
+        windowSize: CGSize,
+        topInset: CGFloat,
+        pageFlipDirection: LauncherPageFlipDirection = .horizontal
+    ) -> SearchChromeLayout {
+        let inset = max(0, topInset)
+        let endInset = pagingGridViewportEndInset(direction: pageFlipDirection)
+        let search = CGRect(x: 0, y: inset, width: windowSize.width, height: searchFieldHeight)
+        let gridTop = search.maxY + endInset.top
+        let footerY = windowSize.height - footerControlsBottomInset - footerControlsHeight
+        let gridHeight = max(0, footerY - endInset.bottom - gridTop)
+        let grid = CGRect(x: 0, y: gridTop, width: windowSize.width, height: gridHeight)
+        let footer = CGRect(x: 0, y: footerY, width: windowSize.width, height: footerControlsHeight)
+        return SearchChromeLayout(
+            topInset: inset,
+            searchChrome: search,
+            gridViewport: grid,
+            footerControls: footer
+        )
+    }
+
+    /// True when the search chrome, grid, or footer would collide. Callers
+    /// assert this is false at both the default and notched insets.
+    public static func searchChromeOverlapsGridOrFooter(_ layout: SearchChromeLayout) -> Bool {
+        layout.searchChrome.maxY > layout.gridViewport.minY
+            || layout.gridViewport.maxY > layout.footerControls.minY
+            || layout.searchChrome.intersects(layout.gridViewport)
+            || layout.gridViewport.intersects(layout.footerControls)
+    }
+
+    /// True when the panel moved to a different screen origin/size, or the
+    /// same point frame is now on a different backing scale, so cached grid
+    /// metrics and page-host frames must not be reused.
+    /// Scale is optional so older call sites that only know frames stay valid.
+    public static func shouldInvalidateGridViewportCacheOnScreenChange(
+        previousScreenFrame: CGRect,
+        newScreenFrame: CGRect,
+        previousBackingScale: CGFloat? = nil,
+        newBackingScale: CGFloat? = nil
+    ) -> Bool {
+        if previousScreenFrame.size != newScreenFrame.size
+            || previousScreenFrame.origin != newScreenFrame.origin {
+            return true
+        }
+        guard let previousBackingScale, let newBackingScale else { return false }
+        return previousBackingScale != newBackingScale
+    }
+
+    /// `layout()` updates flow metrics when the measured viewport changed, or
+    /// when `show()` marked geometry dirty after a screen change (including
+    /// the sticky case where the viewport size matches a previously broken
+    /// cache and would otherwise skip relayout).
+    public static func shouldUpdateGridMetrics(
+        geometryDirty: Bool,
+        viewport: CGSize,
+        lastViewport: CGSize
+    ) -> Bool {
+        guard viewport.width > 0, viewport.height > 0 else { return false }
+        return geometryDirty || viewport != lastViewport
+    }
+
+    /// Decode a new wallpaper thumbnail when the desktop image URL changes,
+    /// the target screen's point size changes, its backing scale changes
+    /// (same points on a 2x display need a larger thumbnail than a 1x display),
+    /// or the light/dark appearance changes. A dynamic picture keeps one URL
+    /// and puts the other appearance in another frame. Skip only when URL,
+    /// point size, scale, and appearance all match. Scale and appearance are
+    /// optional so callers that have not recorded them yet do not reload forever.
+    public static func shouldReloadDesktopBackgroundImage(
+        previousURL: URL?,
+        newURL: URL,
+        previousScreenSize: CGSize?,
+        newScreenSize: CGSize,
+        previousBackingScale: CGFloat? = nil,
+        newBackingScale: CGFloat = 1,
+        previousAppearance: String? = nil,
+        newAppearance: String? = nil
+    ) -> Bool {
+        if previousURL != newURL { return true }
+        guard let previousScreenSize else { return true }
+        if previousScreenSize != newScreenSize { return true }
+        if let previousBackingScale, previousBackingScale != newBackingScale { return true }
+        if let previousAppearance, let newAppearance, previousAppearance != newAppearance {
+            return true
+        }
+        return false
+    }
+
+    /// Light or dark, stored with the wallpaper request. Dynamic desktop
+    /// pictures use one file for both, so the URL alone does not change.
+    public static func desktopBackgroundAppearanceIdentity(isDark: Bool) -> String {
+        isDark ? "dark" : "light"
+    }
+
+    public static func desktopBackgroundAppearanceIsDark(_ identity: String) -> Bool {
+        identity == desktopBackgroundAppearanceIdentity(isDark: true)
+    }
+
+    /// Indices Apple stores for the light and dark frames. `apr` is the
+    /// appearance map. A solar picture keeps the same pair under `ap` and
+    /// uses it when appearance is forced. This does not pick a sun-position
+    /// frame. Missing or negative values mean the file has no such pair.
+    public struct DesktopBackgroundAppearanceIndices: Equatable, Sendable {
+        public var light: Int
+        public var dark: Int
+
+        public init(light: Int, dark: Int) {
+            self.light = light
+            self.dark = dark
+        }
+    }
+
+    public static func desktopBackgroundAppearanceIndices(
+        appearanceDictionary: NSDictionary?,
+        solarDictionary: NSDictionary?
+    ) -> DesktopBackgroundAppearanceIndices? {
+        if let indices = desktopBackgroundAppearancePair(in: appearanceDictionary) {
+            return indices
+        }
+        let solarAppearance = solarDictionary?.object(forKey: "ap") as? NSDictionary
+        return desktopBackgroundAppearancePair(in: solarAppearance)
+    }
+
+    /// Frame to decode. No map, or an index the file does not contain, stays
+    /// on the first frame so a normal picture still loads.
+    public static func desktopBackgroundImageIndex(
+        indices: DesktopBackgroundAppearanceIndices?,
+        appearanceIsDark: Bool,
+        imageCount: Int
+    ) -> Int {
+        guard imageCount > 0 else { return 0 }
+        guard let indices else { return 0 }
+        let chosen = appearanceIsDark ? indices.dark : indices.light
+        guard chosen >= 0, chosen < imageCount else { return 0 }
+        return chosen
+    }
+
+    /// `thumbnailPath` inside a `.madesktop` property list. Missing, blank,
+    /// or non-string values mean the descriptor has no picture to decode.
+    public static func desktopBackgroundDescriptorThumbnailPath(_ plist: NSDictionary?) -> String? {
+        guard let raw = plist?.object(forKey: "thumbnailPath") as? String else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return trimmed
+    }
+
+    /// A `.madesktop` file is a property list, not a picture. ImageIO cannot
+    /// decode it, so a wallpaper change onto one of these used to fail and
+    /// leave the previous picture up. The list's `thumbnailPath` is the
+    /// still Apple ships for that choice. An ordinary image URL is returned
+    /// unchanged, even if a path is passed in. A relative path is resolved
+    /// next to the descriptor. `..` and non-file schemes are refused.
+    /// This does not page and does not read a wallpaper database.
+    public static func desktopBackgroundImageURLToDecode(
+        desktopImageURL: URL,
+        descriptorThumbnailPath: String?
+    ) -> URL {
+        guard desktopImageURL.pathExtension.lowercased() == "madesktop" else {
+            return desktopImageURL
+        }
+        guard let raw = descriptorThumbnailPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else {
+            return desktopImageURL
+        }
+        let parts = raw.split(separator: "/", omittingEmptySubsequences: false)
+        if parts.contains("..") { return desktopImageURL }
+        if raw.lowercased().hasPrefix("file:") {
+            guard let parsed = URL(string: raw), parsed.isFileURL, !parsed.path.isEmpty else {
+                return desktopImageURL
+            }
+            return parsed
+        }
+        if raw.contains(":") { return desktopImageURL }
+        if raw.hasPrefix("/") { return URL(fileURLWithPath: raw) }
+        var resolved = desktopImageURL.deletingLastPathComponent()
+        for part in parts where !part.isEmpty && part != "." {
+            resolved = resolved.appendingPathComponent(String(part))
+        }
+        return resolved
+    }
+
+    /// Same-folder still named "<picture> Light" or "<picture> Dark".
+    /// Dynamic desktop choices often split the two appearances into those
+    /// files instead of frames inside the base thumbnail. A stem that is
+    /// already a variant is stripped first, so light and dark do not stack.
+    public static func desktopBackgroundAppearanceVariantURL(
+        imageURL: URL,
+        appearanceIsDark: Bool
+    ) -> URL {
+        let ext = imageURL.pathExtension
+        var stem = imageURL.deletingPathExtension().lastPathComponent
+        if stem.hasSuffix(" Light") {
+            stem = String(stem.dropLast(" Light".count))
+        } else if stem.hasSuffix(" Dark") {
+            stem = String(stem.dropLast(" Dark".count))
+        }
+        let suffix = appearanceIsDark ? " Dark" : " Light"
+        var name = stem + suffix
+        if !ext.isEmpty { name += ".\(ext)" }
+        return imageURL.deletingLastPathComponent().appendingPathComponent(name)
+    }
+
+    /// Use the appearance still only when it is a different file that exists
+    /// and is not a directory. A missing variant keeps the base thumbnail.
+    public static func shouldUseDesktopBackgroundAppearanceVariant(
+        variantURL: URL,
+        baseURL: URL,
+        variantExists: Bool,
+        variantIsDirectory: Bool
+    ) -> Bool {
+        guard variantExists, !variantIsDirectory else { return false }
+        return variantURL.standardizedFileURL.path != baseURL.standardizedFileURL.path
+    }
+
+    /// Appearance or Space changed while the launcher is up. Re-read the
+    /// desktop image. A hidden window waits for the next `show()`, which
+    /// already re-reads. Does not resize the window and does not page.
+    public static func shouldRefreshDesktopBackgroundForPictureChange(isVisible: Bool) -> Bool {
+        isVisible
+    }
+
+    private static func desktopBackgroundAppearancePair(
+        in dictionary: NSDictionary?
+    ) -> DesktopBackgroundAppearanceIndices? {
+        guard let light = desktopBackgroundMetadataIndex(dictionary?.object(forKey: "l")),
+              let dark = desktopBackgroundMetadataIndex(dictionary?.object(forKey: "d")) else {
+            return nil
+        }
+        return DesktopBackgroundAppearanceIndices(light: light, dark: dark)
+    }
+
+    /// Plist integers arrive as `NSNumber`. Booleans are numbers too; they
+    /// are not frame indexes.
+    private static func desktopBackgroundMetadataIndex(_ value: Any?) -> Int? {
+        guard let number = value as? NSNumber else { return nil }
+        if CFGetTypeID(number) == CFBooleanGetTypeID() { return nil }
+        let int = number.intValue
+        guard int >= 0 else { return nil }
+        return int
+    }
+
+    /// Thumbnail max pixel on the long edge. Point size alone is soft on retina.
+    public static func desktopBackgroundMaximumPixelSize(
+        screenSize: CGSize,
+        backingScale: CGFloat
+    ) -> Int {
+        let scale = backingScale > 0 ? backingScale : 1
+        let points = max(screenSize.width, screenSize.height)
+        return max(1, Int(ceil(max(points, 0) * scale)))
+    }
+
+    /// `contentsScale` for a thumbnail from `desktopBackgroundMaximumPixelSize`.
+    /// A hardcoded 1 resamples that retina bitmap into a 1x backing store, so
+    /// the extra pixels never reach the screen. Non-positive scales fall back
+    /// to 1, matching the pixel-size clamp.
+    public static func desktopBackgroundLayerContentsScale(backingScale: CGFloat) -> CGFloat {
+        backingScale > 0 ? backingScale : 1
+    }
+
+    /// Display reconfiguration while the launcher is already on screen
+    /// (resolution, backing scale, a screen going away) must refresh the
+    /// window frame and wallpaper. A hidden window waits for the next
+    /// `show()`. Dismiss and an in-flight page slide must not be resized
+    /// underneath those animations.
+    public static func shouldRefreshVisibleScreenGeometry(
+        isVisible: Bool,
+        isPaging: Bool,
+        isDismissing: Bool
+    ) -> Bool {
+        isVisible && !isPaging && !isDismissing
+    }
+
+    /// The same change arrived during a page slide. Hold it and apply once
+    /// paging is idle. Dismiss does not defer: the next `show()` reads the
+    /// screen again, and resizing under the fade would jump the card.
+    public static func shouldDeferVisibleScreenGeometry(
+        isVisible: Bool,
+        isPaging: Bool,
+        isDismissing: Bool
+    ) -> Bool {
+        isVisible && isPaging && !isDismissing
+    }
+
+    /// How long to wait before checking a refresh that was held for a page
+    /// slide. A slide lasts a few hundred milliseconds; this is one check
+    /// per interval, not a block on every run-loop pass. The page-turn
+    /// functions do not poll.
+    public static let deferredVisibleScreenGeometryRetryDelay: TimeInterval = 0.05
+
+    /// Layout may apply a held refresh once paging is idle. One apply is
+    /// queued at a time. The flag stays set until that apply runs, so a
+    /// pass that has not seen the screen yet cannot drop the request.
+    public static func shouldScheduleDeferredVisibleScreenGeometryApply(
+        deferred: Bool,
+        isPaging: Bool,
+        applyAlreadyScheduled: Bool
+    ) -> Bool {
+        deferred && !isPaging && !applyAlreadyScheduled
+    }
+
+    /// The held refresh woke up and the window has no screen. Keep the mark
+    /// and do not schedule again from every layout pass. The next display
+    /// notification calls refresh directly.
+    public static func shouldPauseDeferredVisibleScreenGeometryApply(
+        deferred: Bool,
+        screenAvailable: Bool
+    ) -> Bool {
+        deferred && !screenAvailable
+    }
+
+    /// A visible, idle launcher was told the displays changed, but
+    /// `window.screen` is nil: the old screen is gone and AppKit has not
+    /// attached this window yet. Hold the refresh. One follow-up turn may
+    /// see the screen; after that, wait for the next parameter notification
+    /// instead of scheduling from every layout pass. Paging still defers
+    /// through `shouldDeferVisibleScreenGeometry`. Dismiss and a hidden
+    /// window still wait for the next `show()`.
+    public static func shouldHoldVisibleScreenGeometryForMissingScreen(
+        isVisible: Bool,
+        isPaging: Bool,
+        isDismissing: Bool,
+        screenAvailable: Bool
+    ) -> Bool {
+        !screenAvailable && shouldRefreshVisibleScreenGeometry(
+            isVisible: isVisible,
+            isPaging: isPaging,
+            isDismissing: isDismissing
+        )
+    }
+
+    /// Settings refit uses the window's own screen. The first appearance may
+    /// fall back to the main screen so the window has somewhere to open. A
+    /// parameter notification can arrive before AppKit reattaches the window.
+    /// Fitting against the main screen in that gap moves Settings onto the
+    /// wrong display. Hold, look once on the next turn, then wait for the
+    /// next notification. This does not touch paging.
+    public static func shouldHoldSettingsScreenFitForMissingScreen(screenAvailable: Bool) -> Bool {
+        !screenAvailable
+    }
+
+    /// Which screen's work area a Settings fit should use.
+    /// An attached window uses that screen. A closed window has no
+    /// `window.screen`, but its frame still records where the user left it.
+    /// Treating that nil as the main screen pulls the window back on every
+    /// open. Reopen picks the screen with the largest overlap. The first
+    /// appearance, and a frame that no longer meets any screen, may use the
+    /// main screen. This does not touch paging.
+    public enum SettingsFitScreenChoice: Equatable {
+        case attached
+        case candidate(Int)
+        case main
+    }
+
+    public static func settingsFitScreenChoice(
+        windowFrame: CGRect,
+        hasAttachedScreen: Bool,
+        preferFrameIntersection: Bool,
+        candidateScreenFrames: [CGRect],
+        hasMainScreen: Bool
+    ) -> SettingsFitScreenChoice? {
+        if hasAttachedScreen { return .attached }
+        if preferFrameIntersection {
+            let center = CGPoint(x: windowFrame.midX, y: windowFrame.midY)
+            var bestIndex: Int?
+            var bestArea: CGFloat = 0
+            var bestContainsCenter = false
+            for (index, frame) in candidateScreenFrames.enumerated() {
+                let overlap = windowFrame.intersection(frame)
+                let area: CGFloat
+                if overlap.isNull || overlap.isInfinite || overlap.isEmpty {
+                    area = 0
+                } else {
+                    area = overlap.width * overlap.height
+                }
+                guard area > 0 else { continue }
+                let containsCenter = frame.contains(center)
+                let betterArea = area > bestArea
+                let sameAreaPrefersCenter = area == bestArea && containsCenter && !bestContainsCenter
+                if betterArea || sameAreaPrefersCenter {
+                    bestArea = area
+                    bestIndex = index
+                    bestContainsCenter = containsCenter
+                }
+            }
+            if let bestIndex {
+                return .candidate(bestIndex)
+            }
+        }
+        return hasMainScreen ? .main : nil
+    }
+
+    /// VISIBLE-SCREEN-GEOMETRY-DEFER-APPLY-01: the held change is applied
+    /// once paging is idle. Root `layout()` is not guaranteed after the
+    /// slide ends, so a caller outside the page-turn functions must check
+    /// this instead of waiting for the next unrelated layout pass.
+    public static func shouldApplyDeferredVisibleScreenGeometry(
+        deferred: Bool,
+        isVisible: Bool,
+        isPaging: Bool,
+        isDismissing: Bool
+    ) -> Bool {
+        deferred && shouldRefreshVisibleScreenGeometry(
+            isVisible: isVisible,
+            isPaging: isPaging,
+            isDismissing: isDismissing
+        )
+    }
+
+    /// The held change can no longer be applied or kept (window hidden, or
+    /// the dismiss fade started). Drop it. The next `show()` reads the screen.
+    public static func shouldDropDeferredVisibleScreenGeometry(
+        deferred: Bool,
+        isVisible: Bool,
+        isPaging: Bool,
+        isDismissing: Bool
+    ) -> Bool {
+        deferred
+            && !shouldApplyDeferredVisibleScreenGeometry(
+                deferred: deferred,
+                isVisible: isVisible,
+                isPaging: isPaging,
+                isDismissing: isDismissing
+            )
+            && !shouldDeferVisibleScreenGeometry(
+                isVisible: isVisible,
+                isPaging: isPaging,
+                isDismissing: isDismissing
+            )
+    }
+
+    /// A decode started for one screen must not paint after a newer request
+    /// (same desktop URL, different size, scale, or appearance) has taken
+    /// the slot. Cancellation of the in-flight task is not enough: the
+    /// completion also has to see the screen and appearance it was made for.
+    public static func shouldInstallDecodedDesktopBackground(
+        requestedScreenSize: CGSize,
+        requestedBackingScale: CGFloat,
+        currentScreenSize: CGSize?,
+        currentBackingScale: CGFloat?,
+        requestedAppearance: String? = nil,
+        currentAppearance: String? = nil
+    ) -> Bool {
+        guard let currentScreenSize, let currentBackingScale else { return false }
+        guard requestedScreenSize == currentScreenSize,
+              requestedBackingScale == currentBackingScale else { return false }
+        if let requestedAppearance, let currentAppearance {
+            return requestedAppearance == currentAppearance
+        }
+        return true
+    }
+
+    /// WALLPAPER-DECODE-LIVE-SCREEN-01: the async thumbnail may finish after the
+    /// window has moved to another screen. Prefer the live window screen over
+    /// the size stamped when the request started.
+    public static func shouldDiscardDecodedDesktopBackgroundForLiveScreen(
+        requestedScreenSize: CGSize,
+        requestedBackingScale: CGFloat,
+        liveScreenSize: CGSize?,
+        liveBackingScale: CGFloat?
+    ) -> Bool {
+        guard let liveScreenSize, let liveBackingScale else { return false }
+        return liveScreenSize != requestedScreenSize || liveBackingScale != requestedBackingScale
+    }
+
+    /// WINDOW-DID-CHANGE-SCREEN-01: AppKit moved the panel to another NSScreen
+    /// without a parameters notification. Refresh geometry while visible and
+    /// idle (same gates as a parameters change).
+    public static func shouldRefreshGeometryOnWindowScreenChange(
+        isVisible: Bool,
+        isPaging: Bool,
+        isDismissing: Bool
+    ) -> Bool {
+        shouldRefreshVisibleScreenGeometry(
+            isVisible: isVisible,
+            isPaging: isPaging,
+            isDismissing: isDismissing
+        )
+    }
+
+    /// DISPLAY-TARGET-APPLY-WHILE-VISIBLE-01: Settings changed「显示于」while
+    /// the launcher is already up (settings + launcher both open). Relocate
+    /// now; do not wait for the next hide/show.
+    public static func shouldApplyDisplayTargetWhileVisible(
+        isVisible: Bool,
+        isDismissing: Bool,
+        targetChanged: Bool
+    ) -> Bool {
+        targetChanged && isVisible && !isDismissing
+    }
+
+    /// SETTINGS-HIDDEN-REFRESH-ON-LAYOUT-01: hide/restore while Settings stays
+    /// open (launcher brought back) must refresh the hidden list without
+    /// waiting for becomeKey.
+    public static func shouldRefreshSettingsHiddenAppsOnLayoutChange(
+        settingsWindowVisible: Bool
+    ) -> Bool {
+        settingsWindowVisible
     }
 
     /// A toast can be requested during the fade, or after the window has
@@ -4321,6 +7800,96 @@ public enum LauncherLayout {
         isToastVisible
     }
 
+    /// TOAST-ESC-DISMISS-01: Esc clears a visible toast before closing a
+    /// folder / multi-select / search / the launcher. Matches the × button.
+    public static func shouldDismissToastOnEscape(isToastVisible: Bool) -> Bool {
+        isToastVisible
+    }
+
+    /// BLANK-CLICK-TOAST-01: wallpaper / empty-grid click matches Esc — dismiss
+    /// a visible toast before the launcher. Clicking the toast chrome itself
+    /// must not dismiss (Direct hit-tests `toastView`).
+    public static func shouldDismissToastOnBlankClick(isToastVisible: Bool) -> Bool {
+        shouldDismissToastOnEscape(isToastVisible: isToastVisible)
+    }
+
+    /// PINCH-DISMISS-LAYERED-01: one pinch-in peels one dismiss layer (toast →
+    /// folder → multi-select → launcher), matching Esc order. Search stays put
+    /// so pinch still means「收起」when idle chrome is already clear.
+    public enum PinchDismissLayer: Equatable, Sendable {
+        case dismissToast
+        case closeFolder
+        case clearSelection
+        case hideLauncher
+    }
+
+    public static func pinchDismissLayer(
+        isToastVisible: Bool,
+        folderOpen: Bool,
+        selectionCount: Int
+    ) -> PinchDismissLayer {
+        if isToastVisible { return .dismissToast }
+        if folderOpen { return .closeFolder }
+        if selectionCount > 0 { return .clearSelection }
+        return .hideLauncher
+    }
+
+    /// SETTINGS-OPEN-DISMISS-TOAST-01: drop a visible toast before Settings
+    /// covers the launcher so handoff restore does not bring it back.
+    public static func shouldDismissToastWhenOpeningSettings(isToastVisible: Bool) -> Bool {
+        settingsOpenChromeActions(for: SettingsOpenChromeSnapshot(toastVisible: isToastVisible))
+            .contains(.dismissToast)
+    }
+
+    /// SETTINGS-OPEN-CLOSE-FOLDER-01: close an open folder before Settings
+    /// handoff so restore lands on the idle grid.
+    public static func shouldCloseFolderWhenOpeningSettings(folderOpen: Bool) -> Bool {
+        settingsOpenChromeActions(for: SettingsOpenChromeSnapshot(folderOpen: folderOpen))
+            .contains(.closeFolder)
+    }
+
+    /// SEARCH-BEGIN-DISMISS-TOAST-01: type-to-search peels a visible toast so
+    /// the bubble does not float over the first results.
+    public static func shouldDismissToastWhenBeginningSearch(isToastVisible: Bool) -> Bool {
+        isToastVisible
+    }
+
+    /// ICON-MENU-DISMISS-TOAST-01: right-click / Control-click on a tile peels
+    /// toast before the context menu tracks (Esc parity for a new modal layer).
+    public static func shouldDismissToastWhenOpeningIconMenu(isToastVisible: Bool) -> Bool {
+        isToastVisible
+    }
+
+    /// APP-MENU-READONLY-REVEAL-01 / APP-MENU-UNINSTALL-SEPARATOR-01: incomplete
+    /// scan (layout editing off) keeps only the grayed uninstall item — no
+    /// 「在访达中显示」above it.
+    public static func shouldOfferRevealInFinderInAppMenu(layoutEditingEnabled: Bool) -> Bool {
+        layoutEditingEnabled
+    }
+
+    /// FOLDER-MENU-SEP-AFTER-RENAME-01: when rename and any sort share a folder
+    /// menu, separate rename from the sort group.
+    public static func shouldSeparateFolderRenameFromSorts(hasRename: Bool, hasSort: Bool) -> Bool {
+        hasRename && hasSort
+    }
+
+    /// SEARCH-FOCUS-DISMISS-TOAST-01: ⌘F / focusing search peels a visible toast.
+    public static func shouldDismissToastWhenFocusingSearch(isToastVisible: Bool) -> Bool {
+        isToastVisible
+    }
+
+    /// DRAG-BEGIN-DISMISS-TOAST-01: starting an icon drag peels toast so the
+    /// bubble does not float over the lift.
+    public static func shouldDismissToastWhenBeginningDrag(isToastVisible: Bool) -> Bool {
+        isToastVisible
+    }
+
+    /// MARQUEE-ACTIVATE-DISMISS-TOAST-01: when the selection band activates,
+    /// peel toast so it does not cover the rubber-band.
+    public static func shouldDismissToastWhenActivatingMarquee(isToastVisible: Bool) -> Bool {
+        isToastVisible
+    }
+
     /// While a folder is open or its close chrome is still traveling, a new
     /// toast would sit above the veil. Defer until folder chrome is quiet.
     public static func shouldPresentToastWhileFolderChromeQuiet(
@@ -4374,30 +7943,147 @@ public enum LauncherLayout {
         )
     }
 
-    public static func pageCount(forEntryCount count: Int) -> Int {
-        guard count > 0 else { return 0 }
-        return (count + pageCapacity - 1) / pageCapacity
+    public static func pageCount(forEntryCount count: Int, capacity: Int = pageCapacity) -> Int {
+        guard count > 0, capacity > 0 else { return 0 }
+        return (count + capacity - 1) / capacity
     }
 
-    public static func pageIndex(containingEntryAt index: Int) -> Int {
-        guard index >= 0 else { return 0 }
-        return index / pageCapacity
+    public static func pageIndex(containingEntryAt index: Int, capacity: Int = pageCapacity) -> Int {
+        guard index >= 0, capacity > 0 else { return 0 }
+        return index / capacity
     }
 
-    public static func entries(onPage page: Int, from entries: [LauncherEntry]) -> [LauncherEntry] {
-        let start = page * pageCapacity
+    public static func entries(onPage page: Int, from entries: [LauncherEntry], capacity: Int = pageCapacity) -> [LauncherEntry] {
+        let start = page * capacity
         guard page >= 0, start < entries.count else { return [] }
-        return Array(entries[start..<min(start + pageCapacity, entries.count)])
+        return Array(entries[start..<min(start + capacity, entries.count)])
+    }
+
+    /// Which collection is asking for tiles. The folder overlay is not a grid page.
+    public enum GridCollectionRole: Equatable, Sendable {
+        case active
+        case staging
+        case search
+    }
+
+    /// What that collection should realize. `.none` keeps the view in the
+    /// hierarchy but does not build a second or third copy of the visible page.
+    /// Icon bitmaps stay in the process cache either way.
+    public enum GridItemSource: Equatable, Sendable {
+        case page(Int)
+        case searchResults
+        case none
+    }
+
+    /// IDLE-GRID-DUPLICATE-TILES-01. The active grid shows the current page.
+    /// Staging shows a page only while a turn has named one. The search grid
+    /// shows hits only while a query is active. Falling back to the current
+    /// page, or to the whole catalog when idle, realizes extra tiles and
+    /// their layers after the window is ordered out. This does not choose a
+    /// page-turn animation and does not drop cached icons.
+    public static func gridItemSource(
+        role: GridCollectionRole,
+        isSearching: Bool,
+        currentPage: Int,
+        stagingPage: Int?
+    ) -> GridItemSource {
+        switch role {
+        case .search:
+            return isSearching ? .searchResults : .none
+        case .active:
+            return .page(currentPage)
+        case .staging:
+            guard let stagingPage else { return .none }
+            return .page(stagingPage)
+        }
+    }
+
+    /// After a turn the parked host still holds the page that just left.
+    /// Once paging is idle those tiles are disposable. A turn in flight must
+    /// keep them. Does not start or retarget a page transition.
+    public static func shouldReleaseParkedStagingTiles(
+        isPaging: Bool,
+        collectionHasRealizedTiles: Bool
+    ) -> Bool {
+        !isPaging && collectionHasRealizedTiles
+    }
+
+    /// The search grid is reloaded when a query starts and ends. Tiles left
+    /// behind after the query is gone are the idle duplicate. A live query
+    /// keeps its hits. Does not start a page transition.
+    public static func shouldReleaseIdleSearchGridTiles(
+        isPaging: Bool,
+        isSearching: Bool,
+        collectionHasRealizedTiles: Bool
+    ) -> Bool {
+        !isPaging && !isSearching && collectionHasRealizedTiles
     }
 
     /// Top-level entry ids on `page` only (Command-A / current-page select-all).
     /// Does not include other pages or folder members.
-    public static func itemIDs(onPage page: Int, from entries: [LauncherEntry]) -> [UUID] {
-        self.entries(onPage: page, from: entries).map(\.id)
+    public static func itemIDs(onPage page: Int, from entries: [LauncherEntry], capacity: Int = pageCapacity) -> [UUID] {
+        self.entries(onPage: page, from: entries, capacity: capacity).map(\.id)
     }
 
     public enum GridKeyboardDirection: Equatable, Sendable {
         case left, right, up, down
+    }
+
+    /// GRID-HOME-END-01. Home and End jump inside the grid that has the key.
+    /// Page Up (116) and Page Down (121) stay on their own path. Command,
+    /// Shift, Option, and Control do not take this jump. Does not turn a page.
+    public static func gridKeyboardHomeEndSlot(
+        keyCode: UInt16,
+        itemCount: Int,
+        command: Bool,
+        shift: Bool,
+        option: Bool,
+        control: Bool
+    ) -> Int? {
+        guard itemCount > 0, !command, !shift, !option, !control else { return nil }
+        switch keyCode {
+        case 115: return 0
+        case 119: return itemCount - 1
+        default: return nil
+        }
+    }
+
+    /// GRID-SHIFT-HOME-END-01. Shift-Home and Shift-End extend the selection
+    /// to the first or last item of this grid, the same range a Shift-click
+    /// would make. Other modifiers stay out. Does not turn a page.
+    public static func gridKeyboardShiftHomeEnd(
+        keyCode: UInt16,
+        focusedID: UUID,
+        presentedOrder: [UUID],
+        shift: Bool,
+        command: Bool,
+        option: Bool,
+        control: Bool,
+        current: LauncherItemSelection
+    ) -> GridKeyboardShiftStep? {
+        guard shift, !command, !option, !control else { return nil }
+        let targetSlot: Int
+        switch keyCode {
+        case 115: targetSlot = 0
+        case 119: targetSlot = presentedOrder.count - 1
+        default: return nil
+        }
+        guard presentedOrder.indices.contains(targetSlot) else { return nil }
+        let focusID = presentedOrder[targetSlot]
+        var base = current
+        if base.rangeAnchorID == nil {
+            let ids = base.contains(focusedID) ? base.orderedIDs : base.orderedIDs + [focusedID]
+            base = LauncherItemSelection(orderedIDs: ids, rangeAnchorID: focusedID)
+        }
+        return GridKeyboardShiftStep(
+            selection: LauncherItemSelection.applyingRange(
+                to: focusID,
+                presentedOrder: presentedOrder,
+                current: base
+            ),
+            focusID: focusID,
+            consumesKey: true
+        )
     }
 
     /// Arrow keys only. Page Up (116) and Page Down (121) stay on the paging path.
@@ -4599,8 +8285,32 @@ public enum LauncherLayout {
 
     /// Typing another letter from a result or a chrome control continues the
     /// query. It must not replace the letters already there.
+    /// SEARCH-QUERY-SANITIZE-01: paste / insertText can carry newlines, tabs,
+    /// C0/C1 controls, or NS function-key scalars. Those must not open a
+    /// multi-line search or show tofu. Spaces the user typed stay; only
+    /// newlines and tabs become a single space. Does not page.
+    /// Upper bound on a typed or pasted search query, in graphemes. Longer
+    /// input is clipped so typo / pinyin ranking stays bounded.
+    public static let maximumSearchQueryLength = 256
+
+    public static func sanitizedSearchInput(_ raw: String) -> String {
+        var out = String.UnicodeScalarView()
+        for scalar in raw.unicodeScalars {
+            if CharacterSet.newlines.contains(scalar) || scalar == "\t" {
+                out.append(" ")
+                continue
+            }
+            if CharacterSet.controlCharacters.contains(scalar) { continue }
+            if isNSFunctionKeyScalar(scalar) { continue }
+            out.append(scalar)
+        }
+        let cleaned = String(out)
+        if cleaned.count <= maximumSearchQueryLength { return cleaned }
+        return String(cleaned.prefix(maximumSearchQueryLength))
+    }
+
     public static func searchQueryAppending(_ query: String, _ characters: String) -> String {
-        query + characters
+        sanitizedSearchInput(query + characters)
     }
 
     /// A letter typed on the grid opens search. `.interpret` hands that event
@@ -4626,16 +8336,173 @@ public enum LauncherLayout {
         return .interpret
     }
 
+    /// Horizontal flip: Up/Down reaching the root view means no tile holds
+    /// keyboard focus. They never page or open search there. Like Launchpad,
+    /// that first vertical arrow lands focus on the first tile of the current
+    /// page so the next arrow walks the grid (GRID-KEY-WALK). Not while a
+    /// folder is open, a query is up, or a page transition is running.
+    /// Vertical flip keeps Up/Down as paging. Does not page.
+    public static func rootVerticalArrowFocusesFirstGridItem(
+        flipIsHorizontal: Bool,
+        folderOpen: Bool,
+        isSearching: Bool,
+        isPaging: Bool
+    ) -> Bool {
+        flipIsHorizontal && !folderOpen && !isSearching && !isPaging
+    }
+
+    /// Apple maps arrows / F-keys / nav keys to private-use scalars
+    /// U+F700…U+F8FF in `NSEvent.characters`. Those are not
+    /// `CharacterSet.controlCharacters`, so a naive "printable" check
+    /// would treat ↑ as text and open type-to-search with tofu boxes.
+    public static func isNSFunctionKeyScalar(_ scalar: Unicode.Scalar) -> Bool {
+        (0xF700...0xF8FF).contains(scalar.value)
+    }
+
+    /// True when `string` has a character that should open or extend
+    /// type-to-search. Control characters and NS function-key scalars
+    /// (arrows, F-keys) do not count. Does not page.
+    public static func hasPrintableSearchCharacter(_ string: String) -> Bool {
+        string.unicodeScalars.contains { scalar in
+            !CharacterSet.controlCharacters.contains(scalar)
+                && !isNSFunctionKeyScalar(scalar)
+        }
+    }
+
+    /// After the built-in search cancel / clear empties `stringValue`, the
+    /// field editor can still hold leftover query text (including function-key
+    /// tofu). Callers must abort that editor and force an empty committed
+    /// string before `isSearching` / chrome can leave search. An input method
+    /// composition (`editingHasMarkedText`) over an empty committed string is
+    /// a normal in-progress state, not leftover: aborting it would drop the
+    /// half-typed pinyin, so it never forces a clear (same rule as the
+    /// text-change clear path). Does not page.
+    public static func searchCancelRequiresForcedEmpty(
+        committed: String,
+        editing: String?,
+        editingHasMarkedText: Bool = false
+    ) -> Bool {
+        if !committed.isEmpty { return true }
+        if editingHasMarkedText { return false }
+        if let editing, !editing.isEmpty { return true }
+        return false
+    }
+
+    /// SEARCH-CANCEL-BUTTON-ABORTS-IME-01: NSSearchField cancel (×) always
+    /// tears down search chrome, including an in-progress IME composition.
+    /// Distinct from `searchCancelRequiresForcedEmpty`, which protects marked
+    /// text on Esc / text-change paths. Does not page.
+    public static func searchCancelButtonRequiresForcedEmpty(
+        committed: String,
+        editing: String?,
+        editingHasMarkedText: Bool
+    ) -> Bool {
+        if !committed.isEmpty { return true }
+        if editingHasMarkedText { return true }
+        if let editing, !editing.isEmpty { return true }
+        return false
+    }
+
+    /// SEARCH-CANCEL-VISIBLE-DURING-IME-01: AppKit draws the cancel button
+    /// only when the committed string is non-empty. Marked pinyin lives in
+    /// the field editor, so × disappears for the whole composition. Show it
+    /// for that editor text too. Does not page.
+    public static func searchFieldShowsCancelButton(
+        committed: String,
+        editing: String?,
+        editingHasMarkedText: Bool
+    ) -> Bool {
+        searchCancelButtonRequiresForcedEmpty(
+            committed: committed,
+            editing: editing,
+            editingHasMarkedText: editingHasMarkedText
+        )
+    }
+
+    /// SEARCH-CANCEL-AX-DURING-IME-01 / SEARCH-CANCEL-AX-WHEN-COMMITTED-01:
+    /// AppKit's cancel button can be missing from `accessibilityChildren`
+    /// both during marked pinyin (committed string empty) and after a
+    /// committed query, especially once the field/cell override that array.
+    /// Append one synthetic button whenever the × is visible and AppKit did
+    /// not already include it. An idle empty field stays unchanged.
+    /// Does not page.
+    public static func searchCancelAccessibilityShouldAppendSynthetic(
+        committed: String,
+        editing: String?,
+        editingHasMarkedText: Bool,
+        systemAlreadyIncludesCancel: Bool
+    ) -> Bool {
+        if systemAlreadyIncludesCancel { return false }
+        return searchFieldShowsCancelButton(
+            committed: committed,
+            editing: editing,
+            editingHasMarkedText: editingHasMarkedText
+        )
+    }
+
+    /// SEARCH-CANCEL-AX-CHILDREN-CHANGED-DURING-IME-01: VoiceOver keeps the
+    /// tree it already built. Tell it the synthetic × entered or left. A
+    /// later keystroke in the same composition does not notify again.
+    /// `systemAlreadyIncludesCancel` stays false here: this is the policy
+    /// for the child we append, not a second look at AppKit's array.
+    /// Does not page.
+    public struct SearchCancelAccessibilityTreeUpdate: Equatable, Sendable {
+        public var syntheticShown: Bool
+        public var notifyLayoutChanged: Bool
+    }
+
+    public static func searchCancelAccessibilityTreeUpdate(
+        previouslyShown: Bool,
+        committed: String,
+        editing: String?,
+        editingHasMarkedText: Bool
+    ) -> SearchCancelAccessibilityTreeUpdate {
+        let shown = searchCancelAccessibilityShouldAppendSynthetic(
+            committed: committed,
+            editing: editing,
+            editingHasMarkedText: editingHasMarkedText,
+            systemAlreadyIncludesCancel: false
+        )
+        return SearchCancelAccessibilityTreeUpdate(
+            syntheticShown: shown,
+            notifyLayoutChanged: shown != previouslyShown
+        )
+    }
+
+    /// SEARCH-CANCEL-BUTTON-EXITS-SEARCH-01: the cancel click can clear the
+    /// editor before `searchFieldDidEndSearching` runs. The forced-empty
+    /// check then sees nothing and would leave the result grid up. A cancel
+    /// while search is showing still leaves search. An idle empty field does
+    /// not. Does not page.
+    public static func searchCancelButtonShouldExitSearch(
+        isSearching: Bool,
+        committed: String,
+        editing: String?,
+        editingHasMarkedText: Bool
+    ) -> Bool {
+        if isSearching { return true }
+        return searchCancelButtonRequiresForcedEmpty(
+            committed: committed,
+            editing: editing,
+            editingHasMarkedText: editingHasMarkedText
+        )
+    }
+
     /// `characters` on a synthesized key can be empty while the letter sits
     /// in `charactersIgnoringModifiers`. A single ASCII letter or digit is
     /// still the query text. Anything else stays on the raw string so an
-    /// input method can own it. Does not page.
+    /// input method can own it. NS function-key scalars (U+F700…F8FF) are
+    /// never typed search characters. Does not page.
     public static func searchGridTypedCharacters(raw: String, ignoringModifiers: String) -> String {
-        if raw.unicodeScalars.contains(where: { !CharacterSet.controlCharacters.contains($0) }) {
+        if raw.unicodeScalars.contains(where: isNSFunctionKeyScalar) {
+            return ""
+        }
+        if hasPrintableSearchCharacter(raw) {
             return raw
         }
         guard ignoringModifiers.count == 1,
               let scalar = ignoringModifiers.unicodeScalars.first,
+              !isNSFunctionKeyScalar(scalar),
               scalar.isASCII,
               Character(scalar).isLetter || Character(scalar).isNumber else {
             return raw
@@ -4674,7 +8541,7 @@ public enum LauncherLayout {
     /// The field editor's string includes pinyin that is still marked.
     /// `stringValue` does not, so a composition would otherwise filter nothing.
     public static func searchQuery(committed: String, editing: String?) -> String {
-        editing ?? committed
+        sanitizedSearchInput(editing ?? committed)
     }
 
     /// Drop an unfinished composition from a title. The range is UTF-16, the
@@ -4846,6 +8713,19 @@ public enum LauncherLayout {
     }
 
     /// Previous/next arrows share the search/grid fade clock with page dots.
+        /// PAGE-ARROW-AX-AXIS-01: vertical flip uses up/down copy so VoiceOver
+    /// matches the chevron. Horizontal keeps「上一页」/「下一页」.
+    public static func pageArrowAccessibilityLabel(
+        previous: Bool,
+        horizontal: Bool,
+        localize: (String) -> String = { $0 }
+    ) -> String {
+        if horizontal {
+            return localize(previous ? "上一页" : "下一页")
+        }
+        return localize(previous ? "向上翻页" : "向下翻页")
+    }
+
     public static func pageArrowShouldShow(hasMultiplePages: Bool, atUnavailableEdge: Bool) -> Bool {
         hasMultiplePages && !atUnavailableEdge
     }
@@ -4919,6 +8799,56 @@ public enum LauncherLayout {
         slots.append(contentsOf: pages.map(PageIndicatorSlot.page))
         if last < pageCount - 1 { slots.append(.ellipsis) }
         return slots
+    }
+
+    public enum PageIndicatorEllipsisEdge: Equatable, Sendable {
+        case leading
+        case trailing
+    }
+
+    /// PAGE-INDICATOR-ELLIPSIS-JUMP-01: a truncated page dot is not a page.
+    /// The leading mark jumps to the page just before the visible window, the
+    /// trailing mark to the page just after. Nil when that side is not
+    /// truncated. The result is always an existing page.
+    public static func pageIndicatorEllipsisDestination(
+        pageCount: Int,
+        selectedPage: Int,
+        edge: PageIndicatorEllipsisEdge,
+        maxVisible: Int = pageIndicatorLimit
+    ) -> Int? {
+        guard pageCount > maxVisible, maxVisible > 0 else { return nil }
+        let pages = visiblePageIndices(
+            pageCount: pageCount,
+            selectedPage: selectedPage,
+            maxVisible: maxVisible
+        )
+        guard let first = pages.first, let last = pages.last else { return nil }
+        switch edge {
+        case .leading:
+            guard first > 0 else { return nil }
+            return first - 1
+        case .trailing:
+            guard last < pageCount - 1 else { return nil }
+            return last + 1
+        }
+    }
+
+    public static let pageIndicatorEarlierPagesKey = "更早的页面"
+    public static let pageIndicatorLaterPagesKey = "更后的页面"
+    public static let pageIndicatorJumpToPageFormatKey = "跳到第 %d 页"
+
+    public static func pageIndicatorEllipsisAccessibilityLabel(
+        leading: Bool,
+        localize: (String) -> String = { $0 }
+    ) -> String {
+        localize(leading ? pageIndicatorEarlierPagesKey : pageIndicatorLaterPagesKey)
+    }
+
+    public static func pageIndicatorEllipsisAccessibilityHelp(
+        page: Int,
+        localize: (String) -> String = { $0 }
+    ) -> String {
+        String(format: localize(pageIndicatorJumpToPageFormatKey), page + 1)
     }
 
     /// Which layout a finished scan should reconcile into. The first scan has an
@@ -5179,6 +9109,27 @@ public enum LauncherLayout {
         }
     }
 
+    /// ALERT-MODAL-KEY-01: the launcher is a floating `NSPanel`.
+    /// `NSPanel.worksWhenModal` defaults to true, so the panel can receive
+    /// key and mouse during `NSAlert.runModal()` and steal Return from
+    /// Save on the alias or folder-name alert. The panel must not work
+    /// when modal, and must not become key while another application-modal
+    /// window is running. Document-modal sheets on the panel keep
+    /// `otherApplicationModalWindow` false.
+    /// Settings is a standalone window: `showSettings` hides the launcher
+    /// first, and Settings file panels are sheets on that window, not the
+    /// launcher. Icon and blank-area menus use `NSMenu.popUpContextMenu`,
+    /// which is not an application-modal session. Uninstall confirmation
+    /// uses `NSAlert.runModal()` like the alias prompt, so the same policy
+    /// keeps Return on the alert. Item drag does not run a modal session.
+    /// Does not page.
+    public static func launcherPanelWorksWhenModal() -> Bool { false }
+
+    public static func launcherPanelCanBecomeKey(otherApplicationModalWindow: Bool) -> Bool {
+        !otherApplicationModalWindow
+    }
+
+
     /// FOLDER-EMPTY-NAME-FALLBACK-01 — blank folder titles show the same
     /// localized「新建文件夹」as the rename placeholder (menus + toasts).
     public static func emptyFolderDisplayName(
@@ -5352,6 +9303,12 @@ public enum LauncherLayout {
             localize: (String) -> String = { $0 }
         ) -> String {
             localize(available ? restoreBackupAvailableToolTipKey : restoreBackupUnavailableToolTipKey)
+        }
+
+        /// Settings「恢复上次备份」is enabled only when a backup file exists.
+        /// A stale click or key equivalent must not open the confirm sheet.
+        public static func shouldEnableRestoreBackupControl(hasBackupFile: Bool) -> Bool {
+            hasBackupFile
         }
     }
 
@@ -5536,6 +9493,10 @@ public enum LauncherLayout {
     public static let sortFolderByNameMenuTitleKey = "按名称排列文件夹内应用"
     public static let sortFolderByNameToastKey = "已按名称排列文件夹内应用"
     public static let sortFolderAlreadySortedToastKey = "文件夹内应用已按名称排列"
+    public static let sortFolderByKindToastKey = "已按类型排列文件夹内应用"
+    public static let sortFolderAlreadyKindSortedToastKey = "文件夹内应用已按类型排列"
+    public static let sortFolderByCategoryToastKey = "已按分类排列文件夹内应用"
+    public static let sortFolderAlreadyCategorySortedToastKey = "文件夹内应用已按分类排列"
     // FOLDER-SORT-AX-HELP-01
     public static let sortFolderByNameAccessibilityHelpKey = "只调整这个文件夹内的顺序，主屏幕不变"
 
@@ -5581,6 +9542,90 @@ public enum LauncherLayout {
         return path.hasPrefix("/System/Applications/")
             || path.hasPrefix("/System/Cryptexes/App/System/Applications/")
             || path.hasPrefix("/System/Volumes/Preboot/Cryptexes/App/System/Applications/")
+    }
+
+    /// FOLDER-COMMAND-OPTION-K-OPEN-SORT-01. Reorders only that folder's
+    /// members: system apps, then other known apps, then names. An app with
+    /// no catalog row stays last. Returns nil when the folder is missing,
+    /// has fewer than two members, or is already in that order. Top-level
+    /// entries stay put.
+    public static func sortingFolderMembersByKind(
+        _ folderID: UUID,
+        in state: LayoutState,
+        catalog: [AppCandidate]
+    ) -> LayoutState? {
+        guard let folder = state.folders[folderID], folder.itemIDs.count > 1 else { return nil }
+        let byKey = AppCandidate.firstByDeduplicationKey(catalog)
+        func name(_ id: UUID) -> String {
+            guard let key = state.appKeys[id] else { return id.uuidString }
+            if let alias = state.appAliases[key], !alias.isEmpty { return alias }
+            return byKey[key]?.displayName ?? id.uuidString
+        }
+        func rank(_ id: UUID) -> Int {
+            guard let key = state.appKeys[id], let candidate = byKey[key] else { return 2 }
+            return isSystemApplication(candidate) ? 0 : 1
+        }
+        let names = Dictionary(folder.itemIDs.map { ($0, name($0)) }, uniquingKeysWith: { first, _ in first })
+        let ranks = Dictionary(folder.itemIDs.map { ($0, rank($0)) }, uniquingKeysWith: { first, _ in first })
+        let sorted = folder.itemIDs.sorted { lhs, rhs in
+            let leftRank = ranks[lhs, default: 2]
+            let rightRank = ranks[rhs, default: 2]
+            if leftRank != rightRank { return leftRank < rightRank }
+            let order = names[lhs, default: ""].localizedStandardCompare(names[rhs, default: ""])
+            if order != .orderedSame { return order == .orderedAscending }
+            return lhs.uuidString < rhs.uuidString
+        }
+        guard sorted != folder.itemIDs else { return nil }
+        var next = state
+        next.folders[folderID]?.itemIDs = sorted
+        next.updatedAt = .now
+        return next
+    }
+
+    /// FOLDER-COMMAND-OPTION-G-OPEN-SORT-01. Reorders only that folder's
+    /// members by category group, then display name. An app with no catalog
+    /// row stays in the last group. `categoryType` is injected so tests avoid
+    /// the filesystem. Returns nil when the folder is missing, has fewer than
+    /// two members, or is already in that order. Top-level entries stay put.
+    public static func sortingFolderMembersByCategory(
+        _ folderID: UUID,
+        in state: LayoutState,
+        catalog: [AppCandidate],
+        categoryType: (AppCandidate) -> String? = { applicationCategoryType(forAppAt: $0.canonicalURL) }
+    ) -> LayoutState? {
+        guard let folder = state.folders[folderID], folder.itemIDs.count > 1 else { return nil }
+        let byKey = AppCandidate.firstByDeduplicationKey(catalog)
+        func name(_ id: UUID) -> String {
+            guard let key = state.appKeys[id] else { return id.uuidString }
+            if let alias = state.appAliases[key], !alias.isEmpty { return alias }
+            return byKey[key]?.displayName ?? id.uuidString
+        }
+        func rank(_ id: UUID) -> Int {
+            guard let key = state.appKeys[id], let candidate = byKey[key] else {
+                return AppCategoryGroup.other.rawValue
+            }
+            return AppCategoryGroup.group(forCategoryType: categoryType(candidate)).rawValue
+        }
+        var seen = Set<UUID>()
+        var names: [UUID: String] = [:]
+        var ranks: [UUID: Int] = [:]
+        for id in folder.itemIDs where seen.insert(id).inserted {
+            names[id] = name(id)
+            ranks[id] = rank(id)
+        }
+        let sorted = folder.itemIDs.sorted { lhs, rhs in
+            let leftRank = ranks[lhs, default: AppCategoryGroup.other.rawValue]
+            let rightRank = ranks[rhs, default: AppCategoryGroup.other.rawValue]
+            if leftRank != rightRank { return leftRank < rightRank }
+            let order = names[lhs, default: ""].localizedStandardCompare(names[rhs, default: ""])
+            if order != .orderedSame { return order == .orderedAscending }
+            return lhs.uuidString < rhs.uuidString
+        }
+        guard sorted != folder.itemIDs else { return nil }
+        var next = state
+        next.folders[folderID]?.itemIDs = sorted
+        next.updatedAt = .now
+        return next
     }
 
     public static func searchableApps(in state: LayoutState, catalog: [AppCandidate]) -> [AppCandidate] {
@@ -5784,6 +9829,7 @@ public enum LauncherLayout {
 
     /// Search field, result/item/selection count labels, footer Esc hints, and
     /// the top-bar settings button. Esc-clear reuses CatalogEmptyChromeCopy.
+    // SEARCH-FIELD-CHROME-02: tighter pill + gear (OpenAI 6.1-sol-high).
     public enum SearchFieldChromeCopy {
         public static let searchPlaceholderKey = "搜索应用"
         public static let searchHelpKey = "按应用名称或 Bundle ID 搜索"
@@ -5791,6 +9837,7 @@ public enum LauncherLayout {
         public static let clearSearchHelpKey = "清除搜索并返回应用网格"
         public static let escReturnKey = "Esc 返回"
         public static let escReturnWithPagingKey = "← → 翻页 · Esc 返回"
+        public static let escReturnWithVerticalPagingKey = "↑ ↓ 翻页 · Esc 返回"
         public static let resultsFormatKey = "%d 个结果"
         public static let resultsAccessibilityKey = "搜索结果数量"
         public static let selectedAccessibilityKey = "已选数量"
@@ -5827,10 +9874,16 @@ public enum LauncherLayout {
         public static func footerNavigationText(
             isSearching: Bool,
             pageCount: Int,
+            pageFlipDirection: LauncherPageFlipDirection = .horizontal,
             localize: (String) -> String = { $0 }
         ) -> String {
             if isSearching { return escClearSearch(localize: localize) }
-            if pageCount > 1 { return localize(escReturnWithPagingKey) }
+            if pageCount > 1 {
+                let key = pageFlipDirection.isHorizontal
+                    ? escReturnWithPagingKey
+                    : escReturnWithVerticalPagingKey
+                return localize(key)
+            }
             return localize(escReturnKey)
         }
 
@@ -5871,6 +9924,7 @@ public enum LauncherLayout {
         public static let dragHintKey = "拖拽整理"
         public static let dragHintMultiPageKey = "拖拽整理 · 悬停左右边缘跨页"
         public static let toastCloseKey = "关闭提示"
+        public static let pageIndicatorAccessibilityKey = "页码"
 
         public static func dragHint(pageCount: Int, localize: (String) -> String = { $0 }) -> String {
             if pageCount > 1 { return localize(dragHintMultiPageKey) }
@@ -5879,6 +9933,11 @@ public enum LauncherLayout {
 
         public static func toastCloseLabel(localize: (String) -> String = { $0 }) -> String {
             localize(toastCloseKey)
+        }
+
+        /// AX-PAGE-INDICATOR-LABEL-01
+        public static func pageIndicatorAccessibilityLabel(localize: (String) -> String = { $0 }) -> String {
+            localize(pageIndicatorAccessibilityKey)
         }
     }
 
@@ -5916,6 +9975,47 @@ public enum LauncherLayout {
         }
     }
 
+    /// SEARCH-HIDDEN-HINT-MATCH-01: a hidden app is absent from results, so the
+    /// empty state should name it when the same query would have found it.
+    /// Display-name substrings stay on the overload above. This one uses the
+    /// search index: pinyin, initials, alias, package name, bundle id, and the
+    /// one-typo fallback. An empty query does not list every hidden app.
+    /// The single-match name is the alias when one is set, matching the name
+    /// shown in Settings. Does not page.
+    public static func searchHiddenMatchHint(
+        query: String,
+        catalog: [AppCandidate],
+        hiddenKeys: Set<String>,
+        aliases: [String: String] = [:]
+    ) -> SearchHiddenMatchHint {
+        let needle = sanitizedSearchInput(query).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !needle.isEmpty, !hiddenKeys.isEmpty else { return .none }
+        var seen = Set<String>()
+        let hidden = catalog.filter { candidate in
+            hiddenKeys.contains(candidate.deduplicationKey)
+                && seen.insert(candidate.deduplicationKey).inserted
+        }
+        guard !hidden.isEmpty else { return .none }
+        let matches = AppSearch.filter(hidden, query: needle, aliases: aliases)
+        switch matches.count {
+        case 0:
+            return .none
+        case 1:
+            return .one(name: hiddenHintName(for: matches[0], aliases: aliases))
+        default:
+            return .several(count: matches.count)
+        }
+    }
+
+    private static func hiddenHintName(for candidate: AppCandidate, aliases: [String: String]) -> String {
+        if let alias = aliases[candidate.deduplicationKey]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !alias.isEmpty {
+            return alias
+        }
+        return candidate.displayName
+    }
+
     /// Folder that currently contains `appID` on the home grid, if any.
     /// Used by search results to show where a member hit lives.
     public static func containingFolderName(forAppID appID: UUID, in state: LayoutState) -> String? {
@@ -5939,6 +10039,29 @@ public enum LauncherLayout {
         return primary + "\n" + folder
     }
 
+    /// AX-FOLDER-COUNT-01: VoiceOver reads a folder tile as「文件夹 名」plus
+    /// this value, so the member count is heard without opening it. The label
+    /// stays「文件夹 %@」(UI tests and search hits key off it). Members whose
+    /// app is not in the catalog are not counted. nil for an empty count.
+    public static func folderTileAccessibilityValue(
+        memberCount: Int,
+        localize: (String) -> String = { $0 }
+    ) -> String? {
+        guard memberCount > 0 else { return nil }
+        if memberCount == 1 { return localize("1 个项目") }
+        return String(format: localize("%d 个项目"), memberCount)
+    }
+
+    /// AX-PAGE-DOT-CURRENT-01: page dots only differ by size / alpha, so the
+    /// current page was invisible to VoiceOver. The current dot reports a
+    /// value; others report none. Accessibility only, no paging change.
+    public static func pageDotAccessibilityValue(
+        isCurrent: Bool,
+        localize: (String) -> String = { $0 }
+    ) -> String? {
+        isCurrent ? localize("当前页") : nil
+    }
+
     /// Accessibility / tooltip for a search app hit that lives in a folder.
     public static func searchHitAccessibilityLabel(
         displayName: String,
@@ -5952,9 +10075,59 @@ public enum LauncherLayout {
 
     /// Folder titles always keep a visible label. Whitespace-only or empty
     /// drafts resolve back to `previous` (same rule `renameFolder` applies).
+    /// NAME-SINGLE-LINE-01: folder names and aliases render on one tile line.
+    /// A pasted multi-line / tabbed string would otherwise wrap the label or
+    /// show tofu. Line breaks (incl. U+2028/2029) and tabs become one space,
+    /// other C0/C1 controls are dropped, whitespace runs collapse. Format
+    /// characters (ZWJ emoji, RTL marks) are kept.
+    public static func singleLineDisplayName(_ raw: String) -> String {
+        var out = String.UnicodeScalarView()
+        var pendingSpace = false
+        for scalar in raw.unicodeScalars {
+            if CharacterSet.whitespacesAndNewlines.contains(scalar) {
+                pendingSpace = true
+                continue
+            }
+            if scalar.properties.generalCategory == .control { continue }
+            if pendingSpace, !out.isEmpty { out.append(" ") }
+            pendingSpace = false
+            out.append(scalar)
+        }
+        return String(out)
+    }
+
     public static func resolvedFolderName(draft: String, previous: String) -> String {
-        let trimmed = String(draft.trimmingCharacters(in: .whitespacesAndNewlines).prefix(40))
-        return trimmed.isEmpty ? previous : trimmed
+        resolvedNewFolderName(draft, fallback: previous)
+    }
+
+    /// Name stored when creating a folder. Same single-line / 40-grapheme
+    /// cap as rename; a blank or whitespace-only draft uses `fallback`
+    /// (「新建文件夹」 for a new folder, the previous title when renaming).
+    public static func resolvedNewFolderName(
+        _ raw: String,
+        fallback: String = "新建文件夹"
+    ) -> String {
+        let trimmed = String(singleLineDisplayName(raw).prefix(maximumFolderNameLength))
+            .trimmingCharacters(in: .whitespaces)
+        return trimmed.isEmpty ? fallback : trimmed
+    }
+
+    /// Menu titles for existing folders. Duplicate names get a trailing
+    /// 「（2）」/「（3）」 so two "工作" folders stay distinguishable. Blank
+    /// names stay blank so Direct can still localize the「新建文件夹」fallback.
+    public static func disambiguatedFolderMenuNames(_ names: [String]) -> [String] {
+        var used = Set<String>()
+        return names.map { name in
+            let base = name
+            guard !base.isEmpty else { return base }
+            var candidate = base
+            var index = 2
+            while !used.insert(candidate).inserted {
+                candidate = "\(base)（\(index)）"
+                index += 1
+            }
+            return candidate
+        }
     }
 
     /// Finder/Launchpad-style rename: select the whole name when editing begins
@@ -6033,6 +10206,15 @@ public enum LauncherLayout {
     /// the empty collection view skips the focus fill and leaves Tab odd.
     public static let folderTitleFocusesFirstMemberAfterEndingEdit = true
 
+    /// FOLDER-TITLE-RETURN-CONFIRMS-IME-01: Return while the folder name is
+    /// still marked belongs to the input method. Ending the edit here drops
+    /// the candidate and saves the name without it. A Return with no marked
+    /// text still leaves the field. Same rule as search. Click-away and the
+    /// close button still strip an unconfirmed composition. Does not page.
+    public static func folderTitleReturnEndsEditing(hasMarkedText: Bool) -> Bool {
+        !hasMarkedText
+    }
+
     public static func renameFolder(_ id: UUID, to name: String, in state: LayoutState) -> LayoutState {
         var state = state
         guard var folder = state.folders[id] else { return state }
@@ -6046,7 +10228,8 @@ public enum LauncherLayout {
 
     public static func setAlias(_ alias: String, forApplicationKey key: String, in state: LayoutState) -> LayoutState {
         var state = state
-        let trimmed = String(alias.trimmingCharacters(in: .whitespacesAndNewlines).prefix(60))
+        let trimmed = String(singleLineDisplayName(alias).prefix(60))
+            .trimmingCharacters(in: .whitespaces)
         guard !key.isEmpty else { return state }
         guard state.appAliases[key] != (trimmed.isEmpty ? nil : trimmed) else { return state }
         if trimmed.isEmpty {
@@ -6211,8 +10394,7 @@ public enum LauncherLayout {
             state.orderedEntries.remove(at: index)
         }
         let folderID = uniqueFolderID(in: state)
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let folderName = trimmed.isEmpty ? "新建文件夹" : trimmed
+        let folderName = resolvedNewFolderName(name)
         state.folders[folderID] = LauncherFolder(id: folderID, name: folderName, itemIDs: apps)
         state.orderedEntries.insert(.folder(folderID), at: min(insertAt, state.orderedEntries.count))
         state.updatedAt = .now
@@ -6301,11 +10483,14 @@ public enum LauncherLayout {
         in state: LayoutState
     ) -> [FolderMenuTarget] {
         guard state.folders[appID] == nil, state.orderedEntries.contains(.app(appID)) else { return [] }
-        return state.orderedEntries.compactMap { entry in
+        let raw: [(id: UUID, name: String)] = state.orderedEntries.compactMap { entry in
             guard case .folder(let id) = entry, let folder = state.folders[id] else { return nil }
-            let trimmed = folder.name.trimmingCharacters(in: .whitespacesAndNewlines)
-            return FolderMenuTarget(id: id, name: trimmed)
+            let trimmed = singleLineDisplayName(folder.name)
+                .trimmingCharacters(in: .whitespaces)
+            return (id, trimmed)
         }
+        let titles = disambiguatedFolderMenuNames(raw.map(\.name))
+        return zip(raw, titles).map { FolderMenuTarget(id: $0.0.id, name: $0.1) }
     }
 
     /// Menu move of one top-level app into an existing folder (appended last,
@@ -6367,7 +10552,8 @@ public enum LauncherLayout {
     public static func focusIDAfterMenuDissolve(
         folderID: UUID,
         previousEntries: [LauncherEntry],
-        currentEntries: [LauncherEntry]
+        currentEntries: [LauncherEntry],
+        capacity: Int = pageCapacity
     ) -> UUID? {
         guard let folderIndex = previousEntries.firstIndex(of: .folder(folderID)),
               let id = entryReplacingDissolvedFolder(
@@ -6376,7 +10562,7 @@ public enum LauncherLayout {
                 currentEntries: currentEntries
               ),
               let index = currentEntries.firstIndex(where: { $0.id == id }),
-              pageIndex(containingEntryAt: index) == pageIndex(containingEntryAt: folderIndex) else { return nil }
+              pageIndex(containingEntryAt: index, capacity: capacity) == pageIndex(containingEntryAt: folderIndex, capacity: capacity) else { return nil }
         return id
     }
 
@@ -6754,14 +10940,15 @@ public enum LauncherLayout {
     public static func topLevelAppIDsForBatchMoveIntoFolder(
         selection: LauncherItemSelection,
         folderID: UUID,
-        in state: LayoutState
+        in state: LayoutState,
+        capacity: Int = pageCapacity
     ) -> [UUID] {
         guard state.folders[folderID] != nil,
               let folderIndex = state.orderedEntries.firstIndex(of: .folder(folderID)) else {
             return []
         }
-        let page = pageIndex(containingEntryAt: folderIndex)
-        let pageIDs = Set(itemIDs(onPage: page, from: state.orderedEntries))
+        let page = pageIndex(containingEntryAt: folderIndex, capacity: capacity)
+        let pageIDs = Set(itemIDs(onPage: page, from: state.orderedEntries, capacity: capacity))
         guard pageIDs.contains(folderID) else { return [] }
         return topLevelAppIDsForBatchFolder(selection: selection, in: state)
             .filter { $0 != folderID && pageIDs.contains($0) }
@@ -6773,14 +10960,16 @@ public enum LauncherLayout {
         selection: LauncherItemSelection,
         draggedID: UUID,
         folderID: UUID,
-        in state: LayoutState
+        in state: LayoutState,
+        capacity: Int = pageCapacity
     ) -> Bool {
         guard state.folders[folderID] != nil else { return false }
         guard selection.contains(draggedID) else { return false }
         let apps = topLevelAppIDsForBatchMoveIntoFolder(
             selection: selection,
             folderID: folderID,
-            in: state
+            in: state,
+            capacity: capacity
         )
         return apps.count >= 2 && apps.contains(draggedID)
     }
@@ -6791,15 +10980,16 @@ public enum LauncherLayout {
     public static func topLevelAppIDsForBatchCreateFolder(
         selection: LauncherItemSelection,
         targetAppID: UUID,
-        in state: LayoutState
+        in state: LayoutState,
+        capacity: Int = pageCapacity
     ) -> [UUID] {
         guard state.folders[targetAppID] == nil,
               state.orderedEntries.contains(.app(targetAppID)),
               let targetIndex = state.orderedEntries.firstIndex(of: .app(targetAppID)) else {
             return []
         }
-        let page = pageIndex(containingEntryAt: targetIndex)
-        let pageIDs = Set(itemIDs(onPage: page, from: state.orderedEntries))
+        let page = pageIndex(containingEntryAt: targetIndex, capacity: capacity)
+        let pageIDs = Set(itemIDs(onPage: page, from: state.orderedEntries, capacity: capacity))
         guard pageIDs.contains(targetAppID) else { return [] }
 
         var apps: [UUID] = [targetAppID]
@@ -6818,7 +11008,8 @@ public enum LauncherLayout {
         selection: LauncherItemSelection,
         draggedID: UUID,
         targetAppID: UUID,
-        in state: LayoutState
+        in state: LayoutState,
+        capacity: Int = pageCapacity
     ) -> Bool {
         guard draggedID != targetAppID else { return false }
         guard selection.contains(draggedID) else { return false }
@@ -6829,8 +11020,8 @@ public enum LauncherLayout {
         guard let targetIndex = state.orderedEntries.firstIndex(of: .app(targetAppID)) else {
             return false
         }
-        let page = pageIndex(containingEntryAt: targetIndex)
-        let pageIDs = Set(itemIDs(onPage: page, from: state.orderedEntries))
+        let page = pageIndex(containingEntryAt: targetIndex, capacity: capacity)
+        let pageIDs = Set(itemIDs(onPage: page, from: state.orderedEntries, capacity: capacity))
         let selectedOnPage = topLevelAppIDsForBatchFolder(selection: selection, in: state)
             .filter { pageIDs.contains($0) && $0 != targetAppID }
         // Need dragged + at least one other selected app on the page (not only clear single merge).
@@ -6838,7 +11029,8 @@ public enum LauncherLayout {
         let apps = topLevelAppIDsForBatchCreateFolder(
             selection: selection,
             targetAppID: targetAppID,
-            in: state
+            in: state,
+            capacity: capacity
         )
         return apps.count >= 3 && apps.contains(draggedID) && apps.contains(targetAppID)
     }
@@ -6917,17 +11109,18 @@ public enum LauncherLayout {
         selection: LauncherItemSelection,
         draggedID: UUID,
         insertAt: Int,
-        in state: LayoutState
+        in state: LayoutState,
+        capacity: Int = pageCapacity
     ) -> [UUID] {
         guard selection.contains(draggedID) else { return [] }
         guard let dragIndex = state.orderedEntries.firstIndex(where: { $0.id == draggedID }) else {
             return []
         }
-        let page = pageIndex(containingEntryAt: dragIndex)
-        let pageStart = page * pageCapacity
-        let pageEnd = min((page + 1) * pageCapacity, state.orderedEntries.count)
+        let page = pageIndex(containingEntryAt: dragIndex, capacity: capacity)
+        let pageStart = page * max(capacity, 1)
+        let pageEnd = min((page + 1) * max(capacity, 1), state.orderedEntries.count)
         guard insertAt >= pageStart, insertAt <= pageEnd else { return [] }
-        let pageIDs = Set(itemIDs(onPage: page, from: state.orderedEntries))
+        let pageIDs = Set(itemIDs(onPage: page, from: state.orderedEntries, capacity: capacity))
         var ids: [UUID] = []
         var seen = Set<UUID>()
         for id in selection.orderedIDs where pageIDs.contains(id) && seen.insert(id).inserted {
@@ -6942,13 +11135,15 @@ public enum LauncherLayout {
         selection: LauncherItemSelection,
         draggedID: UUID,
         insertAt: Int,
-        in state: LayoutState
+        in state: LayoutState,
+        capacity: Int = pageCapacity
     ) -> Bool {
         let ids = topLevelIDsForBatchReorder(
             selection: selection,
             draggedID: draggedID,
             insertAt: insertAt,
-            in: state
+            in: state,
+            capacity: capacity
         )
         return ids.count >= 2 && ids.contains(draggedID)
     }
@@ -6995,6 +11190,406 @@ public enum LauncherLayout {
         return next
     }
 
+    /// GRID-COMMAND-OPTION-HORIZONTAL-NUDGE-01. Swap one focused top-level
+    /// entry with the neighbor that shares its page. A multi-select, a missing
+    /// id, and a step onto another page stay put.
+    public static func nudgingFocusedEntryOneStepOnItsPage(
+        focusedID: UUID,
+        nudge: CommandOptionHorizontalNudge,
+        selectedCount: Int,
+        in state: LayoutState,
+        capacity: Int
+    ) -> LayoutState? {
+        guard selectedCount <= 1 else { return nil }
+        guard let index = state.orderedEntries.firstIndex(where: { $0.id == focusedID }) else { return nil }
+        let target = index + (nudge == .previous ? -1 : 1)
+        guard state.orderedEntries.indices.contains(target) else { return nil }
+        let safeCapacity = max(capacity, 1)
+        guard pageIndex(containingEntryAt: index, capacity: safeCapacity)
+            == pageIndex(containingEntryAt: target, capacity: safeCapacity) else { return nil }
+        var next = state
+        next.orderedEntries.swapAt(index, target)
+        next.updatedAt = .now
+        return next
+    }
+
+    /// GRID-COMMAND-OPTION-SELECTION-NUDGE-01. Shift a contiguous top-level
+    /// selection one slot toward the neighbor just outside it. The neighbor
+    /// moves to the other side of the block. A single icon, a broken run,
+    /// a focus outside the run, and a step onto another page stay put.
+    /// One focused icon still uses the single-step swap.
+    public static func nudgingTopLevelSelectionOneStepOnItsPage(
+        focusedID: UUID,
+        nudge: CommandOptionHorizontalNudge,
+        selectedIDs: [UUID],
+        in state: LayoutState,
+        capacity: Int
+    ) -> LayoutState? {
+        var seen = Set<UUID>()
+        var selected: [UUID] = []
+        for id in selectedIDs {
+            guard state.orderedEntries.contains(where: { $0.id == id }) else { continue }
+            if seen.insert(id).inserted {
+                selected.append(id)
+            }
+        }
+        guard selected.count >= 2, selected.contains(focusedID) else { return nil }
+        let indexes = selected.compactMap { id in
+            state.orderedEntries.firstIndex(where: { $0.id == id })
+        }.sorted()
+        guard indexes.count == selected.count,
+              let first = indexes.first, let last = indexes.last,
+              last - first + 1 == indexes.count else { return nil }
+        let safeCapacity = max(capacity, 1)
+        let targetIndex = nudge == .previous ? first - 1 : last + 1
+        guard state.orderedEntries.indices.contains(targetIndex) else { return nil }
+        guard pageIndex(containingEntryAt: first, capacity: safeCapacity)
+            == pageIndex(containingEntryAt: last, capacity: safeCapacity),
+              pageIndex(containingEntryAt: targetIndex, capacity: safeCapacity)
+            == pageIndex(containingEntryAt: first, capacity: safeCapacity) else { return nil }
+        var entries = state.orderedEntries
+        let neighbor = entries.remove(at: targetIndex)
+        entries.insert(neighbor, at: nudge == .previous ? last : first)
+        var next = state
+        next.orderedEntries = entries
+        next.updatedAt = .now
+        return next
+    }
+
+    /// GRID-COMMAND-SHIFT-HORIZONTAL-EDGE-01. Move one focused top-level entry
+    /// to the front or the back. Other entries keep their relative order.
+    /// A multi-select, a selection that is not this entry, a missing id, and
+    /// an entry that is already at that end stay put.
+    public static func movingFocusedTopLevelEntryToEdge(
+        focusedID: UUID,
+        atStart: Bool,
+        selectedIDs: [UUID],
+        in state: LayoutState
+    ) -> LayoutState? {
+        if selectedIDs.count >= 2 { return nil }
+        if selectedIDs.count == 1, selectedIDs[0] != focusedID { return nil }
+        guard let index = state.orderedEntries.firstIndex(where: { $0.id == focusedID }) else { return nil }
+        let destination = atStart ? 0 : state.orderedEntries.count - 1
+        guard index != destination else { return nil }
+        var entries = state.orderedEntries
+        let entry = entries.remove(at: index)
+        entries.insert(entry, at: destination)
+        var next = state
+        next.orderedEntries = entries
+        next.updatedAt = .now
+        return next
+    }
+
+    /// GRID-COMMAND-SHIFT-SELECTION-EDGE-01. Move a contiguous top-level
+    /// selection to the front or the back. Other icons keep their relative
+    /// order. A single icon, a broken run, a focus outside the run, and a
+    /// run that is already at that end stay put. One icon still uses the
+    /// single-entry move.
+    public static func movingTopLevelSelectionToEdge(
+        focusedID: UUID,
+        atStart: Bool,
+        selectedIDs: [UUID],
+        in state: LayoutState
+    ) -> LayoutState? {
+        let chosen = Set(selectedIDs)
+        let order = state.orderedEntries
+        let indexes = order.indices.filter { chosen.contains(order[$0].id) }
+        guard indexes.count >= 2,
+              let first = indexes.first,
+              let last = indexes.last,
+              last - first + 1 == indexes.count,
+              order[first...last].contains(where: { $0.id == focusedID }) else { return nil }
+        if atStart, first == order.startIndex { return nil }
+        if !atStart, last == order.index(before: order.endIndex) { return nil }
+        let block = Array(order[first...last])
+        let rest = order.enumerated().compactMap { index, entry in
+            indexes.contains(index) ? nil : entry
+        }
+        var next = state
+        next.orderedEntries = atStart ? block + rest : rest + block
+        next.updatedAt = .now
+        return next
+    }
+
+    /// GRID-COMMAND-OPTION-SHIFT-PAGE-MOVE-01. Move one focused top-level
+    /// entry to the first slot of the next or previous page. Other entries
+    /// keep their relative order. A multi-select, a missing id, and a page
+    /// that is not already there stay put. The entry count does not grow.
+    public static func movingFocusedEntryToAdjacentPage(
+        focusedID: UUID,
+        nudge: CommandOptionHorizontalNudge,
+        selectedCount: Int,
+        in state: LayoutState,
+        capacity: Int
+    ) -> LayoutState? {
+        guard selectedCount <= 1 else { return nil }
+        guard let index = state.orderedEntries.firstIndex(where: { $0.id == focusedID }) else { return nil }
+        let safeCapacity = max(capacity, 1)
+        let page = pageIndex(containingEntryAt: index, capacity: safeCapacity)
+        let finalIndex = nudge == .next
+            ? (page + 1) * safeCapacity
+            : (page - 1) * safeCapacity
+        guard state.orderedEntries.indices.contains(finalIndex), finalIndex != index else { return nil }
+        var entries = state.orderedEntries
+        let entry = entries.remove(at: index)
+        entries.insert(entry, at: finalIndex)
+        var next = state
+        next.orderedEntries = entries
+        next.updatedAt = .now
+        return next
+    }
+
+    /// GRID-COMMAND-OPTION-SHIFT-SELECTION-PAGE-MOVE-01. Move a contiguous
+    /// top-level run to the first slot of the next or previous page. Other
+    /// icons keep their relative order. One icon, a broken run, a focus
+    /// outside the run, a run that crosses two pages, and a destination that
+    /// cannot hold the run stay put. The entry count does not grow. One icon
+    /// still uses the single-entry move.
+    public static func movingTopLevelSelectionToAdjacentPage(
+        focusedID: UUID,
+        nudge: CommandOptionHorizontalNudge,
+        selectedIDs: [UUID],
+        in state: LayoutState,
+        capacity: Int
+    ) -> LayoutState? {
+        let chosen = Set(selectedIDs)
+        let order = state.orderedEntries
+        let indexes = order.indices.filter { chosen.contains(order[$0].id) }
+        guard indexes.count >= 2,
+              let first = indexes.first,
+              let last = indexes.last,
+              last - first + 1 == indexes.count,
+              order[first...last].contains(where: { $0.id == focusedID }) else { return nil }
+        let safeCapacity = max(capacity, 1)
+        let page = pageIndex(containingEntryAt: first, capacity: safeCapacity)
+        guard page == pageIndex(containingEntryAt: last, capacity: safeCapacity) else { return nil }
+        let finalIndex = nudge == .next
+            ? (page + 1) * safeCapacity
+            : (page - 1) * safeCapacity
+        let block = Array(order[first...last])
+        guard finalIndex >= 0,
+              finalIndex != first,
+              finalIndex + block.count <= order.count,
+              order.indices.contains(finalIndex) else { return nil }
+        var entries = order
+        entries.removeSubrange(first...last)
+        // The shortened list still uses finalIndex, matching the single-icon move.
+        entries.insert(contentsOf: block, at: finalIndex)
+        var next = state
+        next.orderedEntries = entries
+        next.updatedAt = .now
+        return next
+    }
+
+    /// FOLDER-COMMAND-OPTION-HORIZONTAL-NUDGE-01. Swap one focused folder
+    /// member with its neighbor in that folder's list. A multi-select, a
+    /// missing folder or member, and a step off either end stay put. The
+    /// folder list is linear, so a visual row inside the folder is not a page.
+    public static func nudgingFocusedFolderMember(
+        folderID: UUID,
+        memberID: UUID,
+        nudge: CommandOptionHorizontalNudge,
+        selectedCount: Int,
+        in state: LayoutState
+    ) -> LayoutState? {
+        guard selectedCount <= 1 else { return nil }
+        guard var folder = state.folders[folderID] else { return nil }
+        guard let index = folder.itemIDs.firstIndex(of: memberID) else { return nil }
+        let target = index + (nudge == .previous ? -1 : 1)
+        guard folder.itemIDs.indices.contains(target) else { return nil }
+        folder.itemIDs.swapAt(index, target)
+        var next = state
+        next.folders[folderID] = folder
+        next.updatedAt = .now
+        return next
+    }
+
+    /// FOLDER-COMMAND-OPTION-SELECTION-NUDGE-01. Shift a contiguous run of
+    /// members one slot. The neighbor moves to the other side of the run.
+    /// A single member, a broken run, a focus outside the run, and a step
+    /// off either end stay put. One member still uses the single swap.
+    public static func nudgingFolderMemberSelection(
+        folderID: UUID,
+        focusedID: UUID,
+        nudge: CommandOptionHorizontalNudge,
+        selectedIDs: [UUID],
+        in state: LayoutState
+    ) -> LayoutState? {
+        guard var folder = state.folders[folderID] else { return nil }
+        let chosen = Set(selectedIDs)
+        let indexes = folder.itemIDs.indices.filter { chosen.contains(folder.itemIDs[$0]) }
+        guard indexes.count >= 2,
+              let first = indexes.first,
+              let last = indexes.last,
+              last - first + 1 == indexes.count,
+              folder.itemIDs[first...last].contains(focusedID) else { return nil }
+        let target = nudge == .previous ? first - 1 : last + 1
+        guard folder.itemIDs.indices.contains(target) else { return nil }
+        let neighbor = folder.itemIDs.remove(at: target)
+        folder.itemIDs.insert(neighbor, at: nudge == .previous ? last : first)
+        var next = state
+        next.folders[folderID] = folder
+        next.updatedAt = .now
+        return next
+    }
+
+    /// FOLDER-COMMAND-SHIFT-HORIZONTAL-EDGE-01. Move one focused folder member
+    /// to the front or the back of that folder. Other members keep their
+    /// relative order. A multi-select, a missing folder or member, and a
+    /// member that is already at that end stay put.
+    public static func movingFocusedFolderMemberToEdge(
+        folderID: UUID,
+        memberID: UUID,
+        atStart: Bool,
+        selectedCount: Int,
+        in state: LayoutState
+    ) -> LayoutState? {
+        guard selectedCount <= 1 else { return nil }
+        guard var folder = state.folders[folderID] else { return nil }
+        guard let index = folder.itemIDs.firstIndex(of: memberID) else { return nil }
+        let destination = atStart ? 0 : folder.itemIDs.count - 1
+        guard index != destination else { return nil }
+        let member = folder.itemIDs.remove(at: index)
+        folder.itemIDs.insert(member, at: destination)
+        var next = state
+        next.folders[folderID] = folder
+        next.updatedAt = .now
+        return next
+    }
+
+    /// FOLDER-COMMAND-SHIFT-SELECTION-EDGE-01. Move a contiguous member run
+    /// to the front or the back of that folder. Other members keep their
+    /// relative order. A single member, a broken run, a focus outside the
+    /// run, and a run that is already at that end stay put. One member still
+    /// uses the single move.
+    public static func movingFolderMemberSelectionToEdge(
+        folderID: UUID,
+        focusedID: UUID,
+        atStart: Bool,
+        selectedIDs: [UUID],
+        in state: LayoutState
+    ) -> LayoutState? {
+        guard var folder = state.folders[folderID] else { return nil }
+        let chosen = Set(selectedIDs)
+        let order = folder.itemIDs
+        let indexes = order.indices.filter { chosen.contains(order[$0]) }
+        guard indexes.count >= 2,
+              let first = indexes.first,
+              let last = indexes.last,
+              last - first + 1 == indexes.count,
+              order[first...last].contains(focusedID) else { return nil }
+        if atStart, first == order.startIndex { return nil }
+        if !atStart, last == order.index(before: order.endIndex) { return nil }
+        let block = Array(order[first...last])
+        let rest = order.enumerated().compactMap { index, id in
+            indexes.contains(index) ? nil : id
+        }
+        folder.itemIDs = atStart ? block + rest : rest + block
+        var next = state
+        next.folders[folderID] = folder
+        next.updatedAt = .now
+        return next
+    }
+
+    /// FOLDER-COMMAND-SHIFT-VERTICAL-EDGE-01. Move the focused folder member,
+    /// or a block of selected members that includes the focus, to the front
+    /// or the back. Relative order stays. A block that is already there, a
+    /// multi-select that does not include the focus, and a missing folder or
+    /// member stay put.
+    public static func movingFocusedFolderMembersToEdge(
+        folderID: UUID,
+        focusedID: UUID,
+        atStart: Bool,
+        selectedIDs: [UUID],
+        in state: LayoutState
+    ) -> LayoutState? {
+        guard var folder = state.folders[folderID] else { return nil }
+        let selectedSet = Set(selectedIDs)
+        let selected = folder.itemIDs.filter { selectedSet.contains($0) }
+        if selected.count >= 2 {
+            guard selectedSet.contains(focusedID) else { return nil }
+            let remaining = folder.itemIDs.filter { !selectedSet.contains($0) }
+            let nextIDs = atStart ? selected + remaining : remaining + selected
+            guard nextIDs != folder.itemIDs else { return nil }
+            folder.itemIDs = nextIDs
+        } else {
+            guard let index = folder.itemIDs.firstIndex(of: focusedID) else { return nil }
+            let destination = atStart ? 0 : folder.itemIDs.count - 1
+            guard index != destination else { return nil }
+            let member = folder.itemIDs.remove(at: index)
+            folder.itemIDs.insert(member, at: destination)
+        }
+        var next = state
+        next.folders[folderID] = folder
+        next.updatedAt = .now
+        return next
+    }
+
+    /// FOLDER-COMMAND-OPTION-VERTICAL-NUDGE-01. Swap one focused folder member
+    /// with the member one row away. A multi-select, a missing folder or
+    /// member, and a step off the list stay put. The row length is the
+    /// folder's column count, not a launcher page.
+    public static func nudgingFocusedFolderMemberByRow(
+        folderID: UUID,
+        memberID: UUID,
+        nudge: CommandOptionHorizontalNudge,
+        columns: Int,
+        selectedCount: Int,
+        in state: LayoutState
+    ) -> LayoutState? {
+        guard selectedCount <= 1 else { return nil }
+        guard var folder = state.folders[folderID] else { return nil }
+        guard let index = folder.itemIDs.firstIndex(of: memberID) else { return nil }
+        let stride = max(columns, 1)
+        let target = index + (nudge == .previous ? -stride : stride)
+        guard folder.itemIDs.indices.contains(target) else { return nil }
+        folder.itemIDs.swapAt(index, target)
+        var next = state
+        next.folders[folderID] = folder
+        next.updatedAt = .now
+        return next
+    }
+
+    /// FOLDER-COMMAND-OPTION-SELECTION-ROW-NUDGE-01. Move a contiguous member
+    /// run one row. Each member swaps with the member in that column on the
+    /// next or previous row. A single member, a broken run, a focus outside
+    /// the run, a step off the list, and a step that would land inside the
+    /// run stay put. One member still uses the single row swap.
+    public static func nudgingFolderMemberSelectionByRow(
+        folderID: UUID,
+        focusedID: UUID,
+        nudge: CommandOptionHorizontalNudge,
+        columns: Int,
+        selectedIDs: [UUID],
+        in state: LayoutState
+    ) -> LayoutState? {
+        guard var folder = state.folders[folderID] else { return nil }
+        let chosen = Set(selectedIDs)
+        let order = folder.itemIDs
+        let indexes = order.indices.filter { chosen.contains(order[$0]) }
+        guard indexes.count >= 2,
+              let first = indexes.first,
+              let last = indexes.last,
+              last - first + 1 == indexes.count,
+              order[first...last].contains(focusedID) else { return nil }
+        let stride = max(columns, 1)
+        let delta = nudge == .previous ? -stride : stride
+        let targets = indexes.map { $0 + delta }
+        guard targets.allSatisfy(order.indices.contains),
+              Set(targets).isDisjoint(with: Set(indexes)) else { return nil }
+        var nextIDs = order
+        for (source, target) in zip(indexes, targets) {
+            nextIDs[target] = order[source]
+            nextIDs[source] = order[target]
+        }
+        guard nextIDs != order else { return nil }
+        folder.itemIDs = nextIDs
+        var next = state
+        next.folders[folderID] = folder
+        next.updatedAt = .now
+        return next
+    }
+
     /// After a tile is hidden, put keyboard on the next remaining id, else the previous.
     public static func focusItemIDAfterHiding(
         hiddenID: UUID,
@@ -7012,7 +11607,7 @@ public enum LauncherLayout {
     }
 
     public static func hideApplication(withKey key: String, in state: LayoutState) -> LayoutState {
-        guard !key.isEmpty else { return state }
+        guard !key.isEmpty, state.appKeys.values.contains(key) else { return state }
         var state = state
         state.hiddenAppKeys.insert(key)
         let hiddenIDs = Set(state.appKeys.compactMap { $0.value == key ? $0.key : nil })
@@ -7275,7 +11870,7 @@ public enum LauncherLayout {
                 return .failure(.missingTarget)
             }
 
-            let folder = LauncherFolder(id: folderID, name: name, itemIDs: [targetID, sourceID])
+            let folder = LauncherFolder(id: folderID, name: resolvedNewFolderName(name), itemIDs: [targetID, sourceID])
             state.folders[folderID] = folder
             state.orderedEntries.insert(.folder(folderID), at: min(insertionIndex, state.orderedEntries.count))
             state.updatedAt = .now
@@ -7531,11 +12126,13 @@ public enum LauncherMarquee {
         isDragging: Bool,
         isPaging: Bool,
         isDismissing: Bool,
-        isPromptingForAlias: Bool
+        isPromptingForAlias: Bool,
+        isPromptingForUninstall: Bool = false
     ) -> Bool {
+        // PRESENCE-GESTURE-SUPPRESS-UNINSTALL-PROMPT-01: uninstall modal same as alias.
         buttonNumber == 0 && clickCount == 1 && startsOnBlankArea
             && !isSearching && !folderOpen && !isDragging && !isPaging
-            && !isDismissing && !isPromptingForAlias
+            && !isDismissing && !isPromptingForAlias && !isPromptingForUninstall
     }
 
     public static func hasActivated(from start: CGPoint, to current: CGPoint) -> Bool {

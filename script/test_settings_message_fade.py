@@ -77,5 +77,38 @@ for chunk in (body[:800], same_branch):
     if "showPage(" in chunk or "pageTransition" in chunk or "pageAnimationDuration" in chunk:
         fail("settings message fade must not retune paging")
 
+# SETTINGS-MESSAGE-FADE-FINISH-ON-CLOSE-01: close lands the in-flight fade.
+if "settingsMessageFadeLandingOnClose" not in core:
+    fail("Core missing settingsMessageFadeLandingOnClose")
+if "enum SettingsMessageFadeCloseLanding" not in core:
+    fail("Core missing SettingsMessageFadeCloseLanding")
+handle_at = settings.index("private func handleSettingsWindowWillClose")
+handle = settings[handle_at:handle_at + 700]
+if "finishSettingsMessageFadeForClose()" not in handle:
+    fail("window close must finish the message fade")
+finish_at = settings.index("private func finishSettingsMessageFadeForClose")
+finish = settings[finish_at:finish_at + 1600]
+for needle in (
+    "settingsMessageFadeLandingOnClose",
+    "messageFadeGeneration &+= 1",
+    "settingsMessageFadeAnimationKey",
+    "messageFadeReplacement",
+):
+    if needle not in finish:
+        fail(f"finishSettingsMessageFadeForClose missing {needle}")
+if "wantsLayer =" in finish:
+    fail("close landing must read an existing layer")
+for token in ("showPage(", "transitionToPage(", "completePageTransition(", "prepareChromeForOpeningSettings", "closeFolder"):
+    if token in finish:
+        fail(f"message fade close must not call {token}")
+set_end = settings.index("private func fadeMessageOpacity")
+set_body = settings[settings.index("private func setMessage("):set_end]
+if "messageFadeReplacement = nil" not in set_body:
+    fail("setMessage must clear the pending replacement")
+if "messageFadeReplacement = text" not in set_body:
+    fail("crossfade must remember the replacement string")
+if set_body.find("messageFadeReplacement = nil") > set_body.find("messageFadeReplacement = text"):
+    fail("setMessage must clear a stale replacement before storing the next one")
+
 print("PASS: settings message opacity-before-unhide + interrupted fade restore")
 

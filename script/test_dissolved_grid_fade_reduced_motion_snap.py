@@ -38,6 +38,30 @@ need(
 need("shouldSnapDissolvedGridFadeForReducedMotion" in direct, "Direct must consult snap gate")
 need("dissolvedGridFadeDuration" in direct, "Direct must use Core duration")
 
+# DISSOLVED-GRID-FADE-FINISH-WHEN-HIDDEN-01: a hidden window never pinned the
+# named fade. Finish it from applyDeferred. Lookup reads an existing layer.
+need("shouldFinishUnpinnedDissolvedGridFade" in core, "Core missing hidden-fade finish")
+need("DISSOLVED-GRID-FADE-FINISH-WHEN-HIDDEN-01" in core, "Core missing hidden-fade marker")
+need("testDissolvedGridFadeFinishesWhenHiddenWithoutWaitFlag" in tests, "Core test missing hidden-fade finish")
+need("shouldFinishUnpinnedDissolvedGridFade" in direct, "Direct must finish an unpinned hidden fade")
+need("dissolvedGridFadeAnimationIsAttached" in direct, "Direct must look up the named fade")
+lookup = direct[direct.index("func dissolvedGridFadeAnimationIsAttached"):
+                direct.index("func dissolvedGridFadeAnimationIsAttached") + 500]
+need("wantsLayer = true" not in lookup, "fade lookup must not create a layer")
+need("view.layer?" in lookup, "fade lookup must read an existing layer")
+need("dissolvedGridFadeAnimationKey" in lookup, "fade lookup must use the named key")
+need("showPage(" not in lookup and "transitionToPage(" not in lookup and "completePageTransition(" not in lookup,
+     "fade lookup must not retune paging")
+deferred = direct[direct.index("func applyDeferredDissolvedGridFade"):
+                  direct.index("func dissolvedGridFadeAnimationIsAttached")]
+need("shouldFinishUnpinnedDissolvedGridFade" in deferred, "applyDeferred must ask the hidden-fade gate")
+need("showPage(" not in deferred and "transitionToPage(" not in deferred and "completePageTransition(" not in deferred,
+     "applyDeferred dissolved fade must not retune paging")
+prep = direct[direct.index("func prepareChromeForOpeningSettings()"):
+              direct.index("func cancelIconLoadsForSettingsWhileLauncherHidden")]
+need("shouldFinishUnpinnedDissolvedGridFade" not in prep, "prepareChrome must not finish the dissolved fade")
+need("dissolvedGridFadeAnimationIsAttached" not in prep, "prepareChrome must not look up the dissolved fade")
+
 # Locate dissolved fade play block via finishDissolvedGridFade nearby with snap
 idx = direct.index("if snapDissolvedGridFade")
 chunk = direct[idx : idx + 900]

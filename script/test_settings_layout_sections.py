@@ -11,8 +11,15 @@ def need(cond, msg):
     if not cond:
         failures.append(msg)
 
-for title in ("外观与呼出", "行为", "应用管理", "维护"):
-    need(title in settings, f"missing section title {title}")
+# SETTINGS-TAB-CHROME-01: titles may live in Core chrome copy used as tab labels.
+for title, core_ref in (
+    ("外观与呼出", "SettingsSectionChromeCopy.appearanceSectionTitle"),
+    ("行为", "SettingsSectionChromeCopy.behaviorSectionTitle"),
+    ("应用管理", "SettingsSectionChromeCopy.appsSectionTitle"),
+    ("维护", "SettingsSectionChromeCopy.maintenanceSectionTitle"),
+):
+    need(title in settings or core_ref in settings, f"missing section title {title}")
+need("NSTabView" in settings and "topTabsBezelBorder" in settings, "SETTINGS-TAB-CHROME-01: NSTabView top tabs")
 
 need("SettingsChrome" in settings, "missing SettingsChrome metrics")
 need("rowHeight" in settings, "missing consistent rowHeight")

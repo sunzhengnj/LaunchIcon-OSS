@@ -38,6 +38,9 @@ need("testScanReportsMissingRequiredCustomRootAsUnavailable" in tests, "Core sca
 need("testRetainingCandidatesKeepsUnavailableRootAppsThroughReconcile" in tests, "Core retain test missing")
 need("allowsPersistingReconcile" in models, "Core must refuse persist when retention cannot cover the layout")
 need("testMissingRootWithoutRetentionSourceDoesNotPersist" in tests, "Core no-cache missing-root test missing")
+need("testTrustedRootDeletionPersistsWhileOfflineRootUnavailable" in tests, "Core trusted-delete-while-offline test missing")
+need("MISSING-ROOT-TRUSTED-DELETE-01" in models or "pathIsUnderRetainRoot" in models,
+     "allowsPersistingReconcile must scope missing keys to untrusted roots")
 need("allowsPersistingReconcile(retainingFrom:" in direct, "Direct must use the no-cache persist gate")
 need("layoutKeepingStoredNewerThanUnsafeReconcile" in direct, "unsafe reconcile must not outdate the layout file")
 need("refusedUntrustedDrop" in direct, "read-only explanation must follow the no-cache gate")

@@ -211,7 +211,12 @@ public actor AppCatalogScanner: AppCataloging {
                         makeCandidate(
                             at: resolvedURL,
                             sourcePriority: priority,
-                            modificationDate: resolvedValues.contentModificationDate,
+                            modificationDate: WorkspaceIconCache.iconCacheModificationDate(
+                                ofBundleAt: resolvedURL,
+                                bundleModificationDate: resolvedValues.contentModificationDate,
+                                info: info,
+                                fileManager: fileManager
+                            ),
                             info: info
                         )
                     )

@@ -2,8 +2,10 @@
 """Execute production flight cleanup/pinning on AppKit views without a window.
 
 Lookup and ownership fixtures replace the collection views; cleanup, pinning,
-and tile visibility methods come directly from the production source. There is
-no presentation tree, so this does not verify rendered motion or UI dispatch.
+and tile visibility methods come directly from the production source. An empty
+lookup still clears glyph-hide flags and the incoming preview limit on folder
+tiles that remain in the hierarchy. There is no presentation tree, so this
+does not verify rendered motion or UI dispatch.
 """
 from pathlib import Path
 import subprocess
@@ -11,8 +13,28 @@ import sys
 import tempfile
 
 root = Path(__file__).resolve().parents[1]
-source = (Path(sys.argv[1]) if len(sys.argv) > 1 else
-          root / "Sources/Direct/LauncherWindowController.swift").read_text()
+if len(sys.argv) > 1:
+    source = Path(sys.argv[1]).read_text()
+else:
+    source = "".join(
+        p.read_text()
+        for p in [root / "Sources/Direct/LauncherWindowController.swift", *sorted((root / "Sources/Direct").glob("LauncherWindowController+*.swift"))]
+    )
+core = (root / "Sources/Core/LauncherLayout.swift").read_text()
+def static_func(name):
+    start = core.index(f"    public static func {name}(")
+    end = core.index("\n    }", start) + len("\n    }")
+    return core[start:end].replace("public static func", "static func", 1)
+
+layout_stub = (
+    "enum LauncherLayout {\n"
+    + static_func("folderGlyphFlightShouldRevealCells")
+    + "\n"
+    + static_func("dropLandingShouldRevealRetainedTiles")
+    + "\n"
+    + static_func("previewPlateShouldWriteRetainedTiles")
+    + "\n}\n"
+)
 
 
 def method(name):
@@ -20,17 +42,32 @@ def method(name):
     end = source.index("\n    }", start) + len("\n    }")
     return source[start:end].replace("private func", "func", 1)
 
+glyph_commit = method("commitFolderPreviewGlyphFlight")
+incoming_reveal = method("revealIncomingPreviewGlyphs")
+if "forEachFolderPreviewPlateTile" not in glyph_commit:
+    print("FAIL: glyph commit still clears hide flags through its own lookup")
+    sys.exit(1)
+if "forEachFolderPreviewPlateTile" not in incoming_reveal:
+    print("FAIL: incoming reveal still clears the glyph limit through item(at:)")
+    sys.exit(1)
+for bad in ("showPage(", "transitionToPage(", "completePageTransition(", "tileForPresentedItem", "item(at:"):
+    if bad in glyph_commit or bad in incoming_reveal:
+        print(f"FAIL: {bad} leaked into hidden glyph-state clear")
+        sys.exit(1)
+
 
 tile = '''
 @MainActor final class Tile: NSView {
     let iconView = NSImageView()
     let titleLabel = NSTextField()
     var isFolder = true
+    var representedItemID: UUID?
     var openFlightHidesPreviewGlyphs = true
     var openFlightHidesPlate = false
     var previewGlyphDrawLimit: Int? = 1
 ''' + method("setOpenFlightContentHidden") + "\n}\n"
 harness = '''
+typealias AppGridTileView = Tile
 @MainActor final class Harness: NSView {
     struct Hidden { var itemID = UUID(); weak var tile: Tile? }
     struct Flyer { var itemID = UUID(); let view: NSImageView }
@@ -41,13 +78,27 @@ harness = '''
     var borrowedPreviewPlateFolderID: UUID? = UUID()
     let activeCollectionView = 0, stagingCollectionView = 1, searchCollectionView = 2
     var plates: [Tile] = []
-    struct Overlay { let collectionView = 3 }
+    struct Overlay {
+        let collectionView = 3
+        var isAnimatingClose = false
+    }
     let folderOverlay = Overlay()
     var pendingDropLanding: Int? = 1
     var dropLandingItemID: UUID?
     weak var dropLandingView: NSView?
     var dropLandingGeneration: UInt64 = 7
     var dropLandingWaitsForLauncher = true
+    struct DropLandingHiddenTile { weak var tile: Tile? }
+    var dropLandingHiddenTiles: [DropLandingHiddenTile] = []
+    var suppressDropLandingLookup = false
+    var suppressGlyphTileLookup = false
+    var retainedFolderTiles: [Tile] = []
+    func realizedGridTiles() -> [Tile] { retainedFolderTiles }
+    func tileForPresentedItem(_ id: UUID, in index: Int) -> Tile? {
+        if suppressDropLandingLookup || suppressGlyphTileLookup { return nil }
+        guard plates.indices.contains(index) else { return nil }
+        return plates[index]
+    }
     var previewGlyphHiddenContent: [Hidden] = []
     var previewGlyphFlyerBoxes: [Flyer] = []
     var previewGlyphFlyers: [NSImageView] { previewGlyphFlyerBoxes.map(\\.view) }
@@ -55,15 +106,17 @@ harness = '''
     var dissolveScatterWaitsForLauncher = true
     var dissolveScatterHiddenTiles: [Hidden] = []
     var dissolveScatterFlyers: [NSImageView] = []
-    func tileForPresentedItem(_ id: UUID, in index: Int) -> Tile? { plates[index] }
 '''
 for name in ("commitFolderPreviewGlyphFlight", "pinInFlightFolderPreviewGlyphFlight",
              "pinPresentedAlpha", "commitFolderDissolveScatter", "pinInFlightDissolveScatter",
-             "revealDropLandingContents", "commitDropLanding", "freezeDropLandingFlyer"):
+             "revealDropLandingContents", "commitDropLanding", "freezeDropLandingFlyer",
+             "forEachFolderPreviewPlateTile"):
     harness += method(name) + "\n"
+hide_on = source.index("    func hideDropLandingContents(on ")
+hide_on_end = source.index("\n    }", hide_on) + len("\n    }")
+harness += source[hide_on:hide_on_end].replace("private func", "func", 1) + "\n"
 harness += "}\n"
 merge_harness = '''
-typealias AppGridTileView = Tile
 @MainActor final class MergeHarness: NSView {
     struct Flyer { let view: NSImageView }
     struct Item { let id: UUID }
@@ -84,8 +137,15 @@ typealias AppGridTileView = Tile
     var mergePreviewFlyers: [Flyer] = []
     var incomingPreviewLimitedFolderID: UUID?
     var incomingPreviewGlyphLimit: Int? = 1
+    var retainedIncomingTiles: [Tile] = []
+    func realizedGridTiles() -> [Tile] { retainedIncomingTiles }
     func presentedItems(for collection: Collection) -> [Item] { collection.items }
-''' + method("commitMergePreviewLanding") + "\n" + method("revealIncomingPreviewGlyphs") + "\n}\n"
+    func tileForPresentedItem(_ id: UUID, in collection: Collection) -> Tile? {
+        guard let index = collection.items.firstIndex(where: { $0.id == id }),
+              collection.tiles.indices.contains(index) else { return nil }
+        return collection.tiles[index]
+    }
+''' + method("commitMergePreviewLanding") + "\n" + method("revealIncomingPreviewGlyphs") + "\n" + method("forEachFolderPreviewPlateTile") + "\n}\n"
 cases = r'''
 var failures = 0
 @MainActor func check(_ condition: Bool, _ label: String) {
@@ -116,16 +176,18 @@ for returnsHome in [false, true] {
     host.commitFolderPreviewGlyphFlight()
     check(host.previewGlyphFlyers.isEmpty && flyer.superview == nil
           && flyer.layer?.animationKeys()?.isEmpty != false, "preview flyers detached and stopped, returning=\(returnsHome)")
-    check(tile.iconView.alphaValue == (returnsHome ? 0 : 1)
-          && tile.titleLabel.alphaValue == (returnsHome ? 0 : 1), "opening reveals / closing keeps content hidden")
+    // No window: a return is not still closing on screen, so member icons
+    // come back. An on-screen shrink stays hidden; Core covers that case.
+    check(tile.iconView.alphaValue == 1
+          && tile.titleLabel.alphaValue == 1,
+          "off-screen commit reveals member icons, returning=\(returnsHome)")
     check(host.previewGlyphFlightGeneration == 4 && !host.previewGlyphFlightWaitsForLauncher
           && !host.previewGlyphFlightReturnsHome && host.previewGlyphHiddenContent.isEmpty
           && host.previewGlyphSourceTile == nil && host.plates.allSatisfy { !$0.openFlightHidesPreviewGlyphs },
           "preview ownership, generation and plate flags cleaned")
-    if !returnsHome {
-        check(tile.iconView.layer?.animationKeys()?.isEmpty != false
-              && tile.titleLabel.layer?.animationKeys()?.isEmpty != false, "revealed content has no stale fade")
-    }
+    check(tile.iconView.layer?.animationKeys()?.isEmpty != false
+          && tile.titleLabel.layer?.animationKeys()?.isEmpty != false,
+          "revealed content has no stale fade, returning=\(returnsHome)")
     host.commitFolderPreviewGlyphFlight()
     check(host.previewGlyphFlyers.isEmpty && flyer.superview == nil, "preview cleanup is repeatable")
 }
@@ -187,6 +249,7 @@ check(dropFlyer.layer?.animationKeys()?.isEmpty != false
       && dropFlyer.layer?.speed == 1 && dropFlyer.layer?.timeOffset == 0
       && dropFlyer.layer?.beginTime == 0, "drop freeze clears animation clocks")
 animate(dropFlyer)
+dropped.dropLandingHiddenTiles = dropped.plates.map { Harness.DropLandingHiddenTile(tile: $0) }
 dropped.commitDropLanding()
 check(dropFlyer.superview == nil && dropped.dropLandingView == nil
       && dropFlyer.layer?.animationKeys()?.isEmpty != false, "drop commit detaches and stops flyer")
@@ -208,6 +271,41 @@ lostDrop.dropLandingItemID = UUID()
 lostDrop.commitDropLanding()
 check(lostDrop.dropLandingView == nil && lostDrop.dropLandingItemID == nil
       && lostDrop.pendingDropLanding == nil, "missing weak drop flyer does not prevent cleanup")
+let remembered = Harness()
+let parked = Tile()
+remembered.hideDropLandingContents(on: parked)
+check(parked.iconView.alphaValue == 0 && parked.titleLabel.alphaValue == 0
+      && parked.openFlightHidesPlate && parked.openFlightHidesPreviewGlyphs
+      && remembered.dropLandingHiddenTiles.count == 1
+      && remembered.dropLandingHiddenTiles[0].tile === parked,
+      "hide remembers the cell it parks")
+remembered.hideDropLandingContents(on: parked)
+check(remembered.dropLandingHiddenTiles.count == 1, "hide remembers each cell once")
+remembered.suppressDropLandingLookup = true
+remembered.dropLandingItemID = UUID()
+remembered.commitDropLanding()
+check(parked.iconView.alphaValue == 1 && parked.titleLabel.alphaValue == 1
+      && !parked.openFlightHidesPlate && !parked.openFlightHidesPreviewGlyphs
+      && remembered.dropLandingHiddenTiles.isEmpty && remembered.dropLandingItemID == nil,
+      "order-out commit reveals the remembered cell when item(at:) is nil")
+let lookupOnly = Harness()
+let stray = Tile()
+stray.setOpenFlightContentHidden(true)
+stray.openFlightHidesPlate = true
+stray.openFlightHidesPreviewGlyphs = true
+lookupOnly.plates = [stray, stray, stray, stray]
+lookupOnly.dropLandingItemID = UUID()
+lookupOnly.commitDropLanding()
+check(stray.iconView.alphaValue == 0 && stray.openFlightHidesPlate
+      && stray.openFlightHidesPreviewGlyphs,
+      "lookup alone does not uncover a cell this flight did not remember")
+let gone = Harness()
+gone.dropLandingHiddenTiles = [Harness.DropLandingHiddenTile(tile: nil)]
+gone.dropLandingItemID = UUID()
+gone.suppressDropLandingLookup = true
+gone.commitDropLanding()
+check(gone.dropLandingHiddenTiles.isEmpty && gone.dropLandingItemID == nil,
+      "deallocated drop cell does not prevent cleanup")
 
 let merged = MergeHarness()
 let mergeID = UUID()
@@ -250,12 +348,74 @@ missingMerge.incomingPreviewLimitedFolderID = UUID()
 missingMerge.commitMergePreviewLanding()
 check(missingMerge.incomingPreviewLimitedFolderID == nil && missingMerge.incomingPreviewGlyphLimit == nil,
       "offscreen merge with no cell still clears preview ownership")
+
+let hiddenGlyphs = Harness()
+hiddenGlyphs.suppressGlyphTileLookup = true
+let glyphFolder = hiddenGlyphs.borrowedPreviewPlateFolderID!
+let keptGlyph = Tile()
+keptGlyph.representedItemID = glyphFolder
+keptGlyph.openFlightHidesPreviewGlyphs = true
+let otherGlyph = Tile()
+otherGlyph.representedItemID = UUID()
+otherGlyph.openFlightHidesPreviewGlyphs = true
+let appGlyph = Tile()
+appGlyph.isFolder = false
+appGlyph.representedItemID = glyphFolder
+appGlyph.openFlightHidesPreviewGlyphs = true
+let recycledGlyph = Tile()
+recycledGlyph.representedItemID = nil
+recycledGlyph.openFlightHidesPreviewGlyphs = true
+let sourceGlyph = Tile()
+sourceGlyph.openFlightHidesPreviewGlyphs = true
+hiddenGlyphs.previewGlyphSourceTile = sourceGlyph
+hiddenGlyphs.retainedFolderTiles = [keptGlyph, otherGlyph, appGlyph, recycledGlyph]
+hiddenGlyphs.commitFolderPreviewGlyphFlight()
+check(!sourceGlyph.openFlightHidesPreviewGlyphs && !keptGlyph.openFlightHidesPreviewGlyphs,
+      "order-out glyph commit clears the source and the retained folder copy")
+check(otherGlyph.openFlightHidesPreviewGlyphs && appGlyph.openFlightHidesPreviewGlyphs
+      && recycledGlyph.openFlightHidesPreviewGlyphs,
+      "order-out glyph commit leaves other folders, apps, and recycled cells")
+let liveGlyph = Harness()
+liveGlyph.plates = [Tile(), Tile(), Tile()]
+let decoyGlyph = Tile()
+decoyGlyph.representedItemID = liveGlyph.borrowedPreviewPlateFolderID
+decoyGlyph.openFlightHidesPreviewGlyphs = true
+liveGlyph.retainedFolderTiles = [decoyGlyph]
+liveGlyph.commitFolderPreviewGlyphFlight()
+check(liveGlyph.plates.allSatisfy { !$0.openFlightHidesPreviewGlyphs } && decoyGlyph.openFlightHidesPreviewGlyphs,
+      "a live glyph lookup does not clear a folder tile item(at:) did not return")
+
+let hiddenMerge = MergeHarness()
+let hiddenMergeFolder = UUID()
+hiddenMerge.incomingPreviewLimitedFolderID = hiddenMergeFolder
+let shownLimit = Tile()
+shownLimit.representedItemID = hiddenMergeFolder
+shownLimit.previewGlyphDrawLimit = 2
+let strangerLimit = Tile()
+strangerLimit.representedItemID = UUID()
+strangerLimit.previewGlyphDrawLimit = 2
+let plainLimit = Tile()
+plainLimit.isFolder = false
+plainLimit.representedItemID = hiddenMergeFolder
+plainLimit.previewGlyphDrawLimit = 2
+let blankLimit = Tile()
+blankLimit.representedItemID = nil
+blankLimit.previewGlyphDrawLimit = 2
+hiddenMerge.retainedIncomingTiles = [shownLimit, strangerLimit, plainLimit, blankLimit]
+hiddenMerge.commitMergePreviewLanding()
+check(shownLimit.previewGlyphDrawLimit == nil
+      && strangerLimit.previewGlyphDrawLimit == 2
+      && plainLimit.previewGlyphDrawLimit == 2
+      && blankLimit.previewGlyphDrawLimit == 2
+      && hiddenMerge.incomingPreviewLimitedFolderID == nil,
+      "order-out merge reveal clears only the retained folder's glyph limit")
 print("Failures: \(failures)")
 exit(failures == 0 ? 0 : 1)
 '''
 with tempfile.TemporaryDirectory(prefix="LaunchIcon-FlightCleanup-") as directory:
     path = Path(directory)
-    (path / "main.swift").write_text("import AppKit\nimport QuartzCore\n" + tile + harness + merge_harness + cases)
+    (path / "main.swift").write_text(
+        "import AppKit\nimport QuartzCore\n" + layout_stub + tile + harness + merge_harness + cases)
     subprocess.run(["xcrun", "swiftc", "-swift-version", "6", str(path / "main.swift"),
                     "-o", str(path / "cleanup")], check=True)
     sys.exit(subprocess.run([str(path / "cleanup")], check=False).returncode)

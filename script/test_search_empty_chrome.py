@@ -32,8 +32,11 @@ need(
     "search empty detail should hint Esc via literal or CatalogEmptyChromeCopy",
 )
 need("func searchHiddenMatchHint(" in core and "testSearchHiddenMatchHint" in tests, "hidden-match hint Core + test")
+need("testSearchHiddenMatchHintUsesTheSameRulesAsSearch" in tests, "hidden hint must follow search matching")
+need("hiddenKeys: Set<String>" in core, "hidden hint must take the layout's hidden keys")
 need("LauncherLayout.searchHiddenMatchHint(" in direct, "search empty detail should explain hidden matches")
-need("layoutState.hiddenAppKeys.isEmpty ? [] : hiddenApplications()" in direct, "skip hidden scan when nothing hidden")
+need("layoutState.hiddenAppKeys.isEmpty ? [] : allCandidates" in direct, "skip hidden scan when nothing hidden")
+need("aliases: layoutState.appAliases" in direct, "hidden hint must see aliases")
 need("kind: emptyKind" in direct, "setEmptyStateChrome must take kind")
 need("search.empty" in direct, "search empty a11y id")
 

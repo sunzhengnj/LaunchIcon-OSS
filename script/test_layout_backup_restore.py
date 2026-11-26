@@ -43,11 +43,15 @@ need(
     "SettingsSectionChromeCopy.maintenanceSectionTitle" in settings,
     "backup controls should live under 维护 (Core-owned)",
 )
-# layout backup row must be in 维护 section with actions
-maint = settings.index("SettingsSectionChromeCopy.maintenanceSectionTitle")
-block = settings[max(0, maint - 800):maint + 200]
-need("layoutBackupRow" in block or "exportLayoutButton" in block,
-     "export/import/restore should be in 维护 section build")
+# layout backup row must be in 维护 tab/section with actions (SETTINGS-TAB-CHROME-01
+# may place the Core title at the NSTabViewItem site after maintenanceRows).
+need(
+    "let maintenanceRows" in settings and "layoutBackupRow" in settings,
+    "export/import/restore should be in 维护 section build",
+)
+maint_rows = settings.index("let maintenanceRows")
+block = settings[maint_rows:maint_rows + 250]
+need("layoutBackupRow" in block, "layoutBackupRow must be listed in maintenanceRows")
 need("settings-export-layout" in settings and "settings-import-layout" in settings
      and "settings-restore-layout-backup" in settings, "a11y ids for layout backup")
 

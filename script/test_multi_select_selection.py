@@ -23,7 +23,7 @@ need("selected: Bool = false" in core, "tileChromeFillAlpha must take selected")
 need("testLauncherItemSelectionReplaceToggleAndPrune" in tests, "Core tests missing selection model test")
 need("tileChromeSelectionAlpha" in tests, "Core tests must assert selection alpha ordering")
 need("LauncherItemSelection" in docs, "Design doc must name Core type")
-need("private var itemSelection" in direct, "Direct must hold itemSelection")
+need("var itemSelection" in direct, "Direct must hold itemSelection")
 need("onCommandToggleSelection" in direct, "Direct must wire Command-click toggle")
 need(("modifierFlags.contains(.command)" in direct) or ("mods.contains(.command)" in direct),
      "Direct mouseUp must honour Command")
@@ -80,7 +80,7 @@ if "onShiftSelectRange = {" in direct:
     need("showPage" not in chunk and "movePage" not in chunk and "pageTransition" not in chunk,
          "Shift-click handler must not touch paging")
 
-block = direct[direct.index("private func refreshItemSelectionChrome("):]
+block = direct[direct.index("func refreshItemSelectionChrome("):]
 block = block[: block.index("private func visibleGridTiles(")]
 need("showPage" not in block and "pageTransition" not in block and "movePage" not in block,
      "refreshItemSelectionChrome must not touch paging")
@@ -111,7 +111,7 @@ need("pageAnimationDuration" not in direct[direct.index("batchIntoFolder"):direc
      if "batchIntoFolder" in direct else True,
      "batch-into-folder block must not touch pageAnimationDuration")
 drop_idx = direct.index("let batchReorderIDs") if "let batchReorderIDs" in direct else direct.index("let batchIntoFolder")
-drop_chunk = direct[drop_idx:drop_idx + 9000]
+drop_chunk = direct[drop_idx:drop_idx + 14000]
 need("showPage" not in drop_chunk.split("commitLayout(next)")[0],
      "batch branch setup must not call showPage before commit")
 need("batchCreateFolderApps" in drop_chunk, "applyDrop must consider batch create-folder")
@@ -136,9 +136,23 @@ need("showPage" not in chunk and "pageTransition" not in chunk and "movePage" no
      and "transitionToPage" not in chunk,
      "selectAllItemsOnCurrentPage must not touch paging")
 need("itemIDs(onPage: currentPage" in chunk, "select-all must use current page ids only")
+need("func commandShiftASelectsEveryTopLevelEntry(" in core, "Core command-shift-a select-all missing")
+need("func topLevelEntryIDsForSelectAll(" in core, "Core all-pages ids missing")
+need("func selectEveryTopLevelEntryFromCommandShiftA(" in direct, "Direct command-shift-a select-all missing")
+need("selectEveryTopLevelEntryFromCommandShiftA(" in direct, "panel must ask to select every page")
+need("testCommandShiftASelectsEveryTopLevelEntry" in tests, "Core command-shift-a test missing")
+all_at = direct.index("func selectEveryTopLevelEntryFromCommandShiftA(")
+all_pages = direct[all_at:direct.index("func selectAllItemsOnCurrentPage(", all_at)]
+need("commandShiftASelectsEveryTopLevelEntry(" in all_pages, "all-pages select must ask Core")
+need("topLevelEntryIDsForSelectAll(" in all_pages, "all-pages select must use every top-level id")
+need("selectingAll(ids:" in all_pages, "all-pages select must use the existing selection model")
+for banned in ("showPage", "transitionToPage", "completePageTransition", "movePage", "currentPage"):
+    need(banned not in all_pages, f"all-pages select must not page ({banned})")
 esc = direct.index("func handleEscape()")
-esc_chunk = direct[esc:esc + 900]
+esc_chunk = direct[esc:esc + 1600]
 need("itemSelection.clear()" in esc_chunk, "Escape should clear multi-select when non-empty")
+need("cancelInProgressItemDragIfNeeded()" in esc_chunk,
+     "Escape must cancel in-progress item drag before multi-select clear")
 
 
 need("onBatchUninstallSelection" in direct, "Direct tile missing batch uninstall callback")

@@ -46,4 +46,27 @@ if '"所选项目移到最前"' not in xc:
 if "BATCH-BLANK-SELECTED-EDGE" not in docs:
     fail("MULTI_SELECT_DESIGN.md must mention blank selected edge")
 
+if "func commandShiftVerticalSelectionEdge(" not in core:
+    fail("Core command-shift edge gate missing")
+if "func moveSelectionToEdgeFromCommandShiftVertical(" not in direct:
+    fail("Direct command-shift edge missing")
+if "moveSelectionToEdgeFromCommandShiftVertical(" not in direct:
+    fail("panel must ask to move the selection")
+if "testCommandShiftVerticalMovesTheSelectionToTheEdge" not in tests:
+    fail("Core command-shift edge test missing")
+edge_at = direct.index("func moveSelectionToEdgeFromCommandShiftVertical(")
+edge_body = direct[edge_at:direct.index("private func moveSelectedEntriesToEdgeFromBlankAreaMenu(", edge_at)]
+if "commandShiftVerticalSelectionEdge(" not in edge_body:
+    fail("command-shift edge must ask Core")
+if "moveSelectedEntriesToEdgeFromBlankAreaMenu(" not in edge_body:
+    fail("command-shift edge must use the blank-area action")
+selection_edge = direct[edge_at:direct.index("private func commitKeyboardLayoutChange(", edge_at)]
+if "recordingKeyboardLayoutUndo(" not in selection_edge:
+    fail("command-shift vertical edge must keep one undo")
+if "testCommandZUndoesAKeyboardVerticalEdgeMove" not in tests:
+    fail("Core vertical-edge undo test missing")
+for bad in ("showPage", "transitionToPage", "completePageTransition", "movePage"):
+    if bad in edge_body:
+        fail(f"command-shift edge must not page ({bad})")
+
 print("PASS: batch blank selected edge")

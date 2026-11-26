@@ -1,0 +1,48 @@
+name: Package preview DMG
+
+# Builds the ad-hoc unnotarized preview DMG with the existing package scripts.
+# Does NOT launch the app, run the UI Runner, or notarize.
+# workflow_dispatch only — not on every push/PR.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Build ad-hoc preview DMG
+    runs-on: xcode-27
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Record toolchain
+        run: xcodebuild -version && git rev-parse HEAD && git status --porcelain
+
+      - name: Package preview
+        run: ./script/package_preview.sh "$RUNNER_TEMP/release-preview"
+
+      - name: Verify preview package
+        run: |
+          set -euo pipefail
+          dmg="$(find "$RUNNER_TEMP/release-preview" -maxdepth 1 -name 'LaunchIcon-*-macOS-unnotarized.dmg' | sort | head -n 1)"
+          test -n "$dmg"
+          ./script/verify_preview_package.sh "$dmg" "$(git rev-parse HEAD)"
+          ls -l "$dmg" "$dmg.sha256"
+          shasum -a 256 "$dmg"
+
+      - name: Upload DMG artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: launchicon-preview-dmg
+          path: |
+            ${{ runner.temp }}/release-preview/LaunchIcon-*-macOS-unnotarized.dmg
+            ${{ runner.temp }}/release-preview/LaunchIcon-*-macOS-unnotarized.dmg.sha256
+          if-no-files-found: error
+          retention-days: 5

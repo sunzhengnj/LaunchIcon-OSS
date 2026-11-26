@@ -13,3 +13,7 @@ xcuserdata/
 !.env.example
 *.xcresult
 .notary*
+.build/
+default.profraw
+script/__pycache__/
+.tmp-screenshots/

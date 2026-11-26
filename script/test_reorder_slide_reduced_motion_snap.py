@@ -5,7 +5,7 @@ import sys
 
 root = Path(__file__).resolve().parents[1]
 core = (root / "Sources/Core/LauncherLayout.swift").read_text()
-direct = (root / "Sources/Direct/LauncherWindowController.swift").read_text()
+direct = "".join(p.read_text() for p in [root / "Sources/Direct/LauncherWindowController.swift", *sorted((root / "Sources/Direct").glob("LauncherWindowController+*.swift"))])
 tests = (root / "Tests/CoreTests/LaunchIconCoreTests.swift").read_text()
 failures = []
 
@@ -27,7 +27,7 @@ anim = core[
 need("shouldSnapReorderSlideForReducedMotion" in anim, "shouldAnimate must consult snap")
 
 set_fn = direct[
-    direct.index("    func setReorderTranslation(_ translation: CGSize, animated: Bool) {") : direct.index(
+    direct.index("func setReorderTranslation(_ translation: CGSize, animated: Bool) {") : direct.index(
         "    fileprivate func receiveReorderSlideFrame("
     )
 ]
@@ -42,8 +42,8 @@ need("reorderClock.start" in set_fn, "full-motion spring start must remain")
 
 # applyReorderSlots still uses shouldAnimateReorderSlide
 slots = direct[
-    direct.index("    private func applyReorderSlots(") : direct.index(
-        "    private func restoreDragSourceTile()"
+    direct.index("func applyReorderSlots(") : direct.index(
+        "func restoreDragSourceTile()"
     )
 ]
 need("shouldAnimateReorderSlide" in slots, "applyReorderSlots must use shouldAnimateReorderSlide")

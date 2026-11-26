@@ -10,8 +10,7 @@ settings = (root / "Sources/Direct/SettingsWindowController.swift").read_text()
 monitor = (root / "Sources/Direct/HotCornerMonitor.swift").read_text()
 delegate = (root / "Sources/Direct/DirectAppDelegate.swift").read_text()
 tests = (root / "Tests/CoreTests/LaunchIconCoreTests.swift").read_text()
-decisions_path = root / "DECISIONS.md"
-decisions = decisions_path.read_text() if decisions_path.is_file() else ""
+decisions = (root / "DECISIONS.md").read_text()
 failures = []
 
 def need(cond, msg):
@@ -29,7 +28,11 @@ need(
     "呼出触发角" in settings or "SettingsAppearanceChromeCopy.hotCornerLabel" in settings,
     "Settings missing hot corner label",
 )
-need("外观与呼出" in settings, "hot corner must live under 外观与呼出")
+need(
+    "外观与呼出" in settings
+    or "SettingsSectionChromeCopy.appearanceSectionTitle" in settings,
+    "hot corner must live under 外观与呼出",
+)
 need("settings-hot-corner" in settings, "a11y id missing")
 need("hotCornerPopup" in settings, "missing popup")
 need(
@@ -47,8 +50,7 @@ need("toggleVisibility" in monitor or "onTriggered" in monitor, "monitor should 
 need("configureHotCornerMonitor" in delegate, "AppDelegate must configure monitor")
 need("hotCornerMonitor" in delegate, "AppDelegate missing monitor property")
 
-if decisions:
-    need("Mission Control" in decisions or "触发角" in decisions, "DECISIONS must document system conflict")
+need("Mission Control" in decisions or "触发角" in decisions, "DECISIONS must document system conflict")
 need("showPage" not in monitor and "pageTransition" not in monitor, "monitor must not touch paging")
 need("showPage" not in settings[settings.find("hotCornerPopup"):settings.find("hotCornerPopup")+800]
      if "hotCornerPopup" in settings else True, "settings hot corner block must not page")
@@ -71,13 +73,15 @@ if failures:
 need("shouldAnimateLauncherPresenceForHotCorner" in core, "Core missing hot-corner presence animate gate")
 need("shouldSnapPagingChromeForHotCornerTrigger" in core, "Core missing hot-corner no-paging-snap gate")
 need("testHotCornerUsesAnimatedLauncherPresenceNotPagingSnaps" in tests, "Core presence test missing")
-lwc = (root / "Sources/Direct/LauncherWindowController.swift").read_text()
-need("func respondToHotCornerTrigger()" in lwc, "LWC missing respondToHotCornerTrigger")
-hc = lwc[lwc.index("func respondToHotCornerTrigger()"):lwc.index("func respondToHotCornerTrigger()") + 900]
+lwc = "".join(p.read_text() for p in [root / "Sources/Direct/LauncherWindowController.swift", *sorted((root / "Sources/Direct").glob("LauncherWindowController+*.swift"))])
+need("func respondToHotCornerTrigger" in lwc, "LWC missing respondToHotCornerTrigger")
+hc_at = lwc.index("func respondToHotCornerTrigger")
+hc = lwc[hc_at:hc_at + 1200]
 need("shouldAnimateLauncherPresenceForHotCorner" in hc, "hot corner must consult animate gate")
+need("shouldAcceptHotCornerPresenceToggle" in hc, "hot corner must suppress settings/modals")
 need("show(animated:" in hc and "hide(animated:" in hc, "hot corner must call show/hide(animated:)")
 need("snapPageIndicator" not in hc and "snapPageArrows" not in hc, "hot corner must not snap paging chrome")
-need("respondToHotCornerTrigger()" in delegate, "AppDelegate must call respondToHotCornerTrigger")
+need("respondToHotCornerTrigger(settingsIsKey:" in delegate, "AppDelegate must call respondToHotCornerTrigger with settingsIsKey")
 need("toggleVisibility()" not in delegate[delegate.index("configureHotCornerMonitor"):delegate.index("configureHotCornerMonitor")+500]
      or "respondToHotCornerTrigger" in delegate[delegate.index("configureHotCornerMonitor"):delegate.index("configureHotCornerMonitor")+500],
      "hot corner callback should not bare-toggle without presence helper")

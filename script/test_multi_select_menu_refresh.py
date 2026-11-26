@@ -24,7 +24,7 @@ body = d[j:d.index("\n    }\n", j)]
 need("showPage" not in body and "movePage" not in body and "reloadData" not in body,
      "menu refresh must not page or reload")
 k = d.index("tile.onWillPresentContextMenu = {")
-hook = d[k:k + 500]
+hook = d[k:k + 900]
 need("applySelectionDependentContextMenu(" in hook and "tile.refreshContextMenu()" in hook,
      "hook must re-apply selection items and rebuild the menu")
 

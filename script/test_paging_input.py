@@ -21,7 +21,7 @@ def extract(text: str, signature: str) -> str:
 
 
 handle = extract(source, '    func handlePagingScroll(').replace('NSEvent', 'PageScrollEvent')
-dominant = extract(source, '    static func dominantScrollDelta(').replace('NSEvent', 'PageScrollEvent')
+dominant = extract(source, '    func dominantScrollDelta(').replace('NSEvent', 'PageScrollEvent')
 methods = [extract(source, f'    private func {name}(') for name in
            ('beginGesture', 'updateGesture', 'finishGesture', 'resetGesture')]
 turn = extract(layout, '    public static func shouldTurnPage(').replace('public static', 'static', 1)
@@ -37,6 +37,7 @@ struct PageScrollEvent {
     let phase: ScrollPhase
     let momentumPhase: ScrollPhase = .none
     let hasPreciseScrollingDeltas = true
+    let isDirectionInvertedFromDevice = false
     var deltaX: CGFloat { scrollingDeltaX }
     var deltaY: CGFloat { scrollingDeltaY }
 }
@@ -49,10 +50,30 @@ enum LauncherLayout {
         quietPeriod: TimeInterval) -> (accumulatedDelta: CGFloat, direction: Int?, holdDelay: TimeInterval?) {
         (0, nil, nil)
     }
+    static func pageFlipLocksHorizontalAxis(preferredHorizontal: Bool, dx: CGFloat, dy: CGFloat) -> Bool {
+        if preferredHorizontal { return abs(dx) >= abs(dy) }
+        return abs(dx) > abs(dy)
+    }
+    static func pagingScrollDeltaPreservingNaturalScrolling(
+        deviceDelta: CGFloat,
+        isDirectionInvertedFromDevice: Bool
+    ) -> CGFloat {
+        _ = isDirectionInvertedFromDevice
+        return deviceDelta.isFinite ? deviceDelta : 0
+    }
+    enum WheelPageWhileItemDragging {
+        static let deltaThreshold: CGFloat = 2
+        static func pageTurnDirection(isItemDragging: Bool, dominantDelta: CGFloat) -> Int? {
+            guard isItemDragging else { return nil }
+            guard dominantDelta.isFinite, abs(dominantDelta) >= deltaThreshold else { return nil }
+            return dominantDelta < 0 ? 1 : -1
+        }
+    }
 ''' + turn + '''
 }
 @MainActor final class PagingHarness {
     let bounds = CGRect(x: 0, y: 0, width: 800, height: 500)
+    var prefersHorizontalPagingAxis = true
     var isDismissing: () -> Bool = { false }
     var accumulatedDelta: CGFloat = 0
     var lastTimestamp: TimeInterval?
@@ -64,6 +85,8 @@ enum LauncherLayout {
     var heldDiscreteToken = 0
     var dragChangedHandler: ((CGFloat) -> Void)?
     var dragEndedHandler: ((Int?) -> Void)?
+    var isItemDraggingForWheelPaging: () -> Bool = { false }
+    var discretePageWhileItemDraggingHandler: ((Int) -> Void)?
 ''' + dominant + '''
     func cancelPagingInput() {}
     func deliverDiscretePageTurn(_ direction: Int, at timestamp: TimeInterval) {}

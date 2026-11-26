@@ -5,7 +5,7 @@ import sys
 
 root = Path(__file__).resolve().parents[1]
 core = (root / "Sources/Core/LauncherLayout.swift").read_text()
-direct = (root / "Sources/Direct/LauncherWindowController.swift").read_text()
+direct = "".join(p.read_text() for p in [root / "Sources/Direct/LauncherWindowController.swift", *sorted((root / "Sources/Direct").glob("LauncherWindowController+*.swift"))])
 delegate = (root / "Sources/Direct/DirectAppDelegate.swift").read_text()
 tests = (root / "Tests/CoreTests/LaunchIconCoreTests.swift").read_text()
 failures = []
@@ -23,7 +23,7 @@ need("shouldRefreshStatusItemToggleTitleOnDismissArm" in direct, "hide must refr
 need("shouldRefreshStatusItemToggleTitleOnDismissCancel" in direct, "show must refresh on dismiss cancel")
 need("wasDismissing" in direct, "show must capture wasDismissing before clearing")
 
-hide = direct[direct.index("func hide(animated:"):direct.index("func toggleVisibility()")]
+hide = direct[direct.index("func hide(animated:"):direct.index("func toggleVisibility")]
 arm_at = hide.find("dismissArmed = true")
 refresh_at = hide.find("shouldRefreshStatusItemToggleTitleOnDismissArm")
 need(arm_at >= 0 and refresh_at > arm_at, "dismiss-arm refresh must follow dismissArmed = true")

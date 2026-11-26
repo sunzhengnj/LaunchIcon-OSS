@@ -21,7 +21,18 @@ need("private var searchKeyboardHighlightID" in direct, "Direct missing highligh
 need("isSearchKeyboardHighlighted" in direct, "Direct missing tile highlight flag")
 need("syncSearchKeyboardHighlight(pinFirst: true)" in direct, "typing must pin first hit")
 need("activateSearchKeyboardHighlightOrFirst" in direct, "Return must open highlight")
-need("moveSearchKeyboardHighlight(by:" in direct, "arrow move must exist")
+need("moveSearchKeyboardHighlightByRow(" in direct, "arrow move must exist")
+need("searchKeyboardHighlightIDMovingByRow(" in core, "Core missing row step")
+need("searchKeyboardHighlightIDMovingByRow(" in direct, "field arrows must use the row step")
+need("gridGeometry.columns" in direct[direct.index("func moveSearchKeyboardHighlightByRow"):direct.index("func revealSearchKeyboardHighlightOrFirst")], "row step must use the live column count")
+need("testSearchFieldArrowMovesHighlightByGridRow" in tests, "Core row-step test missing")
+need("func searchKeyboardHighlightAnnouncement(" in core, "Core missing highlight announcement")
+need("testSearchFieldArrowAnnouncesTheNewlyHighlightedHit" in tests, "Core announcement test missing")
+row = direct[direct.index("func moveSearchKeyboardHighlightByRow"):direct.index("func revealSearchKeyboardHighlightOrFirst")]
+sync = direct[direct.index("func syncSearchKeyboardHighlight"):direct.index("func moveSearchKeyboardHighlightByRow")]
+need("searchKeyboardHighlightAnnouncement(" in row, "row step must ask whether to speak")
+need("announcementRequested" in row, "row step must post the announcement")
+need("searchKeyboardHighlightAnnouncement(" not in sync, "typing must not announce every keystroke")
 need("moveDown(_:)" in direct and "moveUp(_:)" in direct, "doCommandBy must handle arrows")
 
 # Must not steal FR on typing path.

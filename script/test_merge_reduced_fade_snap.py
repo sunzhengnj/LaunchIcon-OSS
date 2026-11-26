@@ -30,7 +30,7 @@ need("return 0" in dur, "reduced must return 0")
 
 merge = direct[
     direct.index("private func playMergeAnimation(") : direct.index(
-        "private func materializedFolderItem("
+        "func materializedFolderItem("
     )
 ]
 branch = merge.index("if prefersReducedMotion {")
